@@ -8,6 +8,11 @@ on:
   pull_request:
     paths: ['windows/**']
   workflow_dispatch:
+    inputs:
+      package:
+        description: Build the installer as an artifact (nothing is published)
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -31,6 +36,8 @@ jobs:
         run: |
           if [[ "$GITHUB_REF" == refs/tags/windows-v* ]]; then
             echo "version=${GITHUB_REF_NAME#windows-v}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ inputs.package }}" == "true" ]]; then
+            echo "version=0.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
           else
             echo "version=0.0.0-ci.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
           fi
@@ -50,7 +57,7 @@ jobs:
           if (-not (Test-Path publish/e_sqlite3.dll)) { throw "SQLite native library missing" }
 
       - name: Package (installer + update feed)
-        if: startsWith(github.ref, 'refs/tags/windows-v')
+        if: startsWith(github.ref, 'refs/tags/windows-v') || inputs.package
         shell: bash
         run: |
           dotnet tool install -g vpk --version 1.2.161
