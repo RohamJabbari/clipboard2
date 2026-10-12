@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Platform-independent logic: history store, dedupe, retention, search, transforms,
+       snippets, AI clients. Unit-tested on any OS. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Clipboard2.Core</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.9" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Clipboard2.Core.Tests" />
+  </ItemGroup>
+</Project>

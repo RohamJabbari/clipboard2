@@ -5,7 +5,7 @@ DERIVED    := build
 RELEASE_APP := $(DERIVED)/Build/Products/Release/$(APP_NAME).app
 INSTALL_DIR := /Applications
 
-.PHONY: all generate build debug test install run icon pkg release clean
+.PHONY: all generate build debug test install run icon pkg release windows-test windows-release clean
 
 # Sign with Developer ID when that certificate exists, so local installs and the .pkg share one
 # signature (Accessibility/Keychain grants are tied to it). Otherwise Apple Development.
@@ -50,6 +50,18 @@ pkg:
 release:
 	@test -n "$(VERSION)" || (echo "usage: make release VERSION=x.y.z" && exit 1)
 	scripts/release.sh $(VERSION)
+
+# Windows version: tests run locally with .NET 10; the installer is built on GitHub's Windows servers.
+windows-test:
+	dotnet test windows/tests/Clipboard2.Core.Tests
+
+# make windows-release VERSION=1.1.0 — tags windows-v<version>; GitHub Actions builds the installer,
+# publishes the release and updates the feed installed copies check every hour.
+windows-release:
+	@test -n "$(VERSION)" || (echo "usage: make windows-release VERSION=x.y.z" && exit 1)
+	git tag "windows-v$(VERSION)"
+	git push origin "windows-v$(VERSION)"
+	@echo "Building on GitHub: gh run watch --repo RohamJabbari/clipboard2-macOS"
 
 icon:
 	swift scripts/make-icon.swift Clipboard2/Resources/Assets.xcassets/AppIcon.appiconset

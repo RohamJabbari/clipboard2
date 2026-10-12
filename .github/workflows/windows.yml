@@ -1,0 +1,89 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+    paths: ['windows/**', '.github/workflows/windows.yml']
+    tags: ['windows-v*']
+  pull_request:
+    paths: ['windows/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      DOTNET_NOLOGO: 1
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/windows-v* ]]; then
+            echo "version=${GITHUB_REF_NAME#windows-v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-ci.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Test
+        run: dotnet test windows/tests/Clipboard2.Core.Tests -c Release
+
+      - name: Publish
+        run: >
+          dotnet publish windows/src/Clipboard2.App -c Release -r win-x64 --self-contained
+          -p:Version=${{ steps.version.outputs.version }} -o publish
+
+      - name: Smoke-check the build
+        shell: pwsh
+        run: |
+          if (-not (Test-Path publish/Clipboard2.exe)) { throw "Clipboard2.exe missing" }
+          if (-not (Test-Path publish/e_sqlite3.dll)) { throw "SQLite native library missing" }
+
+      - name: Package (installer + update feed)
+        if: startsWith(github.ref, 'refs/tags/windows-v')
+        shell: bash
+        run: |
+          dotnet tool install -g vpk --version 1.2.161
+          vpk pack --packId Clipboard2 --packVersion "${{ steps.version.outputs.version }}" \
+            --packDir publish --mainExe Clipboard2.exe --outputDir releases \
+            --packTitle "Clipboard2" --packAuthors "Softmaze Solutions GmbH" \
+            --icon windows/src/Clipboard2.App/Assets/app.ico --delta None
+          ls -la releases
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/windows-v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          cp releases/Clipboard2-win-Setup.exe "releases/Clipboard2-${VERSION}-Setup.exe"
+          gh release create "$GITHUB_REF_NAME" "releases/Clipboard2-${VERSION}-Setup.exe" releases/Clipboard2-win-Portable.zip \
+            --title "Clipboard2 for Windows ${VERSION}" --latest=false \
+            --notes "Download **Clipboard2-${VERSION}-Setup.exe** and run it — it installs in seconds, no admin rights needed. Installed copies update themselves.
+
+          The installer isn't code-signed yet, so Windows may say \"Windows protected your PC\": click **More info → Run anyway**."
+          # One fixed release holds the update feed the app checks every hour.
+          gh release view windows-latest >/dev/null 2>&1 || \
+            gh release create windows-latest --title "Windows update feed" --latest=false --prerelease \
+              --notes "Used by installed copies of Clipboard2 for Windows to update themselves. Download the installer from the newest *Clipboard2 for Windows* release instead."
+          gh release upload windows-latest releases/releases.win.json releases/*-full.nupkg --clobber
+          [ -f releases/assets.win.json ] && gh release upload windows-latest releases/assets.win.json --clobber || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipboard2-windows-${{ steps.version.outputs.version }}
+          path: |
+            publish
+            releases
+          if-no-files-found: ignore

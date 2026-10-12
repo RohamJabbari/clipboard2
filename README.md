@@ -17,6 +17,39 @@ Needs Xcode 26 and `xcodegen` (`brew install xcodegen`). `project.yml` is the so
 truth; the `.xcodeproj` is generated and git-ignored. Signing uses the Apple Development
 identity of team `XWTH2647FF` (not ad-hoc) so the Accessibility grant survives rebuilds.
 
+## Windows version
+
+`windows/` is a native Windows 10/11 app (C#, .NET 10, WPF with the Windows 11 Fluent theme) with
+the same features, sharing no code with the Mac app but following it one to one:
+
+| Mac | Windows |
+|---|---|
+| ⇧⌘V quick panel | **Ctrl+Shift+V** |
+| ⌥⌘K actions on selection | **Ctrl+Alt+K** |
+| ⌥⇧⌘V paste as text (OCR) | **Ctrl+Alt+Shift+V** |
+| ⌥⇧⌘2 capture text | **Ctrl+Alt+Shift+2** (Snipping Tool + on-device OCR) |
+| ⌘-right-click menu | **Ctrl+right-click** |
+| ⌘1–9 / ⌘⇧1–9 quick slots | **Ctrl+1–9 / Ctrl+Shift+1–9** |
+| ⌥⏎ plain text | **Shift+Enter** |
+| Keychain | Windows Credential Manager |
+| Touch ID | Windows Hello |
+| Menu bar popover | Tray icon flyout |
+| Sparkle | Velopack (Setup.exe installer + in-place updates) |
+| Services menu | — (Windows has no equivalent) |
+
+Layout: `src/Clipboard2.Core` (all logic — store, dedupe, retention, search, transforms,
+snippets, AI clients, panel model; unit-tested on any OS), `src/Clipboard2.App` (Windows UI and
+system hooks), `tests/Clipboard2.Core.Tests`.
+
+```sh
+make windows-test                       # unit tests (needs .NET 10; runs on macOS too)
+make windows-release VERSION=1.1.0      # tag → GitHub Actions builds Setup.exe, publishes, updates feed
+```
+
+Data: `%LOCALAPPDATA%\Softmaze\Clipboard2` (history, images, log), settings in
+`%APPDATA%\Softmaze\Clipboard2\settings.json`, keys and secrets in Credential Manager.
+The installer isn't code-signed yet, so SmartScreen asks once ("More info → Run anyway").
+
 ## Installer
 
 ```sh

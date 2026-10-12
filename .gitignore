@@ -4,3 +4,5 @@ build/
 xcuserdata/
 dist/
 build-dev/
+windows/**/bin/
+windows/**/obj/
