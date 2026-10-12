@@ -267,9 +267,17 @@ final class PanelViewModel {
         targetApp = target
         query = ""
         filter = .all
+        userMovedSelection = false
         refresh(resetSelection: true)
         focusToken &+= 1
+        openToken &+= 1
     }
+
+    /// Bumped on every open so the list scrolls back to the top.
+    private(set) var openToken = 0
+    /// Until the user moves the selection, it stays on the newest item — even when a copy made
+    /// just before opening lands a moment later.
+    @ObservationIgnored private var userMovedSelection = false
 
     func didClose() {
         selectionItem = nil
@@ -357,7 +365,7 @@ final class PanelViewModel {
         }
 
         entries = Array(result.prefix(Self.maxEntries))
-        if resetSelection || !entries.contains(where: { $0.id == selectedID }) {
+        if resetSelection || !userMovedSelection || !entries.contains(where: { $0.id == selectedID }) {
             selectedID = entries.first?.id
         } else {
             let live = Set(entries.map(\.id))
@@ -375,6 +383,7 @@ final class PanelViewModel {
 
     func moveSelection(by delta: Int, extending: Bool = false) {
         guard !entries.isEmpty else { return }
+        userMovedSelection = true
         let current = selectedIndex ?? (delta > 0 ? -1 : entries.count)
         let next = min(max(current + delta, 0), entries.count - 1)
         if extending {
@@ -397,6 +406,7 @@ final class PanelViewModel {
 
     /// Mouse selection following macOS conventions: ⌘ toggles, ⇧ selects a range.
     func click(_ entry: PanelEntry) {
+        userMovedSelection = true
         let flags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if flags.contains(.command) {
             toggleSelection(entry.id)

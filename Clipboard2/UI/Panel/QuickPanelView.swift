@@ -107,6 +107,9 @@ struct QuickPanelView: View {
                         }
                         .padding(8)
                     }
+                    .onChange(of: model.openToken) {
+                        if let first = model.entries.first?.id { proxy.scrollTo(first, anchor: .top) }
+                    }
                     .onChange(of: model.selectedID) { _, id in
                         guard let id else { return }
                         if reduceMotion {

@@ -51,6 +51,9 @@ codesign --verify --strict --deep "$APP"
 
 can_notarize() { [[ -n "$APP_ID" ]] && xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; }
 
+if [[ -n "$APP_ID" ]] && ! can_notarize; then
+    printf '\033[33m  ⚠ No working notarization login (profile "%s"). Run:\n    xcrun notarytool store-credentials %s --apple-id <you> --team-id XWTH2647FF\033[0m\n' "$NOTARY_PROFILE" "$NOTARY_PROFILE"
+fi
 if can_notarize; then
     step "Notarizing app"
     ditto -c -k --keepParent "$APP" "$DERIVED/$APP_NAME-notarize.zip"

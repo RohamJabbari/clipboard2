@@ -154,4 +154,20 @@ struct PanelKeyboardTests {
         #expect(model.handleKeyDown(key(KeyCode.escape, "\u{1b}")))
         #expect(closed)
     }
+
+    @Test func openingAlwaysSelectsTheNewestItem() {
+        let older = env.store.ingest(.text("open-older \(UUID())"), now: .now.addingTimeInterval(-10))
+        let newer = env.store.ingest(.text("open-newer \(UUID())"))
+        defer { [older, newer].forEach(env.store.delete) }
+        model.prepareForOpen(target: nil)
+        model.moveSelection(by: 1)                       // user picks something lower down
+        model.prepareForOpen(target: nil)                // reopen
+        #expect(model.selectedID == model.entries.first?.id)
+
+        // A copy that lands just after opening becomes the selection too.
+        let late = env.store.ingest(.text("open-late \(UUID())"))
+        defer { env.store.delete(late) }
+        model.refresh()
+        #expect(model.selectedID == PanelEntry.clip(late).id)
+    }
 }
