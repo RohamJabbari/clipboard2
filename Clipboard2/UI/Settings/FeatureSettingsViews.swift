@@ -455,7 +455,9 @@ struct SubscriptionAccountRow: View {
             }
             if account.state == .signingIn {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Finish signing in in your browser, then come back here.")
+                    Text(account.needsCode
+                         ? "Sign in on the page that opened. It then shows a code — copy it and paste it here."
+                         : "Finish signing in in your browser, then come back here.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     if let url = account.signInURL {
@@ -464,6 +466,10 @@ struct SubscriptionAccountRow: View {
                     if account.needsCode {
                         HStack {
                             TextField("Code", text: $code, prompt: Text("Paste the code from the browser"))
+                                .onSubmit {
+                                    account.submitCode(code)
+                                    code = ""
+                                }
                             Button("Continue") {
                                 account.submitCode(code)
                                 code = ""

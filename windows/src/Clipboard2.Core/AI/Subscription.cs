@@ -108,10 +108,10 @@ public sealed class SubscriptionAccount(SubscriptionCli cli)
         {
             var process = Process.Start(AI.Cli.StartInfo(exe, Cli.LoginArguments())) ?? throw new InvalidOperationException("Couldn't start sign-in.");
             process.EnableRaisingEvents = true;
-            process.OutputDataReceived += (_, e) => HandleOutput(e.Data);
-            process.ErrorDataReceived += (_, e) => HandleOutput(e.Data);
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
+            _output.Clear();
+            // Read raw chunks, not lines: the "Paste code here >" prompt has no line break.
+            _ = PumpAsync(process.StandardOutput);
+            _ = PumpAsync(process.StandardError);
             process.Exited += async (_, _) =>
             {
                 _login = null;
@@ -126,11 +126,31 @@ public sealed class SubscriptionAccount(SubscriptionCli cli)
         }
     }
 
-    private void HandleOutput(string? line)
+    private readonly System.Text.StringBuilder _output = new();
+
+    private async Task PumpAsync(StreamReader reader)
     {
-        if (line is null) return;
-        if (SignInUrl is null && FirstUrl(line) is { } url) SignInUrl = url;
-        var lower = line.ToLowerInvariant();
+        var buffer = new char[1024];
+        try
+        {
+            int read;
+            while ((read = await reader.ReadAsync(buffer, 0, buffer.Length)) > 0) HandleOutput(new string(buffer, 0, read));
+        }
+        catch { /* process ended */ }
+    }
+
+    private void HandleOutput(string chunk)
+    {
+        string text;
+        lock (_output) text = _output.Append(chunk).ToString();
+        var lastNewline = text.LastIndexOf('\n');
+        if (SignInUrl is null && lastNewline >= 0 && FirstUrl(text[..lastNewline]) is { } url)
+        {
+            SignInUrl = url;
+            // Without a console the CLI often can't open the browser itself; do it here.
+            try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); } catch { }
+        }
+        var lower = text.ToLowerInvariant();
         if (lower.Contains("paste") && lower.Contains("code")) NeedsCode = true;
         Changed?.Invoke();
     }

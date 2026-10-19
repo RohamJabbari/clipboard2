@@ -657,7 +657,9 @@ public sealed class SettingsWindow : Window
         stack.Children.Add(Row("Account", controls));
         if (state.Phase == SubscriptionPhase.SigningIn)
         {
-            stack.Children.Add(Fluent.Label("Finish signing in in your browser, then come back here.", 12, Fluent.Secondary));
+            stack.Children.Add(Fluent.Label(account.NeedsCode
+                ? "Sign in on the page that opened. It then shows a code — copy it and paste it here."
+                : "Finish signing in in your browser, then come back here.", 12, Fluent.Secondary, wrap: true));
             if (account.SignInUrl is { } url)
                 stack.Children.Add(Action("Open Sign-In Page Again", () => Process.Start(new ProcessStartInfo(url) { UseShellExecute = true })));
             if (account.NeedsCode)

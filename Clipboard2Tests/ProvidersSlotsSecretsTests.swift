@@ -159,6 +159,13 @@ struct ClaudeAccountTests {
         #expect(SubscriptionAccount.firstURL(in: "no url here") == nil)
     }
 
+    @Test func extractsTheFullClaudeCodeSignInURL() throws {
+        let line = "If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile&code_challenge=9shm&code_challenge_method=S256&state=YG85\n"
+        let url = try #require(SubscriptionAccount.firstURL(in: line))
+        #expect(url.absoluteString.hasSuffix("state=YG85"))
+        #expect(url.absoluteString.contains("redirect_uri=https%3A%2F%2Fplatform.claude.com"))
+    }
+
     @Test func notLoggedInMapsToSignInError() {
         #expect(AIError.notSignedIn.needsSettings)
     }

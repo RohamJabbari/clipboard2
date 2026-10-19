@@ -108,6 +108,7 @@ final class SubscriptionAccount {
         state = .signingIn
         signInURL = nil
         needsCode = false
+        loginOutput = ""
 
         let process = Process()
         process.executableURL = executable
@@ -136,21 +137,30 @@ final class SubscriptionAccount {
         loginProcess = process
         loginInput = input.fileHandleForWriting
 
-        let reader = output.fileHandleForReading
-        Task { [weak self] in
-            do {
-                for try await line in reader.bytes.lines {
-                    self?.handleLoginOutput(line)
-                }
-            } catch {}
+        // Read raw chunks, not lines: the CLI's "Paste code here >" prompt has no newline.
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+            let chunk = String(decoding: data, as: UTF8.self)
+            Task { @MainActor in self?.handleLoginOutput(chunk) }
         }
     }
 
-    private func handleLoginOutput(_ line: String) {
-        if signInURL == nil, let url = Self.firstURL(in: line) {
+    @ObservationIgnored private var loginOutput = ""
+
+    private func handleLoginOutput(_ chunk: String) {
+        loginOutput += chunk
+        // Only complete lines can contain a whole URL.
+        if signInURL == nil, let lastNewline = loginOutput.lastIndex(of: "\n"),
+           let url = Self.firstURL(in: String(loginOutput[...lastNewline])) {
             signInURL = url
+            // Run without a terminal, the CLI often can't open the browser itself; do it here.
+            NSWorkspace.shared.open(url)
         }
-        let lower = line.lowercased()
+        let lower = loginOutput.lowercased()
         if lower.contains("paste") && lower.contains("code") {
             needsCode = true
         }
