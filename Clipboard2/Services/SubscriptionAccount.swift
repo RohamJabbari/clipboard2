@@ -158,12 +158,39 @@ final class SubscriptionAccount {
            let url = Self.firstURL(in: String(loginOutput[...lastNewline])) {
             signInURL = url
             // Run without a terminal, the CLI often can't open the browser itself; do it here.
-            NSWorkspace.shared.open(url)
+            openSignInPage()
         }
         let lower = loginOutput.lowercased()
         if lower.contains("paste") && lower.contains("code") {
             needsCode = true
         }
+    }
+
+    /// Why the last attempt to open the browser failed, if it did.
+    private(set) var openError: String?
+
+    func openSignInPage() {
+        guard let url = signInURL else { return }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.open(url, configuration: configuration) { [weak self] app, error in
+            Task { @MainActor in
+                if let error {
+                    self?.openError = error.localizedDescription
+                    Log.app.error("Opening the sign-in page failed: \(error.localizedDescription, privacy: .public)")
+                } else {
+                    self?.openError = nil
+                    Log.app.notice("Opened the sign-in page in \(app?.bundleIdentifier ?? "unknown", privacy: .public)")
+                }
+            }
+        }
+    }
+
+    func copySignInLink() {
+        guard let url = signInURL else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+        NSPasteboard.general.setData(Data(), forType: NSPasteboard.PasteboardType(ClipboardFilter.internalMarkerType))
     }
 
     nonisolated static func firstURL(in line: String) -> URL? {

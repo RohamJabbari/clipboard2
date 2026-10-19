@@ -461,7 +461,7 @@ struct SubscriptionAccountRow: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     if let url = account.signInURL {
-                        Button("Open Sign-In Page Again") { NSWorkspace.shared.open(url) }
+                        signInLink(url)
                     }
                     if account.needsCode {
                         HStack {
@@ -484,6 +484,29 @@ struct SubscriptionAccountRow: View {
                 .foregroundStyle(.secondary)
         }
         .task { await account.refresh() }
+    }
+
+    @ViewBuilder
+    private func signInLink(_ url: URL) -> some View {
+        HStack(spacing: 8) {
+            Text(url.absoluteString)
+                .font(.caption.monospaced())
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+                .foregroundStyle(.secondary)
+            Button("Open in Browser") { account.openSignInPage() }
+            Button("Copy Link") { account.copySignInLink() }
+        }
+        if let error = account.openError {
+            Text("Couldn't open the browser (\(error)). Copy the link and paste it into your browser's address bar.")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        } else {
+            Text("No browser window? Copy the link and paste it into your browser's address bar.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 
     @ViewBuilder
