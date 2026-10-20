@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import Security
 import Observation
 
@@ -263,6 +264,76 @@ nonisolated enum AIAction: Hashable, Identifiable, Sendable {
     static func userMessage(for input: String) -> String {
         "<text>\n\(input)\n</text>"
     }
+
+    /// Actions that make sense for an image (Fix Grammar needs editable text).
+    var worksOnImages: Bool {
+        if case .fixGrammar = self { return false }
+        return true
+    }
+
+    /// Same instructions, but the input is an attached image instead of `<text>`.
+    var imageSystemPrompt: String {
+        let suffix = "The input is the attached image."
+        switch self {
+        case .translate(let language):
+            return "Translate all text in the image into \(language), keeping its structure and line breaks. Reply with the translation only. \(suffix)"
+        case .summarize:
+            return "Summarize what the image shows and the text in it, concisely. \(suffix)"
+        case .fixGrammar:
+            return "Transcribe the text in the image with grammar, spelling and punctuation corrected. Reply with the text only. \(suffix)"
+        case .explain:
+            return "Explain what the image shows, clearly and concisely for a smart reader. If it contains code, an error message, a chart or a document, explain that content. \(suffix)"
+        case .custom(let prompt):
+            return "\(prompt.prompt)\n\n\(suffix) Reply with the result only — no preamble."
+        case .instruction(let text):
+            return "Do the following with the image: \(text)\n\nIf it asks a question, answer it concisely. \(suffix)"
+        }
+    }
+
+    static let imageUserMessage = "Here is the image."
+}
+
+/// An image sent along with the prompt (screenshots, copied pictures), downscaled for the model.
+nonisolated struct AIImage: Sendable, Hashable {
+    var data: Data
+    var mediaType: String
+    /// The same bytes on disk, for CLIs that take a file path.
+    var fileURL: URL
+
+    var base64: String { data.base64EncodedString() }
+
+    /// Longest edge the vision models use anyway; bigger only costs tokens and upload time.
+    static let maxPixelSize = 1_568
+
+    static func load(from url: URL) -> AIImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+              ] as CFDictionary)
+        else { return nil }
+        // PNG keeps screenshot text crisp; fall back to JPEG for large photos (APIs cap at ~5 MB).
+        var encoded = encode(image, type: "public.png", options: [:])
+        var mediaType = "image/png"
+        if (encoded?.count ?? .max) > 3_500_000 {
+            encoded = encode(image, type: "public.jpeg", options: [kCGImageDestinationLossyCompressionQuality: 0.85])
+            mediaType = "image/jpeg"
+        }
+        guard let encoded else { return nil }
+        let dir = FileManager.default.temporaryDirectory.appending(path: "clippy-cli", directoryHint: .isDirectory)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appending(path: "image-\(UUID().uuidString).\(mediaType == "image/png" ? "png" : "jpg")")
+        guard (try? encoded.write(to: file)) != nil else { return nil }
+        return AIImage(data: encoded, mediaType: mediaType, fileURL: file)
+    }
+
+    private static func encode(_ image: CGImage, type: String, options: [CFString: Any]) -> Data? {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, type as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(destination, image, options as CFDictionary)
+        return CGImageDestinationFinalize(destination) ? data as Data : nil
+    }
 }
 
 // MARK: - Errors & SSE
@@ -371,7 +442,13 @@ nonisolated enum SSEParser {
 // MARK: - Clients
 
 nonisolated protocol AIStreamingClient: Sendable {
-    func stream(system: String, user: String) -> AsyncThrowingStream<String, Error>
+    func stream(system: String, user: String, image: AIImage?) -> AsyncThrowingStream<String, Error>
+}
+
+extension AIStreamingClient {
+    func stream(system: String, user: String) -> AsyncThrowingStream<String, Error> {
+        stream(system: system, user: user, image: nil)
+    }
 }
 
 nonisolated enum HTTPStreaming {
@@ -420,14 +497,14 @@ nonisolated struct ClaudeClient: AIStreamingClient {
     static let effortPrefixes = ["claude-fable-5", "claude-mythos-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-5",
                                  "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-sonnet-4-6"]
 
-    func makeRequest(system: String, user: String, maxTokens: Int = 8_192) throws -> URLRequest {
+    func makeRequest(system: String, user: String, image: AIImage? = nil, maxTokens: Int = 8_192) throws -> URLRequest {
         guard let endpoint = Self.endpoint else { throw AIError.badURL }
         var body: [String: Any] = [
             "model": model,
             "max_tokens": maxTokens,
             "stream": true,
             "system": system,
-            "messages": [["role": "user", "content": user]],
+            "messages": [["role": "user", "content": Self.content(user: user, image: image)]],
         ]
         if Self.effortPrefixes.contains(where: model.hasPrefix) {
             body["output_config"] = ["effort": "low"]
@@ -446,8 +523,17 @@ nonisolated struct ClaudeClient: AIStreamingClient {
         return request
     }
 
-    func stream(system: String, user: String) -> AsyncThrowingStream<String, Error> {
-        HTTPStreaming.stream({ try makeRequest(system: system, user: user) }, session: session) { line, continuation in
+    /// Plain string for text; image block first, then the text, when there's an image.
+    static func content(user: String, image: AIImage?) -> Any {
+        guard let image else { return user }
+        return [
+            ["type": "image", "source": ["type": "base64", "media_type": image.mediaType, "data": image.base64]],
+            ["type": "text", "text": user],
+        ]
+    }
+
+    func stream(system: String, user: String, image: AIImage?) -> AsyncThrowingStream<String, Error> {
+        HTTPStreaming.stream({ try makeRequest(system: system, user: user, image: image) }, session: session) { line, continuation in
             switch SSEParser.parse(line: line) {
             case .textDelta(let text): continuation.yield(text)
             case .stop(let reason) where reason == "refusal": throw AIError.refusal
@@ -467,7 +553,7 @@ nonisolated struct OpenAICompatibleClient: AIStreamingClient {
     var extraHeaders: [String: String] = [:]
     var session: URLSession = .shared
 
-    func makeRequest(system: String, user: String) throws -> URLRequest {
+    func makeRequest(system: String, user: String, image: AIImage? = nil) throws -> URLRequest {
         let trimmed = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
         guard let url = URL(string: trimmed + "/chat/completions"), url.scheme?.hasPrefix("http") == true else {
             throw AIError.badURL
@@ -485,15 +571,23 @@ nonisolated struct OpenAICompatibleClient: AIStreamingClient {
             "stream": true,
             "messages": [
                 ["role": "system", "content": system],
-                ["role": "user", "content": user],
+                ["role": "user", "content": Self.content(user: user, image: image)],
             ],
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         return request
     }
 
-    func stream(system: String, user: String) -> AsyncThrowingStream<String, Error> {
-        HTTPStreaming.stream({ try makeRequest(system: system, user: user) }, session: session) { line, continuation in
+    static func content(user: String, image: AIImage?) -> Any {
+        guard let image else { return user }
+        return [
+            ["type": "text", "text": user],
+            ["type": "image_url", "image_url": ["url": "data:\(image.mediaType);base64,\(image.base64)"]],
+        ]
+    }
+
+    func stream(system: String, user: String, image: AIImage?) -> AsyncThrowingStream<String, Error> {
+        HTTPStreaming.stream({ try makeRequest(system: system, user: user, image: image) }, session: session) { line, continuation in
             switch SSEParser.parseOpenAI(line: line) {
             case .textDelta(let text): continuation.yield(text)
             case .stop(let reason) where reason == "content_filter": throw AIError.refusal
@@ -519,7 +613,7 @@ nonisolated struct ClaudeCodeCLIClient: AIStreamingClient {
         candidatePaths.first { FileManager.default.isExecutableFile(atPath: $0) }.map(URL.init(fileURLWithPath:))
     }
 
-    func arguments(system: String) -> [String] {
+    func arguments(system: String, jsonInput: Bool = false) -> [String] {
         var args = [
             "-p",
             "--system-prompt", system,
@@ -532,7 +626,20 @@ nonisolated struct ClaudeCodeCLIClient: AIStreamingClient {
             "--verbose",
         ]
         if !model.isEmpty { args += ["--model", model] }
+        // Images can only be passed as content blocks, which need stream-json input.
+        if jsonInput { args += ["--input-format", "stream-json"] }
         return args
+    }
+
+    /// One stream-json user message carrying the image and the text.
+    static func jsonInput(user: String, image: AIImage) -> Data {
+        let message: [String: Any] = [
+            "type": "user",
+            "message": ["role": "user", "content": ClaudeClient.content(user: user, image: image)],
+        ]
+        var data = (try? JSONSerialization.data(withJSONObject: message)) ?? Data()
+        data.append(0x0A)
+        return data
     }
 
     /// Parses one stream-json line. Returns text to yield, or throws for errors.
@@ -564,8 +671,9 @@ nonisolated struct ClaudeCodeCLIClient: AIStreamingClient {
         }
     }
 
-    func stream(system: String, user: String) -> AsyncThrowingStream<String, Error> {
-        let arguments = arguments(system: system)
+    func stream(system: String, user: String, image: AIImage?) -> AsyncThrowingStream<String, Error> {
+        let arguments = arguments(system: system, jsonInput: image != nil)
+        let input = image.map { Self.jsonInput(user: user, image: $0) } ?? Data(user.utf8)
         return AsyncThrowingStream { continuation in
             guard let executable = Self.executableURL else {
                 continuation.finish(throwing: AIError.cliNotFound)
@@ -575,7 +683,7 @@ nonisolated struct ClaudeCodeCLIClient: AIStreamingClient {
             let task = Task {
                 do {
                     let (stdout, stdin) = try process.launch(executable: executable, arguments: arguments)
-                    stdin.write(Data(user.utf8))
+                    stdin.write(input)
                     try? stdin.close()
                     var streamed = false
                     var buffered = ""
@@ -673,10 +781,11 @@ nonisolated struct CodexCLIClient: AIStreamingClient {
         return environment
     }
 
-    func arguments() -> [String] {
+    func arguments(image: URL? = nil) -> [String] {
         var args = ["exec", "--skip-git-repo-check", "--ephemeral", "--sandbox", "read-only",
                     "--ignore-rules", "--ignore-user-config", "--json"]
         if !model.isEmpty { args += ["-m", model] }
+        if let image { args += ["-i", image.path] }
         return args + ["-"]   // prompt from stdin
     }
 
@@ -709,8 +818,8 @@ nonisolated struct CodexCLIClient: AIStreamingClient {
         return message
     }
 
-    func stream(system: String, user: String) -> AsyncThrowingStream<String, Error> {
-        let arguments = arguments()
+    func stream(system: String, user: String, image: AIImage?) -> AsyncThrowingStream<String, Error> {
+        let arguments = arguments(image: image?.fileURL)
         let prompt = system + "\n\n" + user
         return AsyncThrowingStream { continuation in
             guard let executable = Self.executableURL else {
@@ -829,10 +938,14 @@ final class AIRun {
     private(set) var errorMessage: String?
     @ObservationIgnored private var task: Task<Void, Never>?
 
-    init(action: AIAction, item: ClipItem, providerName: String) {
+    /// Set for image items; the prompt then asks about the picture instead of `<text>`.
+    let image: AIImage?
+
+    init(action: AIAction, item: ClipItem, providerName: String, image: AIImage? = nil) {
         self.action = action
         self.item = item
         self.providerName = providerName
+        self.image = image
     }
 
     var isFinished: Bool { !isStreaming && errorMessage == nil && !output.isEmpty }
@@ -845,12 +958,13 @@ final class AIRun {
             fail(error)
             return
         }
-        let system = action.systemPrompt
-        let user = AIAction.userMessage(for: item.text)
+        let image = self.image
+        let system = image == nil ? action.systemPrompt : action.imageSystemPrompt
+        let user = image == nil ? AIAction.userMessage(for: item.text) : AIAction.imageUserMessage
         isStreaming = true
         task = Task { [weak self] in
             do {
-                for try await chunk in client.stream(system: system, user: user) {
+                for try await chunk in client.stream(system: system, user: user, image: image) {
                     self?.output += chunk
                 }
                 self?.isStreaming = false

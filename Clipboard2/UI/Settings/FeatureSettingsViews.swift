@@ -457,7 +457,7 @@ struct SubscriptionAccountRow: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(account.needsCode
                          ? "Sign in on the page that opened. It then shows a code — copy it and paste it here."
-                         : "Finish signing in in your browser, then come back here.")
+                         : "Finish signing in in your browser — Clipboard2 picks it up by itself.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     if let url = account.signInURL {

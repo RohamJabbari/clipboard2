@@ -112,7 +112,7 @@ enum PanelAction: Identifiable, Hashable {
         case .pastePlain: "Paste as Plain Text"
         case .copy: "Copy to Clipboard"
         case .transform(let t): t.title
-        case .ai(.instruction(let text)): "“\(text)”"
+        case .ai(.instruction(let text)): "Ask: “\(text)”"
         case .ai(let a): a.title
         case .saveAsSecret: "Save as Secret…"
         case .setLabel: "Label…"
@@ -648,6 +648,8 @@ final class PanelViewModel {
                 actions += Transform.allCases.filter { $0 != .plainText }.map(PanelAction.transform)
                 actions += aiActions
                 actions.append(.saveAsSecret)
+            } else if item.kind == .image {
+                actions += aiActions.filter { if case .ai(let ai) = $0 { ai.worksOnImages } else { true } }
             }
             actions.append(.setLabel)
             actions.append(.togglePin)
@@ -677,10 +679,12 @@ final class PanelViewModel {
             }
             .sorted { $0.1 > $1.1 }
             .map(\.0)
-        // Anything typed can also be sent as a one-off instruction for the selected text.
-        if !isMultiSelecting, selectedEntry?.clip?.kind.isTextual == true {
+        // Anything typed can also be sent as a question or instruction about the selected item.
+        if !isMultiSelecting, let kind = selectedEntry?.clip?.kind, kind.isTextual || kind == .image {
             if env.isAIReady {
-                matches.append(.ai(.instruction(q)))
+                // A sentence or question is meant for the AI, not a filter: offer it first.
+                let looksLikeQuestion = q.contains(" ") || q.hasSuffix("?")
+                if looksLikeQuestion { matches.insert(.ai(.instruction(q)), at: 0) } else { matches.append(.ai(.instruction(q))) }
             } else if !matches.contains(.setUpAI) {
                 matches.append(.setUpAI)
             }
@@ -719,7 +723,15 @@ final class PanelViewModel {
             env.paste.paste(text: result, into: target)
         case .ai(let aiAction):
             guard let item = entry.clip else { return }
-            let run = AIRun(action: aiAction, item: item, providerName: env.prefs.aiProvider.title)
+            var image: AIImage?
+            if item.kind == .image {
+                guard let file = item.imageFile, let loaded = AIImage.load(from: env.blobs.url(for: file)) else {
+                    showNotice("Couldn't read this image")
+                    return
+                }
+                image = loaded
+            }
+            let run = AIRun(action: aiAction, item: item, providerName: env.prefs.aiProvider.title, image: image)
             aiRun = run
             mode = .ai
             run.start(prefs: env.prefs)
@@ -780,7 +792,7 @@ final class PanelViewModel {
     func rerunAI() {
         guard let old = aiRun else { return }
         old.cancel()
-        let run = AIRun(action: old.action, item: old.item, providerName: env.prefs.aiProvider.title)
+        let run = AIRun(action: old.action, item: old.item, providerName: env.prefs.aiProvider.title, image: old.image)
         aiRun = run
         run.start(prefs: env.prefs)
     }

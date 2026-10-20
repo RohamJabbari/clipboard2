@@ -116,6 +116,10 @@ final class SecretStore {
     private(set) var unlockedUntil: Date?
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
     @ObservationIgnored private let prefs: Preferences
+    /// True while the Touch ID / password sheet is up, so the quick panel doesn't close under it.
+    @ObservationIgnored private(set) var isAuthenticating = false
+
+    nonisolated static let authenticationEnded = Notification.Name("at.softmaze.Clipboard2.authenticationEnded")
 
     init(prefs: Preferences) {
         self.prefs = prefs
@@ -196,6 +200,11 @@ final class SecretStore {
         guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
             Log.app.error("Authentication unavailable: \(error?.localizedDescription ?? "unknown", privacy: .public)")
             return false
+        }
+        isAuthenticating = true
+        defer {
+            isAuthenticating = false
+            NotificationCenter.default.post(name: Self.authenticationEnded, object: self)
         }
         do {
             try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason)

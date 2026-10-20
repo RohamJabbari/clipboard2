@@ -33,6 +33,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
     let model: PanelViewModel
     private var panel: QuickPanel?
     private var keyMonitor: Any?
+    private var authObserver: NSObjectProtocol?
 
     static let cornerRadius: CGFloat = 22
 
@@ -41,6 +42,13 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         self.model = PanelViewModel(env: env)
         super.init()
         model.onClose = { [weak self] in self?.close() }
+        // Touch ID takes key focus; take it back afterwards if the panel is still meant to be up.
+        authObserver = NotificationCenter.default.addObserver(forName: SecretStore.authenticationEnded, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let panel = self.panel, panel.isVisible, !panel.isKeyWindow else { return }
+                panel.makeKey()
+            }
+        }
     }
 
     var isVisible: Bool { panel?.isVisible == true }
@@ -115,6 +123,8 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
     // MARK: NSWindowDelegate
 
     func windowDidResignKey(_ notification: Notification) {
+        // The Touch ID / password sheet steals focus; that isn't the user leaving the panel.
+        if env.secrets.isAuthenticating { return }
         close()
     }
 

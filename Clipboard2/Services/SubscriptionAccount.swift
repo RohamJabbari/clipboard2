@@ -109,11 +109,15 @@ final class SubscriptionAccount {
         signInURL = nil
         needsCode = false
         loginOutput = ""
+        printedURL = nil
 
         let process = Process()
         process.executableURL = executable
         process.arguments = cli.loginArguments
-        if let environment = cli.environment(for: executable) { process.environment = environment }
+        let shim = BrowserShim.prepare()
+        var environment = cli.environment(for: executable) ?? ProcessInfo.processInfo.environment
+        if let shim { BrowserShim.apply(shim, to: &environment) }
+        process.environment = environment
         process.currentDirectoryURL = FileManager.default.temporaryDirectory
         let output = Pipe(), input = Pipe()
         process.standardOutput = output
@@ -136,6 +140,7 @@ final class SubscriptionAccount {
         }
         loginProcess = process
         loginInput = input.fileHandleForWriting
+        if let shim { watchBrowserRequests(shim.urlFile, process: process) }
 
         // Read raw chunks, not lines: the CLI's "Paste code here >" prompt has no newline.
         output.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -150,19 +155,50 @@ final class SubscriptionAccount {
     }
 
     @ObservationIgnored private var loginOutput = ""
+    /// The link the CLI prints for "browser didn't open". For Claude it's the copy-a-code flow.
+    @ObservationIgnored private var printedURL: URL?
+    /// True once the CLI's own "open the browser" request reached us: that link finishes the
+    /// login by itself (local callback), so there's no code to copy.
+    private(set) var isAutomatic = false
 
     private func handleLoginOutput(_ chunk: String) {
         loginOutput += chunk
         // Only complete lines can contain a whole URL.
-        if signInURL == nil, let lastNewline = loginOutput.lastIndex(of: "\n"),
+        if printedURL == nil, let lastNewline = loginOutput.lastIndex(of: "\n"),
            let url = Self.firstURL(in: String(loginOutput[...lastNewline])) {
-            signInURL = url
-            // Run without a terminal, the CLI often can't open the browser itself; do it here.
-            openSignInPage()
+            printedURL = url
+            // Prefer the CLI's automatic link; it arrives within a moment if it's coming at all.
+            Task {
+                try? await Task.sleep(for: .seconds(1.5))
+                guard signInURL == nil, state == .signingIn else { return }
+                signInURL = url
+                openSignInPage()
+                updateNeedsCode()
+            }
         }
+        updateNeedsCode()
+    }
+
+    private func updateNeedsCode() {
         let lower = loginOutput.lowercased()
-        if lower.contains("paste") && lower.contains("code") {
-            needsCode = true
+        needsCode = !isAutomatic && signInURL != nil && lower.contains("paste") && lower.contains("code")
+    }
+
+    /// The CLI "opens the browser" through our shim, which writes the URL to a file; pick it up.
+    private func watchBrowserRequests(_ file: URL, process: Process) {
+        Task {
+            while process.isRunning, state == .signingIn {
+                if let text = try? String(contentsOf: file, encoding: .utf8),
+                   let url = text.split(separator: "\n").compactMap({ URL(string: String($0)) }).first(where: { $0.scheme == "https" }),
+                   url != signInURL {
+                    signInURL = url
+                    isAutomatic = true
+                    updateNeedsCode()
+                    openSignInPage()
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(200))
+            }
         }
     }
 
@@ -178,6 +214,8 @@ final class SubscriptionAccount {
                 if let error {
                     self?.openError = error.localizedDescription
                     Log.app.error("Opening the sign-in page failed: \(error.localizedDescription, privacy: .public)")
+                    // Last resort: the same request through the `open` command.
+                    try? Process.run(URL(fileURLWithPath: "/usr/bin/open"), arguments: [url.absoluteString])
                 } else {
                     self?.openError = nil
                     Log.app.notice("Opened the sign-in page in \(app?.bundleIdentifier ?? "unknown", privacy: .public)")
@@ -206,6 +244,7 @@ final class SubscriptionAccount {
     }
 
     func cancelSignIn() {
+        isAutomatic = false
         if loginProcess?.isRunning == true { loginProcess?.terminate() }
         loginProcess = nil
         loginInput = nil
@@ -229,6 +268,51 @@ final class SubscriptionAccount {
             return
         }
         await refresh()
+    }
+}
+
+/// Stand-in `open` / `xdg-open` / `$BROWSER` for the login CLIs. Run from an app (no terminal),
+/// Claude Code's own browser launch goes nowhere and it falls back to a copy-the-code flow; this
+/// script hands its automatic sign-in link to Clipboard2, which opens it.
+nonisolated enum BrowserShim {
+    struct Prepared {
+        var directory: URL
+        var urlFile: URL
+    }
+
+    static let script = """
+    #!/bin/sh
+    # Clipboard2: passes sign-in links from the login tool to the app, which opens them.
+    for arg in "$@"; do
+      case "$arg" in https://*) printf '%s\\n' "$arg" >> "$CLIPBOARD2_BROWSER_FILE" ;; esac
+    done
+    exit 0
+    """
+
+    static func prepare() -> Prepared? {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appending(path: "clippy-cli/browser", directoryHint: .isDirectory)
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            for name in ["open", "xdg-open"] {
+                let file = dir.appending(path: name)
+                try Data(script.utf8).write(to: file)
+                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+            }
+            let urlFile = dir.appending(path: "requested-url")
+            try? fm.removeItem(at: urlFile)
+            return Prepared(directory: dir, urlFile: urlFile)
+        } catch {
+            Log.app.error("Browser shim unavailable: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
+    static func apply(_ shim: Prepared, to environment: inout [String: String]) {
+        let path = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        environment["PATH"] = shim.directory.path + ":" + path
+        environment["BROWSER"] = shim.directory.appending(path: "open").path
+        environment["CLIPBOARD2_BROWSER_FILE"] = shim.urlFile.path
     }
 }
 

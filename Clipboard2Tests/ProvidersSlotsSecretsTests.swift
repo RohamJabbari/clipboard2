@@ -297,3 +297,56 @@ struct CodexProviderTests {
         #expect(AIProviderKind.chatGPT.isSubscription && !AIProviderKind.chatGPT.requiresAPIKey)
     }
 }
+
+struct ImageAndSignInTests {
+    private var image: AIImage {
+        AIImage(data: Data([1, 2, 3]), mediaType: "image/png", fileURL: URL(fileURLWithPath: "/tmp/x.png"))
+    }
+
+    @Test func claudeRequestPutsImageBlockBeforeText() throws {
+        let request = try ClaudeClient(apiKey: "k", model: "claude-sonnet-5-5").makeRequest(system: "s", user: "what is this?", image: image)
+        let json = try #require(try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any])
+        let content = try #require((json["messages"] as? [[String: Any]])?.first?["content"] as? [[String: Any]])
+        #expect(content.map { $0["type"] as? String } == ["image", "text"])
+        #expect((content[0]["source"] as? [String: String])?["data"] == "AQID")
+    }
+
+    @Test func openAIRequestUsesDataURL() throws {
+        let request = try OpenAICompatibleClient(baseURL: "https://api.openai.com/v1", apiKey: "k", model: "m")
+            .makeRequest(system: "s", user: "u", image: image)
+        let json = try #require(try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any])
+        let content = try #require((json["messages"] as? [[String: Any]])?.last?["content"] as? [[String: Any]])
+        #expect((content[1]["image_url"] as? [String: String])?["url"] == "data:image/png;base64,AQID")
+    }
+
+    @Test func cliClientsPassImages() throws {
+        #expect(ClaudeCodeCLIClient(model: "").arguments(system: "S", jsonInput: true).suffix(2) == ["--input-format", "stream-json"])
+        let line = ClaudeCodeCLIClient.jsonInput(user: "u", image: image)
+        #expect(line.last == 0x0A)
+        let json = try #require(try JSONSerialization.jsonObject(with: line.dropLast()) as? [String: Any])
+        #expect(json["type"] as? String == "user")
+        let args = CodexCLIClient(model: "").arguments(image: URL(fileURLWithPath: "/tmp/x.png"))
+        #expect(args.suffix(3) == ["-i", "/tmp/x.png", "-"])
+    }
+
+    @Test func imageActionsAndPrompts() {
+        #expect(!AIAction.fixGrammar.worksOnImages && AIAction.explain.worksOnImages)
+        #expect(AIAction.instruction("what is this?").imageSystemPrompt.contains("what is this?"))
+        #expect(!AIAction.explain.imageSystemPrompt.contains("<text>"))
+    }
+
+    @Test func browserShimRecordsOnlyLinks() throws {
+        let shim = try #require(BrowserShim.prepare())
+        var env: [String: String] = ["PATH": "/usr/bin:/bin"]
+        BrowserShim.apply(shim, to: &env)
+        #expect(env["PATH"]?.hasPrefix(shim.directory.path + ":") == true)
+        let process = Process()
+        process.executableURL = shim.directory.appending(path: "open")
+        process.arguments = ["-a", "Safari", "https://claude.com/x?redirect_uri=http%3A%2F%2Flocalhost%3A1%2Fcallback"]
+        process.environment = env
+        try process.run()
+        process.waitUntilExit()
+        let text = try String(contentsOf: shim.urlFile, encoding: .utf8)
+        #expect(text == "https://claude.com/x?redirect_uri=http%3A%2F%2Flocalhost%3A1%2Fcallback\n")
+    }
+}
