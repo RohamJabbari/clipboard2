@@ -9,6 +9,7 @@ using Clipboard2.App.Platform;
 using Clipboard2.App.Views;
 using Clipboard2.Core;
 using Clipboard2.Core.AI;
+using Clipboard2.Core.Sync;
 using Transform = Clipboard2.Core.Transform;
 
 namespace Clipboard2.App;
@@ -35,6 +36,7 @@ public sealed class AppServices : IPanelHost
     public SubscriptionAccount ClaudeAccount { get; } = new(SubscriptionCli.Claude);
     public SubscriptionAccount ChatGptAccount { get; } = new(SubscriptionCli.Codex);
     public ModelLister Models { get; }
+    public SyncAccount Sync { get; }
     public Dispatcher Dispatcher { get; }
 
     private readonly ClipboardListener _listener = new();
@@ -47,6 +49,8 @@ public sealed class AppServices : IPanelHost
     private IntPtr _panelTarget;
     private readonly DispatcherTimer _maintenance = new() { Interval = TimeSpan.FromMinutes(1) };
     private readonly DispatcherTimer _updateTimer = new() { Interval = TimeSpan.FromHours(1) };
+    /// <summary>Sync runs 3 s after the last local change.</summary>
+    private readonly DispatcherTimer _syncDebounce = new() { Interval = TimeSpan.FromSeconds(3) };
     private int _maintenanceRuns;
 
     public event Action? StoreChanged;
@@ -63,16 +67,49 @@ public sealed class AppServices : IPanelHost
         Slots = new QuickSlots(Settings);
         Models = new ModelLister(Keys);
         Panel = new PanelModel(Store, Settings, Slots, Secrets, this);
+        Sync = new SyncAccount(Store, Secrets, Settings, Keys) { Logger = message => Log.Info("Sync: " + message) };
         Store.Changed += () => StoreChanged?.Invoke();
-        Secrets.Changed += () => Store.RemoveUnpinned(Secrets.ValueHashes);
+        Store.Changed += ScheduleSync;
+        Secrets.Changed += () =>
+        {
+            RemoveSecretCopies();
+            ScheduleSync();
+        };
+        _syncDebounce.Tick += (_, _) =>
+        {
+            _syncDebounce.Stop();
+            _ = Sync.SyncNowAsync();
+        };
+    }
+
+    /// <summary>A saved secret never stays in the history of its own space.</summary>
+    private void RemoveSecretCopies()
+    {
+        foreach (var (space, hashes) in Secrets.HashesBySpace)
+            Store.RemoveUnpinned(hashes, space == SecretVault.PersonalSpaceKey ? null : space);
+    }
+
+    /// <summary>Debounced: restarts the 3-second timer on every change.</summary>
+    public void ScheduleSync()
+    {
+        if (!Sync.IsSignedIn) return;
+        _syncDebounce.Stop();
+        _syncDebounce.Start();
     }
 
     public void Start(bool background)
     {
         ApplyAppearance();
         _listener.Changed += OnClipboardChanged;
-        Store.RemoveUnpinned(Secrets.ValueHashes);
+        RemoveSecretCopies();
+        Sync.Restore();
+        Sync.Changed += () =>
+        {
+            if (Sync.IsSignedIn == _sendToGroupRegistered) return;
+            UpdateSendToGroupHotkey();
+        };
         RunMaintenance();
+        ScheduleSync();
         _maintenance.Tick += (_, _) => RunMaintenance();
         _maintenance.Start();
 
@@ -121,11 +158,22 @@ public sealed class AppServices : IPanelHost
         Hotkeys.Register(Hotkey.SelectionActions, Settings.Hotkeys.GetValueOrDefault(Hotkey.SelectionActions), () => _ = ShowSelectionActionsAsync());
         Hotkeys.Register(Hotkey.PasteAsText, Settings.Hotkeys.GetValueOrDefault(Hotkey.PasteAsText), () => _ = PasteClipboardAsTextAsync());
         Hotkeys.Register(Hotkey.CaptureText, Settings.Hotkeys.GetValueOrDefault(Hotkey.CaptureText), () => _ = CaptureScreenTextAsync());
+        UpdateSendToGroupHotkey();
         for (var n = QuickSlots.First; n <= QuickSlots.Last; n++)
         {
             var slot = n;
             Hotkeys.Register(Hotkey.Slot(slot), Settings.Hotkeys.GetValueOrDefault(Hotkey.Slot(slot)), () => PasteSlot(slot));
         }
+    }
+
+    private bool _sendToGroupRegistered;
+
+    /// <summary>Ctrl+Alt+C is only taken while signed in to sync, so it doesn't block other apps otherwise.</summary>
+    private void UpdateSendToGroupHotkey()
+    {
+        _sendToGroupRegistered = Sync.IsSignedIn;
+        if (Sync.IsSignedIn) Hotkeys.Register(Hotkey.SendToGroup, Settings.Hotkeys.GetValueOrDefault(Hotkey.SendToGroup), () => _ = SendSelectionToGroupAsync());
+        else Hotkeys.Unregister(Hotkey.SendToGroup);
     }
 
     public void ApplyAppearance()
@@ -146,6 +194,7 @@ public sealed class AppServices : IPanelHost
             if (_maintenanceRuns++ % 30 == 0) Store.RemoveOrphanedBlobs();
         }
         catch (Exception ex) { Log.Error("Maintenance failed", ex); }
+        if (Sync.IsSignedIn) _ = Sync.SyncNowAsync();
     }
 
     // MARK: Capture
@@ -198,6 +247,7 @@ public sealed class AppServices : IPanelHost
         _panelTarget = Tracker.TargetWindow;
         Panel.PrepareForOpen(Tracker.AppFor(_panelTarget));
         PanelWindow.ShowNear(_panelTarget);
+        _ = Sync.SyncNowAsync();
     }
 
     private QuickPanelWindow PanelWindow => _panelWindow ??= new QuickPanelWindow(this);
@@ -315,6 +365,19 @@ public sealed class AppServices : IPanelHost
         if (value is not null) Dispatcher.Invoke(() => WriteSecretWithAutoClear(value));
     });
 
+    public void ShareSecret(SecretRef secret, string groupId, string groupName) => _ = ShareSecretAsync(secret, groupId, groupName);
+
+    private async Task ShareSecretAsync(SecretRef secret, string groupId, string groupName)
+    {
+        var value = await Secrets.RevealAsync(secret, $"share “{secret.Name}” with {groupName}");
+        if (value is null) return;
+        Dispatcher.Invoke(() =>
+        {
+            if (Secrets.Add(secret.Name, value, groupId) is null) return;
+            Panel.ShowNotice($"Shared “{secret.Name}” to “{groupName}”");
+        });
+    }
+
     private void WriteSecretWithAutoClear(string value)
     {
         ClipboardIO.WriteSecret(value);
@@ -354,9 +417,9 @@ public sealed class AppServices : IPanelHost
 
     // MARK: Actions on selected text, paste as text, capture text
 
-    public async Task ShowSelectionActionsAsync()
+    /// <summary>Copies the selection in the frontmost app with Ctrl+C, then puts the previous clipboard back.</summary>
+    private async Task<string?> CopySelectionAsync()
     {
-        var target = Tracker.TargetWindow;
         string? text = null;
         await WithoutCapture(async () =>
         {
@@ -368,6 +431,13 @@ public sealed class AppServices : IPanelHost
             if (Native.GetClipboardSequenceNumber() != before) text = ClipboardIO.CurrentText();
             ClipboardIO.Restore(saved);
         });
+        return text;
+    }
+
+    public async Task ShowSelectionActionsAsync()
+    {
+        var target = Tracker.TargetWindow;
+        var text = await CopySelectionAsync();
         if (string.IsNullOrEmpty(text))
         {
             System.Media.SystemSounds.Beep.Play();
@@ -376,6 +446,27 @@ public sealed class AppServices : IPanelHost
         _panelTarget = target;
         Panel.PrepareForSelection(text, Tracker.AppFor(target));
         PanelWindow.ShowNear(target);
+    }
+
+    /// <summary>Ctrl+Alt+C: the selected text goes straight into the default sync group's history.</summary>
+    public async Task SendSelectionToGroupAsync()
+    {
+        if (!Sync.IsSignedIn || Sync.DefaultGroup is not { } group)
+        {
+            OpenSettings("Sync");
+            return;
+        }
+        var source = Tracker.AppFor(Tracker.TargetWindow);
+        var text = await CopySelectionAsync();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            System.Media.SystemSounds.Beep.Play();
+            return;
+        }
+        Store.Ingest(ProcessedCapture.ForText(text, source: source), spaceId: group.Id);
+        _tray?.ShowBalloon($"Sent to {group.DisplayName}", TextPreview.Make(text, 120));
+        _syncDebounce.Stop();
+        _ = Sync.SyncNowAsync();
     }
 
     public async Task PasteClipboardAsTextAsync()

@@ -10,6 +10,7 @@ using System.Windows.Media;
 using Clipboard2.App.Platform;
 using Clipboard2.Core;
 using Clipboard2.Core.AI;
+using Clipboard2.Core.Sync;
 using Transform = Clipboard2.Core.Transform;
 
 namespace Clipboard2.App.Views;
@@ -45,6 +46,7 @@ public sealed class SettingsWindow : Window
         _services.ClaudeAccount.Changed += () => Dispatcher.BeginInvoke(() => RefreshTab("AI"));
         _services.ChatGptAccount.Changed += () => Dispatcher.BeginInvoke(() => RefreshTab("AI"));
         _services.Updates.Changed += () => Dispatcher.BeginInvoke(() => RefreshTab("About"));
+        _services.Sync.Changed += () => Dispatcher.BeginInvoke(() => RefreshTab("Sync"));
     }
 
     private readonly Dictionary<string, (TabItem Tab, Func<UIElement> Build)> _pages = [];
@@ -160,10 +162,10 @@ public sealed class SettingsWindow : Window
 
         page.Children.Add(Header("Shortcuts"));
         var shortcuts = new List<UIElement>();
-        foreach (var name in new[] { Hotkey.QuickPanel, Hotkey.SelectionActions, Hotkey.PasteAsText, Hotkey.CaptureText })
+        foreach (var name in new[] { Hotkey.QuickPanel, Hotkey.SelectionActions, Hotkey.PasteAsText, Hotkey.CaptureText, Hotkey.SendToGroup })
             shortcuts.Add(HotkeyRow(name));
         page.Children.Add(Card([.. shortcuts]));
-        page.Children.Add(Hint("Actions on selected text: select text in any app to transform it or ask AI; Enter replaces the selection. Paste as text pastes plain text — or the text inside an image or screenshot on the clipboard. Capture text: drag over anything on screen. Text recognition runs on this PC."));
+        page.Children.Add(Hint("Actions on selected text: select text in any app to transform it or ask AI; Enter replaces the selection. Paste as text pastes plain text — or the text inside an image or screenshot on the clipboard. Capture text: drag over anything on screen. Text recognition runs on this PC. Send to group: copies the selected text into your default sync group (Settings → Sync)."));
 
         page.Children.Add(Header("Quick slots"));
         var slotRows = new List<UIElement>();
@@ -449,7 +451,7 @@ public sealed class SettingsWindow : Window
         }
         if (rows.Count == 0) rows.Add(Fluent.Label("No secrets yet. Add one below, or select a copied password in the quick panel and choose Ctrl+K → Save as Secret.", 13, Fluent.Secondary, wrap: true));
         page.Children.Add(Card([.. rows]));
-        page.Children.Add(Hint("Values are stored only in Windows Credential Manager — never in history, never synced, never sent to AI or transforms."));
+        page.Children.Add(Hint("Values are stored in Windows Credential Manager — never in history, never sent to AI or transforms. With Sync on, they're end-to-end encrypted on this PC before upload; the server can't read them."));
 
         page.Children.Add(Header("Add a secret"));
         var name = new TextBox { MinWidth = 260 };
@@ -748,14 +750,356 @@ public sealed class SettingsWindow : Window
         RefreshTab("AI");
     }
 
-    // MARK: Sync & About
+    // MARK: Sync
 
-    private static UIElement BuildSync()
+    // Form state survives page rebuilds (the page rebuilds on every account change).
+    private string _syncEmail = "";
+    private string _syncPassword = "";
+    private string _syncConfirm = "";
+    private bool _syncCreating;
+    private bool _syncUnderstood;
+
+    private UIElement BuildSync()
     {
         var page = Page();
-        page.Children.Add(Card(Fluent.Label("End-to-end encrypted sync of pinned items and snippets is planned. Your data stays on this PC until then.", 13, Fluent.Secondary, wrap: true)));
+        var sync = _services.Sync;
+        if (sync.Email is { Length: > 0 } known && _syncEmail.Length == 0) _syncEmail = known;
+        page.Children.Add(Header("Sync"));
+
+        if (sync.Status is { } status) page.Children.Add(Card(Fluent.Label(status, 13, sync.IsBusy ? Fluent.Secondary : Fluent.Accent, wrap: true)));
+        if (sync.Error is { } error && sync.Phase != SyncPhase.SignedIn)
+            page.Children.Add(Card(Fluent.Label(error, 13, Brushes.OrangeRed, wrap: true)));
+
+        switch (sync.Phase)
+        {
+            case SyncPhase.SignedOut: BuildSyncSignedOut(page, sync); break;
+            case SyncPhase.NeedsSignIn: BuildSyncSignIn(page, sync, again: true); break;
+            default: BuildSyncSignedIn(page, sync); break;
+        }
+
+        page.Children.Add(Header("Advanced"));
+        var server = new TextBox { Text = S.SyncApiBaseUrl ?? "", MinWidth = 300 };
+        server.LostFocus += (_, _) =>
+        {
+            var value = server.Text.Trim();
+            S.SyncApiBaseUrl = value.Length == 0 ? null : value;
+            Save();
+        };
+        page.Children.Add(Card(Row("Sync server (leave empty for the default)", server)));
+        page.Children.Add(Hint($"Default: {SyncConfig.DefaultApiBaseUrl}. Only change this for testing."));
         return page;
     }
+
+    private const string WhatSyncs =
+        "End-to-end encrypted: your history (newest 200 items), images, pinned items, snippets and secrets are encrypted on this PC before upload. " +
+        "Your password never leaves this PC. The server only sees your email, sizes and timestamps — never your content, snippet names, secret values or group names.";
+
+    private void SyncCredentialFields(List<UIElement> rows, bool emailEditable = true)
+    {
+        var email = new TextBox { Text = _syncEmail, MinWidth = 280, IsReadOnly = !emailEditable };
+        email.TextChanged += (_, _) => _syncEmail = email.Text;
+        var password = new PasswordBox { MinWidth = 280, Password = _syncPassword };
+        password.PasswordChanged += (_, _) => _syncPassword = password.Password;
+        rows.Add(Row("Email", email));
+        rows.Add(Row("Password", password));
+    }
+
+    private void ClearSyncPasswords()
+    {
+        _syncPassword = "";
+        _syncConfirm = "";
+        _syncUnderstood = false;
+    }
+
+    private void BuildSyncSignedOut(StackPanel page, SyncAccount sync)
+    {
+        page.Children.Add(Card(Fluent.Label(WhatSyncs, 13, null, wrap: true)));
+        var modes = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
+        foreach (var (title, creating) in new[] { ("Sign in", false), ("Create account", true) })
+        {
+            var radio = new RadioButton { Content = title, IsChecked = _syncCreating == creating, GroupName = "syncmode", Margin = new Thickness(0, 0, 18, 0) };
+            radio.Checked += (_, _) => { _syncCreating = creating; RefreshTab("Sync"); };
+            modes.Children.Add(radio);
+        }
+        page.Children.Add(modes);
+        if (_syncCreating) BuildSyncCreate(page, sync); else BuildSyncSignIn(page, sync, again: false);
+    }
+
+    private void BuildSyncCreate(StackPanel page, SyncAccount sync)
+    {
+        var rows = new List<UIElement>();
+        SyncCredentialFields(rows);
+        var confirm = new PasswordBox { MinWidth = 280, Password = _syncConfirm };
+        confirm.PasswordChanged += (_, _) => _syncConfirm = confirm.Password;
+        rows.Add(Row("Confirm password", confirm));
+        var warning = Fluent.Label("There is no password recovery. Your password is the only key to your synced data, and it never leaves your devices — " +
+            "nobody, including Clipboard2, can reset it. If you forget it, your synced data is lost for good. Write it down or keep it in a password manager.",
+            13, Brushes.OrangeRed, wrap: true);
+        warning.FontWeight = FontWeights.SemiBold;
+        rows.Add(warning);
+        var understood = new CheckBox { Content = "I understand: a forgotten password means my synced data is lost", IsChecked = _syncUnderstood };
+        understood.Checked += (_, _) => _syncUnderstood = true;
+        understood.Unchecked += (_, _) => _syncUnderstood = false;
+        rows.Add(understood);
+        var create = Action("Create Account", async () =>
+        {
+            if (!_syncUnderstood) { MessageBox.Show(this, "Please confirm that you understand there's no password recovery.", "Create Account"); return; }
+            if (await _services.Sync.CreateAccountAsync(_syncEmail, _syncPassword, _syncConfirm)) ClearSyncPasswords();
+        }, accent: true);
+        create.IsEnabled = !sync.IsBusy;
+        rows.Add(Row("", create));
+        page.Children.Add(Card([.. rows]));
+        page.Children.Add(Hint($"Use at least {SyncAccount.MinPasswordLength} characters — a passphrase of a few words is best. Your email is only your sign-in name; it isn't verified and gets no mail."));
+    }
+
+    private void BuildSyncSignIn(StackPanel page, SyncAccount sync, bool again)
+    {
+        var rows = new List<UIElement>();
+        if (again)
+            rows.Add(Fluent.Label("Your session ended — it expired, or the password was changed on another device. Enter your password to keep syncing. " +
+                "Everything on this PC stays as it is.", 13, null, wrap: true));
+        SyncCredentialFields(rows, emailEditable: !again);
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal };
+        if (again)
+            buttons.Children.Add(Action("Sign Out…", async () =>
+            {
+                if (MessageBox.Show(this, "Sign out of sync on this PC? Group items are removed from this PC; your personal history stays.",
+                        "Sign Out", MessageBoxButton.OKCancel, MessageBoxImage.Question) == MessageBoxResult.OK)
+                    await _services.Sync.SignOutAsync();
+            }));
+        var signIn = Action(again ? "Continue" : "Sign In", async () =>
+        {
+            if (await _services.Sync.SignInAsync(_syncEmail, _syncPassword)) ClearSyncPasswords();
+        }, accent: true);
+        signIn.IsEnabled = !sync.IsBusy;
+        buttons.Children.Add(signIn);
+        rows.Add(Row("", buttons));
+        page.Children.Add(Card([.. rows]));
+        if (!again) page.Children.Add(Hint("Forgot your password? It can't be reset — that's what keeps your data private. You can delete the account from a device that's still signed in and start a new one."));
+    }
+
+    private static StackPanel Buttons(params Button[] buttons)
+    {
+        var panel = new StackPanel { Orientation = Orientation.Horizontal };
+        foreach (var b in buttons) panel.Children.Add(b);
+        return panel;
+    }
+
+    private void BuildSyncSignedIn(StackPanel page, SyncAccount sync)
+    {
+        var state = sync.IsSyncing ? "Syncing…"
+            : sync.RetryAfter is { } retry && retry > DateTime.UtcNow ? $"Paused until {retry.ToLocalTime():t} (server busy)"
+            : sync.Error is { } error ? error
+            : sync.LastSync is { } last ? $"Up to date · synced {last.ToLocalTime():t}" : "Not synced yet";
+        var statusLabel = Fluent.Label(state, 13, sync.Error is null ? Fluent.Secondary : Brushes.OrangeRed, wrap: true);
+        statusLabel.MaxWidth = 380;
+        var syncNow = Action("Sync Now", () => _ = _services.Sync.SyncNowAsync(), accent: true);
+        syncNow.IsEnabled = !sync.IsSyncing;
+        var rows = new List<UIElement>
+        {
+            Row("Account", Fluent.Label(sync.Email ?? "", 13, Fluent.Secondary)),
+            Row("Status", statusLabel),
+        };
+        foreach (var warning in sync.Warnings.Distinct()) rows.Add(Fluent.Label(warning, 12, Brushes.OrangeRed, wrap: true));
+        rows.Add(Row("", syncNow));
+        page.Children.Add(Card([.. rows]));
+        page.Children.Add(Hint(WhatSyncs + " Files sync as paths only."));
+
+        // Groups
+        page.Children.Add(Header("Groups"));
+        var groups = sync.Groups;
+        var groupRows = new List<UIElement>();
+        foreach (var group in groups)
+        {
+            var id = group.Id;
+            var name = group.DisplayName;
+            var controls = new StackPanel { Orientation = Orientation.Horizontal };
+            controls.Children.Add(Fluent.Label($"{(group.IsOwner ? "Owner" : "Member")} · {group.MemberCount} {(group.MemberCount == 1 ? "member" : "members")}  ", 12, Fluent.Secondary));
+            controls.Children.Add(Action("Members…", () => ShowMembers(group)));
+            if (group.IsOwner)
+            {
+                controls.Children.Add(Action("Invite…", async () =>
+                {
+                    if (await sync.CreateInviteAsync(id) is { } code) ShowInviteCode(name, code);
+                    else if (sync.Error is { } e) MessageBox.Show(this, e, "Invite");
+                }));
+                controls.Children.Add(Action("Rename…", async () =>
+                {
+                    if (InputDialog.Ask("Rename Group", "New name:", name) is { Length: > 0 } newName) await sync.RenameGroupAsync(id, newName);
+                }));
+                controls.Children.Add(Action("Delete…", async () =>
+                {
+                    if (MessageBox.Show(this, $"Delete “{name}” for everyone? Its items, snippets and secrets are removed from the server and from every member's devices.",
+                            "Delete Group", MessageBoxButton.OKCancel, MessageBoxImage.Warning) == MessageBoxResult.OK)
+                        await sync.DeleteGroupAsync(id);
+                }));
+            }
+            else
+            {
+                controls.Children.Add(Action("Leave…", async () =>
+                {
+                    if (MessageBox.Show(this, $"Leave “{name}”? Its items are removed from this PC.", "Leave Group",
+                            MessageBoxButton.OKCancel, MessageBoxImage.Question) == MessageBoxResult.OK)
+                        await sync.LeaveGroupAsync(id);
+                }));
+            }
+            groupRows.Add(Row(name, controls));
+        }
+        if (groupRows.Count == 0) groupRows.Add(Fluent.Label("No groups yet. A group shares items with other people: everyone in it can see and add items.", 13, Fluent.Secondary, wrap: true));
+        groupRows.Add(Buttons(
+            Action("New Group…", async () =>
+            {
+                if (InputDialog.Ask("New Group", "Name (only members can read it):", okTitle: "Create") is { Length: > 0 } groupName) await sync.CreateGroupAsync(groupName);
+            }),
+            Action("Join a Group…", JoinGroup)));
+        if (sync.Error is { } groupError && !sync.IsSyncing && sync.LastSync is not null)
+            groupRows.Add(Fluent.Label(groupError, 12, Brushes.OrangeRed, wrap: true));
+        page.Children.Add(Card([.. groupRows]));
+        if (groups.Count > 0)
+        {
+            var hotkey = S.Hotkeys.GetValueOrDefault(Hotkey.SendToGroup) is { Length: > 0 } combo ? combo : "the Send to group shortcut";
+            page.Children.Add(Card(Row("Default group", Choice(groups, sync.DefaultGroup ?? groups[0], g => g.DisplayName, g => sync.SetDefaultGroup(g.Id)))));
+            page.Children.Add(Hint($"Select text anywhere and press {hotkey} to send it to the default group. Share any item with Ctrl+K → Share to Group, or right-click it."));
+        }
+
+        // Account
+        page.Children.Add(Header("Account"));
+        page.Children.Add(Card(Row("", Buttons(
+            Action("Change Password…", async () =>
+            {
+                if (InputDialog.Ask("Change Password", "Current password:", secret: true) is not { Length: > 0 } current) return;
+                if (InputDialog.Ask("Change Password", $"New password (at least {SyncAccount.MinPasswordLength} characters). There's no recovery — don't lose it:", secret: true) is not { Length: > 0 } next) return;
+                if (InputDialog.Ask("Change Password", "New password again:", secret: true) is not { } confirm) return;
+                if (!await sync.ChangePasswordAsync(current, next, confirm) && sync.Error is { } e) MessageBox.Show(this, e, "Change Password");
+            }),
+            Action("Sign Out…", async () =>
+            {
+                if (MessageBox.Show(this, "Sign out of sync on this PC? Group items are removed from this PC; your personal history stays.",
+                        "Sign Out", MessageBoxButton.OKCancel, MessageBoxImage.Question) == MessageBoxResult.OK)
+                    await sync.SignOutAsync();
+            }),
+            Action("Delete Account…", async () =>
+            {
+                if (MessageBox.Show(this, "Delete your sync account? Everything synced — your personal space and the groups you own — is deleted from the server for good. " +
+                        "Items on this PC stay.", "Delete Account", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
+                if (InputDialog.Ask("Delete Account", "Enter your password to confirm:", secret: true, okTitle: "Delete") is not { Length: > 0 } password) return;
+                if (!await sync.DeleteAccountAsync(password) && sync.Error is { } e) MessageBox.Show(this, e, "Delete Account");
+            })))));
+        page.Children.Add(Hint("Changing your password keeps your synced data; other devices ask for the new one. Your keys are stored in Windows Credential Manager."));
+    }
+
+    private async void JoinGroup()
+    {
+        var sync = _services.Sync;
+        if (InputDialog.Ask("Join a Group", "Paste the invite code you were given (like ABCD-EFGH-…):", okTitle: "Continue") is not { Length: > 0 } code) return;
+        if (await sync.PreviewInviteAsync(code) is not { } invite)
+        {
+            MessageBox.Show(this, sync.Error ?? "That code didn't work.", "Join a Group");
+            return;
+        }
+        var members = invite.MemberCount == 1 ? "1 member" : $"{invite.MemberCount} members";
+        if (MessageBox.Show(this, $"Join “{invite.Name}” ({members})? Everyone in it can see and add items.", "Join a Group",
+                MessageBoxButton.OKCancel, MessageBoxImage.Question) != MessageBoxResult.OK) return;
+        if (!await sync.JoinAsync(invite) && sync.Error is { } e) MessageBox.Show(this, e, "Join a Group");
+    }
+
+    /// <summary>The code is shown once; only its hash is on the server.</summary>
+    private void ShowInviteCode(string groupName, string code)
+    {
+        var window = new Window
+        {
+            Title = $"Invite to {groupName}", Width = 460, SizeToContent = SizeToContent.Height, Owner = this,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, ResizeMode = ResizeMode.NoResize,
+        };
+        var stack = new StackPanel { Margin = new Thickness(20) };
+        stack.Children.Add(Fluent.Label("Send this code to the person you want to invite. They choose Settings → Sync → Join a Group and paste it.", 13, null, wrap: true));
+        var box = new TextBox
+        {
+            Text = code, IsReadOnly = true, FontFamily = new FontFamily("Cascadia Mono, Consolas"), FontSize = 20,
+            HorizontalContentAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 14, 0, 10),
+        };
+        stack.Children.Add(box);
+        stack.Children.Add(Fluent.Label("It works once and expires in 7 days. You won't see it again — anyone with the code can join, so share it privately.",
+            12, Fluent.Secondary, wrap: true));
+        // Copied like a secret: kept out of the history (and so out of sync) and out of Win+V.
+        var copy = Action("Copy", () => ClipboardIO.WriteSecret(code), accent: true);
+        var close = Action("Done", window.Close);
+        var buttons = Buttons(copy, close);
+        buttons.HorizontalAlignment = HorizontalAlignment.Right;
+        buttons.Margin = new Thickness(0, 14, 0, 0);
+        stack.Children.Add(buttons);
+        window.Content = stack;
+        window.ShowDialog();
+    }
+
+    private async void ShowMembers(SpaceRecord group)
+    {
+        var sync = _services.Sync;
+        var window = new Window
+        {
+            Title = $"Members of {group.DisplayName}", Width = 480, SizeToContent = SizeToContent.Height, Owner = this,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, ResizeMode = ResizeMode.NoResize,
+        };
+        var list = new StackPanel { Margin = new Thickness(20) };
+        list.Children.Add(Fluent.Label("Loading…", 13, Fluent.Secondary));
+        window.Content = list;
+        window.Show();
+
+        async Task Fill()
+        {
+            var members = await sync.MembersAsync(group.Id);
+            list.Children.Clear();
+            foreach (var member in members)
+            {
+                var row = new DockPanel { LastChildFill = false, MinHeight = 32 };
+                row.Children.Add(Fluent.Label(member.Email + (member.Role == "owner" ? "  (owner)" : "") + (member.Uid == sync.Uid ? "  — you" : ""), 13));
+                if (group.IsOwner && member.Role != "owner")
+                {
+                    var uid = member.Uid;
+                    var remove = Action("Remove", async () =>
+                    {
+                        if (MessageBox.Show(window, $"Remove {member.Email} from the group? They keep anything they already copied.", "Remove Member",
+                                MessageBoxButton.OKCancel) != MessageBoxResult.OK) return;
+                        await sync.RemoveMemberAsync(group.Id, uid);
+                        await Fill();
+                    });
+                    DockPanel.SetDock(remove, Dock.Right);
+                    row.Children.Add(remove);
+                }
+                list.Children.Add(row);
+            }
+            if (members.Count == 0) list.Children.Add(Fluent.Label(sync.Error ?? "No members found.", 13, Fluent.Secondary, wrap: true));
+
+            if (group.IsOwner)
+            {
+                var invites = await sync.InvitesAsync(group.Id);
+                var header = Fluent.Label("Pending invites", 13, null, FontWeights.SemiBold);
+                header.Margin = new Thickness(0, 14, 0, 4);
+                list.Children.Add(header);
+                foreach (var invite in invites)
+                {
+                    var row = new DockPanel { LastChildFill = false, MinHeight = 30 };
+                    row.Children.Add(Fluent.Label($"Created {SyncPayload.FromMillis(invite.CreatedAt).ToLocalTime():g} · expires {SyncPayload.FromMillis(invite.ExpiresAt).ToLocalTime():g}", 12, Fluent.Secondary));
+                    var inviteId = invite.InviteId;
+                    var revoke = Action("Revoke", async () =>
+                    {
+                        await sync.RevokeInviteAsync(group.Id, inviteId);
+                        await Fill();
+                    });
+                    DockPanel.SetDock(revoke, Dock.Right);
+                    row.Children.Add(revoke);
+                    list.Children.Add(row);
+                }
+                if (invites.Count == 0) list.Children.Add(Fluent.Label("None.", 12, Fluent.Secondary));
+            }
+            list.Children.Add(new Border { Height = 10 });
+            list.Children.Add(Fluent.Label("Members can read and add items. Removing someone ends their access on the server; " +
+                "the group key isn't rotated.", 12, Fluent.Secondary, wrap: true));
+        }
+        await Fill();
+    }
+
+    // MARK: About
 
     private UIElement BuildAbout()
     {

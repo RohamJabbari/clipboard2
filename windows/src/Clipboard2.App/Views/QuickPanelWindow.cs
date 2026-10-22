@@ -38,6 +38,7 @@ public sealed class QuickPanelWindow : Window
     // Detail pane caching so forms keep focus while the model changes.
     private (PanelMode Mode, string? Key) _detailState;
     private TextBox? _actionFilter;
+    private TextBlock? _actionHint;
     private StackPanel? _actionList;
     private TextBox? _aiOutput;
     private TextBlock? _aiStatus;
@@ -232,27 +233,34 @@ public sealed class QuickPanelWindow : Window
         _chips.Children.Clear();
         foreach (var filter in PanelFilters.All)
         {
-            var selected = filter == Model.Filter;
             var title = filter == PanelFilter.ThisApp && Model.TargetApp is { } app ? app.Name : filter.Title();
-            var content = new StackPanel { Orientation = Orientation.Horizontal };
-            var icon = Glyphs.Icon(Glyphs.For(filter), 13, selected ? Fluent.AccentText : Fluent.Secondary);
-            icon.Margin = new Thickness(0, 0, 6, 0);
-            content.Children.Add(icon);
-            content.Children.Add(Fluent.Label(title, 13, selected ? Fluent.AccentText : null));
-            var chip = new Border
-            {
-                Child = content,
-                CornerRadius = new CornerRadius(12),
-                Padding = new Thickness(10, 4, 10, 4),
-                Margin = new Thickness(0, 0, 6, 0),
-                Background = selected ? Fluent.Accent : Fluent.Subtle,
-                Cursor = Cursors.Hand,
-            };
-            AutomationName(chip, $"{title} filter");
             var f = filter;
-            chip.MouseLeftButtonUp += (_, _) => Model.SetFilter(f);
-            _chips.Children.Add(chip);
+            AddChip(title, Glyphs.For(filter), Model.GroupFilter is null && filter == Model.Filter, () => Model.SetFilter(f));
         }
+        // Sync groups come after the built-in filters (Tab cycles through them too).
+        foreach (var (id, name) in Model.GroupNames.OrderBy(g => g.Value, StringComparer.CurrentCultureIgnoreCase))
+            AddChip(name, Glyphs.Group, Model.GroupFilter == id, () => Model.SetGroupFilter(id));
+    }
+
+    private void AddChip(string title, string glyph, bool selected, Action choose)
+    {
+        var content = new StackPanel { Orientation = Orientation.Horizontal };
+        var icon = Glyphs.Icon(glyph, 13, selected ? Fluent.AccentText : Fluent.Secondary);
+        icon.Margin = new Thickness(0, 0, 6, 0);
+        content.Children.Add(icon);
+        content.Children.Add(Fluent.Label(title, 13, selected ? Fluent.AccentText : null));
+        var chip = new Border
+        {
+            Child = content,
+            CornerRadius = new CornerRadius(12),
+            Padding = new Thickness(10, 4, 10, 4),
+            Margin = new Thickness(0, 0, 6, 0),
+            Background = selected ? Fluent.Accent : Fluent.Subtle,
+            Cursor = Cursors.Hand,
+        };
+        AutomationName(chip, $"{title} filter");
+        chip.MouseLeftButtonUp += (_, _) => choose();
+        _chips.Children.Add(chip);
     }
 
     private void RenderRows()
@@ -349,6 +357,19 @@ public sealed class QuickPanelWindow : Window
         grid.Children.Add(texts);
 
         var trailing = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        if (Model.GroupBadge(entry) is { } group)
+        {
+            var badgeContent = new StackPanel { Orientation = Orientation.Horizontal };
+            var groupIcon = Glyphs.Icon(Glyphs.Group, 10, sub);
+            groupIcon.Margin = new Thickness(0, 0, 4, 0);
+            badgeContent.Children.Add(groupIcon);
+            badgeContent.Children.Add(Fluent.Label(group.Length > 18 ? group[..17] + "…" : group, 11, sub));
+            trailing.Children.Add(new Border
+            {
+                Child = badgeContent, Padding = new Thickness(6, 1, 6, 1), CornerRadius = new CornerRadius(8), Margin = new Thickness(6, 0, 0, 0),
+                Background = selected ? Brushes.Transparent : Fluent.Subtle, ToolTip = $"Shared in “{group}”",
+            });
+        }
         if (entry.ClipItem is { IsPinned: true })
         {
             var pin = Glyphs.Icon(Glyphs.Pinned, 12, sub);
@@ -371,7 +392,7 @@ public sealed class QuickPanelWindow : Window
         Grid.SetColumn(trailing, 3);
         grid.Children.Add(trailing);
         border.Child = grid;
-        AutomationName(border, $"{title}, {subtitle}" + (selected ? ", selected" : ""));
+        AutomationName(border, $"{title}, {subtitle}" + (Model.GroupBadge(entry) is { } g ? $", in {g}" : "") + (selected ? ", selected" : ""));
     }
 
     private FrameworkElement LeadingVisual(PanelEntry entry, bool selected)
@@ -422,6 +443,7 @@ public sealed class QuickPanelWindow : Window
             slots.Items.Add(Item($"Ctrl+{slot}", () => { Model.Select(entry.Id); Model.AssignSelection(slot); }));
         }
         menu.Items.Add(slots);
+        if (ShareMenu(entry) is { } share) menu.Items.Add(share);
         if (entry.ClipItem is { } item)
         {
             menu.Items.Add(Item("Paste as Plain Text", () => Model.Activate(entry, Transform.PlainText)));
@@ -432,6 +454,31 @@ public sealed class QuickPanelWindow : Window
             if (item.Kind.IsTextual()) menu.Items.Add(Item("Save as Secret…", () => Model.BeginSaveSecret(item)));
             menu.Items.Add(Item("Delete", () => { _services.Store.Delete(item); Model.Refresh(); }));
         }
+    }
+
+    private MenuItem? ShareMenu(PanelEntry entry)
+    {
+        var own = entry switch
+        {
+            PanelEntry.Clip c => c.Item.SpaceId,
+            PanelEntry.SnippetEntry s => s.Snippet.SpaceId,
+            PanelEntry.SecretEntry k => k.Secret.SpaceId,
+            _ => null,
+        };
+        var groups = Model.GroupNames.Where(g => g.Key != own).OrderBy(g => g.Value, StringComparer.CurrentCultureIgnoreCase).ToList();
+        if (groups.Count == 0) return null;
+        var menu = new MenuItem { Header = "Share to Group" };
+        foreach (var (id, name) in groups)
+        {
+            var item = new MenuItem { Header = name };
+            item.Click += (_, _) =>
+            {
+                Model.Select(entry.Id);
+                Model.Perform(new PanelAction.ShareTo(id, name));
+            };
+            menu.Items.Add(item);
+        }
+        return menu;
     }
 
     // MARK: Detail pane
@@ -660,7 +707,7 @@ public sealed class QuickPanelWindow : Window
         _actionFilter.TextChanged += (_, _) => Model.SetActionQuery(_actionFilter.Text);
         AutomationName(_actionFilter, "Filter actions or ask AI");
         var placeholder = new Grid();
-        var hint = Fluent.Label($"Filter actions or ask {Model.AIName}", 14, Fluent.Tertiary);
+        var hint = _actionHint = Fluent.Label($"Filter actions or ask {Model.AIName}", 14, Fluent.Tertiary);
         hint.IsHitTestVisible = false;
         hint.Margin = new Thickness(4, 0, 0, 0);
         _actionFilter.TextChanged += (_, _) => hint.Visibility = _actionFilter.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -684,6 +731,8 @@ public sealed class QuickPanelWindow : Window
     {
         if (_actionList is null) return;
         _actionList.Children.Clear();
+        if (_actionFilter is not null && _actionFilter.Text != Model.ActionQuery) _actionFilter.Text = Model.ActionQuery;
+        if (_actionHint is not null) _actionHint.Text = Model.IsPickingGroup ? "Choose a group to share with" : $"Filter actions or ask {Model.AIName}";
         var actions = Model.FilteredActions;
         var pinned = Model.SelectedEntry?.ClipItem?.IsPinned ?? false;
         string? section = null;
@@ -901,6 +950,7 @@ public sealed class QuickPanelWindow : Window
         {
             PanelMode.Browse when Model.IsMultiSelecting => $"Enter Paste {Model.SelectedClips.Count} items    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+P Pin    Del Delete    Esc Close",
             PanelMode.Browse => "Enter Paste    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Shift+1–9 Assign Slot    Tab Filter    Esc Close",
+            PanelMode.Actions when Model.IsPickingGroup => "↑↓ Choose Group    Enter Share    Esc Back",
             PanelMode.Actions => "↑↓ Choose    Enter Run    Esc Back",
             PanelMode.AI => "Enter Paste    Ctrl+C Copy    Ctrl+R Replace Item    Esc Back",
             _ => "Enter Save    Esc Back",

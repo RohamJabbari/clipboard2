@@ -19,7 +19,8 @@ public static class Glyphs
         Image = "", File = "", Sparkle = "", Copy = "", Paste = "", Lock = "",
         Unlock = "", Download = "", All = "", App = "", Tag = "", Check = "",
         Panel = "", Clock = "", Cut = "", SelectAll = "", Undo = "", Redo = "",
-        OpenWith = "", Info = "", Rename = "", Menu = "", Eye = "", Book = "";
+        OpenWith = "", Info = "", Rename = "", Menu = "", Eye = "", Book = "",
+        Group = "\uE716", Cloud = "\uE753";
 
     public static TextBlock Icon(string glyph, double size = 16, Brush? brush = null) => new()
     {

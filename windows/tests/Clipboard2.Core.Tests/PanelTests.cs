@@ -10,9 +10,9 @@ internal sealed class FakeVault : ISecretVault
     public IReadOnlyList<SecretRef> Secrets => _secrets;
     public IReadOnlySet<string> ValueHashes => _values.Values.Select(ContentHasher.HashText).ToHashSet();
     public event Action? Changed;
-    public SecretRef? Add(string name, string value)
+    public SecretRef? Add(string name, string value, string? spaceId = null)
     {
-        var s = new SecretRef(Guid.NewGuid().ToString(), name, DateTime.UtcNow);
+        var s = new SecretRef(Guid.NewGuid().ToString(), name, DateTime.UtcNow, spaceId);
         _secrets.Add(s);
         _values[s.Id] = value;
         Changed?.Invoke();
@@ -22,6 +22,15 @@ internal sealed class FakeVault : ISecretVault
     public void SetValue(SecretRef secret, string value) => _values[secret.Id] = value;
     public void Delete(SecretRef secret) { _secrets.RemoveAll(s => s.Id == secret.Id); _values.Remove(secret.Id); }
     public string? Value(string id) => _values.GetValueOrDefault(id);
+    public string? ReadValue(SecretRef secret) => _values.GetValueOrDefault(secret.Id);
+    public void Put(Guid id, string name, string value, string? spaceId)
+    {
+        var key = id.ToString();
+        _secrets.RemoveAll(s => s.Id == key);
+        _secrets.Add(new SecretRef(key, name, DateTime.UtcNow, spaceId));
+        _values[key] = value;
+        Changed?.Invoke();
+    }
 }
 
 internal sealed class FakeHost : IPanelHost
@@ -37,6 +46,7 @@ internal sealed class FakeHost : IPanelHost
     public void CopyText(string text) => Log.Add($"copy-text:{text}");
     public void PasteSecret(SecretRef secret) => Log.Add($"paste-secret:{secret.Name}");
     public void CopySecret(SecretRef secret) => Log.Add($"copy-secret:{secret.Name}");
+    public void ShareSecret(SecretRef secret, string groupId, string groupName) => Log.Add($"share-secret:{secret.Name}:{groupName}");
     public string? CurrentClipboardText() => "CLIP";
     public void OpenSettings() => Log.Add("settings");
     public IAIStreamingClient MakeAIClient() => throw new AIException(AIErrorKind.NotSignedIn, "not signed in");
@@ -259,5 +269,52 @@ public sealed class PanelTests : IDisposable
         Assert.True(_model.HandleKey(K(PanelKey.Escape)));
         Assert.Equal(PanelMode.Browse, _model.Mode);
         Assert.Equal("hunter2", _vault.Value(secret.Id));
+    }
+
+    [Fact]
+    public void ShareToGroupCopiesWithANewIdAndGroupsBecomeFilters()
+    {
+        Assert.DoesNotContain(new PanelAction.ShareToGroup(), _model.AvailableActions);
+        _store.SaveSyncSpaces([new SpaceRecord("p", "personal", "owner", null, "me", 1), new SpaceRecord("g1", "group", "owner", "Team", "me", 2)]);
+        var item = Add("share me");
+        _model.PrepareForOpen(null);
+        _model.OpenActions();
+        Assert.Contains(new PanelAction.ShareToGroup(), _model.AvailableActions);
+        _model.Perform(new PanelAction.ShareToGroup());
+        Assert.True(_model.IsPickingGroup);
+        Assert.Equal([new PanelAction.ShareTo("g1", "Team")], _model.FilteredActions);
+        Assert.True(_model.HandleKey(K(PanelKey.Enter)));
+        Assert.Equal(PanelMode.Browse, _model.Mode);
+        var copy = Assert.Single(_store.ItemsInSpace("g1"));
+        Assert.NotEqual(item.Id, copy.Id);
+        Assert.Equal("share me", copy.Text);
+        Assert.Equal("Team", _model.GroupBadge(new PanelEntry.Clip(copy)));
+        Assert.Null(_model.GroupBadge(new PanelEntry.Clip(item)));
+
+        // Tab cycles through the built-in filters and then the group.
+        for (var i = 0; i < PanelFilters.All.Length; i++) _model.CycleFilter(true);
+        Assert.Equal("g1", _model.GroupFilter);
+        Assert.Equal(copy.Id, Assert.Single(_model.Entries).ClipItem!.Id);
+        _model.CycleFilter(true);
+        Assert.Null(_model.GroupFilter);
+        Assert.Equal(PanelFilter.All, _model.Filter);
+    }
+
+    [Fact]
+    public void EscapeWhilePickingAGroupReturnsToActions()
+    {
+        _store.SaveSyncSpaces([new SpaceRecord("g1", "group", "member", "Team", "x", 2)]);
+        Add("x");
+        var secret = _vault.Add("PIN", "1234")!;
+        _model.PrepareForOpen(null);
+        _model.BeginShareToGroup();
+        Assert.True(_model.HandleKey(K(PanelKey.Escape)));
+        Assert.Equal(PanelMode.Actions, _model.Mode);
+        Assert.False(_model.IsPickingGroup);
+
+        _model.SetFilter(PanelFilter.Secrets);
+        _model.Select(new PanelEntry.SecretEntry(secret).Id);
+        _model.Perform(new PanelAction.ShareTo("g1", "Team"));
+        Assert.Contains("share-secret:PIN:Team", _host.Log);
     }
 }

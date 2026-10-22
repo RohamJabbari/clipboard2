@@ -53,6 +53,8 @@ public abstract record PanelAction
     public sealed record SetUpAI : PanelAction;
     public sealed record ClearSlot(int Slot) : PanelAction;
     public sealed record TogglePin : PanelAction;
+    public sealed record ShareToGroup : PanelAction;
+    public sealed record ShareTo(string GroupId, string GroupName) : PanelAction;
     public sealed record Delete : PanelAction;
 
     public string Section(string aiName) => this switch
@@ -60,6 +62,7 @@ public abstract record PanelAction
         Paste or PastePlain or Copy => "Paste",
         ApplyTransform => "Transform & Paste",
         Ask or SetUpAI => $"Ask {aiName}",
+        ShareTo => "Share to Group",
         _ => "Item",
     };
 
@@ -76,6 +79,8 @@ public abstract record PanelAction
         SetUpAI => "Set Up AI…",
         ClearSlot c => $"Remove from Quick Slot Ctrl+{c.Slot}",
         TogglePin => isPinned ? "Unpin" : "Pin",
+        ShareToGroup => "Share to Group…",
+        ShareTo s => s.GroupName,
         _ => "Delete",
     };
 }
@@ -92,6 +97,8 @@ public interface IPanelHost
     void CopyText(string text);
     void PasteSecret(SecretRef secret);
     void CopySecret(SecretRef secret);
+    /// <summary>Copies a secret into a sync group (after confirming with Windows Hello).</summary>
+    void ShareSecret(SecretRef secret, string groupId, string groupName);
     string? CurrentClipboardText();
     void OpenSettings();
     IAIStreamingClient MakeAIClient();
@@ -105,10 +112,14 @@ public interface ISecretVault
 {
     IReadOnlyList<SecretRef> Secrets { get; }
     IReadOnlySet<string> ValueHashes { get; }
-    SecretRef? Add(string name, string value);
+    SecretRef? Add(string name, string value, string? spaceId = null);
     void Rename(SecretRef secret, string name);
     void SetValue(SecretRef secret, string value);
     void Delete(SecretRef secret);
+    /// <summary>The value without asking the user — for sync only, never for pasting.</summary>
+    string? ReadValue(SecretRef secret);
+    /// <summary>Creates or replaces a secret with a known id (a synced secret).</summary>
+    void Put(Guid id, string name, string value, string? spaceId);
     event Action? Changed;
 }
 
@@ -168,6 +179,12 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     public string Query { get; private set; } = "";
     public PanelFilter Filter { get; private set; } = PanelFilter.All;
+    /// <summary>When set, the list shows only this sync group (and <see cref="Filter"/> is ignored).</summary>
+    public string? GroupFilter { get; private set; }
+    /// <summary>Sync groups the user belongs to, by id (badges, filters, sharing).</summary>
+    public IReadOnlyDictionary<string, string> GroupNames { get; private set; } = new Dictionary<string, string>();
+    /// <summary>In the action menu: picking the group to share with.</summary>
+    public bool IsPickingGroup { get; private set; }
     public List<PanelEntry> Entries { get; private set; } = [];
     public string? SelectedId { get; private set; }
     public HashSet<string> SelectedIds { get; private set; } = [];
@@ -200,6 +217,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         TargetApp = target;
         Query = "";
         Filter = PanelFilter.All;
+        GroupFilter = null;
         _userMovedSelection = false;
         Refresh(resetSelection: true);
         OpenToken++;
@@ -232,6 +250,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         EditSecretForm = null;
         ActionQuery = "";
         ActionSelection = 0;
+        IsPickingGroup = false;
         Mode = PanelMode.Browse;
         Notify();
     }
@@ -245,9 +264,31 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     public void SetFilter(PanelFilter filter)
     {
-        if (filter == Filter) return;
+        if (filter == Filter && GroupFilter is null) return;
         Filter = filter;
+        GroupFilter = null;
         Refresh(resetSelection: true);
+    }
+
+    public void SetGroupFilter(string groupId)
+    {
+        if (GroupFilter == groupId) return;
+        GroupFilter = groupId;
+        Filter = PanelFilter.All;
+        Refresh(resetSelection: true);
+    }
+
+    /// <summary>The group badge for an entry, or null for personal items.</summary>
+    public string? GroupBadge(PanelEntry entry)
+    {
+        var space = entry switch
+        {
+            PanelEntry.Clip c => c.Item.SpaceId,
+            PanelEntry.SnippetEntry s => s.Snippet.SpaceId,
+            PanelEntry.SecretEntry k => k.Secret.SpaceId,
+            _ => null,
+        };
+        return space is null ? null : GroupNames.GetValueOrDefault(space, "Group");
     }
 
     public void ShowNotice(string text)
@@ -266,7 +307,11 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         }
         var q = Query.Trim();
         var target = TargetApp?.Id;
-        var clips = Filter is PanelFilter.Snippets or PanelFilter.Secrets ? [] : store.AllItems().Where(item => Filter switch
+        GroupNames = store.Groups().ToDictionary(g => g.Id, g => g.DisplayName);
+        if (GroupFilter is not null && !GroupNames.ContainsKey(GroupFilter)) GroupFilter = null;
+        var group = GroupFilter;
+        var clips = group is not null ? store.ItemsInSpace(group)
+            : Filter is PanelFilter.Snippets or PanelFilter.Secrets ? [] : store.AllItems().Where(item => Filter switch
         {
             PanelFilter.Pinned => item.IsPinned,
             PanelFilter.Text => item.Kind.IsTextual(),
@@ -277,8 +322,10 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         }).ToList();
         // Snippets and secrets join "All" only while searching, so history stays uncluttered.
         var searchingAll = Filter == PanelFilter.All && q.Length > 0;
-        var snippets = Filter == PanelFilter.Snippets || searchingAll ? store.AllSnippets() : [];
-        var secretList = Filter == PanelFilter.Secrets || searchingAll ? secrets.Secrets.ToList() : [];
+        var snippets = group is not null ? store.AllSnippets().Where(s => s.SpaceId == group).ToList()
+            : Filter == PanelFilter.Snippets || searchingAll ? store.AllSnippets() : [];
+        var secretList = group is not null ? secrets.Secrets.Where(s => s.SpaceId == group).ToList()
+            : Filter == PanelFilter.Secrets || searchingAll ? secrets.Secrets.ToList() : [];
 
         List<PanelEntry> result;
         if (q.Length == 0)
@@ -388,11 +435,14 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         Notify();
     }
 
+    /// <summary>Tab: the built-in filters, then one per sync group.</summary>
     public void CycleFilter(bool forward)
     {
-        var all = PanelFilters.All;
-        var index = Array.IndexOf(all, Filter);
-        SetFilter(all[(index + (forward ? 1 : all.Length - 1)) % all.Length]);
+        List<(PanelFilter Filter, string? Group)> all = [.. PanelFilters.All.Select(f => (f, (string?)null)),
+            .. store.Groups().Select(g => (PanelFilter.All, (string?)g.Id))];
+        var index = all.FindIndex(x => GroupFilter is not null ? x.Group == GroupFilter : x.Group is null && x.Filter == Filter);
+        var next = all[(Math.Max(index, 0) + (forward ? 1 : all.Count - 1)) % all.Count];
+        if (next.Group is { } g) SetGroupFilter(g); else SetFilter(next.Filter);
     }
 
     // MARK: Quick slots
@@ -574,9 +624,26 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         if (SelectedEntry is null && !IsMultiSelecting) return;
         ActionQuery = "";
         ActionSelection = 0;
+        IsPickingGroup = false;
         Mode = PanelMode.Actions;
         Notify();
     }
+
+    /// <summary>Switches the action list to the sync groups to share with.</summary>
+    public void BeginShareToGroup()
+    {
+        if (SelectedEntry is null && !IsMultiSelecting) return;
+        ActionQuery = "";
+        ActionSelection = 0;
+        IsPickingGroup = true;
+        Mode = PanelMode.Actions;
+        Notify();
+    }
+
+    private List<PanelAction> ShareActions(string? exceptGroup) =>
+        [.. store.Groups().Where(g => g.Id != exceptGroup).Select(g => new PanelAction.ShareTo(g.Id, g.DisplayName))];
+
+    private bool CanShare => store.Groups().Count > 0;
 
     public void SetActionQuery(string query)
     {
@@ -607,6 +674,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 List<PanelAction> multi = [new PanelAction.Paste()];
                 if (clips.All(c => c.Kind.IsTextual())) multi.AddRange([new PanelAction.PastePlain(), new PanelAction.Copy(), .. TransformActions]);
                 else multi.Add(new PanelAction.Copy());
+                if (CanShare) multi.Add(new PanelAction.ShareToGroup());
                 return [.. multi, new PanelAction.TogglePin(), new PanelAction.Delete()];
             }
             if (SelectedEntry is not { } entry) return [];
@@ -614,7 +682,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             switch (entry)
             {
                 case PanelEntry.Clip c when c.Item == SelectionItem:
-                    return [new PanelAction.Copy(), .. AIActions, .. TransformActions, new PanelAction.SaveAsSecret()];
+                    return [new PanelAction.Copy(), .. AIActions, .. TransformActions, new PanelAction.SaveAsSecret(),
+                            .. CanShare ? [new PanelAction.ShareToGroup()] : Array.Empty<PanelAction>()];
                 case PanelEntry.Clip c:
                     if (c.Item.Kind.IsTextual()) actions.Add(new PanelAction.PastePlain());
                     actions.Add(new PanelAction.Copy());
@@ -632,6 +701,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                     actions.Add(new PanelAction.SetLabel());
                     break;
             }
+            if (CanShare) actions.Add(new PanelAction.ShareToGroup());
             if (slots.SlotFor(entry.SlotTarget) is { } slot) actions.Add(new PanelAction.ClearSlot(slot));
             if (entry is PanelEntry.Clip or PanelEntry.SecretEntry) actions.Add(new PanelAction.Delete());
             return actions;
@@ -643,6 +713,13 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         get
         {
             var q = ActionQuery.Trim();
+            if (IsPickingGroup)
+            {
+                var groups = ShareActions(!IsMultiSelecting && SelectedEntry is { } e ? SpaceOf(e) : null);
+                return q.Length == 0 ? groups
+                    : [.. groups.Select(a => (Action: a, Score: FuzzyMatcher.Score(q, a.Title(false)))).Where(x => x.Score is not null)
+                        .OrderByDescending(x => x.Score).Select(x => x.Action)];
+            }
             if (q.Length == 0) return AvailableActions;
             var pinned = SelectedEntry?.ClipItem?.IsPinned ?? false;
             var matches = AvailableActions
@@ -707,6 +784,12 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 Mode = PanelMode.Browse;
                 Notify();
                 break;
+            case PanelAction.ShareToGroup:
+                BeginShareToGroup();
+                break;
+            case PanelAction.ShareTo share:
+                Share(entry, share);
+                break;
             case PanelAction.Delete:
                 Mode = PanelMode.Browse;
                 DeleteSelection(includingSecrets: true);
@@ -739,11 +822,53 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 TogglePinOnSelectedClips();
                 Mode = PanelMode.Browse;
                 break;
+            case PanelAction.ShareToGroup:
+                BeginShareToGroup();
+                break;
+            case PanelAction.ShareTo share:
+                foreach (var c in clips.Where(c => c.SpaceId != share.GroupId)) store.CopyToSpace(c, share.GroupId);
+                ResetMode();
+                Refresh();
+                ShowNotice($"Shared {clips.Count} items to “{share.GroupName}”");
+                break;
             case PanelAction.Delete:
                 Mode = PanelMode.Browse;
                 DeleteSelectedClips();
                 break;
         }
+    }
+
+    private static string? SpaceOf(PanelEntry entry) => entry switch
+    {
+        PanelEntry.Clip c => c.Item.SpaceId,
+        PanelEntry.SnippetEntry s => s.Snippet.SpaceId,
+        PanelEntry.SecretEntry k => k.Secret.SpaceId,
+        _ => null,
+    };
+
+    /// <summary>Copies the entry into the group with a new id; the original stays where it is.</summary>
+    private void Share(PanelEntry entry, PanelAction.ShareTo share)
+    {
+        switch (entry)
+        {
+            case PanelEntry.Clip c when c.Item == SelectionItem:
+                store.Ingest(ProcessedCapture.ForText(c.Item.Text, source: c.Item.Source), spaceId: share.GroupId);
+                host.ClosePanel();
+                return;
+            case PanelEntry.Clip c:
+                store.CopyToSpace(c.Item, share.GroupId);
+                break;
+            case PanelEntry.SnippetEntry s:
+                store.CopySnippetToSpace(s.Snippet, share.GroupId);
+                break;
+            case PanelEntry.SecretEntry k:
+                host.ShareSecret(k.Secret, share.GroupId, share.GroupName);
+                ResetMode();
+                return;
+        }
+        ResetMode();
+        Refresh();
+        ShowNotice($"Shared to “{share.GroupName}”");
     }
 
     // MARK: AI result
@@ -896,7 +1021,9 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         switch (key.Key)
         {
             case PanelKey.Escape:
-                if (IsSelectionMode) host.ClosePanel(); else { Mode = PanelMode.Browse; Notify(); }
+                if (IsPickingGroup) { IsPickingGroup = false; ActionQuery = ""; ActionSelection = 0; Notify(); }
+                else if (IsSelectionMode) host.ClosePanel();
+                else { Mode = PanelMode.Browse; Notify(); }
                 return true;
             case PanelKey.Up: ActionSelection = Math.Max(0, ActionSelection - 1); Notify(); return true;
             case PanelKey.Down: ActionSelection = Math.Min(Math.Max(0, actions.Count - 1), ActionSelection + 1); Notify(); return true;

@@ -66,6 +66,46 @@ public sealed class ClipStore : IDisposable
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, keyword TEXT NOT NULL, body TEXT NOT NULL,
                 created INTEGER NOT NULL, updated INTEGER NOT NULL);
             """);
+        Migrate();
+    }
+
+    /// <summary>Schema version stored in <c>PRAGMA user_version</c>. v0 is the original, unversioned schema.</summary>
+    public const int SchemaVersion = 1;
+
+    public int UserVersion => Convert.ToInt32(Scalar("PRAGMA user_version"));
+
+    private void Migrate()
+    {
+        var version = UserVersion;
+        if (version >= SchemaVersion) return;
+        Exec("BEGIN");
+        try
+        {
+            if (version < 1)
+            {
+                // v1: sync. space_id null = personal; sync_meta tracks what the server has; cursors per space.
+                Exec("""
+                    ALTER TABLE clips ADD COLUMN space_id TEXT;
+                    ALTER TABLE snippets ADD COLUMN space_id TEXT;
+                    CREATE INDEX IF NOT EXISTS clips_space ON clips(space_id);
+                    CREATE TABLE IF NOT EXISTS sync_meta (
+                        space_id TEXT NOT NULL, local_id TEXT NOT NULL, category TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                        remote_seq INTEGER NOT NULL, updated_at INTEGER NOT NULL, trimmed INTEGER NOT NULL DEFAULT 0, blobs TEXT,
+                        PRIMARY KEY (space_id, local_id));
+                    CREATE TABLE IF NOT EXISTS sync_cursor (space_id TEXT PRIMARY KEY, since INTEGER NOT NULL);
+                    CREATE TABLE IF NOT EXISTS sync_spaces (
+                        id TEXT PRIMARY KEY, kind TEXT NOT NULL, role TEXT NOT NULL, name TEXT, owner_uid TEXT NOT NULL,
+                        member_count INTEGER NOT NULL);
+                    """);
+            }
+            Exec($"PRAGMA user_version = {SchemaVersion}");
+            Exec("COMMIT");
+        }
+        catch
+        {
+            Exec("ROLLBACK");
+            throw;
+        }
     }
 
     public void Dispose() => _db.Dispose();
@@ -76,18 +116,24 @@ public sealed class ClipStore : IDisposable
 
     public ClipItem? Find(Guid id) => Query("SELECT * FROM clips WHERE id = $id", ("$id", id.ToString())).FirstOrDefault();
 
-    public ClipItem? ItemWithHash(string hash) =>
-        Query("SELECT * FROM clips WHERE hash = $h ORDER BY pinned DESC, last_copied DESC LIMIT 1", ("$h", hash)).FirstOrDefault();
+    /// <summary>Items of one space (null = personal), newest first.</summary>
+    public List<ClipItem> ItemsInSpace(string? spaceId) =>
+        Query("SELECT * FROM clips WHERE space_id IS $s ORDER BY last_copied DESC", ("$s", spaceId));
+
+    /// <summary>Same content in the same space (dedupe never crosses spaces).</summary>
+    public ClipItem? ItemWithHash(string hash, string? spaceId = null) =>
+        Query("SELECT * FROM clips WHERE hash = $h AND space_id IS $s ORDER BY pinned DESC, last_copied DESC LIMIT 1",
+            ("$h", hash), ("$s", spaceId)).FirstOrDefault();
 
     public int Count() => Convert.ToInt32(Scalar("SELECT COUNT(*) FROM clips"));
 
     // MARK: Writes
 
     /// <summary>Inserts a capture, or — if identical content exists — moves that item to the top.</summary>
-    public ClipItem Ingest(ProcessedCapture capture, DateTime? now = null)
+    public ClipItem Ingest(ProcessedCapture capture, DateTime? now = null, string? spaceId = null)
     {
         var time = now ?? DateTime.UtcNow;
-        if (ItemWithHash(capture.Hash) is { } existing)
+        if (ItemWithHash(capture.Hash, spaceId) is { } existing)
         {
             existing.LastCopiedAt = time;
             existing.CopyCount += 1;
@@ -109,6 +155,7 @@ public sealed class ClipStore : IDisposable
             return existing;
         }
         var item = ClipItem.From(capture, time);
+        item.SpaceId = spaceId;
         Save(item);
         Commit();
         return item;
@@ -149,9 +196,10 @@ public sealed class ClipStore : IDisposable
         Commit();
     }
 
+    /// <summary>Clears the personal history; group items belong to the group and stay.</summary>
     public void ClearHistory(bool includingPinned = false)
     {
-        foreach (var item in AllItems().Where(i => includingPinned || !i.IsPinned)) Remove(item);
+        foreach (var item in ItemsInSpace(null).Where(i => includingPinned || !i.IsPinned)) Remove(item);
         Commit();
     }
 
@@ -159,7 +207,7 @@ public sealed class ClipStore : IDisposable
     public void ReplaceText(ClipItem item, string text)
     {
         var hash = ContentHasher.HashText(text);
-        if (ItemWithHash(hash) is { } duplicate && duplicate.Id != item.Id) Remove(duplicate);
+        if (ItemWithHash(hash, item.SpaceId) is { } duplicate && duplicate.Id != item.Id) Remove(duplicate);
         Blobs.Delete(item.ImageFile);
         Blobs.Delete(item.ThumbnailFile);
         item.Kind = ClipKind.Text;
@@ -179,19 +227,28 @@ public sealed class ClipStore : IDisposable
 
     // MARK: Retention & cleanup
 
-    /// <summary>Pinned items are exempt. <paramref name="maxAge"/> null keeps forever; maxItems 0 = no count limit.</summary>
+    /// <summary>Unpinned history each group keeps locally, matching the server's limit.</summary>
+    public const int GroupHistoryLimit = 200;
+
+    /// <summary>Pinned items are exempt. <paramref name="maxAge"/> null keeps forever; maxItems 0 = no count limit.
+    /// The user's limits apply to the personal space; each group keeps its newest <see cref="GroupHistoryLimit"/>.
+    /// Items removed here stop being tracked by sync rather than being deleted on other devices.</summary>
     public int EnforceRetention(int maxItems, TimeSpan? maxAge, DateTime? now = null)
     {
         var time = now ?? DateTime.UtcNow;
         var removed = 0;
-        var unpinned = AllItems().Where(i => !i.IsPinned).ToList();   // newest first
-        foreach (var (item, index) in unpinned.Select((item, index) => (item, index)))
+        foreach (var space in AllItems().Where(i => !i.IsPinned).GroupBy(i => i.SpaceId))   // newest first
         {
-            var expired = maxAge is { } age && item.LastCopiedAt < time - age;
-            var overflow = maxItems > 0 && index >= maxItems;
-            if (!expired && !overflow) continue;
-            Remove(item);
-            removed++;
+            foreach (var (item, index) in space.Select((item, index) => (item, index)))
+            {
+                var expire = space.Key is null
+                    ? (maxAge is { } age && item.LastCopiedAt < time - age) || (maxItems > 0 && index >= maxItems)
+                    : index >= GroupHistoryLimit;
+                if (!expire) continue;
+                Remove(item);
+                Exec("DELETE FROM sync_meta WHERE local_id = $id", ("$id", SyncId(item.Id)));
+                removed++;
+            }
         }
         if (removed > 0) Commit();
         return removed;
@@ -201,7 +258,7 @@ public sealed class ClipStore : IDisposable
     public int MergeDuplicates()
     {
         var removed = 0;
-        foreach (var group in AllItems().GroupBy(i => i.ContentHash).Where(g => g.Count() > 1))
+        foreach (var group in AllItems().GroupBy(i => (i.SpaceId, i.ContentHash)).Where(g => g.Count() > 1))
         {
             var items = group.ToList();
             var newest = items.MaxBy(i => i.LastCopiedAt)!;
@@ -221,12 +278,12 @@ public sealed class ClipStore : IDisposable
         return removed;
     }
 
-    /// <summary>Removes unpinned items whose content hash is in <paramref name="hashes"/> (e.g. saved secrets).</summary>
-    public void RemoveUnpinned(IReadOnlySet<string> hashes)
+    /// <summary>Removes unpinned items of one space whose content hash is in <paramref name="hashes"/> (e.g. that space's saved secrets).</summary>
+    public void RemoveUnpinned(IReadOnlySet<string> hashes, string? spaceId = null)
     {
         if (hashes.Count == 0) return;
         var removed = 0;
-        foreach (var item in AllItems().Where(i => !i.IsPinned && hashes.Contains(i.ContentHash)))
+        foreach (var item in ItemsInSpace(spaceId).Where(i => !i.IsPinned && hashes.Contains(i.ContentHash)))
         {
             Remove(item);
             removed++;
@@ -250,14 +307,14 @@ public sealed class ClipStore : IDisposable
     public List<Snippet> AllSnippets()
     {
         using var cmd = _db.CreateCommand();
-        cmd.CommandText = "SELECT id, name, keyword, body, created, updated FROM snippets ORDER BY name COLLATE NOCASE";
+        cmd.CommandText = "SELECT id, name, keyword, body, created, updated, space_id FROM snippets ORDER BY name COLLATE NOCASE";
         using var r = cmd.ExecuteReader();
         var list = new List<Snippet>();
         while (r.Read())
             list.Add(new Snippet
             {
                 Id = Guid.Parse(r.GetString(0)), Name = r.GetString(1), Keyword = r.GetString(2), Body = r.GetString(3),
-                CreatedAt = FromUnix(r.GetInt64(4)), UpdatedAt = FromUnix(r.GetInt64(5)),
+                CreatedAt = FromUnix(r.GetInt64(4)), UpdatedAt = FromUnix(r.GetInt64(5)), SpaceId = r.IsDBNull(6) ? null : r.GetString(6),
             });
         return list;
     }
@@ -272,19 +329,234 @@ public sealed class ClipStore : IDisposable
     public void SaveSnippet(Snippet snippet)
     {
         snippet.UpdatedAt = DateTime.UtcNow;
+        PutSnippet(snippet);
+    }
+
+    /// <summary>Inserts or replaces a snippet as given, keeping its timestamps (sync).</summary>
+    public void PutSnippet(Snippet snippet)
+    {
         Exec("""
-            INSERT INTO snippets (id, name, keyword, body, created, updated) VALUES ($id, $n, $k, $b, $c, $u)
+            INSERT INTO snippets (id, name, keyword, body, created, updated, space_id) VALUES ($id, $n, $k, $b, $c, $u, $s)
             ON CONFLICT(id) DO UPDATE SET name = $n, keyword = $k, body = $b, updated = $u
             """,
             ("$id", snippet.Id.ToString()), ("$n", snippet.Name), ("$k", snippet.Keyword), ("$b", snippet.Body),
-            ("$c", ToUnix(snippet.CreatedAt)), ("$u", ToUnix(snippet.UpdatedAt)));
+            ("$c", ToUnix(snippet.CreatedAt)), ("$u", ToUnix(snippet.UpdatedAt)), ("$s", snippet.SpaceId));
         Commit();
     }
 
-    public void DeleteSnippet(Snippet snippet)
+    public void DeleteSnippet(Snippet snippet) => DeleteSnippet(snippet.Id);
+
+    public void DeleteSnippet(Guid id)
     {
-        Exec("DELETE FROM snippets WHERE id = $id", ("$id", snippet.Id.ToString()));
+        Exec("DELETE FROM snippets WHERE id = $id", ("$id", id.ToString()));
         Commit();
+    }
+
+    // MARK: Spaces (sync)
+
+    /// <summary>Inserts or replaces an item exactly as given (sync). Write its blobs first.</summary>
+    public void Put(ClipItem item)
+    {
+        Save(item);
+        Commit();
+    }
+
+    public void Delete(Guid id)
+    {
+        if (Find(id) is { } item) Delete(item);
+    }
+
+    /// <summary>Copies an item into another space with a new id and its own blob files.
+    /// If that space already has the same content, it's moved to the top instead.</summary>
+    public ClipItem CopyToSpace(ClipItem item, string? spaceId, DateTime? now = null)
+    {
+        var time = now ?? DateTime.UtcNow;
+        if (ItemWithHash(item.ContentHash, spaceId) is { } existing)
+        {
+            existing.LastCopiedAt = time;
+            Save(existing);
+            Commit();
+            return existing;
+        }
+        var copy = new ClipItem
+        {
+            CreatedAt = time, LastCopiedAt = time, Kind = item.Kind, Text = item.Text, Preview = item.Preview, Rtf = item.Rtf,
+            Html = item.Html, ContentHash = item.ContentHash, Files = [.. item.Files], ImageWidth = item.ImageWidth,
+            ImageHeight = item.ImageHeight, ByteCount = item.ByteCount, SourceId = item.SourceId, SourceName = item.SourceName,
+            IsPinned = item.IsPinned, PinnedAt = item.PinnedAt, Label = item.Label, SpaceId = spaceId,
+        };
+        copy.ImageFile = CopyBlob(item.ImageFile, copy.Id.ToString("N") + ".png");
+        copy.ThumbnailFile = CopyBlob(item.ThumbnailFile, copy.Id.ToString("N") + "-thumb.png");
+        Save(copy);
+        Commit();
+        return copy;
+    }
+
+    public Snippet CopySnippetToSpace(Snippet snippet, string? spaceId)
+    {
+        var copy = new Snippet { Name = snippet.Name, Keyword = snippet.Keyword, Body = snippet.Body, SpaceId = spaceId };
+        PutSnippet(copy);
+        return copy;
+    }
+
+    private string? CopyBlob(string? name, string target)
+    {
+        if (name is null || !File.Exists(Blobs.PathFor(name))) return null;
+        File.Copy(Blobs.PathFor(name), Blobs.PathFor(target), overwrite: true);
+        return target;
+    }
+
+    /// <summary>Removes every item and snippet of a space (group left, deleted or signed out). Secrets live in the vault.</summary>
+    public void DeleteSpaceData(string spaceId)
+    {
+        foreach (var item in ItemsInSpace(spaceId)) Remove(item);
+        Exec("DELETE FROM snippets WHERE space_id = $s", ("$s", spaceId));
+        Exec("DELETE FROM sync_meta WHERE space_id = $s", ("$s", spaceId));
+        Exec("DELETE FROM sync_cursor WHERE space_id = $s", ("$s", spaceId));
+        Exec("DELETE FROM sync_spaces WHERE id = $s", ("$s", spaceId));
+        Commit();
+    }
+
+    /// <summary>Sign-out: drops group items and snippets and all sync state. Personal items stay.</summary>
+    public void ResetSync()
+    {
+        foreach (var item in Query("SELECT * FROM clips WHERE space_id IS NOT NULL")) Remove(item);
+        Exec("DELETE FROM snippets WHERE space_id IS NOT NULL");
+        Exec("DELETE FROM sync_meta; DELETE FROM sync_cursor; DELETE FROM sync_spaces;");
+        Commit();
+    }
+
+    /// <summary>When two items of one space share a content hash, the lexicographically smaller id wins: it takes
+    /// the summed copy count, the later copy time and the label and pin of either; the others are deleted.</summary>
+    public int ConvergeDuplicates(string? spaceId)
+    {
+        var removed = 0;
+        foreach (var group in ItemsInSpace(spaceId).GroupBy(i => i.ContentHash).Where(g => g.Count() > 1))
+        {
+            var ordered = group.OrderBy(i => SyncId(i.Id), StringComparer.Ordinal).ToList();
+            var winner = ordered[0];
+            var losers = ordered.Skip(1).ToList();
+            winner.CopyCount = group.Sum(i => i.CopyCount);
+            winner.LastCopiedAt = group.Max(i => i.LastCopiedAt);
+            winner.Label ??= losers.Select(l => l.Label).FirstOrDefault(l => l is not null);
+            if (group.Any(i => i.IsPinned))
+            {
+                winner.IsPinned = true;
+                winner.PinnedAt = group.Where(i => i.PinnedAt is not null).Select(i => i.PinnedAt).Min() ?? winner.LastCopiedAt;
+            }
+            Save(winner);
+            foreach (var loser in losers)
+            {
+                Remove(loser);
+                removed++;
+            }
+        }
+        if (removed > 0) Commit();
+        return removed;
+    }
+
+    /// <summary>The id used on the server: lowercase hyphenated.</summary>
+    public static string SyncId(Guid id) => id.ToString("D");
+
+    // MARK: Sync state
+
+    public List<SyncMeta> SyncMetas(string spaceId) => QueryMeta(spaceId, null);
+
+    public SyncMeta? SyncMetaFor(string spaceId, string localId) => QueryMeta(spaceId, localId).FirstOrDefault();
+
+    private List<SyncMeta> QueryMeta(string spaceId, string? localId)
+    {
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = "SELECT space_id, local_id, category, fingerprint, remote_seq, updated_at, trimmed, blobs FROM sync_meta WHERE space_id = $s"
+            + (localId is null ? "" : " AND local_id = $id");
+        cmd.Parameters.AddWithValue("$s", spaceId);
+        if (localId is not null) cmd.Parameters.AddWithValue("$id", localId);
+        using var r = cmd.ExecuteReader();
+        var list = new List<SyncMeta>();
+        while (r.Read())
+            list.Add(new SyncMeta(r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetInt64(4), r.GetInt64(5),
+                r.GetInt64(6) != 0, r.IsDBNull(7) ? null : JsonSerializer.Deserialize<Dictionary<string, string>>(r.GetString(7))));
+        return list;
+    }
+
+    public void SaveSyncMeta(SyncMeta meta) => Exec("""
+        INSERT INTO sync_meta (space_id, local_id, category, fingerprint, remote_seq, updated_at, trimmed, blobs)
+        VALUES ($s, $id, $c, $f, $seq, $u, $t, $b)
+        ON CONFLICT(space_id, local_id) DO UPDATE SET category = $c, fingerprint = $f, remote_seq = $seq, updated_at = $u,
+            trimmed = $t, blobs = $b
+        """,
+        ("$s", meta.SpaceId), ("$id", meta.LocalId), ("$c", meta.Category), ("$f", meta.Fingerprint), ("$seq", meta.RemoteSeq),
+        ("$u", meta.UpdatedAt), ("$t", meta.Trimmed ? 1 : 0), ("$b", meta.Blobs is { Count: > 0 } b ? JsonSerializer.Serialize(b) : null));
+
+    public void DeleteSyncMeta(string spaceId, string localId) =>
+        Exec("DELETE FROM sync_meta WHERE space_id = $s AND local_id = $id", ("$s", spaceId), ("$id", localId));
+
+    public long SyncCursor(string spaceId) =>
+        Scalar("SELECT since FROM sync_cursor WHERE space_id = $s", ("$s", spaceId)) is long since ? since : 0;
+
+    public void SetSyncCursor(string spaceId, long since) => Exec(
+        "INSERT INTO sync_cursor (space_id, since) VALUES ($s, $n) ON CONFLICT(space_id) DO UPDATE SET since = $n",
+        ("$s", spaceId), ("$n", since));
+
+    public List<SpaceRecord> SyncSpaces()
+    {
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = "SELECT id, kind, role, name, owner_uid, member_count FROM sync_spaces";
+        using var r = cmd.ExecuteReader();
+        var list = new List<SpaceRecord>();
+        while (r.Read())
+            list.Add(new SpaceRecord(r.GetString(0), r.GetString(1), r.GetString(2), r.IsDBNull(3) ? null : r.GetString(3), r.GetString(4), r.GetInt32(5)));
+        return list.OrderBy(s => s.IsGroup).ThenBy(s => s.DisplayName, StringComparer.CurrentCultureIgnoreCase).ToList();
+    }
+
+    /// <summary>Groups the user belongs to, by name.</summary>
+    public List<SpaceRecord> Groups() => SyncSpaces().Where(s => s.IsGroup).ToList();
+
+    /// <summary>Replaces the cached spaces; a no-op (and no <see cref="Changed"/>) when nothing differs.</summary>
+    public void SaveSyncSpaces(IEnumerable<SpaceRecord> spaces)
+    {
+        var list = spaces.ToList();
+        var current = SyncSpaces();
+        if (current.Count == list.Count && list.All(current.Contains)) return;
+        Exec("DELETE FROM sync_spaces");
+        foreach (var s in list)
+            Exec("INSERT INTO sync_spaces (id, kind, role, name, owner_uid, member_count) VALUES ($id, $k, $r, $n, $o, $m)",
+                ("$id", s.Id), ("$k", s.Kind), ("$r", s.Role), ("$n", s.Name), ("$o", s.OwnerUid), ("$m", s.MemberCount));
+        Commit();
+    }
+
+    // MARK: Batching
+
+    private int _batchDepth;
+    private bool _pendingCommit;
+
+    /// <summary>Groups many writes into one transaction and one <see cref="Changed"/>.</summary>
+    public IDisposable Batch()
+    {
+        if (_batchDepth++ == 0) Exec("BEGIN");
+        return new BatchScope(this);
+    }
+
+    private void EndBatch()
+    {
+        if (--_batchDepth > 0) return;
+        Exec("COMMIT");
+        if (_pendingCommit)
+        {
+            _pendingCommit = false;
+            Commit();
+        }
+    }
+
+    private sealed class BatchScope(ClipStore store) : IDisposable
+    {
+        private bool _disposed;
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            store.EndBatch();
+        }
     }
 
     // MARK: Private
@@ -298,20 +570,20 @@ public sealed class ClipStore : IDisposable
 
     private void Save(ClipItem i) => Exec("""
         INSERT INTO clips (id, created, last_copied, kind, text, preview, rtf, html, hash, files, image_file, thumb_file,
-                           width, height, bytes, source_id, source_name, pinned, pinned_at, label, copy_count)
+                           width, height, bytes, source_id, source_name, pinned, pinned_at, label, copy_count, space_id)
         VALUES ($id, $created, $last, $kind, $text, $preview, $rtf, $html, $hash, $files, $img, $thumb,
-                $w, $h, $bytes, $sid, $sname, $pinned, $pinnedAt, $label, $count)
+                $w, $h, $bytes, $sid, $sname, $pinned, $pinnedAt, $label, $count, $space)
         ON CONFLICT(id) DO UPDATE SET last_copied = $last, kind = $kind, text = $text, preview = $preview, rtf = $rtf,
             html = $html, hash = $hash, files = $files, image_file = $img, thumb_file = $thumb, width = $w, height = $h,
             bytes = $bytes, source_id = $sid, source_name = $sname, pinned = $pinned, pinned_at = $pinnedAt,
-            label = $label, copy_count = $count
+            label = $label, copy_count = $count, created = $created
         """,
         ("$id", i.Id.ToString()), ("$created", ToUnix(i.CreatedAt)), ("$last", ToUnix(i.LastCopiedAt)), ("$kind", (int)i.Kind),
         ("$text", i.Text), ("$preview", i.Preview), ("$rtf", i.Rtf), ("$html", i.Html), ("$hash", i.ContentHash),
         ("$files", JsonSerializer.Serialize(i.Files)), ("$img", i.ImageFile), ("$thumb", i.ThumbnailFile),
         ("$w", i.ImageWidth), ("$h", i.ImageHeight), ("$bytes", i.ByteCount), ("$sid", i.SourceId), ("$sname", i.SourceName),
         ("$pinned", i.IsPinned ? 1 : 0), ("$pinnedAt", i.PinnedAt is { } p ? ToUnix(p) : null), ("$label", i.Label),
-        ("$count", i.CopyCount));
+        ("$count", i.CopyCount), ("$space", i.SpaceId));
 
     private List<ClipItem> Query(string sql, params (string, object?)[] args)
     {
@@ -347,6 +619,7 @@ public sealed class ClipStore : IDisposable
                 PinnedAt = r.IsDBNull(r.GetOrdinal("pinned_at")) ? null : FromUnix(Num("pinned_at")),
                 Label = Str("label"),
                 CopyCount = (int)Num("copy_count"),
+                SpaceId = Str("space_id"),
             });
         }
         return list;
@@ -360,15 +633,21 @@ public sealed class ClipStore : IDisposable
         cmd.ExecuteNonQuery();
     }
 
-    private object? Scalar(string sql)
+    private object? Scalar(string sql, params (string, object?)[] args)
     {
         using var cmd = _db.CreateCommand();
         cmd.CommandText = sql;
+        foreach (var (name, value) in args) cmd.Parameters.AddWithValue(name, value ?? DBNull.Value);
         return cmd.ExecuteScalar();
     }
 
     private void Commit()
     {
+        if (_batchDepth > 0)
+        {
+            _pendingCommit = true;
+            return;
+        }
         Revision++;
         Changed?.Invoke();
     }

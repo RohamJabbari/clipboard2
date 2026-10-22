@@ -57,6 +57,8 @@ public sealed class ClipItem
     /// <summary>User-chosen name for pinned items; the content stays in <see cref="Text"/>.</summary>
     public string? Label { get; set; }
     public int CopyCount { get; set; } = 1;
+    /// <summary>The sync group this item belongs to; null is the personal space (and every item when signed out).</summary>
+    public string? SpaceId { get; set; }
 
     public AppRef? Source => SourceId is null ? null : new AppRef(SourceId, SourceName ?? SourceId);
 
@@ -103,6 +105,8 @@ public sealed class Snippet
     public string Body { get; set; } = "";
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+    /// <summary>Sync group id, or null for the personal space.</summary>
+    public string? SpaceId { get; set; }
 }
 
 /// <summary>A clipboard capture after hashing / image encoding, ready to store.</summary>
@@ -149,4 +153,24 @@ public sealed record ProcessedCapture
     }
 }
 
-public sealed record SecretRef(string Id, string Name, DateTime? CreatedAt);
+/// <param name="SpaceId">Sync group id, or null for the personal space.</param>
+public sealed record SecretRef(string Id, string Name, DateTime? CreatedAt, string? SpaceId = null);
+
+/// <summary>Sync bookkeeping for one local item (docs/sync/PROTOCOL.md → Client sync rules 1).</summary>
+/// <param name="LocalId">Lowercase hyphenated UUID, the same as the remote item id.</param>
+/// <param name="Fingerprint">SHA-256 of the canonical payload last sent or applied.</param>
+/// <param name="Trimmed">The server trimmed it from personal history: keep the local copy and push it again only if it changes.</param>
+/// <param name="Blobs">Local blob file name → remote blob id, for blobs already on the server.</param>
+public sealed record SyncMeta(string SpaceId, string LocalId, string Category, string Fingerprint, long RemoteSeq, long UpdatedAt,
+                              bool Trimmed = false, IReadOnlyDictionary<string, string>? Blobs = null)
+{
+    public IReadOnlyDictionary<string, string> BlobMap => Blobs ?? new Dictionary<string, string>();
+}
+
+/// <summary>A sync space as last seen on the server, cached so group names and badges work offline.</summary>
+public sealed record SpaceRecord(string Id, string Kind, string Role, string? Name, string OwnerUid, int MemberCount)
+{
+    public bool IsGroup => Kind == "group";
+    public bool IsOwner => Role == "owner";
+    public string DisplayName => string.IsNullOrWhiteSpace(Name) ? "Untitled group" : Name!;
+}

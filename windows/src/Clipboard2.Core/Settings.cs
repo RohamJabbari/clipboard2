@@ -60,6 +60,10 @@ public sealed class Settings
     public bool CheckForUpdates { get; set; } = true;
     public bool InstallUpdatesAutomatically { get; set; }
     public bool HasLaunchedBefore { get; set; }
+    /// <summary>Debug override for the sync API base URL; null uses the built-in one.</summary>
+    public string? SyncApiBaseUrl { get; set; }
+    /// <summary>The group the "send to group" shortcut stores into.</summary>
+    public string? DefaultGroupId { get; set; }
 
     [JsonIgnore] public TimeSpan? MaxAge => MaxAgeMinutes > 0 ? TimeSpan.FromMinutes(MaxAgeMinutes) : null;
     [JsonIgnore] public HashSet<string> IgnoredIds => IgnoredApps.Select(a => a.Id.ToLowerInvariant()).ToHashSet();
@@ -131,6 +135,7 @@ public static class Hotkey
     public const string SelectionActions = "selectionActions";
     public const string PasteAsText = "pasteAsText";
     public const string CaptureText = "captureText";
+    public const string SendToGroup = "sendToGroup";
     public static string Slot(int n) => $"slot{n}";
 
     public static readonly IReadOnlyDictionary<string, string> Defaults = new Dictionary<string, string>
@@ -139,6 +144,7 @@ public static class Hotkey
         [SelectionActions] = "Ctrl+Alt+K",
         [PasteAsText] = "Ctrl+Alt+Shift+V",
         [CaptureText] = "Ctrl+Alt+Shift+2",
+        [SendToGroup] = "Ctrl+Alt+C",
     };
 
     public static string Title(string name) => name switch
@@ -147,6 +153,7 @@ public static class Hotkey
         SelectionActions => "Actions on selected text",
         PasteAsText => "Paste as text",
         CaptureText => "Capture text from screen",
+        SendToGroup => "Send selection to default group",
         _ when name.StartsWith("slot") => $"Paste quick slot {name[4..]}",
         _ => name,
     };

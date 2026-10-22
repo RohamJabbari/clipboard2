@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
@@ -80,10 +81,13 @@ public sealed class FlyoutWindow : Window
         _search.Focus();
     }
 
+    private Dictionary<string, string> _groupNames = [];
+
     private void Render()
     {
         RenderBanner();
         _list.Children.Clear();
+        _groupNames = _services.Store.Groups().ToDictionary(g => g.Id, g => g.DisplayName);
         var query = _search.Text.Trim();
         var items = _services.Store.AllItems();
         if (query.Length > 0)
@@ -145,6 +149,8 @@ public sealed class FlyoutWindow : Window
         else texts.Children.Add(Fluent.Label(item.DisplayTitle, 13));
         Grid.SetColumn(texts, 1);
         grid.Children.Add(texts);
+        if (item.SpaceId is { } space && _groupNames.GetValueOrDefault(space) is { } groupName)
+            texts.Children.Add(Fluent.Label("In " + groupName, 11, Fluent.Tertiary));
         var time = Fluent.Label(item.IsPinned ? Glyphs.Pinned : Fluent.Relative(item.LastCopiedAt), 11, Fluent.Tertiary);
         if (item.IsPinned) time.FontFamily = (FontFamily)Application.Current.Resources["IconFont"];
         time.Margin = new Thickness(8, 0, 0, 0);
@@ -204,6 +210,14 @@ public sealed class FlyoutWindow : Window
             }));
         }
         menu.Items.Add(slots);
+        var groups = _services.Store.Groups().Where(g => g.Id != item.SpaceId).ToList();
+        if (groups.Count > 0)
+        {
+            var share = new MenuItem { Header = "Share to Group" };
+            foreach (var group in groups)
+                share.Items.Add(Item(group.DisplayName, () => _services.Store.CopyToSpace(item, group.Id)));
+            menu.Items.Add(share);
+        }
         menu.Items.Add(new Separator());
         menu.Items.Add(Item("Delete", () => _services.Store.Delete(item)));
         return menu;

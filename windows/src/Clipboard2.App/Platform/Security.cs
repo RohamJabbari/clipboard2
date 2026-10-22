@@ -88,7 +88,8 @@ public sealed class CredentialKeyStore : IKeyStore
     public void Delete(string account) => CredentialManager.Delete(Target(account));
 }
 
-/// <summary>Secrets: values only in Credential Manager; pasting asks Windows Hello unless unlocked.</summary>
+/// <summary>Secrets: values only in Credential Manager; pasting asks Windows Hello unless unlocked.
+/// A synced group secret keeps its group id in the credential's UserName (personal ones have the Windows user name).</summary>
 public sealed class SecretVault : ISecretVault
 {
     private const string Prefix = "Clipboard2/secret/";
@@ -98,6 +99,9 @@ public sealed class SecretVault : ISecretVault
     public List<SecretRef> All { get; private set; } = [];
     public IReadOnlyList<SecretRef> Secrets => All;
     public IReadOnlySet<string> ValueHashes { get; private set; } = new HashSet<string>();
+    /// <summary>Value hashes per space (null key = personal), for removing history copies within one space.</summary>
+    public IReadOnlyDictionary<string, IReadOnlySet<string>> HashesBySpace { get; private set; } = new Dictionary<string, IReadOnlySet<string>>();
+    public const string PersonalSpaceKey = "";
     public event Action? Changed;
 
     public SecretVault(Settings settings)
@@ -112,29 +116,46 @@ public sealed class SecretVault : ISecretVault
     public void Reload()
     {
         All = CredentialManager.Enumerate(Prefix + "*")
-            .Select(e => new SecretRef(e.Target[Prefix.Length..], e.Comment ?? "Untitled", e.Written))
+            .Select(e => new SecretRef(e.Target[Prefix.Length..], e.Comment ?? "Untitled", e.Written, SpaceFrom(e.UserName)))
             .OrderBy(s => s.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
-        ValueHashes = All.Select(s => CredentialManager.Read(Prefix + s.Id)).OfType<string>().Select(ContentHasher.HashText).ToHashSet();
+        var hashes = All.Select(s => (s.SpaceId, Value: CredentialManager.Read(Prefix + s.Id))).Where(x => x.Value is not null)
+            .Select(x => (x.SpaceId, Hash: ContentHasher.HashText(x.Value!))).ToList();
+        ValueHashes = hashes.Select(h => h.Hash).ToHashSet();
+        HashesBySpace = hashes.GroupBy(h => h.SpaceId ?? PersonalSpaceKey)
+            .ToDictionary(g => g.Key, g => (IReadOnlySet<string>)g.Select(h => h.Hash).ToHashSet());
         Changed?.Invoke();
     }
 
-    public SecretRef? Add(string name, string value)
+    private static string? SpaceFrom(string? userName) => Guid.TryParse(userName, out var g) ? g.ToString("D") : null;
+
+    public SecretRef? Add(string name, string value, string? spaceId = null)
     {
         var id = Guid.NewGuid().ToString("N");
-        if (!CredentialManager.Write(Prefix + id, value, comment: name)) return null;
+        if (!CredentialManager.Write(Prefix + id, value, userName: spaceId, comment: name)) return null;
         Reload();
         return All.FirstOrDefault(s => s.Id == id);
     }
 
     public void Rename(SecretRef secret, string name)
     {
-        if (CredentialManager.Read(Prefix + secret.Id) is { } value) CredentialManager.Write(Prefix + secret.Id, value, comment: name);
+        if (CredentialManager.Read(Prefix + secret.Id) is { } value) CredentialManager.Write(Prefix + secret.Id, value, userName: secret.SpaceId, comment: name);
         Reload();
     }
 
     public void SetValue(SecretRef secret, string value)
     {
-        CredentialManager.Write(Prefix + secret.Id, value, comment: secret.Name);
+        CredentialManager.Write(Prefix + secret.Id, value, userName: secret.SpaceId, comment: secret.Name);
+        Reload();
+    }
+
+    /// <summary>For sync only: reads without Windows Hello. Pasting and showing go through <see cref="RevealAsync"/>.</summary>
+    public string? ReadValue(SecretRef secret) => CredentialManager.Read(Prefix + secret.Id);
+
+    public void Put(Guid id, string name, string value, string? spaceId)
+    {
+        // Reuse the local spelling of an existing id (older secrets use "N", synced ones may arrive as "D").
+        var existing = All.FirstOrDefault(s => Guid.TryParse(s.Id, out var g) && g == id)?.Id ?? id.ToString("N");
+        CredentialManager.Write(Prefix + existing, value, userName: spaceId, comment: name);
         Reload();
     }
 
