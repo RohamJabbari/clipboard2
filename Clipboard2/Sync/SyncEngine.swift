@@ -80,26 +80,33 @@ final class SyncEngine {
         try checkActive()
         let remote = try await api.spaces()
         try checkActive()
-        let spaces = updateSpaces(remote)
+        // Groups first, and every download before any upload: a long first upload (or a rate limit
+        // while sending it) must never keep new group items from arriving.
+        let spaces = updateSpaces(remote).sorted { $0.kind != "personal" && $1.kind == "personal" }
+        defer { save() }
         for space in spaces {
-            try checkActive()
-            let spaceId = space.id
-            guard let key = spaceKeys[spaceId] else { continue }
-            let itemKey = SyncCrypto.itemKey(spaceKey: key)
-            do {
-                try await pull(space, itemKey: itemKey)
-                if store.convergeDuplicates(inSpace: localSpaceID(spaceId)) > 0 {
-                    Log.sync.info("Merged duplicates in a space")
-                }
-                try await push(space, itemKey: itemKey)
-            } catch let error as SyncAPIError where error.status == 404 || error.code == "forbidden" {
-                // Removed from the group mid-tick; the next space list drops it.
-                try checkActive()
-                Log.sync.notice("Space \(spaceId, privacy: .public) is gone: \(error.localizedDescription, privacy: .public)")
-            }
-            flushSecrets()
+            try await inSpace(space) { try await self.pull(space, itemKey: $0) }
         }
-        save()
+        for space in spaces {
+            try await inSpace(space) { try await self.push(space, itemKey: $0) }
+        }
+    }
+
+    private func inSpace(_ space: SyncSpace, _ work: (Data) async throws -> Void) async throws {
+        try checkActive()
+        let spaceId = space.id
+        guard let key = spaceKeys[spaceId] else { return }
+        do {
+            try await work(SyncCrypto.itemKey(spaceKey: key))
+            if store.convergeDuplicates(inSpace: localSpaceID(spaceId)) > 0 {
+                Log.sync.info("Merged duplicates in a space")
+            }
+        } catch let error as SyncAPIError where error.status == 404 || error.code == "forbidden" {
+            // Removed from the group mid-tick; the next space list drops it.
+            try checkActive()
+            Log.sync.notice("Space \(spaceId, privacy: .public) is gone: \(error.localizedDescription, privacy: .public)")
+        }
+        flushSecrets()
     }
 
     /// Stop tracking items retention removed locally (they stay on the server and other devices).

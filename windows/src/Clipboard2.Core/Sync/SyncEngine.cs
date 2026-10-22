@@ -64,10 +64,17 @@ public sealed class SyncEngine(ClipStore store, ISecretVault vault, SyncApi api,
     {
         var report = new SyncReport();
         await RefreshSpacesAsync(ct);
-        foreach (var space in _spaces.Values.OrderBy(s => !s.IsPersonal).ToList())
+        // Groups first, and every download before any upload: a long first upload (or a rate limit
+        // while sending it) must never keep new group items from arriving.
+        var spaces = _spaces.Values.OrderBy(s => s.IsPersonal).ToList();
+        foreach (var space in spaces)
         {
             ct.ThrowIfCancellationRequested();
             await PullAsync(space, report, ct);
+        }
+        foreach (var space in spaces)
+        {
+            ct.ThrowIfCancellationRequested();
             await PushAsync(space, report, ct);
         }
         return report;

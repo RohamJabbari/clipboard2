@@ -839,4 +839,24 @@ public sealed class SyncEngineTests : IDisposable
         Assert.Equal(20, _cloud.LiveItems(d.Personal).Count);
         Assert.Null(d.Account.RetryAfter);
     }
+
+    [Fact]
+    public async Task GroupItemsArriveWhileAFirstUploadIsRateLimited()
+    {
+        var a = await SignedUp();
+        var b = await SignedUp("friend@example.com");
+        Assert.True(await a.Account.CreateGroupAsync("Team"));
+        var group = a.Account.Groups.Single();
+        var preview = await b.Account.PreviewInviteAsync((await a.Account.CreateInviteAsync(group.Id))!);
+        Assert.True(await b.Account.JoinAsync(preview!), b.Account.Error);
+        a.Store.CopyToSpace(a.Copy("for the team"), group.Id);
+        await a.Sync();
+
+        // b's long first upload runs into the rate limit; the group download must happen before it.
+        for (var i = 0; i < 30; i++) b.Copy($"backlog {i}", 100 - i);
+        _cloud.RateLimitAfter = 6;
+        await b.Sync();
+        Assert.NotNull(b.Account.RetryAfter);
+        Assert.Contains(b.Store.ItemsInSpace(group.Id), item => item.Text == "for the team");
+    }
 }
