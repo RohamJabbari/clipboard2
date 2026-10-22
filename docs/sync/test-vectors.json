@@ -1,0 +1,143 @@
+{
+  "description": "Clipboard2 sync v1 crypto vectors (docs/sync/PROTOCOL.md). All byte values are base64. Clients must reproduce every output from its inputs (sealing with the given nonce) and open every sealed value.",
+  "pbkdf2": [
+    {
+      "password": "correct horse battery staple",
+      "iterations": 1000,
+      "salt": "9CMd9l1+m/xJXXc53jGLBA==",
+      "kek": "NBMadTu6WCSUYJtJy+nyMADPyThYSVT7wQWVjqzeK6w="
+    },
+    {
+      "password": "café",
+      "iterations": 1000,
+      "salt": "8g/mp5hyOYIg1dTWIpmLXw==",
+      "kek": "S929ViAncczPj1Yb05+SBKBtkeRoQcEWGc83qwqSg5Q="
+    },
+    {
+      "password": "café",
+      "iterations": 1000,
+      "salt": "8g/mp5hyOYIg1dTWIpmLXw==",
+      "kek": "S929ViAncczPj1Yb05+SBKBtkeRoQcEWGc83qwqSg5Q="
+    },
+    {
+      "password": "Zürich-🔑-2026",
+      "iterations": 600000,
+      "salt": "YGOx7ykzWZ1f92wdDMTUuQ==",
+      "kek": "0JkNMQD+HQBWeJhTJWAIDADAFzr0h64s0JpoXyHOEvQ="
+    }
+  ],
+  "aead": [
+    {
+      "key": "drCpES+9FMQ9ErSe5tJS1ivInJlKc4D8ZlxHGxWevbg=",
+      "nonce": "mDLKXIAQiH/8Q17Z",
+      "aad": "c2/test/v1",
+      "plaintext": "aGVsbG8gY2xpcGJvYXJk",
+      "sealed": "AZgyylyAEIh//ENe2aW4gTTlw20s34McTNnDqXhInQ6RU0MAVzOXgmadLtg="
+    },
+    {
+      "key": "lDIHCOucdLo29nK3cNVpl0h7ggKIoG8ljGbueiJQSuU=",
+      "nonce": "LYAhNaosrT+i1mD0",
+      "aad": "",
+      "plaintext": "",
+      "sealed": "AS2AITWqLK0/otZg9MTJfhV+yCCC2aNbSKycUjM="
+    },
+    {
+      "key": "o/mVlY+nzvxxFl+JnUXbSs6mtcQycjt0txJPEDD5wrg=",
+      "nonce": "CwwCZGol0NYHsWaB",
+      "aad": "c2/test/v1/binary",
+      "plaintext": "rFTfl2mGG0mXzPgXpul7Pdnxem6Swsr4luTVScVQ3i0=",
+      "sealed": "AQsMAmRqJdDWB7FmgcCmHe+8jc3DD4j5fSq1XQ8pZl1k0Bp6NcgG5fGdyayIl2SDx5+5jpr6yolIsptLzA=="
+    }
+  ],
+  "hkdf": [
+    {
+      "ikm": "A5SIwU9lU9PjO9/VeZ0dXKeZxSCfWANvsV5H9wMa0h0=",
+      "salt": "",
+      "info": "c2/item/v1",
+      "okm": "hNKLYCFa6ssuHd19KxJkjo407DNanb43RfOPYMnzAWs="
+    },
+    {
+      "ikm": "Jmb1aBhDF/26eHpj86RSqch7d1mqbkLPfMVUrbKf3yw=",
+      "salt": "aVuqXEOlOCuOJkNDu3cy3FnBosm8P1hYtBuunwLaScw=",
+      "info": "c2/space/v1/0b4f6a8e-2d1c-4e7a-9b3f-5c6d7e8f9a0b",
+      "okm": "KuqsNbixaibrrIY7Q2VikMHBB8BgKnMmTdmIP1D+Fnc="
+    }
+  ],
+  "ecdh": {
+    "privA": "yp+OSI0LNy1oXSbQIqns9fM6cvbcnXOwoFtcgc8pkD4=",
+    "pubA": "BMqWl265C5FrgFlkw5UULi49x6tb8d/re8WQbDoATuiUXb38aK4/eGXD+ixcsPfAnxtZkXpCIO+EOfUQ+ICSf5k=",
+    "privB": "v3zCVKpGm3x/E9UtZlL0LFbEHlcoF9cBXxakOOugd2s=",
+    "pubB": "BIcVf0EFlcvfmqi5YGQiOqArzsSSoCpW2FILp0MoOGdnfni4Y/yv2nJQQoGDj0CvFbua+QLSw+OnGRCVluT20LI=",
+    "shared": "QhMyLKKIQ2MUgsSh2/opGWPC2tYyNaXNm4Wx58lG6QI="
+  },
+  "account": {
+    "uid": "vHn3bq0ZtWQ2dXo9JpL7cA1sR4e2",
+    "password": "correct horse battery staple",
+    "salt": "jXSVR9VL+syGjp1PcXvOeQ==",
+    "iterations": 1000,
+    "master": "9eBgFBiHY5XjDL2uoQxevRtLuY72CML3ff9kCJK1YB8=",
+    "authKey": "VZzU0YgsV5mN3cBDnn5u1/pi0TX+GO2fGYJi4BNv6XM=",
+    "wrapKey": "f/IAA9mX5ZzD/SZt57lCcO1ayjssDjRxYRUzyH9FYkY=",
+    "accountKey": "qaGzLCssD2GB96MVdFTLteKGAMjgHrhBRBxOUjQ834I=",
+    "akNonce": "17sA9br0ZW1L7s7R",
+    "wrappedAccountKey": "Ade7APW69GVtS+7O0T1EiLNa6KU6vrfQsGXfZpQhcGscxZhst/D08vX79oKH2uhcm9tKsLBnr5up3RgKUQ==",
+    "idPriv": "UCjs9/c2aWCjlk6s3mlEmyhS1MRaeH5ZgXXSmZZv2zA=",
+    "idPub": "BBzUetIHTF3coEPg7YSfNqj/qCFSn3oAqtAFMTpLFWemuOhGaBdFeuvsMj+fl72dRgC/wbn0iozyJTqvCndk9tM=",
+    "privNonce": "TPnirMVJw51adfFE",
+    "wrappedPrivateKey": "AUz54qzFScOdWnXxRHmlcl6Ab6CX7Yhvs3B7u2aO1CCWmGPZEP73GRtCtgqBh+sAvZofHKMD2GpXQZtZ6g=="
+  },
+  "spaceWrap": {
+    "spaceId": "0b4f6a8e-2d1c-4e7a-9b3f-5c6d7e8f9a0b",
+    "memberUid": "vHn3bq0ZtWQ2dXo9JpL7cA1sR4e2",
+    "memberPriv": "UCjs9/c2aWCjlk6s3mlEmyhS1MRaeH5ZgXXSmZZv2zA=",
+    "memberPub": "BBzUetIHTF3coEPg7YSfNqj/qCFSn3oAqtAFMTpLFWemuOhGaBdFeuvsMj+fl72dRgC/wbn0iozyJTqvCndk9tM=",
+    "ephPriv": "tMGwtllQ6xd4kmlK0R3gyEzMP7ejy2LWw96Cvw8ejWo=",
+    "ephPub": "BNk5g5gDL+0VZjTTxqLiUoAEId02XYujW8jSMTW2t9Sl7/FoWiFckilPbl+L175ttoiYJecPEyaTvKU3bmi5+/c=",
+    "nonce": "SYkE3nd7udXE5rVA",
+    "spaceKey": "jJThtPHZ4EYkMXbqaLyK4MkKDACoQCO8SYluLXRcjC8=",
+    "wrappedKey": "BNk5g5gDL+0VZjTTxqLiUoAEId02XYujW8jSMTW2t9Sl7/FoWiFckilPbl+L175ttoiYJecPEyaTvKU3bmi5+/cBSYkE3nd7udXE5rVA5B4b4RamgGGm6pq9vzqueY9SfPonIWNofEOdoXK0lgDYVrqECPJh2LiIVj/gW/mB"
+  },
+  "item": {
+    "spaceId": "0b4f6a8e-2d1c-4e7a-9b3f-5c6d7e8f9a0b",
+    "itemId": "f1e2d3c4-b5a6-4978-8a9b-0c1d2e3f4a5b",
+    "category": "history",
+    "spaceKey": "jJThtPHZ4EYkMXbqaLyK4MkKDACoQCO8SYluLXRcjC8=",
+    "itemKey": "Jhg3pPlVKscBRrHsgEidhte7MfoEVseeGpVsY+PMjKk=",
+    "nonce": "XAqgTS8E4Y58tAwu",
+    "payload": "{\"v\":1,\"type\":\"clip\",\"kind\":\"text\",\"text\":\"Grüße aus Wien 👋\",\"preview\":\"Grüße aus Wien 👋\",\"sourceId\":\"com.apple.Safari\",\"sourceName\":\"Safari\",\"isPinned\":false,\"copyCount\":2,\"createdAt\":1792396800000,\"lastCopiedAt\":1792400400000,\"contentHash\":\"text:0effc6271a128b56ce3d1c2df55f706b8346e0e224b924b91b8ba03212d49cb5\"}",
+    "ciphertext": "AVwKoE0vBOGOfLQMLmG5lQ5wtfS7k1PajBrWsWNociTl6OcYTAK1xO9pXHw/4498KYLGvFWNqdMdc652GbHmRFlgkrfI1zUOp8nsenoRvYhHTyG6Irc5XrBOGQkr3BpA+qUJ5ikbqVHdzxj3hl0jCBsaOR+Y3+7flfFc4o6dT67bqhauEpFSByZ0ruerC1T7iPHeGMlXEulAkdbYH5ka/1XsFL5+dYH4EmDUaZpNtuZjjkftQC1X/W53lgwNDs0zgwtRSi4Dt439DpTa8c4CRHjesyN0ZafCkUPhngGOEjj0VdNG7rrmF5hgxS5YyIaLM6NOrsUwz+J3OWQ4HiK6zyaxE+4E7fy8x2QJ1CdhCOIucX9Kl2jD4HYtHB2crFscioPb3bu1etmFa6sI66Z8Kq5qSikobasJSDvTG89KteYD78dsMHw0dOE/S1R5O3IAGo7dVrmuSJx4BoCJlBgS48g="
+  },
+  "blob": {
+    "spaceId": "0b4f6a8e-2d1c-4e7a-9b3f-5c6d7e8f9a0b",
+    "blobId": "a0b1c2d3-e4f5-4a6b-8c7d-9e0f1a2b3c4d",
+    "nonce": "yIQZEgXFI7Il1+kI",
+    "plaintext": "yhYOJo7uW6ljk+wbh+Dx+bFcaPsr3BWMoa/PHLS34ok=",
+    "ciphertext": "AciEGRIFxSOyJdfpCPsGza6fceyvHcbrJDJaswGZPZu1rXGix0LDLPEavNpOvnEtLlFidubwMttkmHH2rA=="
+  },
+  "groupName": {
+    "spaceId": "0b4f6a8e-2d1c-4e7a-9b3f-5c6d7e8f9a0b",
+    "nameKey": "BYfY6fr4SgYkZFmzKEwSspfwZXCTh6tgeblJ/UAvT1A=",
+    "nonce": "oI7c+JDFo3EqC1rr",
+    "name": "Team Wien",
+    "encryptedName": "AaCO3PiQxaNxKgta64ArDdWddQcx1/5oSlz5MpyI16lPabVYetQ="
+  },
+  "invite": {
+    "codeBytes": "anXLlfbR70htOJiVO6rVAA==",
+    "code": "NJ24-XFPW-2HXU-Q3JY-TCKT-XKWV-AA",
+    "typedVariants": [
+      "nj24 xfpw 2hxu q3jy tckt xkwv aa",
+      "NJ24XFPW2HXUQ3JYTCKTXKWVAA"
+    ],
+    "invalidCodes": [
+      "NJ24-XFPW-2HXU-Q3JY-TCKT-XKWV-A",
+      "NJ24-XFPW-2HXU-Q3JY-TCKT-XKWV-AAA",
+      "9J24-XFPW-2HXU-Q3JY-TCKT-XKWV-AA"
+    ],
+    "inviteId": "4151f5368c61fd158a8ab924f63a62f0dd5e7de3a9e7ddcd5e3c2c5ae1645bb0",
+    "inviteKey": "VqS+ZjETgYdrB7xrVOFIsrTe+nc9tHGhsXYOcgQfJC8=",
+    "spaceId": "0b4f6a8e-2d1c-4e7a-9b3f-5c6d7e8f9a0b",
+    "spaceKey": "jJThtPHZ4EYkMXbqaLyK4MkKDACoQCO8SYluLXRcjC8=",
+    "nonce": "0wEh1yW1zhEX3IMj",
+    "sealedKey": "AdMBIdcltc4RF9yDIx+S1Wz/sG+z7FV8p19O7a+iJQnD3P7DaHGmhhQ0F12ulII6lsssKn7Irj0xX9vHYg=="
+  }
+}

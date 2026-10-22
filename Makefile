@@ -5,7 +5,7 @@ DERIVED    := build
 RELEASE_APP := $(DERIVED)/Build/Products/Release/$(APP_NAME).app
 INSTALL_DIR := /Applications
 
-.PHONY: all generate build debug test install run icon pkg release windows-test windows-release clean
+.PHONY: all generate build debug test install run icon pkg release windows-test windows-release server-test server-deploy clean
 
 # Sign with Developer ID when that certificate exists, so local installs and the .pkg share one
 # signature (Accessibility/Keychain grants are tied to it). Otherwise Apple Development.
@@ -62,6 +62,13 @@ windows-release:
 	git tag "windows-v$(VERSION)"
 	git push origin "windows-v$(VERSION)"
 	@echo "Building on GitHub: gh run watch --repo RohamJabbari/clipboard2-macOS"
+
+# Sync API (server/): integration tests run against an embedded Postgres; deploy goes to Cloud Run.
+server-test:
+	cd server && npm ci && npx tsc -p tsconfig.json --noEmit && npm test
+
+server-deploy:
+	server/deploy.sh
 
 icon:
 	swift scripts/make-icon.swift Clipboard2/Resources/Assets.xcassets/AppIcon.appiconset
