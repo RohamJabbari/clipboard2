@@ -194,6 +194,62 @@ struct EditSecretView: View {
     }
 }
 
+/// Chooses the sync group the selected items are copied into.
+struct ShareToGroupView: View {
+    @Bindable var form: ShareGroupState
+    let onSubmit: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("Share to Group", systemImage: "person.2.fill")
+                .font(.headline)
+            Text(form.items.count == 1
+                 ? "Copies this item into the group. Every member sees it, end-to-end encrypted."
+                 : "Copies \(form.items.count) items into the group. Every member sees them, end-to-end encrypted.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            VStack(spacing: 2) {
+                ForEach(Array(form.groups.enumerated()), id: \.element.id) { index, group in
+                    let selected = index == form.selection
+                    HStack(spacing: 10) {
+                        Image(systemName: "person.2.fill")
+                            .frame(width: 20)
+                            .foregroundStyle(selected ? AnyShapeStyle(.white) : AnyShapeStyle(.tint))
+                        Text(group.name)
+                            .foregroundStyle(selected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+                        Spacer()
+                        Text("\(group.memberCount) \(group.memberCount == 1 ? "member" : "members")")
+                            .font(.caption)
+                            .foregroundStyle(selected ? AnyShapeStyle(.white.opacity(0.8)) : AnyShapeStyle(.secondary))
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.clear))
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        form.selection = index
+                        onSubmit()
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+                }
+            }
+            Spacer(minLength: 0)
+            HStack {
+                Spacer()
+                Button("Share", action: onSubmit)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(form.selectedGroup == nil)
+            }
+        }
+        .padding(16)
+    }
+}
+
 /// Label for a pinned item, or the name of a secret. Shows the value it belongs to.
 struct LabelFormView: View {
     @Bindable var form: LabelFormState

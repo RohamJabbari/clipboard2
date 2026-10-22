@@ -8,6 +8,7 @@ extension KeyboardShortcuts.Name {
     static let selectionActions = Self("selectionActions", default: .init(.k, modifiers: [.command, .option]))
     static let captureText = Self("captureText", default: .init(.two, modifiers: [.command, .shift, .option]))
     static let pasteAsText = Self("pasteAsText", default: .init(.v, modifiers: [.command, .shift, .option]))
+    static let sendToGroup = Self("sendToGroup", default: .init(.c, modifiers: [.command, .option]))
 }
 
 /// Owns every long-lived service. Created once at launch and injected into SwiftUI via `.environment`.
@@ -29,6 +30,7 @@ final class AppEnvironment {
     let snippets: SnippetStore
     let secrets: SecretStore
     let slots: QuickSlots
+    let sync: SyncAccount
     let claudeAccount = SubscriptionAccount(cli: .claude)
     let chatGPTAccount = SubscriptionAccount(cli: .codex)
     let updates = UpdateController()
@@ -56,10 +58,14 @@ final class AppEnvironment {
         snippets = SnippetStore(context: container.mainContext)
         secrets = SecretStore(prefs: prefs)
         slots = QuickSlots(defaults: .standard, store: store, snippets: snippets, secrets: secrets)
+        sync = SyncAccount(prefs: prefs, context: container.mainContext, store: store, snippets: snippets, secrets: secrets)
     }
 
+    /// Every persisted model; tests build in-memory containers from the same list.
+    static let schema = Schema([ClipItem.self, Snippet.self, SyncMeta.self, SyncSpace.self])
+
     private static func makeContainer(url: URL) -> ModelContainer {
-        let schema = Schema([ClipItem.self, Snippet.self])
+        let schema = Self.schema
         do {
             return try ModelContainer(for: schema, configurations: ModelConfiguration(schema: schema, url: url))
         } catch {
@@ -82,9 +88,16 @@ final class AppEnvironment {
         }
         secrets.onChange = { [weak self] in
             guard let self else { return }
-            self.store.removeUnpinned(matching: self.secrets.valueHashes)
+            self.removeHistoryCopiesOfSecrets()
+            self.sync.localChange()
         }
-        store.removeUnpinned(matching: secrets.valueHashes)
+        removeHistoryCopiesOfSecrets()
+        store.onCommit = { [weak self] in self?.sync.localChange() }
+        snippets.onCommit = { [weak self] in self?.sync.localChange() }
+        // Retention only stops tracking items; it never deletes them on other devices.
+        store.onExpire = { [weak self] ids in self?.sync.engine?.forget(ids) }
+        sync.onSessionChange = { [weak self] active in self?.setSendToGroupShortcut(active: active) }
+        sync.start()
         migrateDedupeIfNeeded()
         applyAppearance()
         monitor.start()
@@ -116,6 +129,7 @@ final class AppEnvironment {
         KeyboardShortcuts.onKeyUp(for: .pasteAsText) { [weak self] in
             self?.pasteClipboardAsText()
         }
+
         contextMenu.update()
         Task {
             await claudeAccount.refresh()
@@ -179,8 +193,16 @@ final class AppEnvironment {
         }
     }
 
+    /// "Remove history copies of saved secrets", within each space.
+    private func removeHistoryCopiesOfSecrets() {
+        for space in secrets.spaceIDs {
+            store.removeUnpinned(matching: secrets.valueHashes(inSpace: space), inSpace: space)
+        }
+    }
+
     func runMaintenance() {
         store.enforceRetention(maxItems: prefs.maxItems, maxAge: prefs.maxAge)
+        sync.periodicSync()
         contextMenu.update()   // starts the right-click tap once Accessibility is granted
         maintenanceRuns &+= 1
         if maintenanceRuns % 30 == 1 { store.removeOrphanedBlobs() }   // directory scan: every ~30 min
@@ -238,6 +260,72 @@ final class AppEnvironment {
                 return
             }
             panel.showForSelection(text, target: target)
+        }
+    }
+
+    // MARK: Send selection to the default group (⌥⌘C)
+
+    @ObservationIgnored private var sendToGroupRegistered = false
+
+    /// ⌥⌘C belongs to Chrome, Safari and Finder until the user signs in to sync, so the shortcut
+    /// is registered only while a sync session exists.
+    private func setSendToGroupShortcut(active: Bool) {
+        guard active != sendToGroupRegistered else { return }
+        sendToGroupRegistered = active
+        if active {
+            KeyboardShortcuts.onKeyUp(for: .sendToGroup) { [weak self] in
+                self?.sendSelectionToGroup()
+            }
+            warnAboutSendToGroupShortcutOnce()
+        } else {
+            KeyboardShortcuts.removeHandler(for: .sendToGroup)
+        }
+    }
+
+    /// Copies the selection in the frontmost app and stores it as history in the default sync
+    /// group, then confirms with a HUD. Without a default group it opens Settings → Sync.
+    func sendSelectionToGroup() {
+        guard sync.isSignedIn, let group = sync.defaultGroup else {
+            SettingsOpener.open(tab: .sync)
+            return
+        }
+        guard AXPermission.isTrusted else {
+            showPermissions()
+            return
+        }
+        let source = appTracker.targetApp.flatMap(FrontmostAppTracker.ref(for:))
+        Task {
+            monitor.isSuspended = true
+            let saved = paste.snapshot()
+            let text = await paste.copySelectedText()
+            paste.restore(saved)
+            monitor.acknowledgeCurrentChange()
+            monitor.isSuspended = false
+            guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                NSSound.beep()
+                return
+            }
+            store.ingest(.text(text, source: source), spaceID: group.id)
+            HUD.show("Sent to \(group.name)", symbol: "person.2.fill")
+            sync.syncNow()
+        }
+    }
+
+    /// The ⌥⌘C default replaces a few well-known shortcuts; say so once.
+    private func warnAboutSendToGroupShortcutOnce() {
+        guard !prefs.hasShownSendToGroupWarning else { return }
+        prefs.hasShownSendToGroupWarning = true
+        guard KeyboardShortcuts.getShortcut(for: .sendToGroup) == .init(.c, modifiers: [.command, .option]) else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            let alert = NSAlert()
+            alert.messageText = "⌥⌘C Now Sends Selected Text to a Sync Group"
+            alert.informativeText = "Clipboard2 uses ⌥⌘C to send the selected text to your default sync group. While you're signed in to sync, this replaces ⌥⌘C in other apps: Chrome's Inspect Elements, Safari's JavaScript Console and Finder's Copy as Pathname.\n\nTo change or clear the shortcut, open Settings → General → Send selection to default group."
+            alert.addButton(withTitle: "OK")
+            alert.addButton(withTitle: "Change Shortcut…")
+            NSApp.activate()
+            if alert.runModal() == .alertSecondButtonReturn {
+                SettingsOpener.open(tab: .general)
+            }
         }
     }
 

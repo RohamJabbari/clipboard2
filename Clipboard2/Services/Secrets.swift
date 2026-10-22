@@ -7,10 +7,15 @@ nonisolated struct SecretRef: Identifiable, Hashable, Sendable {
     let id: String          // keychain account (UUID)
     var name: String
     var createdAt: Date?
+    /// Sync group the secret belongs to; nil is the personal space.
+    var spaceID: String? = nil
+    /// Keychain modification date (last-write-wins for sync).
+    var updatedAt: Date? = nil
 }
 
 /// Secret values live only in the login keychain (one generic-password item each). Names are
-/// stored as the item label so listing never needs to touch the values.
+/// stored as the item label so listing never needs to touch the values; a sync group id, if
+/// any, as the generic attribute.
 nonisolated enum SecretVault {
     static let service = (Bundle.main.bundleIdentifier ?? "at.softmaze.Clippy") + ".secrets"
 
@@ -27,19 +32,22 @@ nonisolated enum SecretVault {
         else { return [] }
         return items.compactMap { attrs in
             guard let account = attrs[kSecAttrAccount as String] as? String else { return nil }
+            let space = (attrs[kSecAttrGeneric as String] as? Data).map { String(decoding: $0, as: UTF8.self) }
             return SecretRef(
                 id: account,
                 name: attrs[kSecAttrLabel as String] as? String ?? "Untitled",
-                createdAt: attrs[kSecAttrCreationDate as String] as? Date
+                createdAt: attrs[kSecAttrCreationDate as String] as? Date,
+                spaceID: space?.isEmpty == false ? space : nil,
+                updatedAt: attrs[kSecAttrModificationDate as String] as? Date
             )
         }
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
+    /// `id` is given for secrets that arrive through sync.
     @discardableResult
-    static func add(name: String, value: String) -> SecretRef? {
-        let id = UUID().uuidString
-        let attributes: [CFString: Any] = [
+    static func add(name: String, value: String, id: String = UUID().uuidString, spaceID: String? = nil) -> SecretRef? {
+        var attributes: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: id,
@@ -47,8 +55,9 @@ nonisolated enum SecretVault {
             kSecAttrDescription: "Clipboard2 secret",
             kSecValueData: Data(value.utf8),
         ]
+        if let spaceID { attributes[kSecAttrGeneric] = Data(spaceID.utf8) }
         guard SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess else { return nil }
-        return SecretRef(id: id, name: name, createdAt: .now)
+        return SecretRef(id: id, name: name, createdAt: .now, spaceID: spaceID, updatedAt: .now)
     }
 
     @discardableResult
@@ -161,6 +170,23 @@ final class SecretStore {
 
     func delete(_ ref: SecretRef) {
         SecretVault.delete(id: ref.id)
+        reload()
+    }
+
+    /// Hashes of the values of the secrets in one space, for "remove history copies of saved
+    /// secrets" within that space.
+    func valueHashes(inSpace spaceID: String?) -> Set<String> {
+        Set(secrets.filter { $0.spaceID == spaceID }.compactMap { SecretVault.value(id: $0.id).map(ContentHasher.hash(text:)) })
+    }
+
+    /// Spaces that hold at least one secret (nil = personal).
+    var spaceIDs: Set<String?> { Set(secrets.map(\.spaceID)) }
+
+    /// Deletes every secret of a group, e.g. after leaving it or signing out.
+    func removeAll(inSpace spaceID: String) {
+        let doomed = secrets.filter { $0.spaceID == spaceID }
+        guard !doomed.isEmpty else { return }
+        for ref in doomed { SecretVault.delete(id: ref.id) }
         reload()
     }
 

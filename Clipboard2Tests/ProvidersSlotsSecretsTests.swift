@@ -73,7 +73,7 @@ struct QuickSlotTests {
     let container: ModelContainer   // ModelContext doesn't retain its container
 
     init() throws {
-        let schema = Schema([ClipItem.self, Snippet.self])
+        let schema = AppEnvironment.schema
         container = try ModelContainer(for: schema, configurations: ModelConfiguration(schema: schema, isStoredInMemoryOnly: true))
         store = ClipStore(context: container.mainContext,
                           blobs: BlobStore(directory: FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)))

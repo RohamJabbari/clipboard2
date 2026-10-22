@@ -24,4 +24,5 @@ nonisolated enum Log {
     static let paste = Logger(subsystem: subsystem, category: "paste")
     static let claude = Logger(subsystem: subsystem, category: "claude")
     static let app = Logger(subsystem: subsystem, category: "app")
+    static let sync = Logger(subsystem: subsystem, category: "sync")
 }

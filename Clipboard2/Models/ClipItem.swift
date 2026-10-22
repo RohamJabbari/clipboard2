@@ -56,6 +56,8 @@ final class ClipItem {
     var label: String?
     var pinnedAt: Date?
     var copyCount: Int = 1
+    /// The sync group this item belongs to; nil is the personal space (also when not signed in).
+    var spaceID: String?
 
     init(capture: ProcessedCapture, now: Date = .now) {
         id = UUID()
@@ -133,6 +135,8 @@ final class Snippet {
     var body: String = ""
     var createdAt: Date = Date.now
     var updatedAt: Date = Date.now
+    /// The sync group this snippet belongs to; nil is the personal space.
+    var spaceID: String?
 
     init(name: String, keyword: String = "", body: String = "") {
         self.id = UUID()

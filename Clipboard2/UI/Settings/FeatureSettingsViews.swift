@@ -620,7 +620,7 @@ struct SecretsSettingsView: View {
             } header: {
                 Text("Secrets")
             } footer: {
-                Text("Values are stored only in your login Keychain — never in Clipboard2's history, never synced, and never sent to AI or transforms.")
+                Text("Values are stored in your login Keychain — never in Clipboard2's history, and never sent to AI or transforms. With Sync turned on they're end-to-end encrypted on this Mac before upload; the server can't read them.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

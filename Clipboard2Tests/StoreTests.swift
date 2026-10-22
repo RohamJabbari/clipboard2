@@ -11,7 +11,7 @@ struct StoreTests {
     let container: ModelContainer
 
     init() throws {
-        let schema = Schema([ClipItem.self, Snippet.self])
+        let schema = AppEnvironment.schema
         container = try ModelContainer(for: schema, configurations: ModelConfiguration(schema: schema, isStoredInMemoryOnly: true))
         let dir = FileManager.default.temporaryDirectory.appending(path: "Clipboard2Tests-\(UUID().uuidString)")
         blobs = BlobStore(directory: dir)

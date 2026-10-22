@@ -9,7 +9,8 @@ struct QuickPanelView: View {
     var body: some View {
         VStack(spacing: 0) {
             searchBar
-            FilterChips(selection: $model.filter, thisAppName: model.targetRef?.name)
+            FilterChips(selection: $model.filter, groupSelection: $model.groupFilter, groups: env.sync.groups,
+                        thisAppName: model.targetRef?.name)
                 .padding(.horizontal, 14)
                 .padding(.bottom, 10)
             Divider()
@@ -26,7 +27,7 @@ struct QuickPanelView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear { searchFocused = true }
-        .onChange(of: model.focusToken) { searchFocused = ![.actions, .snippetForm, .saveSecret, .label, .editSecret].contains(model.mode) }
+        .onChange(of: model.focusToken) { searchFocused = ![.actions, .snippetForm, .saveSecret, .label, .editSecret, .shareToGroup].contains(model.mode) }
         .onChange(of: env.store.revision) { model.refresh() }
         .onChange(of: env.snippets.revision) { model.refresh() }
         .onChange(of: env.secrets.revision) { model.refresh() }
@@ -87,7 +88,8 @@ struct QuickPanelView: View {
                             ForEach(Array(model.entries.enumerated()), id: \.element.id) { index, entry in
                                 PanelRow(entry: entry, shortcut: model.shortcutNumber(for: entry, at: index),
                                          isSelected: model.isSelected(entry),
-                                         showsCheckmark: model.isMultiSelecting)
+                                         showsCheckmark: model.isMultiSelecting,
+                                         groupName: env.sync.groupName(for: entry.clip?.spaceID))
                                     .id(entry.id)
                                     // One recogniser reading AppKit's click count: SwiftUI's stacked
                                     // count:2 / count:1 gestures miss double-clicks in a non-activating panel.
@@ -149,6 +151,14 @@ struct QuickPanelView: View {
             if item.kind.isTextual {
                 Button("Save as Secret…") { model.beginSaveSecret(item) }
             }
+            if model.canShareToGroup {
+                Menu("Share to Group") {
+                    ForEach(env.sync.groups) { group in
+                        Button(group.name) { model.share([item], to: group) }
+                            .disabled(item.spaceID == group.id)
+                    }
+                }
+            }
             Button("Delete", role: .destructive) { env.store.delete(item); model.refresh() }
         }
     }
@@ -171,6 +181,10 @@ struct QuickPanelView: View {
         case .editSecret:
             if let form = model.editSecretForm {
                 EditSecretView(form: form) { model.submitEditSecret() }
+            }
+        case .shareToGroup:
+            if let form = model.shareForm {
+                ShareToGroupView(form: form) { model.submitShare() }
             }
         case .saveSecret:
             if let form = model.saveSecretForm {
@@ -196,37 +210,59 @@ struct QuickPanelView: View {
 
 struct FilterChips: View {
     @Binding var selection: PanelFilter
+    @Binding var groupSelection: String?
+    var groups: [SyncGroup] = []
     let thisAppName: String?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        if groups.isEmpty {
+            chips
+        } else {
+            ScrollView(.horizontal, showsIndicators: false) { chips }
+        }
+    }
+
+    private var chips: some View {
         HStack(spacing: 6) {
             ForEach(PanelFilter.allCases) { filter in
-                let selected = filter == selection
-                Button {
-                    if reduceMotion { selection = filter } else {
-                        withAnimation(.snappy(duration: 0.15)) { selection = filter }
-                    }
-                } label: {
-                    Label(title(for: filter), systemImage: filter.symbol)
-                        .labelStyle(.titleAndIcon)
-                        .font(.callout)
-                        .lineLimit(1)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 4)
-                        .foregroundStyle(selected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
-                        .background {
-                            Capsule(style: .continuous)
-                                .fill(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.quaternary.opacity(0.7)))
-                        }
-                        .contentShape(Capsule())
+                chip(title(for: filter), symbol: filter.symbol, selected: groupSelection == nil && filter == selection) {
+                    groupSelection = nil
+                    selection = filter
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("\(title(for: filter)) filter")
-                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+            ForEach(groups) { group in
+                chip(group.name, symbol: "person.2", selected: groupSelection == group.id) {
+                    groupSelection = group.id
+                    selection = .all
+                }
             }
             Spacer(minLength: 0)
         }
+    }
+
+    private func chip(_ title: String, symbol: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button {
+            if reduceMotion { action() } else {
+                withAnimation(.snappy(duration: 0.15)) { action() }
+            }
+        } label: {
+            Label(title, systemImage: symbol)
+                .labelStyle(.titleAndIcon)
+                .font(.callout)
+                .lineLimit(1)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .foregroundStyle(selected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
+                .background {
+                    Capsule(style: .continuous)
+                        .fill(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.quaternary.opacity(0.7)))
+                }
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(title) filter")
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private func title(for filter: PanelFilter) -> String {
@@ -242,6 +278,8 @@ struct PanelRow: View {
     let shortcut: (number: Int, isSlot: Bool)?
     let isSelected: Bool
     var showsCheckmark = false
+    /// Sync group of the item, shown as a badge.
+    var groupName: String?
 
     var body: some View {
         HStack(spacing: 10) {
@@ -264,6 +302,18 @@ struct PanelRow: View {
                     .foregroundStyle(isSelected ? AnyShapeStyle(.white.opacity(0.8)) : AnyShapeStyle(.secondary))
             }
             Spacer(minLength: 4)
+            if let groupName {
+                Label(groupName, systemImage: "person.2.fill")
+                    .labelStyle(.titleAndIcon)
+                    .font(.caption2)
+                    .lineLimit(1)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
+                    .background(Capsule().strokeBorder(isSelected ? AnyShapeStyle(.white.opacity(0.6)) : AnyShapeStyle(.quaternary)))
+                    .help("Shared with \(groupName)")
+                    .accessibilityHidden(true)
+            }
             if case .clip(let item) = entry, item.isPinned {
                 Image(systemName: "pin.fill")
                     .font(.caption)
@@ -295,7 +345,8 @@ struct PanelRow: View {
         }
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityText + (shortcut?.isSlot == true ? ", quick slot \(shortcut?.number ?? 0)" : ""))
+        .accessibilityLabel(accessibilityText + (groupName.map { ", in group \($0)" } ?? "")
+                            + (shortcut?.isSlot == true ? ", quick slot \(shortcut?.number ?? 0)" : ""))
         .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : .isButton)
         .accessibilityHint("Double-click or press Return to paste")
     }
@@ -387,6 +438,9 @@ struct HintBar: View {
                 hint("⏎", "Paste")
             case .saveSecret, .label, .editSecret:
                 hint("⏎", "Save")
+            case .shareToGroup:
+                hint("↑↓", "Choose")
+                hint("⏎", "Share")
             case .ai:
                 hint("⏎", "Paste")
                 hint("⌘C", "Copy")

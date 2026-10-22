@@ -66,6 +66,7 @@ enum PanelMode: Equatable {
     case saveSecret
     case label
     case editSecret
+    case shareToGroup
     case ai
 }
 
@@ -77,6 +78,7 @@ enum PanelAction: Identifiable, Hashable {
     case ai(AIAction)
     case saveAsSecret
     case setLabel
+    case shareToGroup
     case setUpAI
     case clearSlot(Int)
     case togglePin
@@ -91,6 +93,7 @@ enum PanelAction: Identifiable, Hashable {
         case .ai(let a): "ai-" + a.id
         case .saveAsSecret: "saveAsSecret"
         case .setLabel: "setLabel"
+        case .shareToGroup: "shareToGroup"
         case .setUpAI: "setUpAI"
         case .clearSlot(let n): "clearSlot-\(n)"
         case .togglePin: "pin"
@@ -103,7 +106,7 @@ enum PanelAction: Identifiable, Hashable {
         case .paste, .pastePlain, .copy: "Paste"
         case .transform: "Transform & Paste"
         case .ai, .setUpAI: "Ask \(aiName)"
-        case .saveAsSecret, .setLabel, .clearSlot, .togglePin, .delete: "Item"
+        case .saveAsSecret, .setLabel, .shareToGroup, .clearSlot, .togglePin, .delete: "Item"
         }
     }
 
@@ -117,6 +120,7 @@ enum PanelAction: Identifiable, Hashable {
         case .ai(let a): a.title
         case .saveAsSecret: "Save as Secret…"
         case .setLabel: "Label…"
+        case .shareToGroup: "Share to Group…"
         case .setUpAI: "Set Up AI…"
         case .clearSlot(let n): "Remove from Quick Slot ⌘\(n)"
         case .togglePin: isPinned ? "Unpin" : "Pin"
@@ -133,6 +137,7 @@ enum PanelAction: Identifiable, Hashable {
         case .ai(let a): a.symbol
         case .saveAsSecret: "key"
         case .setLabel: "tag"
+        case .shareToGroup: "person.2"
         case .setUpAI: "sparkles"
         case .clearSlot: "number.square"
         case .togglePin: "pin"
@@ -181,6 +186,22 @@ final class EditSecretState {
     }
 }
 
+/// Picks the sync group that the selected items are copied into.
+@Observable
+final class ShareGroupState {
+    let items: [ClipItem]
+    let groups: [SyncGroup]
+    var selection: Int
+
+    init(items: [ClipItem], groups: [SyncGroup], defaultGroupID: String?) {
+        self.items = items
+        self.groups = groups
+        self.selection = groups.firstIndex { $0.id == defaultGroupID } ?? 0
+    }
+
+    var selectedGroup: SyncGroup? { groups.indices.contains(selection) ? groups[selection] : nil }
+}
+
 @Observable
 final class LabelFormState {
     enum Target {
@@ -219,6 +240,8 @@ final class PanelViewModel {
 
     var query = "" { didSet { if query != oldValue { refresh(resetSelection: true) } } }
     var filter: PanelFilter = .all { didSet { if filter != oldValue { refresh(resetSelection: true) } } }
+    /// A sync group chosen in the filter row; when set it replaces `filter`.
+    var groupFilter: String? { didSet { if groupFilter != oldValue { refresh(resetSelection: true) } } }
     private(set) var entries: [PanelEntry] = []
     /// The focused row (drives the preview and keyboard navigation).
     var selectedID: String? {
@@ -245,6 +268,7 @@ final class PanelViewModel {
     private(set) var saveSecretForm: SaveSecretState?
     private(set) var labelForm: LabelFormState?
     private(set) var editSecretForm: EditSecretState?
+    private(set) var shareForm: ShareGroupState?
     private(set) var aiRun: AIRun?
     /// Transient status line ("Copied", "Not valid JSON", …).
     private(set) var notice: String?
@@ -285,7 +309,9 @@ final class PanelViewModel {
         targetApp = target
         query = ""
         filter = .all
+        groupFilter = nil
         userMovedSelection = false
+        env.sync.periodicSync()
         refresh(resetSelection: true)
         focusToken &+= 1
         openToken &+= 1
@@ -309,6 +335,7 @@ final class PanelViewModel {
         saveSecretForm = nil
         labelForm = nil
         editSecretForm = nil
+        shareForm = nil
         actionQuery = ""
         actionSelection = 0
         mode = .browse
@@ -335,7 +362,9 @@ final class PanelViewModel {
         let targetBundle = targetApp?.bundleIdentifier
 
         var clips: [ClipItem] = []
-        if filter != .snippets && filter != .secrets {
+        if let groupFilter {
+            clips = env.store.allItems().filter { $0.spaceID == groupFilter }
+        } else if filter != .snippets && filter != .secrets {
             clips = env.store.allItems().filter { item in
                 switch filter {
                 case .all: true
@@ -349,9 +378,9 @@ final class PanelViewModel {
             }
         }
         // Snippets and secrets join "All" only while searching, so history stays uncluttered.
-        let searchingAll = filter == .all && !q.isEmpty
-        let snippets = (filter == .snippets || searchingAll) ? env.snippets.all() : []
-        let secrets = (filter == .secrets || searchingAll) ? env.secrets.secrets : []
+        let searchingAll = filter == .all && groupFilter == nil && !q.isEmpty
+        let snippets = groupFilter == nil && (filter == .snippets || searchingAll) ? env.snippets.all() : []
+        let secrets = groupFilter == nil && (filter == .secrets || searchingAll) ? env.secrets.secrets : []
 
         var result: [PanelEntry]
         if q.isEmpty {
@@ -507,10 +536,13 @@ final class PanelViewModel {
         showNotice("Deleted \(clips.count) items")
     }
 
+    /// ⇥ walks the built-in filters, then each sync group.
     func cycleFilter(forward: Bool) {
-        let all = PanelFilter.allCases
-        guard let index = all.firstIndex(of: filter) else { return }
-        filter = all[(index + (forward ? 1 : all.count - 1)) % all.count]
+        let choices: [(PanelFilter, String?)] = PanelFilter.allCases.map { ($0, nil) } + env.sync.groups.map { (.all, $0.id) }
+        let current = choices.firstIndex { groupFilter == nil ? $0.0 == filter && $0.1 == nil : $0.1 == groupFilter } ?? 0
+        let next = choices[(current + (forward ? 1 : choices.count - 1)) % choices.count]
+        groupFilter = next.1
+        filter = next.0
     }
 
     // MARK: Quick slots
@@ -645,6 +677,41 @@ final class PanelViewModel {
         showNotice("Saved “\(name)” to Secrets and removed it from history")
     }
 
+    // MARK: Share to group
+
+    var canShareToGroup: Bool { env.sync.isSignedIn && !env.sync.groups.isEmpty }
+
+    func beginShare(_ items: [ClipItem]) {
+        guard canShareToGroup, !items.isEmpty else { return }
+        shareForm = ShareGroupState(items: items, groups: env.sync.groups, defaultGroupID: env.prefs.syncDefaultGroupID)
+        mode = .shareToGroup
+    }
+
+    func submitShare() {
+        guard let form = shareForm, let group = form.selectedGroup else { return }
+        share(form.items, to: group)
+        resetMode()
+    }
+
+    /// Copies items into a group's space with new ids (selected text from another app is stored there).
+    func share(_ items: [ClipItem], to group: SyncGroup) {
+        for item in items {
+            if item.isTransient {
+                env.store.ingest(.text(item.text, source: item.source), spaceID: group.id)
+            } else if item.spaceID != group.id {
+                env.store.shareCopy(of: item, toSpace: group.id)
+            }
+        }
+        env.sync.syncNow()
+        if isSelectionMode {
+            onClose()
+            HUD.show("Sent to \(group.name)", symbol: "person.2.fill")
+        } else {
+            refresh()
+            showNotice(items.count == 1 ? "Shared to \(group.name)" : "Shared \(items.count) items to \(group.name)")
+        }
+    }
+
     // MARK: Action menu
 
     func openActions() {
@@ -675,6 +742,7 @@ final class PanelViewModel {
             } else {
                 actions.append(.copy)
             }
+            if canShareToGroup { actions.append(.shareToGroup) }
             return actions + [.togglePin, .delete]
         }
         guard let entry = selectedEntry else { return [] }
@@ -686,6 +754,7 @@ final class PanelViewModel {
             actions += aiActions
             actions += Transform.allCases.filter { $0 != .plainText }.map(PanelAction.transform)
             actions.append(.saveAsSecret)
+            if canShareToGroup { actions.append(.shareToGroup) }
             return actions
         case .clip(let item):
             if item.kind.isTextual { actions.append(.pastePlain) }
@@ -698,6 +767,7 @@ final class PanelViewModel {
                 actions += aiActions.filter { if case .ai(let ai) = $0 { ai.worksOnImages } else { true } }
             }
             actions.append(.setLabel)
+            if canShareToGroup { actions.append(.shareToGroup) }
             actions.append(.togglePin)
         case .snippet:
             break
@@ -786,6 +856,8 @@ final class PanelViewModel {
             beginSaveSecret(item)
         case .setLabel:
             beginLabel(entry)
+        case .shareToGroup:
+            if let item = entry.clip { beginShare([item]) }
         case .setUpAI:
             onClose()
             SettingsOpener.open()
@@ -824,6 +896,8 @@ final class PanelViewModel {
         case .togglePin:
             togglePinOnSelectedClips()
             mode = .browse
+        case .shareToGroup:
+            beginShare(clips)
         case .delete:
             mode = .browse
             deleteSelectedClips()
@@ -902,6 +976,7 @@ final class PanelViewModel {
         case .browse: handleBrowseKey(event)
         case .actions: handleActionKey(event)
         case .snippetForm, .saveSecret, .label, .editSecret: handleFormKey(event)
+        case .shareToGroup: handleShareKey(event)
         case .ai: handleAIKey(event)
         }
     }
@@ -1019,6 +1094,23 @@ final class PanelViewModel {
         default:
             return false
         }
+    }
+
+    private func handleShareKey(_ event: NSEvent) -> Bool {
+        guard let form = shareForm else { return false }
+        switch event.keyCode {
+        case KeyCode.escape:
+            if isSelectionMode { mode = .actions } else { resetMode() }
+        case KeyCode.upArrow:
+            form.selection = max(0, form.selection - 1)
+        case KeyCode.downArrow:
+            form.selection = min(form.groups.count - 1, form.selection + 1)
+        case KeyCode.returnKey, KeyCode.keypadEnter:
+            submitShare()
+        default:
+            return false
+        }
+        return true
     }
 
     private func handleAIKey(_ event: NSEvent) -> Bool {

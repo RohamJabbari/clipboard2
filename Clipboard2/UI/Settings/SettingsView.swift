@@ -2,28 +2,40 @@ import SwiftUI
 import KeyboardShortcuts
 
 struct SettingsView: View {
+    @AppStorage(SettingsTab.storageKey) private var tab = SettingsTab.general.rawValue
+
     var body: some View {
-        TabView {
+        TabView(selection: $tab) {
             GeneralSettingsView()
                 .tabItem { Label("General", systemImage: "gearshape") }
+                .tag(SettingsTab.general.rawValue)
             AppearanceSettingsView()
                 .tabItem { Label("Appearance", systemImage: "paintpalette") }
+                .tag(SettingsTab.appearance.rawValue)
             IgnoredAppsSettingsView()
                 .tabItem { Label("Ignored Apps", systemImage: "hand.raised") }
+                .tag(SettingsTab.ignoredApps.rawValue)
             SnippetsSettingsView()
                 .tabItem { Label("Snippets", systemImage: "text.badge.star") }
+                .tag(SettingsTab.snippets.rawValue)
             SecretsSettingsView()
                 .tabItem { Label("Secrets", systemImage: "key") }
+                .tag(SettingsTab.secrets.rawValue)
             TransformsSettingsView()
                 .tabItem { Label("Transforms", systemImage: "wand.and.stars") }
+                .tag(SettingsTab.transforms.rawValue)
             AISettingsView()
                 .tabItem { Label("AI", systemImage: "sparkles") }
+                .tag(SettingsTab.ai.rawValue)
             PermissionsSettingsView()
                 .tabItem { Label("Permissions", systemImage: "lock.shield") }
+                .tag(SettingsTab.permissions.rawValue)
             SyncSettingsView()
                 .tabItem { Label("Sync", systemImage: "arrow.triangle.2.circlepath.icloud") }
+                .tag(SettingsTab.sync.rawValue)
             AboutSettingsView()
                 .tabItem { Label("About", systemImage: "info.circle") }
+                .tag(SettingsTab.about.rawValue)
         }
         .frame(width: 780)
         .frame(minHeight: 460)
@@ -56,7 +68,8 @@ struct GeneralSettingsView: View {
                 KeyboardShortcuts.Recorder("Actions on selected text", name: .selectionActions)
                 KeyboardShortcuts.Recorder("Capture text from screen", name: .captureText)
                 KeyboardShortcuts.Recorder("Paste as text", name: .pasteAsText)
-                Text("Actions on selected text: select text in any app to transform it or ask AI; Return replaces the selection (also under right-click → Services → Clipboard2 Actions…). Capture text: drag over anything on screen and its text is pasted. Paste as text: pastes plain text, or — if an image or screenshot is on the clipboard — the text in it. Text recognition runs on this Mac.")
+                KeyboardShortcuts.Recorder("Send selection to default group", name: .sendToGroup)
+                Text("Actions on selected text: select text in any app to transform it or ask AI; Return replaces the selection (also under right-click → Services → Clipboard2 Actions…). Capture text: drag over anything on screen and its text is pasted. Paste as text: pastes plain text, or — if an image or screenshot is on the clipboard — the text in it. Text recognition runs on this Mac. Send selection: stores the selected text in your default sync group (Settings → Sync). It's active only while you're signed in to sync; then the ⌥⌘C default replaces Chrome's Inspect Elements, Safari's JavaScript Console and Finder's Copy as Pathname.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -310,23 +323,6 @@ struct AppPickerMenu: View {
         let name = FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
         guard !exclude.contains(id) else { return }
         onPick(AppRef(bundleID: id, name: name))
-    }
-}
-
-// MARK: - Sync
-
-struct SyncSettingsView: View {
-    var body: some View {
-        Form {
-            Section {
-                ContentUnavailableView {
-                    Label("Sync Isn't Set Up", systemImage: "lock.icloud")
-                } description: {
-                    Text("End-to-end encrypted sync of pinned items and snippets is planned. Your data stays on this Mac until then.")
-                }
-            }
-        }
-        .formStyle(.grouped)
     }
 }
 

@@ -72,6 +72,8 @@ final class Preferences {
         static let customPrompts = "customPrompts"
         static let hasLaunchedBefore = "hasLaunchedBefore"
         static let hasShownPermissions = "hasShownPermissions"
+        static let syncDefaultGroupID = "syncDefaultGroupID"
+        static let hasShownSendToGroupWarning = "hasShownSendToGroupWarning"
     }
 
     /// 0 means "ask every time".
@@ -121,6 +123,12 @@ final class Preferences {
         didSet { defaults.set(hasShownPermissions, forKey: Key.hasShownPermissions) }
     }
 
+    /// Group the "send selection" shortcut stores into.
+    var syncDefaultGroupID: String? { didSet { defaults.set(syncDefaultGroupID, forKey: Key.syncDefaultGroupID) } }
+    var hasShownSendToGroupWarning: Bool {
+        didSet { defaults.set(hasShownSendToGroupWarning, forKey: Key.hasShownSendToGroupWarning) }
+    }
+
     init(defaults: UserDefaults) {
         self.defaults = defaults
         defaults.register(defaults: [
@@ -164,6 +172,8 @@ final class Preferences {
         customPrompts = Self.load([CustomPrompt].self, defaults, Key.customPrompts) ?? []
         hasLaunchedBefore = defaults.bool(forKey: Key.hasLaunchedBefore)
         hasShownPermissions = defaults.bool(forKey: Key.hasShownPermissions)
+        syncDefaultGroupID = defaults.string(forKey: Key.syncDefaultGroupID)
+        hasShownSendToGroupWarning = defaults.bool(forKey: Key.hasShownSendToGroupWarning)
     }
 
     var maxAge: TimeInterval? {
