@@ -410,7 +410,11 @@ public sealed class QuickPanelWindow : Window
         menu.Items.Clear();
         MenuItem Item(string header, Action action) { var i = new MenuItem { Header = header }; i.Click += (_, _) => action(); return i; }
         menu.Items.Add(Item("Paste", () => Model.Activate(entry)));
-        if (entry is PanelEntry.SecretEntry) menu.Items.Add(Item("Rename…", () => Model.BeginLabel(entry)));
+        if (entry is PanelEntry.SecretEntry k)
+        {
+            menu.Items.Add(Item("Edit…", () => EditSecret(k.Secret)));
+            menu.Items.Add(Item("Rename…", () => Model.BeginLabel(entry)));
+        }
         var slots = new MenuItem { Header = "Assign to Quick Slot" };
         for (var n = QuickSlots.First; n <= QuickSlots.Last; n++)
         {
@@ -452,6 +456,7 @@ public sealed class QuickPanelWindow : Window
                 PanelMode.SnippetForm => BuildSnippetForm(),
                 PanelMode.SaveSecret => BuildSaveSecret(),
                 PanelMode.Label => BuildLabel(),
+                PanelMode.EditSecret => BuildEditSecret(),
                 PanelMode.AI => BuildAI(),
                 _ => Model.IsMultiSelecting ? BuildMulti() : (Model.SelectedEntry is { } e ? BuildPreview(e) : new Border()),
             };
@@ -539,7 +544,13 @@ public sealed class QuickPanelWindow : Window
             }
             else { value.Text = "••••••••••"; show.Content = "Show"; }
         };
-        stack.Children.Add(show);
+        var edit = new Button { Content = "Edit", Margin = new Thickness(8, 0, 0, 0) };
+        edit.Click += (_, _) => EditSecret(secret);
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 6, 0, 0) };
+        show.Margin = new Thickness(0);
+        buttons.Children.Add(show);
+        buttons.Children.Add(edit);
+        stack.Children.Add(buttons);
         var clear = _services.Settings.SecretClearSeconds > 0 ? $" The clipboard clears after {_services.Settings.SecretClearSeconds} seconds." : "";
         var hint = Fluent.Label((_services.Secrets.IsUnlocked ? "Unlocked — press Enter to paste." : "Press Enter to paste. You'll confirm with Windows Hello.") + clear,
             13, Fluent.Secondary, wrap: true);
@@ -781,6 +792,33 @@ public sealed class QuickPanelWindow : Window
         save.Click += (_, _) => Model.SubmitSaveSecret();
         stack.Children.Add(save);
         Dispatcher.BeginInvoke(() => { name.Focus(); name.SelectAll(); }, System.Windows.Threading.DispatcherPriority.Input);
+        return Padded(stack, 16);
+    }
+
+    private async void EditSecret(SecretRef secret)
+    {
+        if (await _services.Secrets.RevealAsync(secret, $"edit “{secret.Name}”") is { } value)
+            Model.ShowEditSecret(secret, value);
+    }
+
+    private UIElement BuildEditSecret()
+    {
+        var form = Model.EditSecretForm!;
+        var stack = new StackPanel();
+        stack.Children.Add(Fluent.Label("Edit Secret", 16, null, FontWeights.SemiBold));
+        stack.Children.Add(Fluent.Label("Changes are saved to Credential Manager.", 13, Fluent.Secondary, wrap: true));
+        stack.Children.Add(new TextBlock { Text = "Name", Margin = new Thickness(0, 12, 0, 4) });
+        var name = new TextBox { Text = form.Name };
+        name.TextChanged += (_, _) => form.Name = name.Text;
+        stack.Children.Add(name);
+        stack.Children.Add(new TextBlock { Text = "Value", Margin = new Thickness(0, 12, 0, 4) });
+        var value = new TextBox { Text = form.Value, FontFamily = new FontFamily("Consolas") };
+        value.TextChanged += (_, _) => form.Value = value.Text;
+        stack.Children.Add(value);
+        var save = new Button { Content = "Save", HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 16, 0, 0) };
+        save.Click += (_, _) => Model.SubmitEditSecret();
+        stack.Children.Add(save);
+        Dispatcher.BeginInvoke(() => { value.Focus(); value.SelectAll(); }, System.Windows.Threading.DispatcherPriority.Input);
         return Padded(stack, 16);
     }
 

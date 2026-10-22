@@ -39,7 +39,7 @@ public abstract record PanelEntry
     };
 }
 
-public enum PanelMode { Browse, Actions, SnippetForm, SaveSecret, Label, AI }
+public enum PanelMode { Browse, Actions, SnippetForm, SaveSecret, Label, EditSecret, AI }
 
 public abstract record PanelAction
 {
@@ -131,6 +131,15 @@ public sealed class LabelForm(PanelEntry entry)
     public bool IsSecret => Entry is PanelEntry.SecretEntry;
 }
 
+/// <summary>Name and value of a secret, filled in after Windows Hello. The value lives only as long as the form.</summary>
+public sealed class EditSecretForm(SecretRef secret, string value)
+{
+    public SecretRef Secret { get; } = secret;
+    public string OriginalValue { get; } = value;
+    public string Name { get; set; } = secret.Name;
+    public string Value { get; set; } = value;
+}
+
 public sealed class SaveSecretForm(ClipItem item)
 {
     public ClipItem Item { get; } = item;
@@ -168,6 +177,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     public SnippetForm? SnippetForm { get; private set; }
     public SaveSecretForm? SaveSecretForm { get; private set; }
     public LabelForm? LabelForm { get; private set; }
+    public EditSecretForm? EditSecretForm { get; private set; }
     public AIRun? AIRun { get; private set; }
     public string? Notice { get; private set; }
     public AppRef? TargetApp { get; private set; }
@@ -219,6 +229,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         SnippetForm = null;
         SaveSecretForm = null;
         LabelForm = null;
+        EditSecretForm = null;
         ActionQuery = "";
         ActionSelection = 0;
         Mode = PanelMode.Browse;
@@ -508,6 +519,29 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         ResetMode();
         Refresh();
         if (id is not null) Select(id);
+    }
+
+    /// <summary>Opens the edit form once the value has been unlocked.</summary>
+    public void ShowEditSecret(SecretRef secret, string value)
+    {
+        Select(new PanelEntry.SecretEntry(secret).Id);
+        EditSecretForm = new EditSecretForm(secret, value);
+        Mode = PanelMode.EditSecret;
+        Notify();
+    }
+
+    public void SubmitEditSecret()
+    {
+        if (EditSecretForm is not { } form) return;
+        var name = form.Name.Trim();
+        if (name.Length == 0 || form.Value.Length == 0) return;
+        if (name != form.Secret.Name) secrets.Rename(form.Secret, name);
+        if (form.Value != form.OriginalValue) secrets.SetValue(form.Secret, form.Value);
+        var id = SelectedId;
+        ResetMode();
+        Refresh();
+        if (id is not null) Select(id);
+        ShowNotice($"Saved “{name}”");
     }
 
     public void BeginSaveSecret(ClipItem item)
@@ -811,7 +845,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     {
         PanelMode.Browse => HandleBrowseKey(key),
         PanelMode.Actions => HandleActionKey(key),
-        PanelMode.SnippetForm or PanelMode.SaveSecret or PanelMode.Label => HandleFormKey(key),
+        PanelMode.SnippetForm or PanelMode.SaveSecret or PanelMode.Label or PanelMode.EditSecret => HandleFormKey(key),
         _ => HandleAIKey(key),
     };
 
@@ -888,6 +922,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 {
                     case PanelMode.SaveSecret: SubmitSaveSecret(); break;
                     case PanelMode.Label: SubmitLabel(); break;
+                    case PanelMode.EditSecret: SubmitEditSecret(); break;
                     default: SubmitSnippetForm(); break;
                 }
                 return true;

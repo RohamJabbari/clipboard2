@@ -26,7 +26,7 @@ struct QuickPanelView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear { searchFocused = true }
-        .onChange(of: model.focusToken) { searchFocused = ![.actions, .snippetForm, .saveSecret, .label].contains(model.mode) }
+        .onChange(of: model.focusToken) { searchFocused = ![.actions, .snippetForm, .saveSecret, .label, .editSecret].contains(model.mode) }
         .onChange(of: env.store.revision) { model.refresh() }
         .onChange(of: env.snippets.revision) { model.refresh() }
         .onChange(of: env.secrets.revision) { model.refresh() }
@@ -129,6 +129,7 @@ struct QuickPanelView: View {
     private func contextMenu(for entry: PanelEntry) -> some View {
         Button("Paste") { model.activate(entry) }
         if case .secret = entry {
+            Button("Edit…") { if case .secret(let ref) = entry { model.beginEditSecret(ref) } }
             Button("Rename…") { model.beginLabel(entry) }
         }
         Menu("Assign to Quick Slot") {
@@ -167,6 +168,10 @@ struct QuickPanelView: View {
             if let form = model.labelForm {
                 LabelFormView(form: form) { model.submitLabel() }
             }
+        case .editSecret:
+            if let form = model.editSecretForm {
+                EditSecretView(form: form) { model.submitEditSecret() }
+            }
         case .saveSecret:
             if let form = model.saveSecretForm {
                 SaveSecretView(form: form) { model.submitSaveSecret() }
@@ -179,7 +184,7 @@ struct QuickPanelView: View {
             if model.isMultiSelecting {
                 MultiSelectionPreview(clips: model.selectedClips, totalSelected: model.selectedIDs.count)
             } else if let entry = model.selectedEntry {
-                PreviewPane(entry: entry)
+                PreviewPane(entry: entry, onEditSecret: model.beginEditSecret)
             } else {
                 Color.clear
             }
@@ -380,7 +385,7 @@ struct HintBar: View {
             case .snippetForm:
                 hint("⇥", "Next Field")
                 hint("⏎", "Paste")
-            case .saveSecret, .label:
+            case .saveSecret, .label, .editSecret:
                 hint("⏎", "Save")
             case .ai:
                 hint("⏎", "Paste")

@@ -65,6 +65,7 @@ enum PanelMode: Equatable {
     case snippetForm
     case saveSecret
     case label
+    case editSecret
     case ai
 }
 
@@ -164,6 +165,22 @@ final class SaveSecretState {
     }
 }
 
+/// Name and value of a secret, filled in after Touch ID. The value lives only as long as the form.
+@Observable
+final class EditSecretState {
+    let ref: SecretRef
+    let originalValue: String
+    var name: String
+    var value: String
+
+    init(ref: SecretRef, value: String) {
+        self.ref = ref
+        self.originalValue = value
+        self.name = ref.name
+        self.value = value
+    }
+}
+
 @Observable
 final class LabelFormState {
     enum Target {
@@ -227,6 +244,7 @@ final class PanelViewModel {
     private(set) var snippetForm: SnippetFormState?
     private(set) var saveSecretForm: SaveSecretState?
     private(set) var labelForm: LabelFormState?
+    private(set) var editSecretForm: EditSecretState?
     private(set) var aiRun: AIRun?
     /// Transient status line ("Copied", "Not valid JSON", …).
     private(set) var notice: String?
@@ -290,6 +308,7 @@ final class PanelViewModel {
         snippetForm = nil
         saveSecretForm = nil
         labelForm = nil
+        editSecretForm = nil
         actionQuery = ""
         actionSelection = 0
         mode = .browse
@@ -580,6 +599,33 @@ final class PanelViewModel {
         selectedID = id
     }
 
+    func beginEditSecret(_ ref: SecretRef) {
+        selectedID = PanelEntry.secret(ref).id
+        Task {
+            guard let value = await env.secrets.reveal(ref, reason: "edit “\(ref.name)”") else { return }
+            showEditSecret(ref, value: value)
+        }
+    }
+
+    /// Opens the edit form once the value has been unlocked.
+    func showEditSecret(_ ref: SecretRef, value: String) {
+        editSecretForm = EditSecretState(ref: ref, value: value)
+        mode = .editSecret
+    }
+
+    func submitEditSecret() {
+        guard let form = editSecretForm else { return }
+        let name = form.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !form.value.isEmpty else { return }
+        if name != form.ref.name { env.secrets.rename(form.ref, to: name) }
+        if form.value != form.originalValue { env.secrets.setValue(form.value, for: form.ref) }
+        let id = selectedID
+        resetMode()
+        refresh()
+        selectedID = id
+        showNotice("Saved “\(name)”")
+    }
+
     func beginSaveSecret(_ item: ClipItem) {
         selectedID = PanelEntry.clip(item).id
         saveSecretForm = SaveSecretState(item: item)
@@ -855,7 +901,7 @@ final class PanelViewModel {
         switch mode {
         case .browse: handleBrowseKey(event)
         case .actions: handleActionKey(event)
-        case .snippetForm, .saveSecret, .label: handleFormKey(event)
+        case .snippetForm, .saveSecret, .label, .editSecret: handleFormKey(event)
         case .ai: handleAIKey(event)
         }
     }
@@ -966,6 +1012,7 @@ final class PanelViewModel {
             switch mode {
             case .saveSecret: submitSaveSecret()
             case .label: submitLabel()
+            case .editSecret: submitEditSecret()
             default: submitSnippetForm()
             }
             return true

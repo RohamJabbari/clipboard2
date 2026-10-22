@@ -171,3 +171,58 @@ struct PanelKeyboardTests {
         #expect(model.selectedID == PanelEntry.clip(late).id)
     }
 }
+
+@MainActor
+struct EditSecretTests {
+    let env = AppEnvironment.shared
+    let model: PanelViewModel
+
+    init() {
+        model = PanelViewModel(env: env)
+    }
+
+    private func key(_ code: UInt16, _ chars: String) -> NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                         windowNumber: 0, context: nil, characters: chars,
+                         charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code)!
+    }
+
+    @Test func returnSavesNameAndValue() throws {
+        let ref = try #require(env.secrets.add(name: "Clipboard2 edit test", value: "hunter2"))
+        defer { env.secrets.delete(ref) }
+
+        model.showEditSecret(ref, value: "hunter2")
+        #expect(model.mode == .editSecret)
+        let form = try #require(model.editSecretForm)
+        form.name = "Clipboard2 edit test renamed"
+        form.value = "correct horse"
+
+        #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
+        #expect(model.mode == .browse)
+        #expect(model.editSecretForm == nil)
+        #expect(SecretVault.value(id: ref.id) == "correct horse")
+        #expect(SecretVault.list().first { $0.id == ref.id }?.name == "Clipboard2 edit test renamed")
+    }
+
+    @Test func emptyValueIsNotSaved() throws {
+        let ref = try #require(env.secrets.add(name: "Clipboard2 edit test", value: "hunter2"))
+        defer { env.secrets.delete(ref) }
+
+        model.showEditSecret(ref, value: "hunter2")
+        model.editSecretForm?.value = ""
+        #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
+        #expect(model.mode == .editSecret)
+        #expect(SecretVault.value(id: ref.id) == "hunter2")
+    }
+
+    @Test func escapeDiscardsChanges() throws {
+        let ref = try #require(env.secrets.add(name: "Clipboard2 edit test", value: "hunter2"))
+        defer { env.secrets.delete(ref) }
+
+        model.showEditSecret(ref, value: "hunter2")
+        model.editSecretForm?.value = "changed"
+        #expect(model.handleKeyDown(key(KeyCode.escape, "\u{1b}")))
+        #expect(model.mode == .browse)
+        #expect(SecretVault.value(id: ref.id) == "hunter2")
+    }
+}

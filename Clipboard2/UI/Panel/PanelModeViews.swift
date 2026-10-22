@@ -161,6 +161,39 @@ struct SaveSecretView: View {
     }
 }
 
+/// Changes a secret's name and value in place (the value is shown only after Touch ID).
+struct EditSecretView: View {
+    @Bindable var form: EditSecretState
+    let onSubmit: () -> Void
+    @FocusState private var valueFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("Edit Secret", systemImage: "key.fill")
+                .font(.headline)
+            Text("Changes are saved to your Keychain.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Form {
+                TextField("Name", text: $form.name)
+                TextField("Value", text: $form.value)
+                    .font(.body.monospaced())
+                    .focused($valueFocused)
+            }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+            HStack {
+                Spacer()
+                Button("Save", action: onSubmit)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(form.name.trimmingCharacters(in: .whitespaces).isEmpty || form.value.isEmpty)
+            }
+        }
+        .padding(16)
+        .onAppear { valueFocused = true }
+    }
+}
+
 /// Label for a pinned item, or the name of a secret. Shows the value it belongs to.
 struct LabelFormView: View {
     @Bindable var form: LabelFormState

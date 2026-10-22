@@ -2,6 +2,7 @@ import SwiftUI
 
 struct PreviewPane: View {
     let entry: PanelEntry
+    var onEditSecret: ((SecretRef) -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -28,7 +29,7 @@ struct PreviewPane: View {
         case .snippet(let snippet):
             TextPreviewView(text: snippet.body)
         case .secret(let ref):
-            SecretPreviewView(ref: ref)
+            SecretPreviewView(ref: ref, onEdit: onEditSecret.map { edit in { edit(ref) } })
         }
     }
 
@@ -180,6 +181,7 @@ struct FilePreviewView: View {
 
 struct SecretPreviewView: View {
     let ref: SecretRef
+    var onEdit: (() -> Void)?
     @Environment(AppEnvironment.self) private var env
     @State private var revealed: String?
 
@@ -202,8 +204,11 @@ struct SecretPreviewView: View {
                     .font(.title3.monospaced())
                     .foregroundStyle(.secondary)
                     .accessibilityLabel("Hidden value")
-                Button("Show") {
-                    Task { revealed = await env.secrets.reveal(ref, reason: "show “\(ref.name)”") }
+                HStack {
+                    Button("Show") {
+                        Task { revealed = await env.secrets.reveal(ref, reason: "show “\(ref.name)”") }
+                    }
+                    if let onEdit { Button("Edit", action: onEdit) }
                 }
             }
             Text(hint)

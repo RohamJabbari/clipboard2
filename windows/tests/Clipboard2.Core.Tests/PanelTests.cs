@@ -232,4 +232,32 @@ public sealed class PanelTests : IDisposable
         _model.HandleKey(K(PanelKey.Escape));
         Assert.Contains("close", _host.Log);
     }
+
+    [Fact]
+    public void EditSecretSavesNameAndValueOnEnter()
+    {
+        var secret = _vault.Add("DB", "hunter2")!;
+        _model.ShowEditSecret(secret, "hunter2");
+        Assert.Equal(PanelMode.EditSecret, _model.Mode);
+        _model.EditSecretForm!.Name = "Prod DB";
+        _model.EditSecretForm!.Value = "correct horse";
+        Assert.True(_model.HandleKey(K(PanelKey.Enter)));
+        Assert.Equal(PanelMode.Browse, _model.Mode);
+        Assert.Null(_model.EditSecretForm);
+        Assert.Equal("correct horse", _vault.Value(secret.Id));
+        Assert.Equal("Prod DB", _vault.Secrets.Single(s => s.Id == secret.Id).Name);
+    }
+
+    [Fact]
+    public void EditSecretKeepsFormForEmptyValueAndEscapeDiscards()
+    {
+        var secret = _vault.Add("DB", "hunter2")!;
+        _model.ShowEditSecret(secret, "hunter2");
+        _model.EditSecretForm!.Value = "";
+        Assert.True(_model.HandleKey(K(PanelKey.Enter)));
+        Assert.Equal(PanelMode.EditSecret, _model.Mode);
+        Assert.True(_model.HandleKey(K(PanelKey.Escape)));
+        Assert.Equal(PanelMode.Browse, _model.Mode);
+        Assert.Equal("hunter2", _vault.Value(secret.Id));
+    }
 }
