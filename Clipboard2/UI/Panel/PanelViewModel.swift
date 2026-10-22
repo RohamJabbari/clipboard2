@@ -241,7 +241,14 @@ final class PanelViewModel {
     var query = "" { didSet { if query != oldValue { refresh(resetSelection: true) } } }
     var filter: PanelFilter = .all { didSet { if filter != oldValue { refresh(resetSelection: true) } } }
     /// A sync group chosen in the filter row; when set it replaces `filter`.
-    var groupFilter: String? { didSet { if groupFilter != oldValue { refresh(resetSelection: true) } } }
+    var groupFilter: String? {
+        didSet {
+            guard groupFilter != oldValue else { return }
+            refresh(resetSelection: true)
+            // Fetch what group members sent since the last sync; the list refreshes when it lands.
+            if groupFilter != nil { env.sync.syncNow() }
+        }
+    }
     private(set) var entries: [PanelEntry] = []
     /// The focused row (drives the preview and keyboard navigation).
     var selectedID: String? {

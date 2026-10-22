@@ -136,6 +136,7 @@ public static class Hotkey
     public const string PasteAsText = "pasteAsText";
     public const string CaptureText = "captureText";
     public const string SendToGroup = "sendToGroup";
+    public const string PasteFromGroup = "pasteFromGroup";
     public static string Slot(int n) => $"slot{n}";
 
     public static readonly IReadOnlyDictionary<string, string> Defaults = new Dictionary<string, string>
@@ -145,6 +146,7 @@ public static class Hotkey
         [PasteAsText] = "Ctrl+Alt+Shift+V",
         [CaptureText] = "Ctrl+Alt+Shift+2",
         [SendToGroup] = "Ctrl+Alt+C",
+        [PasteFromGroup] = "Ctrl+Alt+V",
     };
 
     public static string Title(string name) => name switch
@@ -154,6 +156,7 @@ public static class Hotkey
         PasteAsText => "Paste as text",
         CaptureText => "Capture text from screen",
         SendToGroup => "Send selection to default group",
+        PasteFromGroup => "Paste from default group",
         _ when name.StartsWith("slot") => $"Paste quick slot {name[4..]}",
         _ => name,
     };

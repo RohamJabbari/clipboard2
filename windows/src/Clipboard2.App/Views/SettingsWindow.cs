@@ -162,10 +162,10 @@ public sealed class SettingsWindow : Window
 
         page.Children.Add(Header("Shortcuts"));
         var shortcuts = new List<UIElement>();
-        foreach (var name in new[] { Hotkey.QuickPanel, Hotkey.SelectionActions, Hotkey.PasteAsText, Hotkey.CaptureText, Hotkey.SendToGroup })
+        foreach (var name in new[] { Hotkey.QuickPanel, Hotkey.SelectionActions, Hotkey.PasteAsText, Hotkey.CaptureText, Hotkey.SendToGroup, Hotkey.PasteFromGroup })
             shortcuts.Add(HotkeyRow(name));
         page.Children.Add(Card([.. shortcuts]));
-        page.Children.Add(Hint("Actions on selected text: select text in any app to transform it or ask AI; Enter replaces the selection. Paste as text pastes plain text — or the text inside an image or screenshot on the clipboard. Capture text: drag over anything on screen. Text recognition runs on this PC. Send to group: copies the selected text into your default sync group (Settings → Sync)."));
+        page.Children.Add(Hint("Actions on selected text: select text in any app to transform it or ask AI; Enter replaces the selection. Paste as text pastes plain text — or the text inside an image or screenshot on the clipboard. Capture text: drag over anything on screen. Text recognition runs on this PC. Send to group: copies the selected text into your default sync group (Settings → Sync). Paste from group: fetches the default group and pastes its newest item. Both are active only while you're signed in to sync; Ctrl+Alt+V replaces Paste Special in Office apps."));
 
         page.Children.Add(Header("Quick slots"));
         var slotRows = new List<UIElement>();

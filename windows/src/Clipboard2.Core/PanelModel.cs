@@ -175,6 +175,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     public const int MaxEntries = 300;
 
     public event Action? Changed;
+    /// <summary>A group was picked in the filter row; the host fetches what members sent since the last sync.</summary>
+    public event Action? GroupFilterSelected;
     private void Notify() => Changed?.Invoke();
 
     public string Query { get; private set; } = "";
@@ -276,6 +278,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         GroupFilter = groupId;
         Filter = PanelFilter.All;
         Refresh(resetSelection: true);
+        GroupFilterSelected?.Invoke();
     }
 
     /// <summary>The group badge for an entry, or null for personal items.</summary>

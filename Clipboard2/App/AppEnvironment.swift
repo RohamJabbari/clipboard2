@@ -9,6 +9,7 @@ extension KeyboardShortcuts.Name {
     static let captureText = Self("captureText", default: .init(.two, modifiers: [.command, .shift, .option]))
     static let pasteAsText = Self("pasteAsText", default: .init(.v, modifiers: [.command, .shift, .option]))
     static let sendToGroup = Self("sendToGroup", default: .init(.c, modifiers: [.command, .option]))
+    static let pasteFromGroup = Self("pasteFromGroup", default: .init(.v, modifiers: [.command, .option]))
 }
 
 /// Owns every long-lived service. Created once at launch and injected into SwiftUI via `.environment`.
@@ -276,9 +277,31 @@ final class AppEnvironment {
             KeyboardShortcuts.onKeyUp(for: .sendToGroup) { [weak self] in
                 self?.sendSelectionToGroup()
             }
+            KeyboardShortcuts.onKeyUp(for: .pasteFromGroup) { [weak self] in
+                self?.pasteFromDefaultGroup()
+            }
             warnAboutSendToGroupShortcutOnce()
         } else {
             KeyboardShortcuts.removeHandler(for: .sendToGroup)
+            KeyboardShortcuts.removeHandler(for: .pasteFromGroup)
+        }
+    }
+
+    /// Pastes the newest item of the default group. Fetches first (briefly), so something a group
+    /// member just sent is pasted; if the server is slow or unreachable, the newest known one is.
+    func pasteFromDefaultGroup() {
+        guard sync.isSignedIn, let group = sync.defaultGroup else {
+            SettingsOpener.open(tab: .sync)
+            return
+        }
+        let target = appTracker.targetApp
+        Task {
+            await sync.syncAndWait(timeout: .milliseconds(1500))
+            guard let item = store.items(inSpace: group.id).first else {
+                HUD.show("Nothing in \(group.name) yet", symbol: "person.2")
+                return
+            }
+            paste.paste(item, into: target)
         }
     }
 

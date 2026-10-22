@@ -126,6 +126,7 @@ final class SyncAccount {
     @ObservationIgnored private var scheduled: Task<Void, Never>?
     @ObservationIgnored private var isTicking = false
     @ObservationIgnored private var tickRequested = false
+    @ObservationIgnored private var finishedTicks = 0
     /// true once a session is active, false after sign-out (drives the ⌥⌘C shortcut).
     @ObservationIgnored var onSessionChange: ((Bool) -> Void)?
 
@@ -406,6 +407,18 @@ final class SyncAccount {
         scheduleSync(after: .zero)
     }
 
+    /// Syncs now and waits up to `timeout` for it to finish, e.g. before pasting from a group.
+    /// Downloads run before uploads, so new group items usually land well inside the timeout.
+    func syncAndWait(timeout: Duration) async {
+        guard engine != nil else { return }
+        let start = finishedTicks
+        scheduleSync(after: .zero)
+        let deadline = ContinuousClock.now + timeout
+        while finishedTicks == start, engine != nil, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(40))
+        }
+    }
+
     private func scheduleSync(after delay: Duration) {
         scheduled?.cancel()
         scheduled = Task { [weak self] in
@@ -429,6 +442,7 @@ final class SyncAccount {
         defer {
             isTicking = false
             isSyncing = false
+            finishedTicks &+= 1
         }
         repeat {
             tickRequested = false

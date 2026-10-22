@@ -69,7 +69,8 @@ struct GeneralSettingsView: View {
                 KeyboardShortcuts.Recorder("Capture text from screen", name: .captureText)
                 KeyboardShortcuts.Recorder("Paste as text", name: .pasteAsText)
                 KeyboardShortcuts.Recorder("Send selection to default group", name: .sendToGroup)
-                Text("Actions on selected text: select text in any app to transform it or ask AI; Return replaces the selection (also under right-click → Services → Clipboard2 Actions…). Capture text: drag over anything on screen and its text is pasted. Paste as text: pastes plain text, or — if an image or screenshot is on the clipboard — the text in it. Text recognition runs on this Mac. Send selection: stores the selected text in your default sync group (Settings → Sync). It's active only while you're signed in to sync; then the ⌥⌘C default replaces Chrome's Inspect Elements, Safari's JavaScript Console and Finder's Copy as Pathname.")
+                KeyboardShortcuts.Recorder("Paste from default group", name: .pasteFromGroup)
+                Text("Actions on selected text: select text in any app to transform it or ask AI; Return replaces the selection (also under right-click → Services → Clipboard2 Actions…). Capture text: drag over anything on screen and its text is pasted. Paste as text: pastes plain text, or — if an image or screenshot is on the clipboard — the text in it. Text recognition runs on this Mac. Send selection: stores the selected text in your default sync group (Settings → Sync). Paste from group: fetches the default group and pastes its newest item. Both are active only while you're signed in to sync; then ⌥⌘C replaces Chrome's Inspect Elements, Safari's JavaScript Console and Finder's Copy as Pathname, and ⌥⌘V replaces Finder's Move Item Here.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -67,6 +67,7 @@ public sealed class AppServices : IPanelHost
         Slots = new QuickSlots(Settings);
         Models = new ModelLister(Keys);
         Panel = new PanelModel(Store, Settings, Slots, Secrets, this);
+        Panel.GroupFilterSelected += () => _ = Sync.SyncNowAsync();
         Sync = new SyncAccount(Store, Secrets, Settings, Keys) { Logger = message => Log.Info("Sync: " + message) };
         Store.Changed += () => StoreChanged?.Invoke();
         Store.Changed += ScheduleSync;
@@ -168,12 +169,20 @@ public sealed class AppServices : IPanelHost
 
     private bool _sendToGroupRegistered;
 
-    /// <summary>Ctrl+Alt+C is only taken while signed in to sync, so it doesn't block other apps otherwise.</summary>
+    /// <summary>Ctrl+Alt+C and Ctrl+Alt+V are only taken while signed in to sync, so they don't block other apps otherwise.</summary>
     private void UpdateSendToGroupHotkey()
     {
         _sendToGroupRegistered = Sync.IsSignedIn;
-        if (Sync.IsSignedIn) Hotkeys.Register(Hotkey.SendToGroup, Settings.Hotkeys.GetValueOrDefault(Hotkey.SendToGroup), () => _ = SendSelectionToGroupAsync());
-        else Hotkeys.Unregister(Hotkey.SendToGroup);
+        if (Sync.IsSignedIn)
+        {
+            Hotkeys.Register(Hotkey.SendToGroup, Settings.Hotkeys.GetValueOrDefault(Hotkey.SendToGroup), () => _ = SendSelectionToGroupAsync());
+            Hotkeys.Register(Hotkey.PasteFromGroup, Settings.Hotkeys.GetValueOrDefault(Hotkey.PasteFromGroup), () => _ = PasteFromGroupAsync());
+        }
+        else
+        {
+            Hotkeys.Unregister(Hotkey.SendToGroup);
+            Hotkeys.Unregister(Hotkey.PasteFromGroup);
+        }
     }
 
     public void ApplyAppearance()
@@ -467,6 +476,26 @@ public sealed class AppServices : IPanelHost
         _tray?.ShowBalloon($"Sent to {group.DisplayName}", TextPreview.Make(text, 120));
         _syncDebounce.Stop();
         _ = Sync.SyncNowAsync();
+    }
+
+    /// <summary>Pastes the newest item of the default group. Fetches first (briefly), so something a group
+    /// member just sent is pasted; if the server is slow or unreachable, the newest known one is.</summary>
+    public async Task PasteFromGroupAsync()
+    {
+        if (!Sync.IsSignedIn || Sync.DefaultGroup is not { } group)
+        {
+            OpenSettings("Sync");
+            return;
+        }
+        var target = Tracker.TargetWindow;
+        await Task.WhenAny(Sync.SyncNowAsync(), Task.Delay(TimeSpan.FromMilliseconds(1500)));
+        if (Store.ItemsInSpace(group.Id).FirstOrDefault() is not { } item)
+        {
+            _tray?.ShowBalloon(group.DisplayName, "Nothing in this group yet.");
+            return;
+        }
+        _panelTarget = target;
+        Paste(item, null);
     }
 
     public async Task PasteClipboardAsTextAsync()
