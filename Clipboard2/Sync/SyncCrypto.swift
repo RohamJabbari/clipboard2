@@ -13,6 +13,8 @@ nonisolated enum SyncCryptoError: Error, Equatable {
 nonisolated enum SyncCrypto {
     static let aeadVersion: UInt8 = 0x01
     static let publicKeyLength = 65
+    /// Bytes `seal` adds: version, nonce and tag.
+    static let sealOverhead = 29
 
     // MARK: AEAD
 

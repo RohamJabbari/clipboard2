@@ -14,10 +14,14 @@ public static class SyncCategory
 /// <summary>A decrypted item payload (docs/sync/PROTOCOL.md → Item payloads).</summary>
 public abstract record ItemPayload
 {
-    public sealed record Clip(ClipItem Item, string? ImageBlob, string? ThumbBlob) : ItemPayload;
+    /// <param name="FileBlobs">A file item's uploaded files, in order; empty when none were sent.</param>
+    public sealed record Clip(ClipItem Item, string? ImageBlob, string? ThumbBlob, IReadOnlyList<FileBlob> FileBlobs) : ItemPayload;
     public sealed record SnippetPayload(Snippet Snippet) : ItemPayload;
     public sealed record Secret(string Name, string Value, DateTime? CreatedAt) : ItemPayload;
 }
+
+/// <summary>One file of a file item, uploaded as an encrypted blob. <see cref="Size"/> is the plaintext byte count.</summary>
+public sealed record FileBlob(string Name, string Blob, long Size);
 
 /// <summary>Builds and parses the plaintext JSON inside an item, and its fingerprint.</summary>
 public static partial class SyncPayload
@@ -28,8 +32,10 @@ public static partial class SyncPayload
 
     // MARK: Writing
 
-    /// <summary>Writers omit nulls (and zero sizes / empty file lists). File items sync as metadata.</summary>
-    public static JsonObject ForClip(ClipItem item, string? imageBlob = null, string? thumbBlob = null, bool includeRichText = true)
+    /// <summary>Writers omit nulls (and zero sizes / empty file lists). File items list their paths, plus the files
+    /// that were uploaded as blobs.</summary>
+    public static JsonObject ForClip(ClipItem item, string? imageBlob = null, string? thumbBlob = null, bool includeRichText = true,
+                                     IReadOnlyList<FileBlob>? fileBlobs = null)
     {
         var rich = includeRichText && item.Kind == ClipKind.RichText && (item.Rtf is not null || item.Html is not null);
         var kind = item.Kind switch
@@ -50,6 +56,8 @@ public static partial class SyncPayload
         if (rich && item.Rtf is { } rtf) json["rtf"] = Convert.ToBase64String(Encoding.UTF8.GetBytes(rtf));
         if (rich && item.Html is { } html) json["html"] = Convert.ToBase64String(Encoding.UTF8.GetBytes(CfHtml.Extract(html)));
         if (item.Files.Count > 0) json["files"] = new JsonArray([.. item.Files.Select(f => (JsonNode?)FileUrl(f))]);
+        if (fileBlobs is { Count: > 0 })
+            json["fileBlobs"] = new JsonArray([.. fileBlobs.Select(f => (JsonNode?)new JsonObject { ["name"] = f.Name, ["blob"] = f.Blob, ["size"] = f.Size })]);
         if (imageBlob is not null) json["imageBlob"] = imageBlob;
         if (thumbBlob is not null) json["thumbBlob"] = thumbBlob;
         if (item.ImageWidth > 0) json["imageWidth"] = item.ImageWidth;
@@ -124,7 +132,7 @@ public static partial class SyncPayload
                 {
                     "richText" => ClipKind.RichText,
                     "image" => ClipKind.Image,
-                    _ => ClipKind.Text,   // "file": paths from another device show as text
+                    _ => ClipKind.Text,   // "file": text, until the sync engine has written its fileBlobs to disk
                 };
                 var text = Str(json, "text") ?? "";
                 if (Str(json, "kind") == "file" && text.Length == 0)
@@ -155,7 +163,7 @@ public static partial class SyncPayload
                     CreatedAt = created,
                     LastCopiedAt = Time(json, "lastCopiedAt") ?? created,
                 };
-                return new ItemPayload.Clip(item, Str(json, "imageBlob"), Str(json, "thumbBlob"));
+                return new ItemPayload.Clip(item, Str(json, "imageBlob"), Str(json, "thumbBlob"), FileBlobs(json));
             case "snippet":
                 return new ItemPayload.SnippetPayload(new Snippet
                 {
@@ -192,6 +200,18 @@ public static partial class SyncPayload
     {
         if (Str(json, key) is not { } b64) return null;
         try { return Convert.FromBase64String(b64); } catch (FormatException) { return null; }
+    }
+
+    private static List<FileBlob> FileBlobs(JsonObject json)
+    {
+        if (Str(json, "kind") != "file" || json["fileBlobs"] is not JsonArray array) return [];
+        var list = new List<FileBlob>();
+        foreach (var entry in array.OfType<JsonObject>())
+        {
+            if (Str(entry, "name") is not { } name || Str(entry, "blob") is not { } blob) continue;
+            list.Add(new FileBlob(name, blob, entry["size"] is JsonValue v && v.TryGetValue<double>(out var d) ? (long)d : 0));
+        }
+        return list;
     }
 
     private static string FileUrl(string path)

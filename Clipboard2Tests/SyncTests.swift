@@ -827,6 +827,58 @@ struct SyncEngineTests {
         #expect(await server.live(space: user.personal).first?.blobIds == remote.blobIds)
     }
 
+    @Test func filesTravelAsEncryptedBlobsAndArriveAsFiles() async throws {
+        let server = FakeSyncServer()
+        let user = try await FakeUser.make("alice", on: server)
+        let mac1 = try FakeDevice(user), mac2 = try FakeDevice(user)
+        let dir = FileManager.default.temporaryDirectory.appending(path: "SyncFiles-\(UUID())", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir.appending(path: "Folder"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let report = Data((0..<3000).map { UInt8($0 % 241) })
+        try report.write(to: dir.appending(path: "Report.pdf"))
+        try Data("hello".utf8).write(to: dir.appending(path: "notes.txt"))
+        let urls = [dir.appending(path: "Report.pdf"), dir.appending(path: "notes.txt"), dir.appending(path: "Folder")]
+        mac1.store.ingest(ProcessedCapture(kind: .file, text: urls.map(\.path).joined(separator: "\n"), preview: "3 files",
+                                           fileURLs: urls, hash: ContentHasher.hash(fileURLs: urls)))
+        try await mac1.engine.tick()
+        let remote = try #require(await server.live(space: user.personal).first)
+        #expect(remote.blobIds.count == 2)   // the folder travels as its name only
+
+        try await mac2.engine.tick()
+        let item = try #require(mac2.store.allItems().first)
+        defer { mac2.store.delete(item) }
+        #expect(item.kind == .file)
+        #expect(item.fileURLs.map(\.lastPathComponent) == ["Report.pdf", "notes.txt"])
+        #expect(item.fileURLs.allSatisfy { $0.path.hasPrefix(AppPaths.syncedFilesDirectory.path) })
+        #expect(try Data(contentsOf: item.fileURLs[0]) == report)
+
+        // Nothing changes on the next round trip: no re-upload, no re-download.
+        try await mac2.engine.tick()
+        try await mac1.engine.tick()
+        #expect(await server.live(space: user.personal).first?.blobIds == remote.blobIds)
+        #expect(await server.live(space: user.personal).first?.seq == remote.seq)
+
+        let folder = AppPaths.syncedFilesFolder(for: item.id)
+        mac2.store.delete(item)
+        #expect(!FileManager.default.fileExists(atPath: folder.path))
+    }
+
+    @Test func fileNamesFromOtherDevicesCantEscapeTheirFolder() {
+        var taken = Set<String>()
+        #expect(SyncEngine.safeFileName("../../.ssh/id_rsa", taken: &taken) == "id_rsa")
+        #expect(SyncEngine.safeFileName("..", taken: &taken) == "File")
+        #expect(SyncEngine.safeFileName("a:b", taken: &taken) == "a-b")
+        #expect(SyncEngine.safeFileName("ID_RSA", taken: &taken) == "ID_RSA 2")
+    }
+
+    @Test func filesFromOlderClientsStillArriveAsText() throws {
+        let json = Data(#"{"v":1,"type":"clip","kind":"file","files":["file:///tmp/a.txt"],"createdAt":5}"#.utf8)
+        guard case .clip(let clip) = try SyncPayload.decode(json) else { return }
+        let item = ClipItem(syncID: UUID(), spaceID: "g")
+        clip.apply(to: item, localFiles: [])
+        #expect(item.kind == .text && item.text == "/tmp/a.txt")
+    }
+
     @Test func deletesBecomeTombstones() async throws {
         let server = FakeSyncServer()
         let user = try await FakeUser.make("alice", on: server)

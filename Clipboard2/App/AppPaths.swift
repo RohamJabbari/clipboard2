@@ -15,6 +15,12 @@ nonisolated enum AppPaths {
 
     static var storeURL: URL { supportDirectory.appending(path: "Clipboard2.store") }
     static var blobsDirectory: URL { supportDirectory.appending(path: "Blobs", directoryHint: .isDirectory) }
+    /// Files received through sync, one folder per item: `Synced Files/<item id>/<name>`.
+    static var syncedFilesDirectory: URL { supportDirectory.appending(path: "Synced Files", directoryHint: .isDirectory) }
+
+    static func syncedFilesFolder(for itemID: UUID) -> URL {
+        syncedFilesDirectory.appending(path: itemID.uuidString.lowercased(), directoryHint: .isDirectory)
+    }
 }
 
 nonisolated enum Log {

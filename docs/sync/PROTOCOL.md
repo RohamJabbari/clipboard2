@@ -102,7 +102,7 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
 ```jsonc
 // type "clip"
 {"v":1,"type":"clip","kind":"text|richText|image|file","text":"…","preview":"…",
- "rtf":"<b64>","html":"<b64>","files":["file:///…"],
+ "rtf":"<b64>","html":"<b64>","files":["file:///…"],"fileBlobs":[{"name":"Report.pdf","blob":"<blob uuid>","size":0}],
  "imageBlob":"<blob uuid>","thumbBlob":"<blob uuid>","imageWidth":0,"imageHeight":0,"byteCount":0,
  "sourceId":"com.apple.Safari","sourceName":"Safari",
  "isPinned":false,"pinnedAt":null,"label":null,"copyCount":1,
@@ -115,7 +115,7 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
 
 - **Images:** the PNG and its thumbnail are uploaded as two encrypted blobs. Their ids are listed in the payload and in `blobIds`.
 - **Rich text that won't fit:** if `rtf` + `html` push the ciphertext past the item limit, drop them and sync the item as `text`.
-- **Files:** paths sync as metadata only. Other devices show them as text.
+- **Files:** each regular file (not folders) of up to 25 MiB sealed, at most 10 per item, is uploaded as an encrypted blob, like images. `fileBlobs` lists them in upload order (`name` is the last path component, `size` the plaintext bytes) and `blobIds` repeats their ids. Receivers save them as `Synced Files/<item id>/<name>` — after stripping any path from `name` — and keep the item a file clip pointing there, so pasting puts real files on the clipboard. Files without a blob (too large, folders, or from a sender without `fileBlobs`) arrive as their names, as text. Deleting the item deletes its folder.
 
 | Category | Payload | `sortAt` |
 |---|---|---|

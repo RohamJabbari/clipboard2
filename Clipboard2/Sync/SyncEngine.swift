@@ -256,12 +256,28 @@ final class SyncEngine {
 
     private func applyClip(_ payload: ClipPayload, remote: RemoteItem, spaceId: String, itemKey: Data, force: Bool) async throws {
         guard let uuid = UUID(uuidString: remote.id) else { return }
-        let blobIds = payload.kind == ClipKind.image.rawValue ? payload.blobIds : []
+        let isFile = payload.kind == ClipKind.file.rawValue
+        let blobIds = payload.kind == ClipKind.image.rawValue || isFile ? payload.blobIds : []
         let known = meta(for: remote.id)
         let before = store.item(withID: uuid)
         let dirty = !force && before != nil && known != nil
             && clipFingerprint(before!, blobIds: known!.blobIds) != known!.fingerprint
         let hasImages = before?.imageFile != nil && known?.blobIds == blobIds
+        let keptFiles = before.map(\.fileURLs) ?? []
+        let hasFiles = isFile && known?.blobIds == blobIds && !keptFiles.isEmpty
+            && keptFiles.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }
+
+        var receivedFiles: [(name: String, data: Data)] = []
+        if isFile && !hasFiles {
+            for file in payload.fileBlobs ?? [] {
+                do {
+                    receivedFiles.append((file.name, try await downloadBlob(spaceId: spaceId, blobId: file.blob, itemKey: itemKey)))
+                } catch let error as SyncAPIError where error.status == 404 {
+                    Log.sync.notice("A file of \(remote.id, privacy: .public) is gone; skipping it")
+                }
+                try checkActive()
+            }
+        }
 
         var imageData: Data?
         var thumbData: Data?
@@ -286,7 +302,7 @@ final class SyncEngine {
         let localCount = item.copyCount
         let oldImage = item.imageFile
         let oldThumb = item.thumbnailFile
-        payload.apply(to: item)
+        payload.apply(to: item, localFiles: hasFiles ? keptFiles : writeReceivedFiles(receivedFiles, for: uuid))
         item.spaceID = localSpaceID(spaceId)
         if dirty && existing != nil {
             // Unpushed local copy activity survives; content and pin state come from the server.
@@ -323,6 +339,51 @@ final class SyncEngine {
                                 : clipFingerprint(item, blobIds: blobIds)
         recordMeta(id: remote.id, spaceId: spaceId, category: payload.category, fingerprint: fingerprint,
                    seq: remote.seq, updatedAt: remote.updatedAt, blobIds: blobIds)
+    }
+
+    /// Saves downloaded files as `Synced Files/<item id>/<name>`, replacing an earlier version.
+    private func writeReceivedFiles(_ files: [(name: String, data: Data)], for itemID: UUID) -> [URL] {
+        guard !files.isEmpty else { return [] }
+        let fm = FileManager.default
+        let folder = AppPaths.syncedFilesFolder(for: itemID)
+        try? fm.removeItem(at: folder)
+        do {
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        } catch {
+            Log.sync.error("Can't create a folder for synced files: \(error.localizedDescription, privacy: .public)")
+            return []
+        }
+        var taken = Set<String>()
+        var urls: [URL] = []
+        for file in files {
+            let url = folder.appending(path: Self.safeFileName(file.name, taken: &taken))
+            do {
+                try file.data.write(to: url)
+                urls.append(url)
+            } catch {
+                Log.sync.error("Can't write a synced file: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        return urls
+    }
+
+    /// A sender-chosen name made safe to use inside our folder: no path parts, never empty, unique.
+    static func safeFileName(_ name: String, taken: inout Set<String>) -> String {
+        var base = (name as NSString).lastPathComponent
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if base.isEmpty || base == "." || base == ".." { base = "File" }
+        var candidate = base
+        var n = 2
+        while taken.contains(candidate.lowercased()) {
+            let ext = (base as NSString).pathExtension
+            let stem = (base as NSString).deletingPathExtension
+            candidate = ext.isEmpty ? "\(stem) \(n)" : "\(stem) \(n).\(ext)"
+            n += 1
+        }
+        taken.insert(candidate.lowercased())
+        return candidate
     }
 
     private func applySnippet(_ payload: SnippetPayload, remote: RemoteItem, spaceId: String, force: Bool) {
@@ -381,7 +442,8 @@ final class SyncEngine {
         var plaintext: Data
         var fingerprint: String
         var blobIds: [String]
-        var uploads: [(id: String, data: Data)]
+        /// Read from disk only when sent, so a tick with many files never holds them all in memory.
+        var uploads: [(id: String, file: URL)]
     }
 
     private func push(_ space: SyncSpace, itemKey: Data) async throws {
@@ -440,19 +502,24 @@ final class SyncEngine {
 
     private func clipJob(_ item: ClipItem, meta: SyncMeta?, nowMs: Int64) -> PushJob? {
         let id = item.id.uuidString.lowercased()
-        var blobIds = item.kind == .image ? (meta?.blobIds ?? []) : []
+        var blobIds = item.kind == .image || item.kind == .file ? (meta?.blobIds ?? []) : []
         var fingerprint = clipFingerprint(item, blobIds: blobIds)
         guard fingerprint != meta?.fingerprint, rejected[id] != fingerprint else { return nil }
 
-        var uploads: [(id: String, data: Data)] = []
+        var uploads: [(id: String, file: URL)] = []
         if item.kind == .image && blobIds.isEmpty {
-            guard let file = item.imageFile, let data = try? Data(contentsOf: store.blobs.url(for: file)) else {
+            let fm = FileManager.default
+            guard let file = item.imageFile.map(store.blobs.url(for:)), fm.fileExists(atPath: file.path) else {
                 return nil   // image file missing: nothing to sync
             }
-            uploads.append((SyncCrypto.newID(), data))
-            if let thumb = item.thumbnailFile, let data = try? Data(contentsOf: store.blobs.url(for: thumb)) {
-                uploads.append((SyncCrypto.newID(), data))
+            uploads.append((SyncCrypto.newID(), file))
+            if let thumb = item.thumbnailFile.map(store.blobs.url(for:)), fm.fileExists(atPath: thumb.path) {
+                uploads.append((SyncCrypto.newID(), thumb))
             }
+            blobIds = uploads.map(\.id)
+            fingerprint = clipFingerprint(item, blobIds: blobIds)
+        } else if item.kind == .file && blobIds.isEmpty {
+            uploads = Self.uploadableFiles(item).map { (SyncCrypto.newID(), $0) }
             blobIds = uploads.map(\.id)
             fingerprint = clipFingerprint(item, blobIds: blobIds)
         }
@@ -483,7 +550,11 @@ final class SyncEngine {
     private func send(_ job: PushJob, spaceId: String, itemKey: Data) async throws {
         do {
             for upload in job.uploads {
-                let sealed = try SyncCrypto.seal(upload.data, key: itemKey,
+                guard let data = try? Data(contentsOf: upload.file, options: .mappedIfSafe) else {
+                    Log.sync.notice("\(upload.file.lastPathComponent, privacy: .private) is gone; not syncing \(job.id, privacy: .public)")
+                    return
+                }
+                let sealed = try SyncCrypto.seal(data, key: itemKey,
                                                  aad: SyncCrypto.AAD.blob(spaceId: spaceId, blobId: upload.id))
                 guard sealed.count <= SyncConfig.maxBlobCiphertext else {
                     rejected[job.id] = job.fingerprint
@@ -514,6 +585,22 @@ final class SyncEngine {
         }
     }
 
+    /// Files of a file clip whose contents sync: regular files that fit in one blob, at most 10.
+    static func uploadableFiles(_ item: ClipItem) -> [URL] {
+        let limit = SyncConfig.maxBlobCiphertext - SyncCrypto.sealOverhead
+        return Array(item.fileURLs.filter { url in
+            guard url.isFileURL,
+                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true, let size = values.fileSize
+            else { return false }
+            return size <= limit
+        }.prefix(SyncConfig.maxFilesPerItem))
+    }
+
+    private static func fileSize(_ url: URL) -> Int? {
+        try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize
+    }
+
     private func handleTrimmed(_ id: String, spaceId: String) {
         if spaceId != identity.personalSpaceId { deleteLocal(id) }
         if let meta = meta(for: id) { context.delete(meta) }
@@ -524,7 +611,11 @@ final class SyncEngine {
 
     /// The clip payload as pushed: rich text is dropped when it would exceed the item limit.
     func pushPayload(_ item: ClipItem, blobIds: [String]) -> ClipPayload {
-        let payload = ClipPayload(item: item, imageBlob: blobIds.first, thumbBlob: blobIds.dropFirst().first)
+        let payload = item.kind == .file
+            ? ClipPayload(item: item, fileBlobs: zip(Self.uploadableFiles(item), blobIds).map { file, blob in
+                FileBlob(name: file.lastPathComponent, blob: blob, size: Self.fileSize(file) ?? 0)
+            })
+            : ClipPayload(item: item, imageBlob: blobIds.first, thumbBlob: blobIds.dropFirst().first)
         guard payload.rtf != nil || payload.html != nil,
               let size = try? SyncPayload.clip(payload).canonicalJSON().count,
               size + 29 > SyncConfig.maxItemCiphertext

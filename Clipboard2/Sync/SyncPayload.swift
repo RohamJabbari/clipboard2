@@ -27,6 +27,8 @@ nonisolated struct ClipPayload: Codable, Equatable, Sendable {
     var rtf: Data?
     var html: Data?
     var files: [String]?
+    /// File contents for `kind: "file"`, in upload order; files too large or not regular aren't listed.
+    var fileBlobs: [FileBlob]?
     var imageBlob: String?
     var thumbBlob: String?
     var imageWidth: Int?
@@ -64,6 +66,7 @@ nonisolated struct ClipPayload: Codable, Equatable, Sendable {
         rtf = try c.decodeIfPresent(Data.self, forKey: .rtf)
         html = try c.decodeIfPresent(Data.self, forKey: .html)
         files = try c.decodeIfPresent([String].self, forKey: .files)
+        fileBlobs = try c.decodeIfPresent([FileBlob].self, forKey: .fileBlobs)
         imageBlob = try c.decodeIfPresent(String.self, forKey: .imageBlob)
         thumbBlob = try c.decodeIfPresent(String.self, forKey: .thumbBlob)
         imageWidth = try c.decodeIfPresent(Int.self, forKey: .imageWidth)
@@ -81,7 +84,14 @@ nonisolated struct ClipPayload: Codable, Equatable, Sendable {
     }
 
     var category: SyncCategory { isPinned ? .pinned : .history }
-    var blobIds: [String] { [imageBlob, thumbBlob].compactMap { $0 } }
+    var blobIds: [String] { [imageBlob, thumbBlob].compactMap { $0 } + (fileBlobs ?? []).map(\.blob) }
+}
+
+/// One file of a file clip: its name, the blob holding its contents, and its plaintext size.
+nonisolated struct FileBlob: Codable, Equatable, Sendable {
+    var name: String
+    var blob: String
+    var size: Int
 }
 
 /// `type: "snippet"`.
@@ -187,14 +197,15 @@ nonisolated enum SyncPayload: Equatable, Sendable {
 // MARK: - Mapping to and from the local models
 
 extension ClipPayload {
-    /// The payload for a local item. `blobs` are the server ids of its image and thumbnail.
-    init(item: ClipItem, imageBlob: String? = nil, thumbBlob: String? = nil) {
+    /// The payload for a local item. `blobs` are the server ids of its image and thumbnail, or of its files.
+    init(item: ClipItem, imageBlob: String? = nil, thumbBlob: String? = nil, fileBlobs: [FileBlob] = []) {
         self.init(kind: item.kind.rawValue, text: item.text, preview: item.preview, isPinned: item.isPinned,
                   copyCount: item.copyCount, createdAt: item.createdAt.syncMillis,
                   lastCopiedAt: item.lastCopiedAt.syncMillis, contentHash: item.contentHash)
         rtf = item.rtfData
         html = item.htmlData
         files = item.fileURLStrings.isEmpty ? nil : item.fileURLStrings
+        if item.kind == .file && !fileBlobs.isEmpty { self.fileBlobs = fileBlobs }
         if item.kind == .image {
             self.imageBlob = imageBlob
             self.thumbBlob = thumbBlob
@@ -217,15 +228,19 @@ extension ClipPayload {
         return copy
     }
 
-    /// Writes the payload into a local item. Image files are set by the caller. File paths sync as
-    /// metadata only, so file items arrive as text.
-    func apply(to item: ClipItem) {
+    /// Writes the payload into a local item. Image files are set by the caller. A file clip stays a
+    /// file clip when its contents arrived (`localFiles`); otherwise it arrives as the names, as text.
+    func apply(to item: ClipItem, localFiles: [URL] = []) {
         var kind = ClipKind(rawValue: self.kind) ?? .text
         item.text = text ?? ""
         item.preview = preview ?? TextPreview.make(item.text)
         item.contentHash = contentHash
         item.fileURLStrings = []
-        if kind == .file {
+        if kind == .file && !localFiles.isEmpty {
+            item.fileURLStrings = localFiles.map(\.absoluteString)
+            item.text = localFiles.map(\.path).joined(separator: "\n")
+            if preview == nil { item.preview = TextPreview.make(localFiles.map(\.lastPathComponent).joined(separator: ", ")) }
+        } else if kind == .file {
             kind = .text
             if item.text.isEmpty { item.text = (files ?? []).compactMap { URL(string: $0)?.path }.joined(separator: "\n") }
             if item.preview.isEmpty { item.preview = TextPreview.make(item.text) }

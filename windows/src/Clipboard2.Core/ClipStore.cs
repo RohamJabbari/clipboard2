@@ -44,13 +44,17 @@ public sealed class ClipStore : IDisposable
 {
     private readonly SqliteConnection _db;
     public BlobStore Blobs { get; }
+    /// <summary>Files received through sync, one folder per item (<see cref="SyncedFolder"/>).</summary>
+    public string SyncedFilesDirectory { get; }
     public int Revision { get; private set; }
     public event Action? Changed;
 
     /// <param name="databasePath">File path, or ":memory:" for tests.</param>
-    public ClipStore(string databasePath, BlobStore blobs)
+    /// <param name="syncedFilesDirectory">Where synced files go; defaults to a folder inside the blob directory.</param>
+    public ClipStore(string databasePath, BlobStore blobs, string? syncedFilesDirectory = null)
     {
         Blobs = blobs;
+        SyncedFilesDirectory = syncedFilesDirectory ?? Path.Combine(blobs.Directory, "Synced Files");
         _db = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = databasePath, Pooling = false }.ToString());
         _db.Open();
         Exec("PRAGMA journal_mode=WAL;");
@@ -210,6 +214,7 @@ public sealed class ClipStore : IDisposable
         if (ItemWithHash(hash, item.SpaceId) is { } duplicate && duplicate.Id != item.Id) Remove(duplicate);
         Blobs.Delete(item.ImageFile);
         Blobs.Delete(item.ThumbnailFile);
+        DeleteSyncedFiles(item.Id);
         item.Kind = ClipKind.Text;
         item.Text = text;
         item.Preview = TextPreview.Make(text);
@@ -300,6 +305,35 @@ public sealed class ClipStore : IDisposable
             if (item.ThumbnailFile is { } t) referenced.Add(t);
         }
         foreach (var name in Blobs.AllFileNames().Where(n => !referenced.Contains(n)).ToList()) Blobs.Delete(name);
+        if (!System.IO.Directory.Exists(SyncedFilesDirectory)) return;
+        // Recent folders may belong to an item sync is still downloading.
+        var ids = AllItems().Select(i => SyncId(i.Id)).ToHashSet();
+        foreach (var folder in System.IO.Directory.EnumerateDirectories(SyncedFilesDirectory).ToList())
+            if (!ids.Contains(Path.GetFileName(folder)) && System.IO.Directory.GetLastWriteTimeUtc(folder) < DateTime.UtcNow.AddHours(-1))
+                DeleteFolder(folder);
+    }
+
+    // MARK: Synced files
+
+    /// <summary>The folder holding the files of a file item received through sync.</summary>
+    public string SyncedFolder(Guid id) => Path.Combine(SyncedFilesDirectory, SyncId(id));
+
+    public void DeleteSyncedFiles(Guid id) => DeleteFolder(SyncedFolder(id));
+
+    /// <summary>Deletes the files in an item's synced folder that it no longer lists (all of them when it isn't a file item).</summary>
+    public void PruneSyncedFiles(ClipItem item)
+    {
+        var folder = SyncedFolder(item.Id);
+        if (!System.IO.Directory.Exists(folder)) return;
+        var kept = item.Kind == ClipKind.File ? item.Files.ToHashSet(StringComparer.OrdinalIgnoreCase) : [];
+        foreach (var file in System.IO.Directory.EnumerateFiles(folder).Where(f => !kept.Contains(f)).ToList())
+            try { File.Delete(file); } catch { /* in use: removed with the folder later */ }
+        if (!System.IO.Directory.EnumerateFileSystemEntries(folder).Any()) DeleteFolder(folder);
+    }
+
+    private static void DeleteFolder(string folder)
+    {
+        try { System.IO.Directory.Delete(folder, recursive: true); } catch { /* already gone or in use */ }
     }
 
     // MARK: Snippets
@@ -387,6 +421,7 @@ public sealed class ClipStore : IDisposable
         };
         copy.ImageFile = CopyBlob(item.ImageFile, copy.Id.ToString("N") + ".png");
         copy.ThumbnailFile = CopyBlob(item.ThumbnailFile, copy.Id.ToString("N") + "-thumb.png");
+        copy.Files = [.. item.Files.Select(f => CopySyncedFile(f, item.Id, copy.Id))];
         Save(copy);
         Commit();
         return copy;
@@ -403,6 +438,16 @@ public sealed class ClipStore : IDisposable
     {
         if (name is null || !File.Exists(Blobs.PathFor(name))) return null;
         File.Copy(Blobs.PathFor(name), Blobs.PathFor(target), overwrite: true);
+        return target;
+    }
+
+    /// <summary>A synced file belongs to its item's folder, which goes when the item does: the copy gets its own.</summary>
+    private string CopySyncedFile(string path, Guid from, Guid to)
+    {
+        if (!string.Equals(Path.GetDirectoryName(path), SyncedFolder(from), StringComparison.OrdinalIgnoreCase) || !File.Exists(path)) return path;
+        var target = Path.Combine(SyncedFolder(to), Path.GetFileName(path));
+        System.IO.Directory.CreateDirectory(SyncedFolder(to));
+        File.Copy(path, target, overwrite: true);
         return target;
     }
 
@@ -565,6 +610,7 @@ public sealed class ClipStore : IDisposable
     {
         Blobs.Delete(item.ImageFile);
         Blobs.Delete(item.ThumbnailFile);
+        DeleteSyncedFiles(item.Id);
         Exec("DELETE FROM clips WHERE id = $id", ("$id", item.Id.ToString()));
     }
 

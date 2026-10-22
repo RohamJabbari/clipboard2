@@ -357,6 +357,7 @@ final class ClipStore {
     private func remove(_ item: ClipItem) {
         blobs.delete(item.imageFile)
         blobs.delete(item.thumbnailFile)
+        if item.kind == .file { try? FileManager.default.removeItem(at: AppPaths.syncedFilesFolder(for: item.id)) }
         context.delete(item)
     }
 

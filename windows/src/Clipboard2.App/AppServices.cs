@@ -62,7 +62,8 @@ public sealed class AppServices : IPanelHost
         Directory.CreateDirectory(DataDirectory);
         Log.FilePath = Path.Combine(DataDirectory, "clipboard2.log");
         Settings = Settings.Load(SettingsPath);
-        Store = new ClipStore(Path.Combine(DataDirectory, "history.db"), new BlobStore(Path.Combine(DataDirectory, "Blobs")));
+        Store = new ClipStore(Path.Combine(DataDirectory, "history.db"), new BlobStore(Path.Combine(DataDirectory, "Blobs")),
+            Path.Combine(DataDirectory, "Synced Files"));
         Secrets = new SecretVault(Settings);
         Slots = new QuickSlots(Settings);
         Models = new ModelLister(Keys);

@@ -257,19 +257,45 @@ public sealed class SyncPayloadTests
     }
 
     [Fact]
-    public void FilesSyncAsUrlsAndArriveAsText()
+    public void FilesSyncAsUrlsPlusTheirBlobs()
     {
         var path = OperatingSystem.IsWindows() ? @"C:\Users\me\report 1.pdf" : "/Users/me/report 1.pdf";
         var item = ClipItem.From(ProcessedCapture.ForFiles([path]), DateTime.UtcNow);
         var json = SyncPayload.ForClip(item);
         Assert.Equal("file", json["kind"]!.GetValue<string>());
         Assert.StartsWith("file:///", json["files"]![0]!.GetValue<string>());
+        Assert.Null(json["fileBlobs"]);   // omitted when nothing was uploaded
+
+        // Without fileBlobs (an older sender) it parses as text listing the paths.
         json["text"] = "";
-        var parsed = Assert.IsType<ItemPayload.Clip>(SyncPayload.Parse(SyncPayload.Encode(json), item.Id, null)).Item;
-        Assert.Equal(ClipKind.Text, parsed.Kind);
-        Assert.Equal(path, parsed.Text);
-        Assert.Equal(item.ContentHash, parsed.ContentHash);
+        var old = Assert.IsType<ItemPayload.Clip>(SyncPayload.Parse(SyncPayload.Encode(json), item.Id, null));
+        Assert.Equal(ClipKind.Text, old.Item.Kind);
+        Assert.Equal(path, old.Item.Text);
+        Assert.Equal(item.ContentHash, old.Item.ContentHash);
+        Assert.Empty(old.FileBlobs);
+
+        var blob = new FileBlob("report 1.pdf", "33333333-3333-4333-8333-333333333333", 1234);
+        var withBlobs = SyncPayload.ForClip(item, fileBlobs: [blob]);
+        Assert.Equal("""[{"name":"report 1.pdf","blob":"33333333-3333-4333-8333-333333333333","size":1234}]""", withBlobs["fileBlobs"]!.ToJsonString());
+        var parsed = Assert.IsType<ItemPayload.Clip>(SyncPayload.Parse(SyncPayload.Encode(withBlobs), item.Id, null));
+        Assert.Equal(blob, Assert.Single(parsed.FileBlobs));
     }
+
+    [Theory]
+    [InlineData("report.pdf", "report.pdf")]
+    [InlineData("/Users/me/notes.txt", "notes.txt")]
+    [InlineData(@"C:\Users\me\notes.txt", "notes.txt")]
+    [InlineData("folder/", "folder")]
+    [InlineData("a<b>c:d\"e|f?g*h", "abcdefgh")]
+    [InlineData("tab\there", "tabhere")]
+    [InlineData(".", "file")]
+    [InlineData("..", "file")]
+    [InlineData("../..", "file")]
+    [InlineData("", "file")]
+    [InlineData("trailing. ", "trailing")]
+    [InlineData("CON", "_CON")]
+    [InlineData("nul.txt", "_nul.txt")]
+    public void ReceivedFileNamesAreSanitised(string name, string expected) => Assert.Equal(expected, SyncEngine.SafeFileName(name));
 
     [Fact]
     public void SnippetsAndSecretsRoundTripAndUnknownFieldsAreIgnored()
@@ -570,6 +596,99 @@ public sealed class SyncEngineTests : IDisposable
         Assert.Equal(2, _cloud.BlobCount(a.Personal));
         Assert.True(a.Store.Find(image.Id)!.IsPinned);
         Assert.Equal(png, File.ReadAllBytes(a.Store.Blobs.PathFor(a.Store.Find(image.Id)!.ImageFile!)));
+    }
+
+    private static string WriteFile(Device d, string name, byte[] bytes)
+    {
+        var path = Path.Combine(d.Dir, "Documents", name);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllBytes(path, bytes);
+        return path;
+    }
+
+    [Fact]
+    public async Task FilesSyncAsBlobsAndArriveAsFiles()
+    {
+        var a = await SignedUp();
+        var pdf = WriteFile(a, "report.pdf", RandomNumberGenerator.GetBytes(5000));
+        var png = WriteFile(a, "photo.png", RandomNumberGenerator.GetBytes(300));
+        var folder = Path.Combine(a.Dir, "Documents", "Folder");
+        Directory.CreateDirectory(folder);
+        var big = Path.Combine(a.Dir, "Documents", "huge.iso");
+        using (var f = File.Create(big)) f.SetLength(SyncEngine.MaxBlobBytes);   // + seal overhead: one byte too many
+        var item = a.Store.Ingest(ProcessedCapture.ForFiles([pdf, folder, png, big]));
+        await a.Sync();
+        var remote = _cloud.ItemById(a.Personal, ClipStore.SyncId(item.Id));
+        Assert.Equal(2, remote.BlobIds.Count);
+        Assert.Equal(2, _cloud.BlobCount(a.Personal));
+
+        var b = await SignedIn();
+        var copy = Assert.Single(b.Store.AllItems());
+        Assert.Equal(ClipKind.File, copy.Kind);
+        var folderOnB = b.Store.SyncedFolder(item.Id);
+        Assert.Equal([Path.Combine(folderOnB, "report.pdf"), Path.Combine(folderOnB, "photo.png")], copy.Files);
+        Assert.Equal(File.ReadAllBytes(pdf), File.ReadAllBytes(copy.Files[0]));
+        Assert.Equal(File.ReadAllBytes(png), File.ReadAllBytes(copy.Files[1]));
+        Assert.Equal("2 files: report.pdf, photo.png", copy.Preview);
+        Assert.Equal(string.Join("\n", copy.Files), copy.Text);
+        Assert.Equal(item.ContentHash, copy.ContentHash);
+
+        // Pinning on B reuses the uploaded blobs; A keeps its own files; nothing bounces back.
+        b.Store.TogglePin(copy);
+        await b.Sync();
+        await a.Sync();
+        Assert.Equal(remote.BlobIds, _cloud.ItemById(a.Personal, ClipStore.SyncId(item.Id)).BlobIds);
+        var onA = a.Store.Find(item.Id)!;
+        Assert.True(onA.IsPinned);
+        Assert.Equal([pdf, png], onA.Files);
+        Assert.False(Directory.Exists(a.Store.SyncedFolder(item.Id)));
+        var puts = _cloud.Count("PUT api.fake");
+        await b.Sync();
+        await a.Sync();
+        Assert.Equal(puts, _cloud.Count("PUT api.fake"));
+        Assert.Equal(2, _cloud.BlobCount(a.Personal));
+
+        // Deleting it removes the received files.
+        a.Store.Delete(onA);
+        await a.Sync();
+        await b.Sync();
+        Assert.Empty(b.Store.AllItems());
+        Assert.False(Directory.Exists(folderOnB));
+        Assert.True(File.Exists(pdf));
+    }
+
+    [Fact]
+    public async Task FilesThatCantTravelArriveAsText()
+    {
+        var a = await SignedUp();
+        var b = await SignedIn();
+        var folder = Path.Combine(a.Dir, "Documents", "Folder");
+        Directory.CreateDirectory(folder);
+        var missing = Path.Combine(a.Dir, "Documents", "gone.txt");
+        var nothing = a.Store.Ingest(ProcessedCapture.ForFiles([folder, missing]));   // like an item from an older sender
+        var lost = a.Store.Ingest(ProcessedCapture.ForFiles([WriteFile(a, "a.txt", [1]), WriteFile(a, "b.txt", [2])]));
+        var half = a.Store.Ingest(ProcessedCapture.ForFiles([WriteFile(a, "c.txt", [3]), WriteFile(a, "d.txt", [4])]));
+        await a.Sync();
+        Assert.Empty(_cloud.ItemById(a.Personal, ClipStore.SyncId(nothing.Id)).BlobIds);
+        foreach (var blob in _cloud.ItemById(a.Personal, ClipStore.SyncId(lost.Id)).BlobIds) _cloud.DropBlob(a.Personal, blob);
+        _cloud.DropBlob(a.Personal, _cloud.ItemById(a.Personal, ClipStore.SyncId(half.Id)).BlobIds[0]);
+        await b.Sync();
+
+        foreach (var id in new[] { nothing.Id, lost.Id })
+        {
+            var text = b.Store.Find(id)!;
+            Assert.Equal(ClipKind.Text, text.Kind);
+            Assert.Equal(a.Store.Find(id)!.Text, text.Text);
+            Assert.Empty(text.Files);
+            Assert.False(Directory.Exists(b.Store.SyncedFolder(id)));
+        }
+        var partial = b.Store.Find(half.Id)!;
+        Assert.Equal(ClipKind.File, partial.Kind);
+        Assert.Equal([Path.Combine(b.Store.SyncedFolder(half.Id), "d.txt")], partial.Files);
+
+        // A local delete removes the folder too.
+        b.Store.Delete(partial);
+        Assert.False(Directory.Exists(b.Store.SyncedFolder(half.Id)));
     }
 
     [Fact]

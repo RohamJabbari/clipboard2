@@ -39,12 +39,13 @@ public sealed class SyncAccountGoneException() : Exception("Your sync account no
 /// Change detection compares payload fingerprints with the sync_meta table. Drive it from the store's thread
 /// (the UI thread in the app): network calls are awaited and every store access happens between them.
 /// </summary>
-public sealed class SyncEngine(ClipStore store, ISecretVault vault, SyncApi api, SyncIdentity identity, Func<DateTime>? clock = null)
+public sealed partial class SyncEngine(ClipStore store, ISecretVault vault, SyncApi api, SyncIdentity identity, Func<DateTime>? clock = null)
 {
     public const int HistoryLimit = 200;
     public const int PageSize = 500;
     public const int MaxItemBytes = 2 * 1024 * 1024;
     public const int MaxBlobBytes = 25 * 1024 * 1024;
+    public const int MaxFilesPerItem = 10;
 
     private readonly Func<DateTime> _now = clock ?? (() => DateTime.UtcNow);
     private readonly Dictionary<string, SyncSpace> _spaces = [];
@@ -221,8 +222,83 @@ public sealed class SyncEngine(ClipStore store, ISecretVault vault, SyncApi api,
                 return null;
             }
             if (clip.Item.Kind == ClipKind.Image && clip.Item.ImageFile is null) return null;
+            if (clip.FileBlobs.Count > 0) await ReceiveFilesAsync(space, clip, known, blobs, ct);
         }
         return new Prepared(item, payload, blobs);
+    }
+
+    /// <summary>Writes a file item's blobs to its synced folder, keeping local copies that are still intact, and makes
+    /// it a file item. A file that can't be fetched is left out; with none at all it stays text listing the paths.</summary>
+    private async Task ReceiveFilesAsync(SyncSpace space, ItemPayload.Clip clip, Dictionary<string, string> known,
+                                         Dictionary<string, string> blobs, CancellationToken ct)
+    {
+        var item = clip.Item;
+        var entries = clip.FileBlobs.Where(f => Guid.TryParse(f.Blob, out _)).Take(MaxFilesPerItem).ToList();
+        var files = new string?[entries.Count];
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Kept files first, so a new file with the same name can't overwrite one of them.
+        for (var i = 0; i < entries.Count; i++)
+        {
+            if (!known.TryGetValue(entries[i].Blob, out var key) || ParseFileKey(key) is not { } kept || FileSize(kept.Path) != kept.Size) continue;
+            files[i] = kept.Path;
+            blobs[key] = entries[i].Blob;
+            names.Add(Path.GetFileName(kept.Path));
+        }
+        var folder = store.SyncedFolder(item.Id);
+        for (var i = 0; i < entries.Count; i++)
+        {
+            if (files[i] is not null) continue;
+            var entry = entries[i];
+            try
+            {
+                var url = await api.BlobUrlAsync(space.Id, entry.Blob, ct);
+                var bytes = SyncCrypto.Open(space.ItemKey, await api.DownloadAsync(url, ct), SyncCrypto.Aad.Blob(space.Id, entry.Blob));
+                var name = UniqueName(SafeFileName(entry.Name), names);
+                var path = Path.Combine(folder, name);
+                Directory.CreateDirectory(folder);
+                await File.WriteAllBytesAsync(path + ".tmp", bytes, ct);
+                File.Move(path + ".tmp", path, overwrite: true);
+                names.Add(name);
+                files[i] = path;
+                blobs[FileKey(path, bytes.Length)] = entry.Blob;
+            }
+            catch (Exception ex) when (ex is SyncApiException { Code: not "network" } or CryptographicException or IOException or UnauthorizedAccessException)
+            {
+                Logger?.Invoke($"Skipping a file of item {ClipStore.SyncId(item.Id)}: {ex.Message}");
+            }
+        }
+        var received = files.OfType<string>().ToList();
+        if (received.Count == 0) return;
+        var shown = ProcessedCapture.ForFiles(received);
+        item.Kind = ClipKind.File;
+        item.Files = received;
+        item.Text = shown.Text;
+        item.Preview = shown.Preview;
+    }
+
+    /// <summary>A received file name made safe for a folder: its last path component without the characters Windows
+    /// forbids, and never empty, "." or "..".</summary>
+    public static string SafeFileName(string name)
+    {
+        var last = name.TrimEnd('/', '\\');
+        last = last[(last.LastIndexOfAny(['/', '\\']) + 1)..];
+        var invalid = Path.GetInvalidFileNameChars().Concat("<>:\"/\\|?*").ToHashSet();
+        var safe = new string([.. last.Where(c => c >= ' ' && !invalid.Contains(c))]).TrimEnd('.', ' ');   // Windows drops trailing dots
+        if (safe.Length == 0) return "file";
+        return ReservedName().IsMatch(safe) ? "_" + safe : safe;
+    }
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\..*)?$", System.Text.RegularExpressions.RegexOptions.IgnoreCase)]
+    private static partial System.Text.RegularExpressions.Regex ReservedName();
+
+    /// <summary>"name.ext", or "name (2).ext" and so on when an earlier file of the item took it.</summary>
+    private static string UniqueName(string name, HashSet<string> taken)
+    {
+        var stem = Path.GetFileNameWithoutExtension(name);
+        var ext = Path.GetExtension(name);
+        var candidate = name;
+        for (var n = 2; taken.Contains(candidate); n++) candidate = $"{stem} ({n}){ext}";
+        return candidate;
     }
 
     private async Task<string?> LocalBlobAsync(SyncSpace space, string? blobId, Dictionary<string, string> known,
@@ -268,6 +344,7 @@ public sealed class SyncEngine(ClipStore store, ISecretVault vault, SyncApi api,
                     if (old.ThumbnailFile is { } t && t != clip.Item.ThumbnailFile) store.Blobs.Delete(t);
                 }
                 store.Put(clip.Item);
+                store.PruneSyncedFiles(clip.Item);   // files the previous version had
                 break;
             case ItemPayload.SnippetPayload s:
                 store.PutSnippet(s.Snippet);
@@ -306,7 +383,7 @@ public sealed class SyncEngine(ClipStore store, ISecretVault vault, SyncApi api,
     private Rendered Render(LocalItem local, IReadOnlyDictionary<string, string> blobs, bool includeRichText = true) => local switch
     {
         LocalItem.Clip c => new(
-            SyncPayload.ForClip(c.Item, Lookup(blobs, c.Item.ImageFile), Lookup(blobs, c.Item.ThumbnailFile), includeRichText),
+            SyncPayload.ForClip(c.Item, Lookup(blobs, c.Item.ImageFile), Lookup(blobs, c.Item.ThumbnailFile), includeRichText, FileBlobs(c.Item, blobs)),
             SyncCategory.ForClip(c.Item), SyncPayload.Millis(c.Item.LastCopiedAt)),
         LocalItem.SnippetItem s => new(SyncPayload.ForSnippet(s.Snippet), SyncCategory.Snippet, SyncPayload.Millis(s.Snippet.UpdatedAt)),
         LocalItem.Secret k => new(SyncPayload.ForSecret(k.Ref.Name, k.Value, k.Ref.CreatedAt), SyncCategory.Secret,
@@ -316,6 +393,35 @@ public sealed class SyncEngine(ClipStore store, ISecretVault vault, SyncApi api,
 
     private static string? Lookup(IReadOnlyDictionary<string, string> blobs, string? file) =>
         file is not null && blobs.TryGetValue(file, out var id) ? id : null;
+
+    // A file's blob map key is "path|size": a file whose size changed on disk no longer matches, so it's uploaded again.
+    private static string FileKey(string path, long size) => $"{path}|{size}";
+
+    private static (string Path, long Size)? ParseFileKey(string key)
+    {
+        var bar = key.LastIndexOf('|');
+        return bar > 0 && long.TryParse(key.AsSpan(bar + 1), out var size) ? (key[..bar], size) : null;
+    }
+
+    /// <summary>The length of a regular file, or null for a folder or a missing file.</summary>
+    private static long? FileSize(string path)
+    {
+        try { return new FileInfo(path) is { Exists: true } info ? info.Length : null; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { return null; }
+    }
+
+    /// <summary>The files of a file item that are on the server (in <paramref name="blobs"/>), in the item's order.</summary>
+    private static List<FileBlob> FileBlobs(ClipItem item, IReadOnlyDictionary<string, string> blobs)
+    {
+        if (item.Kind != ClipKind.File || blobs.Count == 0) return [];
+        var uploaded = new Dictionary<string, (long Size, string Blob)>();
+        foreach (var (key, blob) in blobs)
+            if (ParseFileKey(key) is { } k) uploaded[k.Path] = (k.Size, blob);
+        var list = new List<FileBlob>();
+        foreach (var path in item.Files.Distinct())
+            if (uploaded.TryGetValue(path, out var u) && FileSize(path) == u.Size) list.Add(new FileBlob(Path.GetFileName(path), u.Blob, u.Size));
+        return list;
+    }
 
     private LocalItem? Local(SyncSpace space, string itemId, string category)
     {
@@ -441,6 +547,7 @@ public sealed class SyncEngine(ClipStore store, ISecretVault vault, SyncApi api,
                 await api.UploadBlobAsync(upload, ciphertext, ct);
                 blobs[file] = blobId;
             }
+            if (clip.Kind == ClipKind.File) await UploadFilesAsync(space, clip, meta, blobs, ct);
         }
         var full = Render(local, blobs);
         var category = full.Category;
@@ -454,7 +561,7 @@ public sealed class SyncEngine(ClipStore store, ISecretVault vault, SyncApi api,
             return false;
         }
         var updatedAt = Math.Max(NowMs, (meta?.UpdatedAt ?? 0) + 1);
-        var outcome = await api.PutItemAsync(space.Id, local.Id, category, full.SortAt, updatedAt, sealedItem, [.. blobs.Values.Distinct()], ct);
+        var outcome = await api.PutItemAsync(space.Id, local.Id, category, full.SortAt, updatedAt, sealedItem, BlobIds(full.Payload), ct);
         switch (outcome)
         {
             case WriteOutcome.Saved saved:
@@ -467,6 +574,46 @@ public sealed class SyncEngine(ClipStore store, ISecretVault vault, SyncApi api,
         }
         return false;
     }
+
+    /// <summary>Uploads a file item's regular files that fit in a blob, at most <see cref="MaxFilesPerItem"/>, reusing
+    /// blobs already on the server. The others stay listed by path only.</summary>
+    private async Task UploadFilesAsync(SyncSpace space, ClipItem clip, SyncMeta? meta, Dictionary<string, string> blobs, CancellationToken ct)
+    {
+        var uploaded = 0;
+        foreach (var path in clip.Files.Distinct())
+        {
+            if (uploaded == MaxFilesPerItem) break;
+            if (FileSize(path) is not { } size || size + 29 > MaxBlobBytes) continue;   // gone, a folder, or too large
+            if (meta is { Trimmed: false } && meta.BlobMap.TryGetValue(FileKey(path, size), out var known))
+            {
+                blobs[FileKey(path, size)] = known;
+                uploaded++;
+                continue;
+            }
+            byte[] bytes;
+            try { bytes = await File.ReadAllBytesAsync(path, ct); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Logger?.Invoke($"Couldn't read a file of {ClipStore.SyncId(clip.Id)}: {ex.Message}");
+                continue;
+            }
+            if (bytes.Length + 29 > MaxBlobBytes) continue;   // grew since
+            var blobId = Guid.NewGuid().ToString("D");
+            var ciphertext = SyncCrypto.Seal(space.ItemKey, bytes, SyncCrypto.Aad.Blob(space.Id, blobId));
+            var upload = await api.RegisterBlobAsync(space.Id, blobId, ciphertext.Length, ct);
+            await api.UploadBlobAsync(upload, ciphertext, ct);
+            blobs[FileKey(path, bytes.Length)] = blobId;
+            uploaded++;
+        }
+    }
+
+    /// <summary>The item's <c>blobIds</c>: image, thumbnail, then the files in payload order.</summary>
+    private static List<string> BlobIds(JsonObject payload) =>
+    [
+        .. new[] { payload["imageBlob"], payload["thumbBlob"] }
+            .Concat((payload["fileBlobs"] as JsonArray ?? []).Select(f => f?["blob"]))
+            .OfType<JsonValue>().Select(v => v.GetValue<string>()).Distinct(),
+    ];
 
     private static byte[] Seal(SyncSpace space, string id, string category, JsonObject payload) =>
         SyncCrypto.Seal(space.ItemKey, SyncPayload.Encode(payload), SyncCrypto.Aad.Item(space.Id, id, category));

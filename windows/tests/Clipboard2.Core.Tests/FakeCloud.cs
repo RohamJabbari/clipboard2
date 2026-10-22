@@ -85,6 +85,8 @@ internal sealed class FakeCloud : HttpMessageHandler
     public Item ItemById(string spaceId, string id) => _spaces[spaceId].Items[id];
     public int BlobCount(string spaceId) => _blobs.Keys.Count(k => k.Space == spaceId);
     public void ForceReset(string spaceId) => _spaces[spaceId].PurgedSeq = _seq + 1;
+    /// <summary>Loses a blob, as garbage collection would.</summary>
+    public void DropBlob(string spaceId, string blobId) => _blobs.Remove((spaceId, blobId));
 
     /// <summary>Simulates a newer write from elsewhere without the client seeing it yet.</summary>
     public void BumpUpdatedAt(string spaceId, string id, long by) => _spaces[spaceId].Items[id].UpdatedAt += by;
