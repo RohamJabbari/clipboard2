@@ -50,6 +50,7 @@ struct QuickPanelView: View {
                 .font(.title2)
                 .focused($searchFocused)
                 .accessibilityLabel("Search")
+            typeFilterMenu
             if let target = model.targetRef {
                 HStack(spacing: 4) {
                     Image(nsImage: AppIconCache.icon(for: target.bundleID))
@@ -68,6 +69,38 @@ struct QuickPanelView: View {
         .padding(.horizontal, 16)
         .padding(.top, 14)
         .padding(.bottom, 10)
+    }
+
+    /// Text, Images, Files or Snippets. Shows the active type so a filtered list is never a surprise.
+    private var typeFilterMenu: some View {
+        let active = model.groupFilter == nil && model.filter.isContentType ? model.filter : nil
+        return Menu {
+            Picker("Show", selection: Binding(
+                get: { active },
+                set: { type in
+                    model.groupFilter = nil
+                    model.filter = type ?? .all
+                }
+            )) {
+                Label("Everything", systemImage: PanelFilter.all.symbol).tag(PanelFilter?.none)
+                ForEach(PanelFilter.contentTypes) { type in
+                    Label(type.title, systemImage: type.symbol).tag(Optional(type))
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: active == nil ? "line.3.horizontal.decrease.circle" : "line.3.horizontal.decrease.circle.fill")
+                    .font(.title3)
+                if let active { Text(active.title).font(.callout) }
+            }
+            .foregroundStyle(active == nil ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.accentColor))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Show only text, images, files or snippets")
+        .accessibilityLabel(active.map { "Filter: \($0.title)" } ?? "Filter by type")
     }
 
     // MARK: List
@@ -225,7 +258,7 @@ struct FilterChips: View {
 
     private var chips: some View {
         HStack(spacing: 6) {
-            ForEach(PanelFilter.allCases) { filter in
+            ForEach(PanelFilter.chips) { filter in
                 chip(title(for: filter), symbol: filter.symbol, selected: groupSelection == nil && filter == selection) {
                     groupSelection = nil
                     selection = filter

@@ -30,6 +30,11 @@ nonisolated enum PanelFilter: String, CaseIterable, Identifiable, Sendable {
         case .thisApp: "app"
         }
     }
+
+    /// Content types live in the search bar's filter menu; the other filters are chips.
+    var isContentType: Bool { self == .text || self == .images || self == .files || self == .snippets }
+    static let chips = allCases.filter { !$0.isContentType }
+    static let contentTypes = allCases.filter(\.isContentType)
 }
 
 enum PanelEntry: Identifiable {
@@ -543,9 +548,9 @@ final class PanelViewModel {
         showNotice("Deleted \(clips.count) items")
     }
 
-    /// ⇥ walks the built-in filters, then each sync group.
+    /// ⇥ walks the filter chips, then each sync group (content types are in the search bar's menu).
     func cycleFilter(forward: Bool) {
-        let choices: [(PanelFilter, String?)] = PanelFilter.allCases.map { ($0, nil) } + env.sync.groups.map { (.all, $0.id) }
+        let choices: [(PanelFilter, String?)] = PanelFilter.chips.map { ($0, nil) } + env.sync.groups.map { (.all, $0.id) }
         let current = choices.firstIndex { groupFilter == nil ? $0.0 == filter && $0.1 == nil : $0.1 == groupFilter } ?? 0
         let next = choices[(current + (forward ? 1 : choices.count - 1)) % choices.count]
         groupFilter = next.1

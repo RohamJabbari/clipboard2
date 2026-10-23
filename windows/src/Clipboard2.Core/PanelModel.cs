@@ -7,6 +7,10 @@ public enum PanelFilter { All, Pinned, Text, Images, Files, Snippets, Secrets, T
 public static class PanelFilters
 {
     public static readonly PanelFilter[] All = Enum.GetValues<PanelFilter>();
+    /// <summary>Content types live in the search box's filter menu; the other filters are chips.</summary>
+    public static bool IsContentType(this PanelFilter f) => f is PanelFilter.Text or PanelFilter.Images or PanelFilter.Files or PanelFilter.Snippets;
+    public static readonly PanelFilter[] Chips = [.. All.Where(f => !f.IsContentType())];
+    public static readonly PanelFilter[] ContentTypes = [.. All.Where(f => f.IsContentType())];
     public static string Title(this PanelFilter f) => f switch
     {
         PanelFilter.ThisApp => "This App",
@@ -454,10 +458,10 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         Notify();
     }
 
-    /// <summary>Tab: the built-in filters, then one per sync group.</summary>
+    /// <summary>Tab: the filter chips, then one per sync group (content types are in the filter menu).</summary>
     public void CycleFilter(bool forward)
     {
-        List<(PanelFilter Filter, string? Group)> all = [.. PanelFilters.All.Select(f => (f, (string?)null)),
+        List<(PanelFilter Filter, string? Group)> all = [.. PanelFilters.Chips.Select(f => (f, (string?)null)),
             .. store.Groups().Select(g => (PanelFilter.All, (string?)g.Id))];
         var index = all.FindIndex(x => GroupFilter is not null ? x.Group == GroupFilter : x.Group is null && x.Filter == Filter);
         var next = all[(Math.Max(index, 0) + (forward ? 1 : all.Count - 1)) % all.Count];

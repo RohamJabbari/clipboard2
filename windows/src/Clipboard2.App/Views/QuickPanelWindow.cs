@@ -24,6 +24,7 @@ public sealed class QuickPanelWindow : Window
 
     private readonly TextBox _search = new();
     private readonly TextBlock _targetLabel = Fluent.Label("", 12, Fluent.Secondary);
+    private readonly Border _typeFilter = new() { CornerRadius = new CornerRadius(6), Padding = new Thickness(6, 2, 6, 2), Margin = new Thickness(8, 0, 8, 0), Cursor = Cursors.Hand, Background = Brushes.Transparent, VerticalAlignment = VerticalAlignment.Center };
     private readonly StackPanel _chips = new() { Orientation = Orientation.Horizontal };
     private readonly StackPanel _rows = new();
     private readonly ScrollViewer _rowScroll;
@@ -71,8 +72,11 @@ public sealed class QuickPanelWindow : Window
         searchIcon.Margin = new Thickness(0, 0, 10, 0);
         DockPanel.SetDock(searchIcon, Dock.Left);
         DockPanel.SetDock(_targetLabel, Dock.Right);
+        DockPanel.SetDock(_typeFilter, Dock.Right);
+        _typeFilter.MouseLeftButtonUp += (_, _) => ShowTypeFilterMenu();
         searchRow.Children.Add(searchIcon);
         searchRow.Children.Add(_targetLabel);
+        searchRow.Children.Add(_typeFilter);
         searchRow.Children.Add(_search);
 
         _rowScroll = new ScrollViewer { Content = _rows, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(8, 6, 8, 6) };
@@ -231,7 +235,8 @@ public sealed class QuickPanelWindow : Window
     private void RenderChips()
     {
         _chips.Children.Clear();
-        foreach (var filter in PanelFilters.All)
+        RenderTypeFilter();
+        foreach (var filter in PanelFilters.Chips)
         {
             var title = filter == PanelFilter.ThisApp && Model.TargetApp is { } app ? app.Name : filter.Title();
             var f = filter;
@@ -240,6 +245,38 @@ public sealed class QuickPanelWindow : Window
         // Sync groups come after the built-in filters (Tab cycles through them too).
         foreach (var (id, name) in Model.GroupNames.OrderBy(g => g.Value, StringComparer.CurrentCultureIgnoreCase))
             AddChip(name, Glyphs.Group, Model.GroupFilter == id, () => Model.SetGroupFilter(id));
+    }
+
+    private PanelFilter? ActiveContentType => Model.GroupFilter is null && Model.Filter.IsContentType() ? Model.Filter : null;
+
+    /// <summary>The search box's filter button: the icon, plus the active type so a filtered list is never a surprise.</summary>
+    private void RenderTypeFilter()
+    {
+        var active = ActiveContentType;
+        var content = new StackPanel { Orientation = Orientation.Horizontal };
+        content.Children.Add(Glyphs.Icon(Glyphs.Filter, 15, active is null ? Fluent.Secondary : Fluent.Accent));
+        if (active is { } type)
+            content.Children.Add(new TextBlock { Text = type.Title(), Margin = new Thickness(6, 0, 0, 0), Foreground = Fluent.Accent, VerticalAlignment = VerticalAlignment.Center });
+        _typeFilter.Child = content;
+        _typeFilter.ToolTip = "Show only text, images, files or snippets";
+        AutomationName(_typeFilter, active is { } a ? $"Filter: {a.Title()}" : "Filter by type");
+    }
+
+    private void ShowTypeFilterMenu()
+    {
+        var active = ActiveContentType;
+        var menu = new ContextMenu { PlacementTarget = _typeFilter, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
+        MenuItem Item(string title, string glyph, bool selected, PanelFilter filter)
+        {
+            var item = new MenuItem { Header = title, Icon = Glyphs.Icon(glyph, 14), IsCheckable = true, IsChecked = selected };
+            item.Click += (_, _) => Model.SetFilter(filter);
+            return item;
+        }
+        menu.Items.Add(Item("Everything", Glyphs.All, active is null, PanelFilter.All));
+        menu.Items.Add(new Separator());
+        foreach (var type in PanelFilters.ContentTypes)
+            menu.Items.Add(Item(type.Title(), Glyphs.For(type), active == type, type));
+        menu.IsOpen = true;
     }
 
     private void AddChip(string title, string glyph, bool selected, Action choose)

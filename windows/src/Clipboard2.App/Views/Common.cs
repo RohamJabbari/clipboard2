@@ -20,7 +20,7 @@ public static class Glyphs
         Unlock = "", Download = "", All = "", App = "", Tag = "", Check = "",
         Panel = "", Clock = "", Cut = "", SelectAll = "", Undo = "", Redo = "",
         OpenWith = "", Info = "", Rename = "", Menu = "", Eye = "", Book = "",
-        Group = "\uE716", Cloud = "\uE753";
+        Group = "\uE716", Cloud = "\uE753", Filter = "\uE71C";
 
     public static TextBlock Icon(string glyph, double size = 16, Brush? brush = null) => new()
     {

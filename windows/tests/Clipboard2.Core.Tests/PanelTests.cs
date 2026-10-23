@@ -112,6 +112,18 @@ public sealed class PanelTests : IDisposable
     }
 
     [Fact]
+    public void ContentTypesAreMenuFiltersNotTabStops()
+    {
+        Assert.Equal([PanelFilter.All, PanelFilter.Pinned, PanelFilter.Secrets, PanelFilter.ThisApp], PanelFilters.Chips);
+        Add("some text");
+        _model.PrepareForOpen(null);
+        _model.SetFilter(PanelFilter.Images);
+        Assert.Empty(_model.Entries);
+        _model.HandleKey(K(PanelKey.Tab));                 // from a menu filter, Tab goes on to the chips
+        Assert.Equal(PanelFilter.Pinned, _model.Filter);
+    }
+
+    [Fact]
     public void DeleteEditsTextWhileSearching()
     {
         Add("keep me");
@@ -291,8 +303,8 @@ public sealed class PanelTests : IDisposable
         Assert.Equal("Team", _model.GroupBadge(new PanelEntry.Clip(copy)));
         Assert.Null(_model.GroupBadge(new PanelEntry.Clip(item)));
 
-        // Tab cycles through the built-in filters and then the group.
-        for (var i = 0; i < PanelFilters.All.Length; i++) _model.CycleFilter(true);
+        // Tab cycles through the filter chips and then the group.
+        for (var i = 0; i < PanelFilters.Chips.Length; i++) _model.CycleFilter(true);
         Assert.Equal("g1", _model.GroupFilter);
         Assert.Equal(copy.Id, Assert.Single(_model.Entries).ClipItem!.Id);
         _model.CycleFilter(true);
