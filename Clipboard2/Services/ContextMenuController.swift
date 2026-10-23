@@ -1,4 +1,5 @@
 import AppKit
+import KeyboardShortcuts
 
 nonisolated enum ContextMenuModifier: String, CaseIterable, Identifiable, Sendable {
     case command, option
@@ -22,6 +23,8 @@ final class ContextMenuController: NSObject {
     private var swallowNextRightMouseUp = false
     private var clickLocation: CGPoint = .zero          // global, top-left origin
     private var target: NSRunningApplication?
+    /// The global shortcuts shown in the menu, paused while it's open so they don't also fire after it closes.
+    private var pausedShortcuts: [KeyboardShortcuts.Name] = []
 
     init(env: AppEnvironment) {
         self.env = env
@@ -128,25 +131,41 @@ final class ContextMenuController: NSObject {
     private func buildMenu(isFinder: Bool) -> NSMenu {
         let menu = NSMenu(title: "Clipboard2")
         menu.autoenablesItems = false
+        menu.delegate = self
+        pausedShortcuts = []
         let appName = target?.localizedName ?? "App"
 
-        // Clipboard2
+        // Clipboard2 — every global shortcut is listed with its keys, as a reminder.
         menu.addItem(.sectionHeader(title: "Clipboard2"))
-        let imageOnClipboard = ClipboardImage.current(in: .general) != nil
-        menu.addItem(item("Paste Text from Clipboard Image", symbol: "text.viewfinder", enabled: imageOnClipboard) { [weak self] in
-            self?.inTarget { $0.env.pasteClipboardAsText() }
+        menu.addItem(item("Search Clipboard2…", symbol: "magnifyingglass", shortcut: .toggleQuickPanel) { [weak self] in
+            self?.inTarget { $0.env.showQuickPanel() }
         })
         if !isFinder {
-            menu.addItem(item("Actions on Selection…", symbol: "wand.and.stars") { [weak self] in
+            menu.addItem(item("Actions on Selection…", symbol: "wand.and.stars", shortcut: .selectionActions) { [weak self] in
                 self?.inTarget { $0.env.showSelectionActions() }
+            })
+        }
+        let imageOnClipboard = ClipboardImage.current(in: .general) != nil
+        menu.addItem(item("Paste Text from Clipboard Image", symbol: "text.viewfinder", enabled: imageOnClipboard,
+                          shortcut: .pasteAsText) { [weak self] in
+            self?.inTarget { $0.env.pasteClipboardAsText() }
+        })
+        menu.addItem(item("Capture Text from Screen…", symbol: "rectangle.dashed", shortcut: .captureText) { [weak self] in
+            self?.inTarget { $0.env.captureScreenText() }
+        })
+        if env.sync.isSignedIn {
+            menu.addItem(item("Send Selection to Group", symbol: "person.2", shortcut: .sendToGroup) { [weak self] in
+                self?.inTarget { $0.env.sendSelectionToGroup() }
+            })
+            menu.addItem(item("Paste from Group", symbol: "person.2.fill", shortcut: .pasteFromGroup) { [weak self] in
+                self?.inTarget { $0.env.pasteFromDefaultGroup() }
             })
         }
         menu.addItem(submenuItem("Recent", symbol: "clock", items: recentItems()))
         menu.addItem(submenuItem("Snippets", symbol: "text.badge.star", items: snippetItems()))
         menu.addItem(submenuItem("Secrets", symbol: "key", items: secretItems()))
-        menu.addItem(item("Search Clipboard2…", symbol: "magnifyingglass") { [weak self] in
-            self?.inTarget { $0.env.showQuickPanel() }
-        })
+        let slots = slotItems()
+        if !slots.isEmpty { menu.addItem(submenuItem("Quick Slots", symbol: "number", items: slots)) }
 
         menu.addItem(.separator())
         if isFinder {
@@ -166,7 +185,7 @@ final class ContextMenuController: NSObject {
             menu.addItem(keyItem("Cut", symbol: "scissors", key: 7, flags: .maskCommand))
             menu.addItem(keyItem("Copy", symbol: "doc.on.doc", key: 8, flags: .maskCommand))
             menu.addItem(keyItem("Paste", symbol: "doc.on.clipboard", key: 9, flags: .maskCommand))
-            menu.addItem(item("Paste as Plain Text", symbol: "doc.plaintext") { [weak self] in
+            menu.addItem(item("Paste as Plain Text", symbol: "doc.plaintext", shortcut: .pasteAsText) { [weak self] in
                 self?.inTarget { $0.env.pasteClipboardAsText() }
             })
             menu.addItem(.separator())
@@ -186,6 +205,17 @@ final class ContextMenuController: NSObject {
             self?.inTarget { _ in PasteService.postClick(at: location, button: .right) }
         })
         return menu
+    }
+
+    /// Assigned quick slots, each with its global shortcut if one is set.
+    private func slotItems() -> [NSMenuItem] {
+        QuickSlots.range.compactMap { number in
+            guard let title = env.slots.title(for: number) else { return nil }
+            return item("\(number) — \(String(title.prefix(50)))", symbol: "\(number).square",
+                        shortcut: KeyboardShortcuts.Name.quickSlots[number - 1]) { [weak self] in
+                self?.inTarget { $0.env.pasteSlot(number) }
+            }
+        }
     }
 
     private func recentItems() -> [NSMenuItem] {
@@ -276,12 +306,18 @@ final class ContextMenuController: NSObject {
         }
     }
 
-    private func item(_ title: String, symbol: String, enabled: Bool = true, action: @escaping () -> Void) -> NSMenuItem {
+    /// `shortcut` shows that global shortcut's keys next to the title (nothing when it's unassigned).
+    private func item(_ title: String, symbol: String, enabled: Bool = true, shortcut: KeyboardShortcuts.Name? = nil,
+                      action: @escaping () -> Void) -> NSMenuItem {
         let menuItem = NSMenuItem(title: title, action: #selector(MenuActionTarget.perform(_:)), keyEquivalent: "")
         menuItem.target = MenuActionTarget.shared
         menuItem.representedObject = MenuActionTarget.Handler(action)
         menuItem.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         menuItem.isEnabled = enabled
+        if let shortcut, let keys = KeyboardShortcuts.getShortcut(for: shortcut) {
+            menuItem.setShortcut(keys)
+            pausedShortcuts.append(shortcut)
+        }
         return menuItem
     }
 
@@ -328,3 +364,18 @@ nonisolated private func contextMenuTapCallback(
     }
     return swallow ? nil : Unmanaged.passUnretained(event)
 }
+
+extension ContextMenuController: NSMenuDelegate {
+    // While the menu tracks, global shortcut presses queue up and would fire after it closes;
+    // the menu's own key equivalents handle them instead.
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu.supermenu == nil, !pausedShortcuts.isEmpty else { return }
+        KeyboardShortcuts.disable(pausedShortcuts)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        guard menu.supermenu == nil, !pausedShortcuts.isEmpty else { return }
+        KeyboardShortcuts.enable(pausedShortcuts)
+    }
+}
+

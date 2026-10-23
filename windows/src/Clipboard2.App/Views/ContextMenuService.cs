@@ -143,10 +143,20 @@ public sealed class ContextMenuService : IDisposable
             item.Click += (_, _) => action();
             return item;
         }
+        // Every global shortcut is listed with its keys, as a reminder.
+        string? ShortcutFor(string hotkey) => _services.Settings.Hotkeys.TryGetValue(hotkey, out var combo) && combo.Length > 0 ? combo : null;
         var heading = new MenuItem { Header = "Clipboard2", IsEnabled = false, FontWeight = FontWeights.SemiBold };
         menu.Items.Add(heading);
-        menu.Items.Add(Item("Paste Text from Clipboard Image", Glyphs.Image, () => Do(_services.PasteClipboardAsTextAsync), enabled: ClipboardIO.CurrentImage() is not null));
-        if (!explorer) menu.Items.Add(Item("Actions on Selection…", Glyphs.Sparkle, () => Do(_services.ShowSelectionActionsAsync)));
+        menu.Items.Add(Item("Search Clipboard2…", Glyphs.Search, () => Do(() => { _services.ShowPanel(); return Task.CompletedTask; }), ShortcutFor(Hotkey.QuickPanel)));
+        if (!explorer) menu.Items.Add(Item("Actions on Selection…", Glyphs.Sparkle, () => Do(_services.ShowSelectionActionsAsync), ShortcutFor(Hotkey.SelectionActions)));
+        menu.Items.Add(Item("Paste Text from Clipboard Image", Glyphs.Image, () => Do(_services.PasteClipboardAsTextAsync), ShortcutFor(Hotkey.PasteAsText),
+            enabled: ClipboardIO.CurrentImage() is not null));
+        menu.Items.Add(Item("Capture Text from Screen…", Glyphs.Image, () => Do(_services.CaptureScreenTextAsync), ShortcutFor(Hotkey.CaptureText)));
+        if (_services.Sync.IsSignedIn)
+        {
+            menu.Items.Add(Item("Send Selection to Group", Glyphs.Group, () => Do(_services.SendSelectionToGroupAsync), ShortcutFor(Hotkey.SendToGroup)));
+            menu.Items.Add(Item("Paste from Group", Glyphs.Group, () => Do(_services.PasteFromGroupAsync), ShortcutFor(Hotkey.PasteFromGroup)));
+        }
         menu.Items.Add(Submenu("Recent", Glyphs.Clock, _services.Store.AllItems().Take(12).Select(item =>
             Item(item.DisplayTitle.Length > 60 ? item.DisplayTitle[..60] + "…" : item.DisplayTitle, item.IsPinned ? Glyphs.Pin : Glyphs.Text,
                 () => Do(() => { _services.Paste(item, null); return Task.CompletedTask; })))));
@@ -160,7 +170,13 @@ public sealed class ContextMenuService : IDisposable
             })))));
         menu.Items.Add(Submenu("Secrets", Glyphs.Key, _services.Secrets.All.Select(secret =>
             Item(secret.Name, Glyphs.Key, () => Do(() => { _services.PasteSecret(secret); return Task.CompletedTask; })))));
-        menu.Items.Add(Item("Search Clipboard2…", Glyphs.Search, () => Do(() => { _services.ShowPanel(); return Task.CompletedTask; })));
+        var slots = Enumerable.Range(QuickSlots.First, QuickSlots.Last - QuickSlots.First + 1)
+            .Select(n => (Number: n, Entry: _services.Panel.EntryForSlot(n)))
+            .Where(s => s.Entry is not null)
+            .Select(s => Item($"{s.Number} — {SlotTitle(s.Entry!)}", Glyphs.Pin,
+                () => Do(() => { _services.PasteSlot(s.Number); return Task.CompletedTask; }), ShortcutFor(Hotkey.Slot(s.Number))))
+            .ToList();
+        if (slots.Count > 0) menu.Items.Add(Submenu("Quick Slots", Glyphs.Pin, slots));
         menu.Items.Add(new Separator());
 
         if (explorer)
@@ -179,7 +195,7 @@ public sealed class ContextMenuService : IDisposable
             menu.Items.Add(Item("Cut", Glyphs.Cut, () => Keys(Native.VK_CONTROL, 'X'), "Ctrl+X"));
             menu.Items.Add(Item("Copy", Glyphs.Copy, () => Keys(Native.VK_CONTROL, 'C'), "Ctrl+C"));
             menu.Items.Add(Item("Paste", Glyphs.Paste, () => Keys(Native.VK_CONTROL, 'V'), "Ctrl+V"));
-            menu.Items.Add(Item("Paste as Plain Text", Glyphs.Text, () => Do(_services.PasteClipboardAsTextAsync)));
+            menu.Items.Add(Item("Paste as Plain Text", Glyphs.Text, () => Do(_services.PasteClipboardAsTextAsync), ShortcutFor(Hotkey.PasteAsText)));
             menu.Items.Add(new Separator());
             menu.Items.Add(Item("Select All", Glyphs.SelectAll, () => Keys(Native.VK_CONTROL, 'A'), "Ctrl+A"));
             var at = _location;
@@ -194,6 +210,18 @@ public sealed class ContextMenuService : IDisposable
         var location = _location;
         menu.Items.Add(Item($"Show {appName} Menu", Glyphs.Menu, () => Do(() => { InputSender.Click(location, right: true); return Task.CompletedTask; })));
         return menu;
+
+        static string SlotTitle(PanelEntry entry)
+        {
+            var title = entry switch
+            {
+                PanelEntry.Clip c => c.Item.DisplayTitle,
+                PanelEntry.SnippetEntry s => s.Snippet.Name,
+                PanelEntry.SecretEntry k => k.Secret.Name,
+                _ => "",
+            };
+            return title.Length > 50 ? title[..50] + "…" : title;
+        }
 
         MenuItem Submenu(string header, string glyph, System.Collections.Generic.IEnumerable<MenuItem> items)
         {
