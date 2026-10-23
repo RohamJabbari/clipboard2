@@ -33,12 +33,9 @@ nonisolated enum PanelFilter: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// Content types live in the search bar's filter menu; the other filters are chips. The Inbox
-    /// chip shows only once there are contacts (see `chips(hasContacts:)`).
-    var isContentType: Bool { self == .text || self == .images || self == .files || self == .snippets }
-    static let chips = allCases.filter { !$0.isContentType && $0 != .inbox }
+    /// Every filter in one row; the Inbox joins once there are contacts.
+    static let chips = allCases.filter { $0 != .inbox }
     static func chips(hasContacts: Bool) -> [PanelFilter] { hasContacts ? chips + [.inbox] : chips }
-    static let contentTypes = allCases.filter(\.isContentType)
 }
 
 enum PanelEntry: Identifiable {
@@ -291,6 +288,12 @@ final class PanelViewModel {
         }
     }
     private(set) var entries: [PanelEntry] = []
+    /// Date headings ("Today", "Yesterday"…) keyed by the first row under each; empty while searching.
+    private(set) var sectionStarts: [String: String] = [:]
+    /// ⌘ is down: every row shows its ⌘-number, not just the selected one.
+    var isCommandHeld = false
+    /// Which tip the hint bar shows; moves on with every open.
+    var tipIndex = 0
     /// The focused row (drives the preview and keyboard navigation).
     var selectedID: String? {
         didSet {
@@ -360,6 +363,8 @@ final class PanelViewModel {
         filter = .all
         groupFilter = nil
         userMovedSelection = false
+        isCommandHeld = false
+        tipIndex &+= 1
         env.sync.periodicSync()
         refresh(resetSelection: true)
         focusToken &+= 1
@@ -450,10 +455,11 @@ final class PanelViewModel {
     /// Set by the editor: styles the selection (style bar and ⌘B/⌘I/⌘U).
     @ObservationIgnored var applyStyle: (TextStyle) -> Void = { _ in }
 
-    /// Only this account's own text items: transient selections aren't saved, and group items
-    /// belong to everyone in the group.
+    /// Only this account's own plain text items: transient selections aren't saved, group items
+    /// belong to everyone in the group, and recognised content (a color, a link, JSON, a password…)
+    /// keeps its own preview.
     func isEditable(_ item: ClipItem) -> Bool {
-        item.kind.isTextual && !item.isTransient && item.spaceID == nil
+        item.kind.isTextual && !item.isTransient && item.spaceID == nil && ClipContentCache.content(of: item) == .plain
     }
 
     func beginEditing() {
@@ -577,12 +583,32 @@ final class PanelViewModel {
         }
 
         entries = Array(result.prefix(Self.maxEntries))
+        sectionStarts = q.isEmpty && filter != .snippets && filter != .secrets ? Self.dateSections(entries) : [:]
         if resetSelection || !userMovedSelection || !entries.contains(where: { $0.id == selectedID }) {
             selectedID = entries.first?.id
         } else {
             let live = Set(entries.map(\.id))
             setSelection(selectedIDs.intersection(live), focus: selectedID)
         }
+    }
+
+    /// Today, Yesterday, This Week, Earlier: the first row of each, in list (newest-first) order.
+    private static func dateSections(_ entries: [PanelEntry], now: Date = .now) -> [String: String] {
+        let calendar = Calendar.current
+        let weekAgo = calendar.date(byAdding: .day, value: -7, to: calendar.startOfDay(for: now)) ?? now
+        var starts: [String: String] = [:]
+        var current: String?
+        for entry in entries {
+            guard let date = entry.clip?.lastCopiedAt else { continue }
+            let title = calendar.isDateInToday(date) ? "Today"
+                : calendar.isDateInYesterday(date) ? "Yesterday"
+                : date >= weekAgo ? "This Week" : "Earlier"
+            if title != current {
+                starts[entry.id] = title
+                current = title
+            }
+        }
+        return starts
     }
 
     // MARK: Selection
@@ -692,8 +718,7 @@ final class PanelViewModel {
         showNotice("Deleted \(clips.count) items")
     }
 
-    /// ⇥ walks the filter chips (the Inbox once there are contacts), then each sync group
-    /// (content types are in the search bar's menu).
+    /// ⇥ walks the filters (the Inbox once there are contacts), then each sync group.
     func cycleFilter(forward: Bool) {
         let chips = PanelFilter.chips(hasContacts: !env.sync.contacts.isEmpty)
         let choices: [(PanelFilter, String?)] = chips.map { ($0, nil) } + env.sync.groups.map { (.all, $0.id) }
@@ -730,6 +755,13 @@ final class PanelViewModel {
     }
 
     // MARK: Activation
+
+    /// Pastes text made from the selection (a color as RGB, a phone number's digits) into the target app.
+    func pasteText(_ text: String) {
+        let target = targetApp
+        onClose()
+        env.paste.paste(text: text, into: target)
+    }
 
     func activate(_ entry: PanelEntry?, transform: Transform? = nil) {
         guard let entry else { return }

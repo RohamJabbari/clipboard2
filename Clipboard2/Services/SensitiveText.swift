@@ -32,6 +32,18 @@ nonisolated enum SensitiveText {
             }
         }
 
+        /// Mid-sentence name ("Hidden API key").
+        var inlineName: String {
+            switch self {
+            case .privateKey: "private key"
+            case .cardNumber: "card number"
+            case .apiKey: "API key"
+            case .token: "token"
+            case .code: "code"
+            case .password: "password"
+            }
+        }
+
         /// Every kind has a recognisable format except passwords, which are a guess. Only
         /// confident matches are masked in lists; all of them are kept out of groups.
         var isConfident: Bool { self != .password }
@@ -59,6 +71,20 @@ nonisolated enum SensitiveText {
         if isRandomToken(value) { return .token }
         if isPasswordLike(value) { return .password }
         return nil
+    }
+
+    /// The value with its middle hidden, for list rows: `sk-p••••••••7e1b`, `•••• 1111`.
+    static func masked(_ text: String, kind: Kind) -> String {
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch kind {
+        case .privateKey:
+            return "Private key"
+        case .cardNumber:
+            return "•••• " + String(value.filter(\.isNumber).suffix(4))
+        default:
+            guard value.count > 12 else { return String(repeating: "•", count: 10) }
+            return String(value.prefix(4)) + "••••••••" + String(value.suffix(4))
+        }
     }
 
     // MARK: Rules
@@ -106,6 +132,7 @@ nonisolated enum SensitiveText {
               value.contains(where: \.isUppercase), value.contains(where: \.isLowercase), value.contains(where: \.isNumber)
         else { return false }
         if isPathOrFileName(value) || value.contains("(") { return false }
+        if let first = value.first, let last = value.last, "{[".contains(first), "}]".contains(last) { return false }   // compact JSON
         if let at = value.firstIndex(of: "@"), value[at...].contains(".") { return false }   // an email address
         let hasSymbol = value.contains { !$0.isLetter && !$0.isNumber }
         return (hasSymbol || value.count >= 14) && entropy(value) >= 3.0

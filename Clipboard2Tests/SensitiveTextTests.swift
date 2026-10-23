@@ -39,6 +39,7 @@ struct SensitiveTextTests {
             "9f2c1e7a4b6d8f0e1a2b3c4d5e6f7a8b9c0d1e2f",          // a commit hash
             "550e8400-e29b-41d4-a716-446655440000",              // a UUID
             "{\"name\": \"Clipboard2\", \"version\": \"1.4.0\"}",
+            #"{"name":"Clipboard2","version":"1.4.0"}"#,
             "brew install xcodegen && make debug",
             "Clipboard2",
             "iPhone15Pro",

@@ -1,12 +1,11 @@
 import SwiftUI
+import KeyboardShortcuts
 
 struct QuickPanelView: View {
     @Bindable var model: PanelViewModel
     @Environment(AppEnvironment.self) private var env
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var searchFocused: Bool
-    /// The content-type row that drops down from under the search bar.
-    @State private var showsTypes = false
     /// Files from Finder hovering over the list.
     @State private var listDropTargeted = false
 
@@ -36,11 +35,6 @@ struct QuickPanelView: View {
     var body: some View {
         VStack(spacing: 0) {
             searchBar
-                .zIndex(1)
-            if showsTypes {
-                typeRow
-                    .transition(.move(edge: .top).combined(with: .opacity))
-            }
             FilterChips(selection: $model.filter, groupSelection: $model.groupFilter, groups: env.sync.groups,
                         showsInbox: !model.sendableContacts.isEmpty,
                         thisAppName: model.targetRef?.name, dropModel: model)
@@ -72,7 +66,9 @@ struct QuickPanelView: View {
                     pickedFiles: model.pickedFileCount,
                     updateVersion: env.updates.readyVersion,
                     syncIndicator: env.sync.indicator,
-                    onUpdate: { env.updates.installNow() })
+                    onUpdate: { env.updates.installNow() },
+                    tip: tips.isEmpty ? nil : tips[model.tipIndex % tips.count],
+                    onNextTip: { model.tipIndex &+= 1 })
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear { searchFocused = true }
@@ -84,6 +80,33 @@ struct QuickPanelView: View {
 
     private var listWidth: CGFloat {
         env.prefs.panelSize.size.width * 0.44
+    }
+
+    /// One rotates into the hint bar on every open, with the user's own shortcuts.
+    private var tips: [String] {
+        var tips = ["Hold ⌘ to see each row's quick-paste number",
+                    "⌘⇧1–9 keeps the selected item on that number"]
+        if let keys = KeyboardShortcuts.getShortcut(for: .selectionActions) {
+            tips.append("Select text in any app, then \(keys) to fix or translate it")
+        }
+        if env.prefs.contextMenuEnabled {
+            tips.append("\(env.prefs.contextMenuModifier.symbol)-right-click in any app for Clipboard2's menu")
+        }
+        if let keys = KeyboardShortcuts.getShortcut(for: .pasteAsText) {
+            tips.append("\(keys) pastes the text inside a screenshot")
+        }
+        if let keys = KeyboardShortcuts.getShortcut(for: .captureText) {
+            tips.append("\(keys) copies text from anywhere on screen")
+        }
+        return tips
+    }
+
+    /// Group and member for an item that lives in a sync group.
+    private func sharing(for entry: PanelEntry) -> PreviewSharing? {
+        guard let clip = entry.clip, let spaceID = clip.spaceID,
+              let group = env.sync.groups.first(where: { $0.id == spaceID }) else { return nil }
+        let person = env.sync.copiedBy(clip)
+        return PreviewSharing(group: group.name, person: person == group.name ? nil : person, memberCount: group.memberCount)
     }
 
     // MARK: Search
@@ -99,7 +122,6 @@ struct QuickPanelView: View {
                 .font(.system(size: 21, weight: .regular))
                 .focused($searchFocused)
                 .accessibilityLabel("Search clipboard history and snippets")
-            typeFilterMenu
             if let target = model.targetRef {
                 HStack(spacing: 5) {
                     Image(systemName: "arrow.turn.down.right")
@@ -127,59 +149,6 @@ struct QuickPanelView: View {
         .padding(.bottom, 12)
     }
 
-    private var activeType: PanelFilter? {
-        model.groupFilter == nil && model.filter.isContentType ? model.filter : nil
-    }
-
-    private func setTypesShown(_ shown: Bool) {
-        if reduceMotion { showsTypes = shown } else {
-            withAnimation(.snappy(duration: 0.22)) { showsTypes = shown }
-        }
-    }
-
-    /// Opens the type row under the search bar. Shows the active type so a filtered list is never a surprise.
-    private var typeFilterMenu: some View {
-        let active = activeType
-        return Button { setTypesShown(!showsTypes) } label: {
-            HStack(spacing: 4) {
-                Image(systemName: active == nil ? "line.3.horizontal.decrease.circle" : "line.3.horizontal.decrease.circle.fill")
-                    .font(.system(size: 16, weight: .medium))
-                if let active { Text(active.title).font(.callout.weight(.medium)) }
-                Image(systemName: "chevron.down")
-                    .font(.caption2.weight(.semibold))
-                    .rotationEffect(.degrees(showsTypes ? 180 : 0))
-            }
-            .foregroundStyle(active == nil && !showsTypes ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.accentColor))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .fixedSize()
-        .help("Show only text, images, files or snippets")
-        .accessibilityLabel(active.map { "Filter: \($0.title)" } ?? "Filter by type")
-        .accessibilityValue(showsTypes ? "Expanded" : "Collapsed")
-    }
-
-    /// Everything, Text, Images, Files, Snippets. Picking one applies it and folds the row back up.
-    private var typeRow: some View {
-        HStack(spacing: 6) {
-            FilterChip(title: "Everything", symbol: PanelFilter.all.symbol, selected: activeType == nil) {
-                model.groupFilter = nil
-                model.filter = .all
-                setTypesShown(false)
-            }
-            ForEach(PanelFilter.contentTypes) { type in
-                FilterChip(title: type.title, symbol: type.symbol, selected: activeType == type) {
-                    model.groupFilter = nil
-                    model.filter = type
-                    setTypesShown(false)
-                }
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 14)
-        .padding(.bottom, 8)
-    }
-
     // MARK: List
 
     private var resultsList: some View {
@@ -199,9 +168,15 @@ struct QuickPanelView: View {
                     ScrollView {
                         LazyVStack(spacing: 1) {
                             ForEach(Array(model.entries.enumerated()), id: \.element.id) { index, entry in
+                                if let title = model.sectionStarts[entry.id] {
+                                    SectionHeading(title: title, isFirst: index == 0)
+                                }
                                 PanelRow(entry: entry, shortcut: model.shortcutNumber(for: entry, at: index),
                                          isSelected: model.isSelected(entry),
                                          showsCheckmark: model.isMultiSelecting,
+                                         query: model.query,
+                                         commandHeld: model.isCommandHeld,
+                                         sharing: sharing(for: entry),
                                          badge: entry.clip.flatMap(env.sync.badge))
                                     .id(entry.id)
                                     // One recogniser reading AppKit's click count: SwiftUI's stacked
@@ -347,7 +322,9 @@ struct QuickPanelView: View {
             if model.isMultiSelecting {
                 MultiSelectionPreview(clips: model.selectedClips, totalSelected: model.selectedIDs.count)
             } else if let entry = model.selectedEntry {
-                PreviewPane(entry: entry, onEditSecret: model.beginEditSecret, model: model)
+                PreviewPane(entry: entry, sharing: sharing(for: entry), onEditSecret: model.beginEditSecret,
+                            onPasteText: model.pasteText, onSaveAsSecret: model.beginSaveSecret, model: model)
+                    .id(entry.id)
             } else {
                 Color.clear
             }
@@ -357,6 +334,7 @@ struct QuickPanelView: View {
 
 // MARK: - Filter chips
 
+/// Every filter in one row, then the sync groups.
 struct FilterChips: View {
     @Binding var selection: PanelFilter
     @Binding var groupSelection: String?
@@ -376,12 +354,19 @@ struct FilterChips: View {
     }
 
     private var chips: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 2) {
             ForEach(PanelFilter.chips(hasContacts: showsInbox)) { filter in
-                chip(title(for: filter), symbol: filter.symbol, selected: groupSelection == nil && filter == selection) {
+                FilterChip(title: title(for: filter), selected: groupSelection == nil && filter == selection) {
                     groupSelection = nil
                     selection = filter
                 }
+            }
+            if !groups.isEmpty {
+                Rectangle()
+                    .fill(Color.primary.opacity(0.12))
+                    .frame(width: 1, height: 16)
+                    .padding(.horizontal, 6)
+                    .accessibilityHidden(true)
             }
             ForEach(groups) { group in
                 let select = {
@@ -391,15 +376,12 @@ struct FilterChips: View {
                 if let dropModel {
                     GroupDropChip(group: group, selected: groupSelection == group.id, model: dropModel, action: select)
                 } else {
-                    chip(group.name, symbol: "person.2", selected: groupSelection == group.id, action: select)
+                    FilterChip(title: group.name, symbol: "person.2.fill", tint: .purple, selected: groupSelection == group.id,
+                               action: select)
                 }
             }
             Spacer(minLength: 0)
         }
-    }
-
-    private func chip(_ title: String, symbol: String, selected: Bool, action: @escaping () -> Void) -> some View {
-        FilterChip(title: title, symbol: symbol, selected: selected, action: action)
     }
 
     private func title(for filter: PanelFilter) -> String {
@@ -417,7 +399,7 @@ private struct GroupDropChip: View {
     @State private var targeted = false
 
     var body: some View {
-        FilterChip(title: group.name, symbol: targeted ? "person.2.fill" : "person.2", selected: selected,
+        FilterChip(title: group.name, symbol: "person.2.fill", tint: .purple, selected: selected,
                    dropHighlighted: targeted, action: action)
             .onDrop(of: [.clipboard2Clip, .fileURL],
                     delegate: PanelDropDelegate(target: .group(group.id), model: model, isTargeted: $targeted))
@@ -426,10 +408,11 @@ private struct GroupDropChip: View {
     }
 }
 
-/// One capsule in the filter rows.
+/// One tab in the filter row. Sync groups are tinted, so shared items read as shared everywhere.
 struct FilterChip: View {
     let title: String
-    let symbol: String
+    var symbol: String?
+    var tint: Color?
     let selected: Bool
     /// Something droppable is hovering over this chip.
     var dropHighlighted = false
@@ -442,35 +425,63 @@ struct FilterChip: View {
                 withAnimation(.snappy(duration: 0.15)) { action() }
             }
         } label: {
-            Label {
-                Text(title)
-            } icon: {
-                Image(systemName: symbol).imageScale(.small)
-            }
-                .labelStyle(.titleAndIcon)
-                .font(.callout.weight(.medium))
-                .lineLimit(1)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 4)
-                .foregroundStyle(dropHighlighted ? AnyShapeStyle(Color.accentColor)
-                                 : selected ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
-                .background {
-                    if dropHighlighted {
-                        Capsule(style: .continuous)
-                            .fill(Color.accentColor.opacity(0.16))
-                            .overlay(Capsule(style: .continuous).strokeBorder(Color.accentColor.opacity(0.8), lineWidth: 1.5))
-                    } else if selected {
-                        Capsule(style: .continuous)
-                            .fill(Color.primary.opacity(0.09))
-                            .overlay(Capsule(style: .continuous).strokeBorder(Color.primary.opacity(0.07)))
-                    }
+            HStack(spacing: 5) {
+                if let symbol {
+                    Image(systemName: symbol).imageScale(.small)
                 }
-                .contentShape(Capsule())
-                .scaleEffect(dropHighlighted && !reduceMotion ? 1.06 : 1)
+                Text(title)
+            }
+            .font(.callout.weight(selected ? .semibold : .medium))
+            .lineLimit(1)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .foregroundStyle(foreground)
+            .background { background }
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .scaleEffect(dropHighlighted && !reduceMotion ? 1.06 : 1)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(title) filter")
         .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private var foreground: AnyShapeStyle {
+        if dropHighlighted { return AnyShapeStyle(tint ?? .accentColor) }
+        if let tint { return selected ? AnyShapeStyle(.white) : AnyShapeStyle(tint) }
+        return selected ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary)
+    }
+
+    @ViewBuilder
+    private var background: some View {
+        let shape = RoundedRectangle(cornerRadius: 8, style: .continuous)
+        if dropHighlighted {
+            let color = tint ?? .accentColor
+            shape.fill(color.opacity(0.16))
+                .overlay(shape.strokeBorder(color.opacity(0.8), lineWidth: 1.5))
+        } else if let tint {
+            shape.fill(selected ? AnyShapeStyle(tint) : AnyShapeStyle(tint.opacity(0.13)))
+        } else if selected {
+            shape.fill(.background)
+                .shadow(color: .black.opacity(0.12), radius: 1.5, y: 0.5)
+                .overlay(shape.strokeBorder(Color.primary.opacity(0.08)))
+        }
+    }
+}
+
+/// "Today", "Yesterday"… above the first row of each day in the list.
+struct SectionHeading: View {
+    let title: String
+    var isFirst = false
+
+    var body: some View {
+        Text(title)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.top, isFirst ? 4 : 12)
+            .padding(.bottom, 3)
+            .accessibilityAddTraits(.isHeader)
     }
 }
 
@@ -481,8 +492,15 @@ struct PanelRow: View {
     let shortcut: (number: Int, isSlot: Bool)?
     let isSelected: Bool
     var showsCheckmark = false
-    /// For a sync group item: who copied it (their username); for a contact's: who it's from or to.
+    /// Characters it matched are highlighted in the title.
+    var query = ""
+    /// ⌘ is held: show every row's ⌘-number.
+    var commandHeld = false
+    /// For a sync group item: the group and who copied it, shown under the title.
+    var sharing: PreviewSharing?
+    /// For a contact's item: who it's from or to (group items show `sharing` instead).
     var badge: SyncBadge?
+    @State private var hovering = false
 
     var body: some View {
         HStack(spacing: 10) {
@@ -493,20 +511,17 @@ struct PanelRow: View {
                     .transition(.scale.combined(with: .opacity))
                     .accessibilityHidden(true)
             }
-            leading
+            ContentBadge(kind: badgeKind, isSelected: isSelected)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title)
+                Text(SearchHighlight.text(title, query: query, onAccent: isSelected))
                     .font(.system(size: 13.5))
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
-                Text(subtitle)
-                    .font(.caption)
-                    .lineLimit(1)
-                    .foregroundStyle(isSelected ? AnyShapeStyle(.white.opacity(0.8)) : AnyShapeStyle(.secondary))
+                subtitleLine
             }
             Spacer(minLength: 4)
-            if let badge {
+            if let badge, sharing == nil {
                 Label(badge.text, systemImage: badge.symbol)
                     .labelStyle(.titleAndIcon)
                     .font(.caption2)
@@ -524,67 +539,93 @@ struct PanelRow: View {
                     .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
                     .accessibilityHidden(true)
             }
-            if let shortcut {
+            if let shortcut, shortcut.isSlot || isSelected || hovering || commandHeld {
                 Text("⌘\(shortcut.number)")
-                    .font(.caption.monospacedDigit().weight(shortcut.isSlot ? .semibold : .regular))
-                    .padding(.horizontal, shortcut.isSlot ? 5 : 0)
-                    .padding(.vertical, shortcut.isSlot ? 1 : 0)
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
                     .background {
-                        if shortcut.isSlot {
-                            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                .strokeBorder(isSelected ? AnyShapeStyle(.white.opacity(0.7)) : AnyShapeStyle(.tint))
-                        }
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .strokeBorder(isSelected ? AnyShapeStyle(.white.opacity(0.6))
+                                          : shortcut.isSlot ? AnyShapeStyle(.tint) : AnyShapeStyle(.quaternary))
                     }
-                    .foregroundStyle(isSelected ? AnyShapeStyle(.white.opacity(0.9))
-                                     : shortcut.isSlot ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
-                    .help(shortcut.isSlot ? "Quick slot ⌘\(shortcut.number)" : "")
+                    .foregroundStyle(isSelected ? AnyShapeStyle(.white)
+                                     : shortcut.isSlot ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                    .help(shortcut.isSlot ? "Quick slot ⌘\(shortcut.number)" : "⌘\(shortcut.number) pastes this row")
                     .accessibilityHidden(true)
             }
         }
-        .padding(.horizontal, 9)
+        .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background {
-            if isSelected {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.accentColor.gradient)
-                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(.white.opacity(0.12)))
-            }
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(isSelected ? AnyShapeStyle(Color.accentColor)
+                      : hovering ? AnyShapeStyle(Color.primary.opacity(0.05)) : AnyShapeStyle(.clear))
         }
         .contentShape(Rectangle())
+        .onHover { hovering = $0 }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityText + (badge.map { ", \($0.help)" } ?? "")
+        .accessibilityLabel(accessibilityText + (sharing.map { ", shared in \($0.group)" } ?? badge.map { ", \($0.help)" } ?? "")
                             + (shortcut?.isSlot == true ? ", quick slot \(shortcut?.number ?? 0)" : ""))
         .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : .isButton)
         .accessibilityHint("Double-click or press Return to paste")
     }
 
-    @ViewBuilder
-    private var leading: some View {
+    private var badgeKind: ContentBadge.Kind {
         switch entry {
-        case .clip(let item):
-            ClipIconView(item: item, size: 28)
-        case .snippet:
-            Image(systemName: "text.badge.star")
-                .font(.system(size: 16))
-                .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.tint))
-                .frame(width: 28, height: 28)
-                .accessibilityHidden(true)
-        case .secret:
-            Image(systemName: "key.fill")
-                .font(.system(size: 15))
-                .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.tint))
-                .frame(width: 28, height: 28)
-                .accessibilityHidden(true)
+        case .clip(let item): .clip(item)
+        case .snippet: .snippet
+        case .secret: .secret
         }
+    }
+
+    /// A confidently recognised credential, hidden in the list until selected and revealed.
+    private var hiddenKind: SensitiveText.Kind? {
+        guard case .clip(let item) = entry, case .sensitive(let kind) = ClipContentCache.content(of: item),
+              kind.isConfident else { return nil }
+        return kind
     }
 
     private var title: String {
         switch entry {
-        case .clip(let item): item.displayTitle
-        case .snippet(let snippet): snippet.name.isEmpty ? "Untitled Snippet" : snippet.name
-        case .secret(let ref): ref.name
+        case .clip(let item):
+            if item.label == nil, let hiddenKind { return SensitiveText.masked(item.text, kind: hiddenKind) }
+            return item.displayTitle
+        case .snippet(let snippet): return snippet.name.isEmpty ? "Untitled Snippet" : snippet.name
+        case .secret(let ref): return ref.name
         }
+    }
+
+    private var subtitleLine: some View {
+        HStack(spacing: 4) {
+            if let sharing {
+                Image(systemName: "person.2.fill")
+                    .imageScale(.small)
+                    .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.purple))
+                Text(sharing.person.map { "\($0) in \(sharing.group)" } ?? sharing.group)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.purple))
+                Text("·")
+            } else if let hiddenKind {
+                Image(systemName: "eye.slash.fill")
+                    .imageScale(.small)
+                    .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.orange))
+                Text("Hidden \(hiddenKind.inlineName)")
+                    .fontWeight(.semibold)
+                    .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.orange))
+                Text("·")
+            }
+            if case .clip(let item) = entry, item.label == nil, let bundleID = item.sourceBundleID {
+                Image(nsImage: AppIconCache.icon(for: bundleID))
+                    .resizable()
+                    .frame(width: 12, height: 12)
+                    .accessibilityHidden(true)
+            }
+            Text(subtitle)
+        }
+        .font(.caption)
+        .lineLimit(1)
+        .foregroundStyle(isSelected ? AnyShapeStyle(.white.opacity(0.85)) : AnyShapeStyle(.secondary))
     }
 
     private var subtitle: String {
@@ -592,22 +633,27 @@ struct PanelRow: View {
         case .clip(let item):
             if item.label != nil {
                 // Labelled: the label is the title, the value goes underneath.
-                item.preview.isEmpty ? item.kind.displayName : item.preview
-            } else {
-                [item.sourceAppName, item.lastCopiedAt.shortRelative].compactMap { $0 }.joined(separator: " · ")
+                if let hiddenKind { return SensitiveText.masked(item.text, kind: hiddenKind) }
+                return item.preview.isEmpty ? item.kind.displayName : item.preview
             }
+            if sharing != nil { return item.lastCopiedAt.shortRelative }
+            return [item.sourceAppName, item.lastCopiedAt.shortRelative].compactMap { $0 }.joined(separator: " · ")
         case .snippet(let snippet):
-            snippet.keyword.isEmpty ? "Snippet" : "Snippet · \(snippet.keyword)"
+            return snippet.keyword.isEmpty ? "Snippet" : "Snippet · \(snippet.keyword)"
         case .secret:
-            "••••••••"
+            return "Secret · ••••••••"
         }
     }
 
     private var accessibilityText: String {
         switch entry {
-        case .clip(let item): item.accessibilityDescription
-        case .snippet(let snippet): "Snippet \(snippet.name)"
-        case .secret(let ref): "Secret \(ref.name)"
+        case .clip(let item):
+            if let hiddenKind {
+                return "Hidden \(hiddenKind.inlineName)" + (item.sourceAppName.map { ", from \($0)" } ?? "")
+            }
+            return item.accessibilityDescription
+        case .snippet(let snippet): return "Snippet \(snippet.name)"
+        case .secret(let ref): return "Secret \(ref.name)"
         }
     }
 }
@@ -628,6 +674,9 @@ struct HintBar: View {
     /// Sync state, shown as a dot and a few words at the trailing end while signed in.
     var syncIndicator: SyncIndicator = .hidden
     var onUpdate: () -> Void = {}
+    /// A rotating tip that teaches one shortcut at a time; clicking shows the next.
+    var tip: String?
+    var onNextTip: () -> Void = {}
 
     var body: some View {
         HStack(spacing: 14) {
@@ -650,7 +699,6 @@ struct HintBar: View {
                 if entry != nil {
                     hint("⌘K", "Actions")
                     if canEditText { hint("⌘E", "Edit") }
-                    hint("⌘⇧1–9", "Assign Slot")
                 }
             case .actions:
                 hint("↑↓", "Choose")
@@ -668,7 +716,7 @@ struct HintBar: View {
                 hint("⌘C", "Copy")
                 hint("⌘R", "Replace Item")
             }
-            Spacer()
+            Spacer(minLength: 8)
             if let notice {
                 Text(notice)
                     .foregroundStyle(.primary)
@@ -681,8 +729,23 @@ struct HintBar: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.tint)
                 .help("Clipboard2 \(updateVersion) is ready. Relaunches in a second; your history stays.")
-            } else if mode == .browse && !syncIndicator.isVisible {
-                hint("⇥", "Filter")
+            } else if let tip, mode == .browse, selectionCount == nil, !syncIndicator.isVisible {
+                Button(action: onNextTip) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "lightbulb")
+                        Text(tip).lineLimit(1).truncationMode(.tail)
+                        Image(systemName: "chevron.right").imageScale(.small)
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 3)
+                    .background(Color.accentColor.opacity(0.1), in: Capsule())
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tint)
+                .help("Next tip")
+                .accessibilityLabel("Tip: \(tip)")
+                .accessibilityHint("Shows the next tip")
             }
             if notice == nil && syncIndicator.isVisible {
                 // Quiet by design: the dot carries the state, the text says when.
@@ -708,6 +771,7 @@ struct HintBar: View {
                 .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
             Text(label)
         }
+        .fixedSize()
     }
 }
 
