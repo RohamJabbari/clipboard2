@@ -203,7 +203,9 @@ struct ShareToGroupView: View {
         VStack(alignment: .leading, spacing: 14) {
             Label("Share to Group", systemImage: "person.2.fill")
                 .font(.headline)
-            Text(form.items.count == 1
+            Text(form.secret != nil
+                 ? "Sends a copy of this secret to the group, end-to-end encrypted. Members paste it after their own Touch ID or password. Changing yours later won't change theirs."
+                 : form.items.count == 1
                  ? "Copies this item into the group. Every member sees it, end-to-end encrypted."
                  : "Copies \(form.items.count) items into the group. Every member sees them, end-to-end encrypted.")
                 .font(.callout)

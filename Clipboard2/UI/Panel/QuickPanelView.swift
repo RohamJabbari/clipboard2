@@ -205,6 +205,9 @@ struct QuickPanelView: View {
         if case .secret = entry {
             Button("Edit…") { if case .secret(let ref) = entry { model.beginEditSecret(ref) } }
             Button("Rename…") { model.beginLabel(entry) }
+            if case .secret(let ref) = entry, model.canShareToGroup, env.sync.groups.contains(where: { $0.id != ref.spaceID }) {
+                Button("Share to Group…") { model.beginShareSecret(ref) }
+            }
         }
         Menu("Assign to Quick Slot") {
             ForEach(QuickSlots.range, id: \.self) { n in

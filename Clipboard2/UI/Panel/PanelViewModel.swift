@@ -195,11 +195,14 @@ final class EditSecretState {
 @Observable
 final class ShareGroupState {
     let items: [ClipItem]
+    /// Set when sharing a secret instead of clips; its value is read (after Touch ID) only on submit.
+    let secret: SecretRef?
     let groups: [SyncGroup]
     var selection: Int
 
-    init(items: [ClipItem], groups: [SyncGroup], defaultGroupID: String?) {
+    init(items: [ClipItem] = [], secret: SecretRef? = nil, groups: [SyncGroup], defaultGroupID: String?) {
         self.items = items
+        self.secret = secret
         self.groups = groups
         self.selection = groups.firstIndex { $0.id == defaultGroupID } ?? 0
     }
@@ -701,8 +704,39 @@ final class PanelViewModel {
 
     func submitShare() {
         guard let form = shareForm, let group = form.selectedGroup else { return }
-        share(form.items, to: group)
         resetMode()
+        if let ref = form.secret {
+            Task {
+                guard let value = await env.secrets.reveal(ref, reason: "share “\(ref.name)” with \(group.name)") else { return }
+                shareSecret(ref, value: value, to: group)
+            }
+        } else {
+            share(form.items, to: group)
+        }
+    }
+
+    func beginShareSecret(_ ref: SecretRef) {
+        let groups = env.sync.groups.filter { $0.id != ref.spaceID }
+        guard canShareToGroup, !groups.isEmpty else { return }
+        selectedID = PanelEntry.secret(ref).id
+        shareForm = ShareGroupState(secret: ref, groups: groups, defaultGroupID: env.prefs.syncDefaultGroupID)
+        mode = .shareToGroup
+    }
+
+    /// Stores a copy of the secret in the group's space. Yours stays as it is; later edits don't follow.
+    func shareSecret(_ ref: SecretRef, value: String, to group: SyncGroup) {
+        let already = env.secrets.secrets.contains {
+            $0.spaceID == group.id && $0.name == ref.name && SecretVault.value(id: $0.id) == value
+        }
+        if !already {
+            guard env.secrets.add(name: ref.name, value: value, spaceID: group.id) != nil else {
+                showNotice("Couldn't save to the Keychain")
+                return
+            }
+            env.sync.syncNow()
+            refresh()
+        }
+        showNotice(already ? "“\(ref.name)” is already in \(group.name)" : "Shared “\(ref.name)” with \(group.name)")
     }
 
     /// Copies items into a group's space with new ids (selected text from another app is stored there).
@@ -783,9 +817,10 @@ final class PanelViewModel {
             actions.append(.togglePin)
         case .snippet:
             break
-        case .secret:
+        case .secret(let ref):
             actions.append(.copy)
             actions.append(.setLabel)
+            if canShareToGroup && env.sync.groups.contains(where: { $0.id != ref.spaceID }) { actions.append(.shareToGroup) }
         }
         if let slot = env.slots.slot(for: entry.slotTarget) {
             actions.append(.clearSlot(slot))
@@ -869,7 +904,11 @@ final class PanelViewModel {
         case .setLabel:
             beginLabel(entry)
         case .shareToGroup:
-            if let item = entry.clip { beginShare([item]) }
+            if let item = entry.clip {
+                beginShare([item])
+            } else if case .secret(let ref) = entry {
+                beginShareSecret(ref)
+            }
         case .setUpAI:
             onClose()
             SettingsOpener.open()

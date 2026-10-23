@@ -152,8 +152,8 @@ final class SecretStore {
     }
 
     @discardableResult
-    func add(name: String, value: String) -> SecretRef? {
-        let ref = SecretVault.add(name: name, value: value)
+    func add(name: String, value: String, spaceID: String? = nil) -> SecretRef? {
+        let ref = SecretVault.add(name: name, value: value, spaceID: spaceID)
         reload()
         return ref
     }

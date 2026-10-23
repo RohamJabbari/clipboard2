@@ -226,3 +226,31 @@ struct EditSecretTests {
         #expect(SecretVault.value(id: ref.id) == "hunter2")
     }
 }
+
+@MainActor
+struct ShareSecretTests {
+    let env = AppEnvironment.shared
+    let model: PanelViewModel
+
+    init() {
+        model = PanelViewModel(env: env)
+    }
+
+    @Test func sharingASecretCopiesItIntoTheGroupOnce() throws {
+        let ref = try #require(env.secrets.add(name: "Clipboard2 share test", value: "hunter2"))
+        let group = SyncGroup(id: "group-\(UUID().uuidString)", name: "Team", isOwner: true, memberCount: 2)
+        defer {
+            for secret in env.secrets.secrets where secret.name == "Clipboard2 share test" { env.secrets.delete(secret) }
+        }
+
+        model.shareSecret(ref, value: "hunter2", to: group)
+        model.shareSecret(ref, value: "hunter2", to: group)   // again: no duplicate
+        let copies = env.secrets.secrets.filter { $0.spaceID == group.id }
+        #expect(copies.count == 1)
+        let copy = try #require(copies.first)
+        #expect(copy.id != ref.id && copy.name == ref.name)
+        #expect(SecretVault.value(id: copy.id) == "hunter2")
+        #expect(env.secrets.secrets.first { $0.id == ref.id }?.spaceID == nil)   // yours stays personal
+    }
+}
+
