@@ -141,6 +141,7 @@ Pinning or unpinning changes the category, and the category is part of the AAD, 
 | `not_found` | 404 |
 | `no_account` | 404 |
 | `conflict` | 409 |
+| `username_taken` | 409 |
 | `invalid` | 400 |
 | `too_large` | 413 |
 | `quota_exceeded` | 403 |
@@ -151,17 +152,19 @@ Pinning or unpinning changes the category, and the category is part of the AAD, 
 | Request | Response |
 |---|---|
 | `POST /v1/auth/prelogin` `{email}` | `{kdf: {alg: "pbkdf2-sha256", salt, iterations}}`. Unknown emails get a deterministic fake salt (`HMAC-SHA256(serverKey, email)[0..16]`, 600 000 iterations), so this can't be used to find accounts. |
-| `POST /v1/auth/signup` `{email, authKey, kdf: {salt, iterations}, uid, wrappedAccountKey, publicKey, wrappedPrivateKey, personalSpace: {id, wrappedKey}, deviceName?}` | `201 Session`; `409 conflict` if the email is taken |
+| `POST /v1/auth/signup` `{email, authKey, kdf: {salt, iterations}, uid, wrappedAccountKey, publicKey, wrappedPrivateKey, personalSpace: {id, wrappedKey}, deviceName?, username?}` | `201 Session`; `409 conflict` if the email is taken, `409 username_taken` if the username is |
 | `POST /v1/auth/login` `{email, authKey, deviceName?}` | `200 Session`; `401 invalid_credentials` |
 | `POST /v1/auth/logout` | `204`, revokes the calling session |
 | `PUT /v1/account/password` `{authKey, newAuthKey, kdf: {salt, iterations}, wrappedAccountKey}` | `204`. Checks the current `authKey`, replaces the password verifier and `wrappedAK` (AK itself doesn't change), and revokes every other session. |
 | `GET /v1/account` | `Account` |
+| `PUT /v1/account/username` `{username}` | `200 {username}`; `409 username_taken` |
 | `DELETE /v1/account` `{authKey}` | `204`. Deletes sessions, the personal space, owned groups (items, blobs, invites) and memberships. Items the user wrote in other people's groups stay. |
 
 ```jsonc
 Session = {"token","expiresAt","account": Account}
 Account = {"uid","email","kdf":{"alg":"pbkdf2-sha256","salt","iterations"},
-           "wrappedAccountKey","publicKey","wrappedPrivateKey","personalSpaceId"}
+           "wrappedAccountKey","publicKey","wrappedPrivateKey","personalSpaceId",
+           "username":null|"<string>"}
 ```
 
 - **Tokens:** 32 random bytes as base64url. The server stores only their SHA-256.
@@ -169,6 +172,7 @@ Account = {"uid","email","kdf":{"alg":"pbkdf2-sha256","salt","iterations"},
 - **On the device:** the token, uid, email, AK and idPriv go in the Keychain (Mac, service `<bundle id>.sync`) or Credential Manager (Windows, `Clipboard2/sync/*`), never in settings files.
 - **Session ended:** on `401 unauthenticated` the client asks for the password again (prelogin, then login), unlocks AK from the fresh `Account`, and carries on.
 - **Signup:** `kdf.iterations` must be at least 100 000.
+- **Usernames:** optional; trimmed and NFC-normalized, then 3–24 Unicode letters, digits, `_`, `.` or `-`, starting with a letter or digit (`invalid` otherwise). Stored as typed, unique case-insensitively. Accounts without one have `username: null`.
 - **Rate limits:** prelogin, signup and login share one limit per IP and one per email.
 
 ### Spaces and groups
@@ -181,13 +185,16 @@ Account = {"uid","email","kdf":{"alg":"pbkdf2-sha256","salt","iterations"},
 | `POST /v1/groups` `{id, encryptedName, wrappedKey}` | `201 Space`. The caller becomes owner; `wrappedKey` is SK wrapped to the caller. |
 | `PATCH /v1/groups/:id` `{encryptedName}` | `204`, owner only |
 | `DELETE /v1/groups/:id` | `204`, owner only. Removes all items, blobs and invites. |
-| `GET /v1/groups/:id/members` | `{members: [{uid, email, role}]}`, members only |
+| `GET /v1/groups/:id/members` | `{members: [{uid, email, username, role}]}`, members only; `username` may be `null` |
 | `DELETE /v1/groups/:id/members/:uid` | `204`. The owner can remove others; a member can remove themselves (leave). The owner can't leave and has to delete the group instead. |
 
 ```jsonc
 Space = {"id","kind":"personal|group","role":"owner|member","ownerUid",
-         "wrappedKey","encryptedName":null|"<b64>","memberCount","createdAt"}
+         "wrappedKey","encryptedName":null|"<b64>","memberCount",
+         "members":[{"uid","name"}],"createdAt"}
 ```
+
+- **`members`:** everyone in the space, owner first (a personal space lists only the caller). `name` is the username, or the email's part before `@` if there is none. Clients show it next to items by matching `authorUid`.
 
 ### Invites
 
@@ -259,7 +266,7 @@ Item = {"id","category":"history|pinned|snippet|secret","seq","sortAt","updatedA
 ## What the server sees
 
 **Visible to the server:**
-- email
+- email and username
 - the scrypt of `authKey`
 - KDF salt and iterations
 - session hashes

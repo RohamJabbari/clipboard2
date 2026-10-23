@@ -49,6 +49,9 @@ export class ApiError extends Error {
 }
 
 const notFound = () => new ApiError(404, "not_found", "Not found");
+const usernameTaken = () => new ApiError(409, "username_taken", "That username is taken");
+/** The unique index on lower(username) fired (a race past the explicit check). */
+const isUsernameConflict = (error: { code?: string; constraint?: string }) => error.code === "23505" && error.constraint === "users_username";
 const forbidden = (message = "Not allowed") => new ApiError(403, "forbidden", message);
 
 // MARK: Schemas
@@ -69,9 +72,16 @@ const publicKey = b64(65).refine((b) => b.length === 65 && b[0] === 0x04, "X9.63
 const email = z.string().trim().toLowerCase().pipe(z.email().max(320));
 const authKey = b64(32).refine((b) => b.length === 32, "32-byte authKey");
 const deviceName = z.string().max(100).optional();
+/** 3–24 Unicode letters, digits, `_`, `.` or `-`, starting with a letter or digit. NFC so look-alikes can't dodge uniqueness. */
+const username = z
+  .string()
+  .trim()
+  .transform((s) => s.normalize("NFC"))
+  .pipe(z.string().regex(/^[\p{L}\p{Nd}][\p{L}\p{Nd}_.-]{2,23}$/u, "3–24 letters, digits, _ . or -, starting with a letter or digit"));
 const preloginBody = z.object({ email });
 const signupBody = z.object({
   email,
+  username: username.optional(),
   authKey,
   kdf,
   uid: uuid,
@@ -84,6 +94,7 @@ const signupBody = z.object({
 const loginBody = z.object({ email, authKey, deviceName });
 const passwordBody = z.object({ authKey, newAuthKey: authKey, kdf, wrappedAccountKey: sealed });
 const reauthBody = z.object({ authKey });
+const usernameBody = z.object({ username });
 const groupBody = z.object({ id: uuid, encryptedName: sealed, wrappedKey: sealed });
 const renameBody = z.object({ encryptedName: sealed });
 const inviteId = z.string().regex(/^[0-9a-f]{64}$/, "64 hex chars");
@@ -272,6 +283,7 @@ export function buildApp(deps: Deps): FastifyInstance {
   const accountJson = (r: {
     uid: string;
     email: string;
+    username: string | null;
     kdf_salt: Buffer;
     kdf_iterations: number;
     wrapped_account_key: Buffer;
@@ -281,6 +293,7 @@ export function buildApp(deps: Deps): FastifyInstance {
   }) => ({
     uid: r.uid,
     email: r.email,
+    username: r.username,
     kdf: { alg: "pbkdf2-sha256", salt: r.kdf_salt.toString("base64"), iterations: r.kdf_iterations },
     wrappedAccountKey: r.wrapped_account_key.toString("base64"),
     publicKey: r.public_key.toString("base64"),
@@ -307,12 +320,17 @@ export function buildApp(deps: Deps): FastifyInstance {
     const result = await tx(pool, async (db) => {
       const existing = await db.query("SELECT 1 FROM users WHERE lower(email) = $1", [body.email]);
       if (existing.rowCount) throw new ApiError(409, "conflict", "An account with that email already exists");
+      if (body.username) {
+        const taken = await db.query("SELECT 1 FROM users WHERE lower(username) = lower($1)", [body.username]);
+        if (taken.rowCount) throw usernameTaken();
+      }
       const { rows } = await db.query(
-        `INSERT INTO users (uid, email, auth_salt, auth_hash, kdf_salt, kdf_iterations, wrapped_account_key, public_key, wrapped_private_key, personal_space_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+        `INSERT INTO users (uid, email, username, auth_salt, auth_hash, kdf_salt, kdf_iterations, wrapped_account_key, public_key, wrapped_private_key, personal_space_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
         [
           body.uid,
           body.email,
+          body.username ?? null,
           verifier.salt,
           verifier.hash,
           body.kdf.salt,
@@ -330,7 +348,8 @@ export function buildApp(deps: Deps): FastifyInstance {
         body.personalSpace.wrappedKey,
       ]);
       return { ...(await startSession(db, body.uid, body.deviceName)), account: accountJson(rows[0]) };
-    }).catch((error: { code?: string }) => {
+    }).catch((error: { code?: string; constraint?: string }) => {
+      if (isUsernameConflict(error)) throw usernameTaken();
       if (error.code === "23505") throw new ApiError(409, "conflict", "An account with that email already exists");
       throw error;
     });
@@ -355,6 +374,18 @@ export function buildApp(deps: Deps): FastifyInstance {
     const { rows } = await pool.query("SELECT * FROM users WHERE uid = $1", [request.caller.uid]);
     if (!rows[0]) throw new ApiError(404, "no_account", "No sync account");
     return accountJson(rows[0]);
+  });
+
+  app.put("/v1/account/username", async (request) => {
+    const body = usernameBody.parse(request.body);
+    const { rows } = await pool
+      .query<{ username: string }>("UPDATE users SET username = $2 WHERE uid = $1 RETURNING username", [request.caller.uid, body.username])
+      .catch((error: { code?: string; constraint?: string }) => {
+        if (isUsernameConflict(error)) throw usernameTaken();
+        throw error;
+      });
+    if (!rows[0]) throw new ApiError(404, "no_account", "No sync account");
+    return { username: rows[0].username };
   });
 
   app.put("/v1/account/password", async (request, reply) => {
@@ -402,6 +433,7 @@ export function buildApp(deps: Deps): FastifyInstance {
     wrapped_key: Buffer;
     encrypted_name: Buffer | null;
     member_count: number;
+    members: { uid: string; name: string }[];
     created_at: Date;
   }) => ({
     id: r.id,
@@ -411,11 +443,16 @@ export function buildApp(deps: Deps): FastifyInstance {
     wrappedKey: r.wrapped_key.toString("base64"),
     encryptedName: r.encrypted_name ? r.encrypted_name.toString("base64") : null,
     memberCount: Number(r.member_count),
+    members: r.members,
     createdAt: r.created_at.getTime(),
   });
 
+  // members: display name is the username, else the email's local part. Owner first, then by join order.
   const SPACE_SELECT = `SELECT s.id, s.kind, m.role, s.owner_uid, m.wrapped_key, s.encrypted_name, s.created_at,
-      (SELECT count(*) FROM space_members x WHERE x.space_id = s.id) AS member_count
+      (SELECT count(*) FROM space_members x WHERE x.space_id = s.id) AS member_count,
+      (SELECT COALESCE(json_agg(json_build_object('uid', x.uid, 'name', COALESCE(u.username, split_part(u.email, '@', 1)))
+                                ORDER BY x.role DESC, x.added_at, x.uid), '[]'::json)
+         FROM space_members x JOIN users u ON u.uid = x.uid WHERE x.space_id = s.id) AS members
     FROM space_members m JOIN spaces s ON s.id = m.space_id`;
 
   app.get("/v1/spaces", async (request) => {
@@ -466,8 +503,8 @@ export function buildApp(deps: Deps): FastifyInstance {
     const id = uuid.parse(request.params.id);
     const membership = await requireMember(pool, id, request.caller.uid);
     if (membership.kind !== "group") throw notFound();
-    const { rows } = await pool.query<{ uid: string; email: string; role: string }>(
-      "SELECT m.uid, u.email, m.role FROM space_members m JOIN users u ON u.uid = m.uid WHERE m.space_id = $1 ORDER BY m.role DESC, u.email",
+    const { rows } = await pool.query<{ uid: string; email: string; username: string | null; role: string }>(
+      "SELECT m.uid, u.email, u.username, m.role FROM space_members m JOIN users u ON u.uid = m.uid WHERE m.space_id = $1 ORDER BY m.role DESC, u.email",
       [id],
     );
     return { members: rows };

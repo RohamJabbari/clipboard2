@@ -46,7 +46,7 @@ beforeAll(async () => {
   await embedded.start();
   await embedded.createDatabase("c2test");
   pool = new pg.Pool({ connectionString: `postgres://postgres:postgres@localhost:${port}/c2test`, max: 4 });
-  expect(await migrate(pool)).toEqual(["001_init.sql"]);
+  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql"]);
   expect(await migrate(pool)).toEqual([]);
 }, 120_000);
 
@@ -91,7 +91,14 @@ async function call(user: TestUser | string | null, method: string, url: string,
 }
 
 /** Signs up exactly as a client would: password-derived keys, client-chosen uid, only authKey sent. */
-async function signUp(name: string, password = "pw-" + name): Promise<TestUser> {
+async function signUp(name: string, password = "pw-" + name, extra: Record<string, unknown> = {}): Promise<TestUser> {
+  const { res, user } = await trySignUp(name, password, extra);
+  expect(res.status).toBe(201);
+  expect(res.body.account.email).toBe(user.email);
+  return { ...user, token: res.body.token };
+}
+
+async function trySignUp(name: string, password = "pw-" + name, extra: Record<string, unknown> = {}) {
   const uid = randomUUID();
   const email = `${name}-${uid.slice(0, 6)}@example.com`;
   const salt = randomBytes(16);
@@ -110,10 +117,9 @@ async function signUp(name: string, password = "pw-" + name): Promise<TestUser> 
     wrappedPrivateKey: b64(cc.aeadSeal(ak, id.priv, cc.aad.privateKey(uid))),
     personalSpace: { id: personalSpaceId, wrappedKey: b64(cc.wrapSpaceKey(personalKey, personalSpaceId, uid, id.pub)) },
     deviceName: "test",
+    ...extra,
   });
-  expect(res.status).toBe(201);
-  expect(res.body.account.email).toBe(email);
-  return { uid, email, password, token: res.body.token, id, ak, personalSpaceId, personalKey };
+  return { res, user: { uid, email, password, id, ak, personalSpaceId, personalKey } };
 }
 
 /** A second device: prelogin, derive, login. */
@@ -377,6 +383,125 @@ describe("account", () => {
     expect((await call(alice, "GET", "/v1/account")).status).toBe(401);
     expect((await logIn(alice.email, alice.password)).status).toBe(401);
     expect((await call(bob, "GET", "/v1/spaces")).body.spaces).toHaveLength(1);
+  });
+});
+
+describe("usernames", () => {
+  it("signs up with or without a username and returns it on every account", async () => {
+    const plain = await signUp("plain");
+    expect((await call(plain, "GET", "/v1/account")).body.username).toBeNull();
+
+    const { res, user } = await trySignUp("named", "pw", { username: "  Jürgen_K.  " });
+    expect(res.status).toBe(201);
+    expect(res.body.account.username).toBe("Jürgen_K.");
+    expect((await call(res.body.token, "GET", "/v1/account")).body.username).toBe("Jürgen_K.");
+    expect((await logIn(user.email, "pw")).body.account.username).toBe("Jürgen_K.");
+  });
+
+  it("rejects invalid usernames with 400", async () => {
+    for (const bad of ["ab", "_alice", ".alice", "-alice", "a".repeat(25), "al ice", "al@ice", "ali😀", "", "   "]) {
+      const { res } = await trySignUp("bad", "pw", { username: bad });
+      expect(res.status, bad).toBe(400);
+      expect(res.body.error).toBe("invalid");
+    }
+    for (const good of ["abc", "a".repeat(24), "9lives", "名前です", "a-b.c_d"]) {
+      expect((await trySignUp("good", "pw", { username: good })).res.status, good).toBe(201);
+    }
+    const alice = await signUp("alice");
+    expect((await call(alice, "PUT", "/v1/account/username", { username: "x" })).status).toBe(400);
+    expect((await call(alice, "PUT", "/v1/account/username", {})).status).toBe(400);
+  });
+
+  it("refuses a taken username case-insensitively on signup and change", async () => {
+    await signUp("alice", "pw", { username: "Alice" });
+    const { res } = await trySignUp("alice2", "pw", { username: "aLiCe" });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: "username_taken", message: "That username is taken" });
+    expect((await pool.query("SELECT 1 FROM users WHERE email LIKE 'alice2-%'")).rowCount).toBe(0);
+
+    const bob = await signUp("bob");
+    const taken = await call(bob, "PUT", "/v1/account/username", { username: "ALICE" });
+    expect(taken.status).toBe(409);
+    expect(taken.body.error).toBe("username_taken");
+    expect((await call(bob, "GET", "/v1/account")).body.username).toBeNull();
+  });
+
+  it("maps a racing unique-index hit to username_taken, not the email conflict", async () => {
+    // An uncommitted insert of the same name: signup's explicit check can't see it, so its own INSERT
+    // waits on the unique index and fails once the other transaction commits.
+    const blocker = await pool.connect();
+    try {
+      await blocker.query("BEGIN");
+      await blocker.query(
+        `INSERT INTO users (uid, email, username, auth_salt, auth_hash, kdf_salt, kdf_iterations, wrapped_account_key, public_key, wrapped_private_key, personal_space_id)
+         VALUES ($1, 'racer@example.com', 'Racer', '\\x00', '\\x00', '\\x00', 1, '\\x00', '\\x00', '\\x00', $2)`,
+        [randomUUID(), randomUUID()],
+      );
+      const pending = trySignUp("carol", "pw", { username: "racer" });
+      for (let i = 0; i < 200; i++) {
+        const waiting = await pool.query("SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO users%'");
+        if (waiting.rowCount) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      await blocker.query("COMMIT");
+      const { res } = await pending;
+      expect(res.status).toBe(409);
+      expect(res.body.error).toBe("username_taken");
+    } finally {
+      blocker.release();
+    }
+  });
+
+  it("changes the username and GET /v1/account reflects it", async () => {
+    const alice = await signUp("alice", "pw", { username: "alice" });
+    const res = await call(alice, "PUT", "/v1/account/username", { username: " Alice.W " });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ username: "Alice.W" });
+    expect((await call(alice, "GET", "/v1/account")).body.username).toBe("Alice.W");
+    expect((await call(null, "PUT", "/v1/account/username", { username: "nobody" })).status).toBe(401);
+    // The old name is free again.
+    expect((await trySignUp("other", "pw", { username: "alice" })).res.status).toBe(201);
+  });
+
+  it("lists space members by username, falling back to the email's local part", async () => {
+    const alice = await signUp("alice", "pw", { username: "Alice" });
+    const bob = await signUp("bob");
+    const personal = (await call(alice, "GET", "/v1/spaces")).body.spaces;
+    expect(personal).toHaveLength(1);
+    expect(personal[0].members).toEqual([{ uid: alice.uid, name: "Alice" }]);
+
+    const group = await createGroup(alice);
+    const created = await call(alice, "POST", "/v1/groups", { id: randomUUID(), encryptedName: b64(randomBytes(40)), wrappedKey: b64(randomBytes(126)) });
+    expect(created.body.members).toEqual([{ uid: alice.uid, name: "Alice" }]);
+    const accepted = await invite(alice, group, bob);
+    const expected = [
+      { uid: alice.uid, name: "Alice" },
+      { uid: bob.uid, name: bob.email.split("@")[0] },
+    ];
+    expect(accepted.body.members).toEqual(expected);
+    for (const user of [alice, bob]) {
+      const spaces = (await call(user, "GET", "/v1/spaces")).body.spaces;
+      expect(spaces.find((s: { id: string }) => s.id === group.id).members).toEqual(expected);
+    }
+    // Bob's personal space shows only Bob.
+    const bobPersonal = (await call(bob, "GET", "/v1/spaces")).body.spaces.find((s: { kind: string }) => s.kind === "personal");
+    expect(bobPersonal.members).toEqual([{ uid: bob.uid, name: bob.email.split("@")[0] }]);
+
+    await call(bob, "PUT", "/v1/account/username", { username: "bobby" });
+    const after = (await call(alice, "GET", "/v1/spaces")).body.spaces.find((s: { id: string }) => s.id === group.id);
+    expect(after.members[1]).toEqual({ uid: bob.uid, name: "bobby" });
+  });
+
+  it("includes usernames in the group member list", async () => {
+    const alice = await signUp("alice", "pw", { username: "Alice" });
+    const bob = await signUp("bob");
+    const group = await createGroup(alice);
+    await invite(alice, group, bob);
+    const members = (await call(bob, "GET", `/v1/groups/${group.id}/members`)).body.members;
+    expect(members).toEqual([
+      { uid: alice.uid, email: alice.email, username: "Alice", role: "owner" },
+      { uid: bob.uid, email: bob.email, username: null, role: "member" },
+    ]);
   });
 });
 
