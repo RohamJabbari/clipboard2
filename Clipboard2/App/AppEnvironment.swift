@@ -201,10 +201,10 @@ final class AppEnvironment {
             prefs.hasLaunchedBefore = true
             LoginItem.setEnabled(true)
         }
-        // First launch after install: walk through the permissions.
+        // First launch after install: the welcome, then the permissions.
         if !prefs.hasShownPermissions {
             prefs.hasShownPermissions = true
-            showPermissions()
+            permissionsWindow.show(welcome: true)
         }
     }
 
@@ -336,6 +336,7 @@ final class AppEnvironment {
                 self?.pasteFromDefaultGroup()
             }
             warnAboutSendToGroupShortcutOnce()
+            explainSendToGroupChangeOnce()
         } else {
             KeyboardShortcuts.removeHandler(for: .sendToGroup)
             KeyboardShortcuts.removeHandler(for: .pasteFromGroup)
@@ -489,6 +490,24 @@ final class AppEnvironment {
         prefs.clearedSendToGroupDefault = true
         if KeyboardShortcuts.getShortcut(for: .sendToGroup) == .init(.c, modifiers: [.command, .option]) {
             KeyboardShortcuts.setShortcut(nil, for: .sendToGroup)
+            prefs.explainSendToGroupChange = prefs.hasShownSendToGroupWarning
+        }
+    }
+
+    /// For people who had been using ⌥⌘C with a group: say once, while signed in, where it went.
+    private func explainSendToGroupChangeOnce() {
+        guard prefs.explainSendToGroupChange else { return }
+        prefs.explainSendToGroupChange = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            let alert = NSAlert()
+            alert.messageText = "⌥⌘C No Longer Sends to Your Group"
+            alert.informativeText = "To keep things from being shared by accident, sending the selection to a group now uses a shortcut you choose, waits a few seconds with Undo, and holds back anything that looks like a password or key.\n\nSet a shortcut in Settings → Sync → Before anything is shared."
+            alert.addButton(withTitle: "Choose a Shortcut…")
+            alert.addButton(withTitle: "Not Now")
+            NSApp.activate()
+            if alert.runModal() == .alertFirstButtonReturn {
+                SettingsOpener.open(tab: .sync)
+            }
         }
     }
 
@@ -667,6 +686,9 @@ final class AppEnvironment {
             }
         case "check-updates":
             updates.checkForUpdates()
+        case "welcome":
+            // Debug aid: the first-run window, welcome step first.
+            permissionsWindow.show(welcome: true)
         case "group-toast":
             // Debug aid: clipboard2://group-toast?state=pending|blocked|sent shows the toast with
             // inert buttons, so it can be reviewed without sending anything to a real group.

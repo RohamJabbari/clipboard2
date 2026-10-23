@@ -105,6 +105,7 @@ final class Preferences {
         static let confirmGroupSends = "confirmGroupSends"
         static let blockSensitiveGroupSends = "blockSensitiveGroupSends"
         static let clearedSendToGroupDefault = "clearedSendToGroupDefault"
+        static let explainSendToGroupChange = "explainSendToGroupChange"
     }
 
     /// 0 means "ask every time".
@@ -178,6 +179,10 @@ final class Preferences {
     var clearedSendToGroupDefault: Bool {
         didSet { defaults.set(clearedSendToGroupDefault, forKey: Key.clearedSendToGroupDefault) }
     }
+    /// Set when that cleanup removed a shortcut someone had; they're told once, when signed in.
+    var explainSendToGroupChange: Bool {
+        didSet { defaults.set(explainSendToGroupChange, forKey: Key.explainSendToGroupChange) }
+    }
 
     init(defaults: UserDefaults) {
         self.defaults = defaults
@@ -233,6 +238,7 @@ final class Preferences {
         confirmGroupSends = defaults.bool(forKey: Key.confirmGroupSends)
         blockSensitiveGroupSends = defaults.bool(forKey: Key.blockSensitiveGroupSends)
         clearedSendToGroupDefault = defaults.bool(forKey: Key.clearedSendToGroupDefault)
+        explainSendToGroupChange = defaults.bool(forKey: Key.explainSendToGroupChange)
     }
 
     /// The save folder's name as Finder shows it ("Downloads", "Desktop").
