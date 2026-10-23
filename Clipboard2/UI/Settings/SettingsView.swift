@@ -1,44 +1,58 @@
 import SwiftUI
 import KeyboardShortcuts
 
+/// Settings, grouped by what people come here to do:
+/// General (is it working, startup, updates), History (what's kept and for how long, what's
+/// never recorded), Appearance (theme and the quick panel), Shortcuts (every key and the
+/// right-click menu), Snippets, Secrets, Actions (AI and paste transforms), Sync.
 struct SettingsView: View {
-    @AppStorage(SettingsTab.storageKey) private var tab = SettingsTab.general.rawValue
+    @AppStorage(SettingsTab.storageKey) private var stored = SettingsTab.general.rawValue
 
     var body: some View {
-        TabView(selection: $tab) {
+        TabView(selection: Binding(
+            get: { SettingsTab(stored: stored) ?? .general },
+            set: { stored = $0.rawValue }
+        )) {
             GeneralSettingsView()
                 .tabItem { Label("General", systemImage: "gearshape") }
-                .tag(SettingsTab.general.rawValue)
+                .tag(SettingsTab.general)
+            HistorySettingsView()
+                .tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
+                .tag(SettingsTab.history)
             AppearanceSettingsView()
                 .tabItem { Label("Appearance", systemImage: "paintpalette") }
-                .tag(SettingsTab.appearance.rawValue)
-            IgnoredAppsSettingsView()
-                .tabItem { Label("Ignored Apps", systemImage: "hand.raised") }
-                .tag(SettingsTab.ignoredApps.rawValue)
+                .tag(SettingsTab.appearance)
+            ShortcutsSettingsView()
+                .tabItem { Label("Shortcuts", systemImage: "command") }
+                .tag(SettingsTab.shortcuts)
             SnippetsSettingsView()
                 .tabItem { Label("Snippets", systemImage: "text.badge.star") }
-                .tag(SettingsTab.snippets.rawValue)
+                .tag(SettingsTab.snippets)
             SecretsSettingsView()
                 .tabItem { Label("Secrets", systemImage: "key") }
-                .tag(SettingsTab.secrets.rawValue)
-            TransformsSettingsView()
-                .tabItem { Label("Transforms", systemImage: "wand.and.stars") }
-                .tag(SettingsTab.transforms.rawValue)
-            AISettingsView()
-                .tabItem { Label("AI", systemImage: "sparkles") }
-                .tag(SettingsTab.ai.rawValue)
-            PermissionsSettingsView()
-                .tabItem { Label("Permissions", systemImage: "lock.shield") }
-                .tag(SettingsTab.permissions.rawValue)
+                .tag(SettingsTab.secrets)
+            ActionsSettingsView()
+                .tabItem { Label("Actions", systemImage: "wand.and.stars") }
+                .tag(SettingsTab.actions)
             SyncSettingsView()
                 .tabItem { Label("Sync", systemImage: "arrow.triangle.2.circlepath.icloud") }
-                .tag(SettingsTab.sync.rawValue)
-            AboutSettingsView()
-                .tabItem { Label("About", systemImage: "info.circle") }
-                .tag(SettingsTab.about.rawValue)
+                .tag(SettingsTab.sync)
         }
-        .frame(width: 780)
-        .frame(minHeight: 460)
+        .frame(width: 720)
+        .frame(minHeight: 480, idealHeight: 680)
+    }
+}
+
+/// A caption under a control: one short sentence about what it does.
+private struct Hint: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -48,182 +62,120 @@ struct GeneralSettingsView: View {
     @Environment(AppEnvironment.self) private var env
     @State private var launchAtLogin = LoginItem.isEnabled
     @State private var axTrusted = AXPermission.isTrusted
-    @State private var confirmClear = false
 
     var body: some View {
-        @Bindable var prefs = env.prefs
         Form {
-            Section {
-                Toggle("Launch at login", isOn: $launchAtLogin)
-                    .onChange(of: launchAtLogin) { _, on in
-                        LoginItem.setEnabled(on)
-                        launchAtLogin = LoginItem.isEnabled
-                    }
-                if LoginItem.requiresApproval {
-                    Text("Approve Clipboard2 in System Settings → General → Login Items.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                KeyboardShortcuts.Recorder("Open quick panel", name: .toggleQuickPanel)
-                KeyboardShortcuts.Recorder("Actions on selected text", name: .selectionActions)
-                KeyboardShortcuts.Recorder("Capture text from screen", name: .captureText)
-                KeyboardShortcuts.Recorder("Paste as text", name: .pasteAsText)
-                KeyboardShortcuts.Recorder("Send selection to default group", name: .sendToGroup)
-                KeyboardShortcuts.Recorder("Paste from default group", name: .pasteFromGroup)
-                Text("Actions on selected text: select text in any app to transform it or ask AI; Return replaces the selection (also under right-click → Services → Clipboard2 Actions…). Capture text: drag over anything on screen and its text is pasted. Paste as text: pastes plain text, or — if an image or screenshot is on the clipboard — the text in it. Text recognition runs on this Mac. Send selection: stores the selected text in your default sync group (Settings → Sync). Paste from group: fetches the default group and pastes its newest item. Both are active only while you're signed in to sync; then ⌥⌘C replaces Chrome's Inspect Elements, Safari's JavaScript Console and Finder's Copy as Pathname, and ⌥⌘V replaces Finder's Move Item Here.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section {
-                Toggle("Open Clipboard2's menu with \(prefs.contextMenuModifier.symbol)-right-click", isOn: $prefs.contextMenuEnabled)
-                Picker("Modifier", selection: $prefs.contextMenuModifier) {
-                    ForEach(ContextMenuModifier.allCases) { Text($0.title).tag($0) }
-                }
-                .disabled(!prefs.contextMenuEnabled)
-            } header: {
-                Text("Right-click menu")
-            } footer: {
-                Text("Works in every app: Clipboard2's actions plus Cut, Copy, Paste, Select All and the usual items (Finder items in Finder). “Show ‹App› Menu” opens the app's own menu. Plain right-clicks are never changed. Needs Accessibility access.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .onChange(of: prefs.contextMenuEnabled) { env.contextMenu.update() }
-
-            Section("Capture") {
-                LabeledContent("Permissions") {
-                    Button("Review Permissions…") { env.showPermissions() }
-                }
-                Toggle("Pause clipboard capture", isOn: $prefs.isPaused)
-                LabeledContent("Auto-paste") {
-                    HStack(spacing: 8) {
-                        Label(axTrusted ? "Enabled" : "Needs Accessibility access",
-                              systemImage: axTrusted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                            .foregroundStyle(axTrusted ? AnyShapeStyle(.green) : AnyShapeStyle(.orange))
-                            .labelStyle(.titleAndIcon)
-                        if !axTrusted {
-                            Button("Set Up…") { env.showPermissions() }
+            if !axTrusted {
+                Section {
+                    HStack(alignment: .top, spacing: 12) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.title2)
+                            .foregroundStyle(.orange)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Clipboard2 can't paste for you yet").font(.headline)
+                            Text("Allow Accessibility and Return pastes straight into your app. Until then, items are copied and you press ⌘V yourself.")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
+                        Spacer()
+                        Button("Set Up…") { env.showPermissions() }
+                            .buttonStyle(.borderedProminent)
                     }
+                    .padding(.vertical, 4)
                 }
             }
 
-            QuickSlotsSection()
+            Section {
+                Toggle(isOn: $launchAtLogin) {
+                    Text("Open at login")
+                    Text("Keeps your history recording from the moment you log in.")
+                }
+                .onChange(of: launchAtLogin) { _, on in
+                    LoginItem.setEnabled(on)
+                    launchAtLogin = LoginItem.isEnabled
+                }
+                if LoginItem.requiresApproval {
+                    Hint("Approve Clipboard2 in System Settings → General → Login Items.")
+                }
+                LabeledContent {
+                    KeyboardShortcuts.Recorder(for: .toggleQuickPanel)
+                } label: {
+                    Text("Open the quick panel")
+                    Text("All other shortcuts are in the Shortcuts tab.")
+                }
+            }
 
-            Section("History") {
-                Picker("Keep up to", selection: $prefs.maxItems) {
-                    ForEach(Preferences.maxItemChoices, id: \.self) { Text($0 == 0 ? "Unlimited" : "\($0) items").tag($0) }
-                }
-                Picker("Delete items after", selection: $prefs.maxAgeMinutes) {
-                    ForEach(Preferences.maxAgeChoices, id: \.self) { minutes in
-                        Text(Preferences.describeAge(minutes: minutes)).tag(minutes)
+            UpdatesSection()
+
+            PermissionsSection(permissions: [.accessibility, .screenRecording])
+
+            Section("Your data") {
+                LabeledContent {
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([AppPaths.supportDirectory])
                     }
+                } label: {
+                    Text("Stored only on this Mac")
+                    Text(AppPaths.supportDirectory.path(percentEncoded: false))
+                        .textSelection(.enabled)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
-                Text("Measured from the last time an item was copied. Pinned and labelled items and secrets never expire.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                LabeledContent("Stored items", value: "\(env.store.count())")
-                    .id(env.store.revision)
-                Button("Clear History…", role: .destructive) { confirmClear = true }
             }
         }
         .formStyle(.grouped)
-        .onChange(of: prefs.maxItems) { env.runMaintenance() }
-        .onChange(of: prefs.maxAgeMinutes) { env.runMaintenance() }
         .task {
             while !Task.isCancelled {
                 axTrusted = AXPermission.isTrusted
                 try? await Task.sleep(for: .seconds(2))
             }
         }
-        .confirmationDialog("Clear clipboard history?", isPresented: $confirmClear) {
-            Button("Clear History", role: .destructive) { env.store.clearHistory() }
-            Button("Clear Including Pinned", role: .destructive) { env.store.clearHistory(includingPinned: true) }
-        } message: {
-            Text("This can't be undone.")
-        }
     }
 }
 
-// MARK: - Quick slots
+// MARK: - History
 
-struct QuickSlotsSection: View {
+struct HistorySettingsView: View {
     @Environment(AppEnvironment.self) private var env
-
-    var body: some View {
-        Section {
-            ForEach(QuickSlots.range, id: \.self) { n in
-                LabeledContent {
-                    HStack(spacing: 8) {
-                        Text(env.slots.title(for: n) ?? "Empty — falls back to row \(n)")
-                            .foregroundStyle(env.slots.target(for: n) == nil ? .tertiary : .primary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        KeyboardShortcuts.Recorder("", name: KeyboardShortcuts.Name.quickSlots[n - 1])
-                            .accessibilityLabel("Global shortcut for quick slot \(n)")
-                        if env.slots.target(for: n) != nil {
-                            Button {
-                                env.slots.clear(n)
-                            } label: {
-                                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Clear quick slot \(n)")
-                        }
-                    }
-                } label: {
-                    Text("⌘\(n)").monospacedDigit()
-                }
-            }
-        } header: {
-            Text("Quick slots")
-        } footer: {
-            Text("In the quick panel, select an item, snippet or secret and press ⌘⇧1–9 to bind it; ⌘1–9 then always pastes it. Record a global shortcut to paste a slot from any app without opening the panel.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
-}
-
-// MARK: - Appearance
-
-struct AppearanceSettingsView: View {
-    @Environment(AppEnvironment.self) private var env
-
-    var body: some View {
-        @Bindable var prefs = env.prefs
-        Form {
-            Section {
-                Picker("Appearance", selection: $prefs.appearance) {
-                    ForEach(AppearanceMode.allCases) { Text($0.title).tag($0) }
-                }
-                .pickerStyle(.inline)
-            }
-            Section("Quick Panel") {
-                Picker("Size", selection: $prefs.panelSize) {
-                    ForEach(PanelSize.allCases) { Text($0.title).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                Text("Transparency and motion follow your Accessibility display settings.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .formStyle(.grouped)
-        .onChange(of: prefs.appearance) { env.applyAppearance() }
-    }
-}
-
-// MARK: - Ignored apps
-
-struct IgnoredAppsSettingsView: View {
-    @Environment(AppEnvironment.self) private var env
+    @State private var confirmClear = false
     @State private var selection: AppRef.ID?
 
     var body: some View {
         @Bindable var prefs = env.prefs
         Form {
+            Section {
+                Toggle(isOn: Binding(get: { !prefs.isPaused }, set: { prefs.isPaused = !$0 })) {
+                    Text("Record what I copy")
+                    Text(prefs.isPaused
+                         ? "Paused: nothing new is saved. Everything already in history still pastes."
+                         : "Everything you copy is saved here, except from the apps below.")
+                }
+            }
+
+            Section {
+                Picker("Keep up to", selection: $prefs.maxItems) {
+                    ForEach(Preferences.maxItemChoices, id: \.self) { Text($0 == 0 ? "Unlimited" : "\($0) items").tag($0) }
+                }
+                Picker(selection: $prefs.maxAgeMinutes) {
+                    ForEach(Preferences.maxAgeChoices, id: \.self) { minutes in
+                        Text(Preferences.describeAge(minutes: minutes)).tag(minutes)
+                    }
+                } label: {
+                    Text("Forget items after")
+                    Text("Counted from the last time you copied an item. Pinned and labelled items never expire.")
+                }
+                LabeledContent {
+                    Button("Clear History…", role: .destructive) { confirmClear = true }
+                } label: {
+                    Text("\(env.store.count()) items in history")
+                        .id(env.store.revision)
+                }
+            } header: {
+                Text("How much to keep")
+            }
+
             Section {
                 List(selection: $selection) {
                     ForEach(prefs.ignoredApps) { app in
@@ -231,7 +183,7 @@ struct IgnoredAppsSettingsView: View {
                     }
                     .onDelete { prefs.ignoredApps.remove(atOffsets: $0) }
                 }
-                .frame(minHeight: 220)
+                .frame(minHeight: 150)
                 .contextMenu(forSelectionType: AppRef.ID.self) { ids in
                     Button("Remove") { prefs.ignoredApps.removeAll { ids.contains($0.id) } }
                 }
@@ -251,16 +203,223 @@ struct IgnoredAppsSettingsView: View {
                     }
                 }
             } header: {
-                Text("Never record copies from these apps")
+                Text("Never record from these apps")
             } footer: {
-                Text("Passwords and other items that apps mark as concealed or transient are always skipped, no matter which app they come from.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Hint("Passwords and anything an app marks as private are always skipped, whichever app they come from.")
             }
         }
         .formStyle(.grouped)
+        .onChange(of: prefs.maxItems) { env.runMaintenance() }
+        .onChange(of: prefs.maxAgeMinutes) { env.runMaintenance() }
+        .confirmationDialog("Clear clipboard history?", isPresented: $confirmClear) {
+            Button("Clear History", role: .destructive) { env.store.clearHistory() }
+            Button("Clear Including Pinned", role: .destructive) { env.store.clearHistory(includingPinned: true) }
+        } message: {
+            Text("Snippets and secrets are kept. This can't be undone.")
+        }
     }
 }
+
+// MARK: - Appearance
+
+struct AppearanceSettingsView: View {
+    @Environment(AppEnvironment.self) private var env
+
+    var body: some View {
+        @Bindable var prefs = env.prefs
+        Form {
+            Section {
+                Picker("Theme", selection: $prefs.appearance) {
+                    ForEach(AppearanceMode.allCases) { Text($0 == .system ? "Auto" : $0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+            }
+
+            Section {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Opens from")
+                    HStack(spacing: 10) {
+                        ForEach(PanelOrigin.allCases) { origin in
+                            OriginTile(origin: origin, selected: prefs.panelOrigin == origin) {
+                                prefs.panelOrigin = origin
+                            }
+                        }
+                    }
+                    Hint(prefs.panelOrigin.summary)
+                }
+                .padding(.vertical, 4)
+                Picker("Size", selection: $prefs.panelSize) {
+                    ForEach(PanelSize.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                LabeledContent {
+                    Button("Try It") { env.showQuickPanel() }
+                } label: {
+                    Text("Preview")
+                    Text("With Reduce Motion it fades instead; with Reduce Transparency the glass turns solid.")
+                }
+            } header: {
+                Text("Quick panel")
+            }
+        }
+        .formStyle(.grouped)
+        .onChange(of: prefs.appearance) { env.applyAppearance() }
+    }
+}
+
+/// A tiny screen with the panel against the chosen edge.
+private struct OriginTile: View {
+    let origin: PanelOrigin
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                ZStack(alignment: alignment) {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.primary.opacity(0.05))
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.separator),
+                                      lineWidth: selected ? 2 : 1)
+                    RoundedRectangle(cornerRadius: origin == .center ? 3 : 4, style: .continuous)
+                        .fill(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.secondary.opacity(0.6)))
+                        .frame(width: panelSize.width, height: panelSize.height)
+                        .padding(5)
+                }
+                .frame(width: 70, height: 46)
+                Text(origin.title)
+                    .font(.caption)
+                    .foregroundStyle(selected ? .primary : .secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Open from \(origin.title)")
+        .accessibilityAddTraits(selected ? [.isSelected, .isButton] : .isButton)
+    }
+
+    private var alignment: Alignment {
+        switch origin {
+        case .top: .top
+        case .bottom: .bottom
+        case .left: .leading
+        case .right: .trailing
+        case .center: .center
+        }
+    }
+
+    private var panelSize: CGSize {
+        switch origin {
+        case .top, .bottom: CGSize(width: 34, height: 18)
+        case .left, .right: CGSize(width: 26, height: 24)
+        case .center: CGSize(width: 34, height: 22)
+        }
+    }
+}
+
+// MARK: - Shortcuts
+
+struct ShortcutsSettingsView: View {
+    @Environment(AppEnvironment.self) private var env
+
+    var body: some View {
+        @Bindable var prefs = env.prefs
+        Form {
+            Section("Everywhere") {
+                shortcut(.toggleQuickPanel, "Open the quick panel",
+                         "Search history, snippets and secrets; Return pastes into the app you were in.")
+                shortcut(.selectionActions, "Actions on selected text",
+                         "Transform the selection or ask AI about it; Return replaces it. Also in right-click → Services.")
+                shortcut(.pasteAsText, "Paste as plain text",
+                         "Drops formatting. With an image or screenshot on the clipboard, pastes the text in it.")
+                shortcut(.captureText, "Capture text from screen",
+                         "Drag over anything; the text is recognised on this Mac and pasted.")
+            }
+
+            Section {
+                shortcut(.sendToGroup, "Send selection to default group",
+                         "Copies what's selected into your default sync group.")
+                shortcut(.pasteFromGroup, "Paste from default group",
+                         "Pastes the newest item a group member sent.")
+            } header: {
+                Text("Sync groups")
+            } footer: {
+                Hint(env.sync.isSignedIn
+                     ? "While you're signed in, these replace ⌥⌘C and ⌥⌘V in other apps (e.g. Chrome's Inspect Elements, Finder's Copy as Pathname). Change them here if you use those."
+                     : "Only active while you're signed in to Sync.")
+            }
+
+            Section {
+                Toggle(isOn: $prefs.contextMenuEnabled) {
+                    Text("\(prefs.contextMenuModifier.symbol)-right-click opens Clipboard2's menu")
+                    Text("Recent items, snippets, secrets and text actions, plus Cut, Copy and Paste — in any app. Plain right-clicks are untouched.")
+                }
+                Picker("Modifier key", selection: $prefs.contextMenuModifier) {
+                    ForEach(ContextMenuModifier.allCases) { Text($0.title).tag($0) }
+                }
+                .disabled(!prefs.contextMenuEnabled)
+            } header: {
+                Text("Right-click menu")
+            }
+            .onChange(of: prefs.contextMenuEnabled) { env.contextMenu.update() }
+
+            QuickSlotsSection()
+        }
+        .formStyle(.grouped)
+    }
+
+    private func shortcut(_ name: KeyboardShortcuts.Name, _ title: String, _ detail: String) -> some View {
+        LabeledContent {
+            KeyboardShortcuts.Recorder(for: name)
+        } label: {
+            Text(title)
+            Text(detail)
+        }
+    }
+}
+
+// MARK: - Quick slots
+
+struct QuickSlotsSection: View {
+    @Environment(AppEnvironment.self) private var env
+
+    var body: some View {
+        Section {
+            ForEach(QuickSlots.range, id: \.self) { n in
+                LabeledContent {
+                    HStack(spacing: 8) {
+                        Text(env.slots.title(for: n) ?? "Empty — pastes row \(n)")
+                            .foregroundStyle(env.slots.target(for: n) == nil ? .tertiary : .primary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        KeyboardShortcuts.Recorder(for: KeyboardShortcuts.Name.quickSlots[n - 1])
+                            .accessibilityLabel("Global shortcut for quick slot \(n)")
+                        if env.slots.target(for: n) != nil {
+                            Button {
+                                env.slots.clear(n)
+                            } label: {
+                                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Clear slot")
+                            .accessibilityLabel("Clear quick slot \(n)")
+                        }
+                    }
+                } label: {
+                    Text("⌘\(n)").monospacedDigit()
+                }
+            }
+        } header: {
+            Text("Quick slots")
+        } footer: {
+            Hint("In the quick panel, ⌘⇧1–9 pins the selected item to a slot and ⌘1–9 pastes it. Give a slot a shortcut to paste it from any app.")
+        }
+    }
+}
+
+// MARK: - Shared rows
 
 struct AppRow: View {
     let app: AppRef
@@ -324,85 +483,5 @@ struct AppPickerMenu: View {
         let name = FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
         guard !exclude.contains(id) else { return }
         onPick(AppRef(bundleID: id, name: name))
-    }
-}
-
-// MARK: - About
-
-struct UpdatesSection: View {
-    @Environment(AppEnvironment.self) private var env
-    @State private var autoCheck = true
-    @State private var autoInstall = false
-
-    var body: some View {
-        Section {
-            Toggle("Check for updates every hour", isOn: $autoCheck)
-                .onChange(of: autoCheck) { env.updates.automaticallyChecks = autoCheck }
-            Toggle("Install updates automatically", isOn: $autoInstall)
-                .onChange(of: autoInstall) { env.updates.automaticallyInstalls = autoInstall }
-                .disabled(!autoCheck)
-            LabeledContent("Last checked") {
-                Text(env.updates.lastCheck.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "Never")
-            }
-            HStack {
-                if let version = env.updates.availableVersion {
-                    Label("Version \(version) is available", systemImage: "arrow.down.circle.fill")
-                        .foregroundStyle(.tint)
-                }
-                Spacer()
-                Button("Check for Updates…") { env.updates.checkForUpdates() }
-            }
-        } header: {
-            Text("Updates")
-        } footer: {
-            Text("Updates come from GitHub, are verified with your Developer ID signature, and install in place — Clipboard2 relaunches with your data intact.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .onAppear {
-            autoCheck = env.updates.automaticallyChecks
-            autoInstall = env.updates.automaticallyInstalls
-        }
-    }
-}
-
-struct AboutSettingsView: View {
-    private var version: String {
-        let info = Bundle.main.infoDictionary
-        let short = info?["CFBundleShortVersionString"] as? String ?? "–"
-        let build = info?["CFBundleVersion"] as? String ?? "–"
-        return "Version \(short) (\(build))"
-    }
-
-    var body: some View {
-        Form {
-            Section {
-                VStack(spacing: 10) {
-                    Image(nsImage: NSApp.applicationIconImage)
-                        .resizable()
-                        .frame(width: 96, height: 96)
-                        .accessibilityHidden(true)
-                    Text("Clipboard2").font(.title.weight(.semibold))
-                    Text(version).foregroundStyle(.secondary)
-                    Text("A native clipboard manager for macOS.")
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-            }
-            UpdatesSection()
-            Section("Data") {
-                LabeledContent("Location") {
-                    Text(AppPaths.supportDirectory.path(percentEncoded: false))
-                        .textSelection(.enabled)
-                        .lineLimit(2)
-                        .truncationMode(.middle)
-                }
-                Button("Show in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([AppPaths.supportDirectory])
-                }
-            }
-        }
-        .formStyle(.grouped)
     }
 }

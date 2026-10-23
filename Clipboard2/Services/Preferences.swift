@@ -36,6 +36,32 @@ nonisolated enum PanelSize: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// Where the quick panel emerges from when it opens.
+nonisolated enum PanelOrigin: String, CaseIterable, Identifiable, Sendable {
+    case top, bottom, left, right, center
+    var id: String { rawValue }
+    var title: String { rawValue.capitalized }
+    var symbol: String {
+        switch self {
+        case .top: "rectangle.tophalf.inset.filled"
+        case .bottom: "rectangle.bottomhalf.inset.filled"
+        case .left: "rectangle.lefthalf.inset.filled"
+        case .right: "rectangle.righthalf.inset.filled"
+        case .center: "rectangle.center.inset.filled"
+        }
+    }
+    /// One line for Settings: what the user will see.
+    var summary: String {
+        switch self {
+        case .top: "Drops down from under the menu bar."
+        case .bottom: "Rises from just above the Dock."
+        case .left: "Slides out from the left edge."
+        case .right: "Slides out from the right edge."
+        case .center: "Fades up in the middle of the screen."
+        }
+    }
+}
+
 nonisolated struct AppTransformRule: Codable, Hashable, Identifiable, Sendable {
     var app: AppRef
     var transform: Transform
@@ -58,6 +84,7 @@ final class Preferences {
         static let isPaused = "isPaused"
         static let appearance = "appearance"
         static let panelSize = "panelSize"
+        static let panelOrigin = "panelOrigin"
         static let ignoredApps = "ignoredApps"
         static let appTransforms = "appTransforms"
         static let claudeModel = "claudeModel"          // legacy, migrated into aiModels
@@ -104,6 +131,7 @@ final class Preferences {
     var isPaused: Bool { didSet { defaults.set(isPaused, forKey: Key.isPaused) } }
     var appearance: AppearanceMode { didSet { defaults.set(appearance.rawValue, forKey: Key.appearance) } }
     var panelSize: PanelSize { didSet { defaults.set(panelSize.rawValue, forKey: Key.panelSize) } }
+    var panelOrigin: PanelOrigin { didSet { defaults.set(panelOrigin.rawValue, forKey: Key.panelOrigin) } }
     var ignoredApps: [AppRef] { didSet { store(ignoredApps, Key.ignoredApps) } }
     var appTransforms: [AppTransformRule] { didSet { store(appTransforms, Key.appTransforms) } }
     var aiProvider: AIProviderKind { didSet { defaults.set(aiProvider.rawValue, forKey: Key.aiProvider) } }
@@ -136,6 +164,7 @@ final class Preferences {
             Key.isPaused: false,
             Key.appearance: AppearanceMode.system.rawValue,
             Key.panelSize: PanelSize.regular.rawValue,
+            Key.panelOrigin: PanelOrigin.top.rawValue,
             Key.aiProvider: AIProviderKind.claudeCode.rawValue,
             Key.customBaseURL: AIProviderKind.custom.defaultBaseURL,
             Key.secretGraceMinutes: 15,
@@ -155,6 +184,7 @@ final class Preferences {
         isPaused = defaults.bool(forKey: Key.isPaused)
         appearance = AppearanceMode(rawValue: defaults.string(forKey: Key.appearance) ?? "") ?? .system
         panelSize = PanelSize(rawValue: defaults.string(forKey: Key.panelSize) ?? "") ?? .regular
+        panelOrigin = PanelOrigin(rawValue: defaults.string(forKey: Key.panelOrigin) ?? "") ?? .top
         ignoredApps = Self.load([AppRef].self, defaults, Key.ignoredApps) ?? AppRef.defaultIgnored
         appTransforms = Self.load([AppTransformRule].self, defaults, Key.appTransforms) ?? []
         aiProvider = AIProviderKind(rawValue: defaults.string(forKey: Key.aiProvider) ?? "") ?? .claudeCode

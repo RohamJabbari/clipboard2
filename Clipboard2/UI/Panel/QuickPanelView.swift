@@ -5,25 +5,35 @@ struct QuickPanelView: View {
     @Environment(AppEnvironment.self) private var env
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var searchFocused: Bool
+    /// The content-type row that drops down from under the search bar.
+    @State private var showsTypes = false
 
     var body: some View {
         VStack(spacing: 0) {
             searchBar
+                .zIndex(1)
+            if showsTypes {
+                typeRow
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
             FilterChips(selection: $model.filter, groupSelection: $model.groupFilter, groups: env.sync.groups,
                         thisAppName: model.targetRef?.name)
                 .padding(.horizontal, 14)
                 .padding(.bottom, 10)
-            Divider()
+            Hairline()
             HStack(spacing: 0) {
                 resultsList
                     .frame(width: listWidth)
-                Divider()
+                Hairline(vertical: true)
                 detailPane
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.primary.opacity(0.025))
             }
-            Divider()
+            Hairline()
             HintBar(entry: model.selectedEntry, mode: model.mode, notice: model.notice,
-                    selectionCount: model.isMultiSelecting ? model.selectedClips.count : nil)
+                    selectionCount: model.isMultiSelecting ? model.selectedClips.count : nil,
+                    updateVersion: env.updates.readyVersion,
+                    onUpdate: { env.updates.installNow() })
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear { searchFocused = true }
@@ -40,67 +50,95 @@ struct QuickPanelView: View {
     // MARK: Search
 
     private var searchBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {
             Image(systemName: "magnifyingglass")
-                .font(.title2)
+                .font(.system(size: 18, weight: .medium))
                 .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
-            TextField("Search clipboard history and snippets", text: $model.query)
+            TextField("Search clipboard", text: $model.query)
                 .textFieldStyle(.plain)
-                .font(.title2)
+                .font(.system(size: 21, weight: .regular))
                 .focused($searchFocused)
-                .accessibilityLabel("Search")
+                .accessibilityLabel("Search clipboard history and snippets")
             typeFilterMenu
             if let target = model.targetRef {
-                HStack(spacing: 4) {
+                HStack(spacing: 5) {
+                    Image(systemName: "arrow.turn.down.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
                     Image(nsImage: AppIconCache.icon(for: target.bundleID))
                         .resizable()
-                        .frame(width: 16, height: 16)
+                        .frame(width: 15, height: 15)
                     Text(target.name)
-                        .font(.caption)
+                        .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
+                .padding(.leading, 7)
+                .padding(.trailing, 9)
+                .padding(.vertical, 4)
+                .background(Capsule(style: .continuous).fill(Color.primary.opacity(0.06)))
                 .help("Pastes into \(target.name)")
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("Pastes into \(target.name)")
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 14)
-        .padding(.bottom, 10)
+        .padding(.horizontal, 18)
+        .padding(.top, 16)
+        .padding(.bottom, 12)
     }
 
-    /// Text, Images, Files or Snippets. Shows the active type so a filtered list is never a surprise.
+    private var activeType: PanelFilter? {
+        model.groupFilter == nil && model.filter.isContentType ? model.filter : nil
+    }
+
+    private func setTypesShown(_ shown: Bool) {
+        if reduceMotion { showsTypes = shown } else {
+            withAnimation(.snappy(duration: 0.22)) { showsTypes = shown }
+        }
+    }
+
+    /// Opens the type row under the search bar. Shows the active type so a filtered list is never a surprise.
     private var typeFilterMenu: some View {
-        let active = model.groupFilter == nil && model.filter.isContentType ? model.filter : nil
-        return Menu {
-            Picker("Show", selection: Binding(
-                get: { active },
-                set: { type in
-                    model.groupFilter = nil
-                    model.filter = type ?? .all
-                }
-            )) {
-                Label("Everything", systemImage: PanelFilter.all.symbol).tag(PanelFilter?.none)
-                ForEach(PanelFilter.contentTypes) { type in
-                    Label(type.title, systemImage: type.symbol).tag(Optional(type))
-                }
-            }
-            .pickerStyle(.inline)
-        } label: {
+        let active = activeType
+        return Button { setTypesShown(!showsTypes) } label: {
             HStack(spacing: 4) {
                 Image(systemName: active == nil ? "line.3.horizontal.decrease.circle" : "line.3.horizontal.decrease.circle.fill")
-                    .font(.title3)
-                if let active { Text(active.title).font(.callout) }
+                    .font(.system(size: 16, weight: .medium))
+                if let active { Text(active.title).font(.callout.weight(.medium)) }
+                Image(systemName: "chevron.down")
+                    .font(.caption2.weight(.semibold))
+                    .rotationEffect(.degrees(showsTypes ? 180 : 0))
             }
-            .foregroundStyle(active == nil ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.accentColor))
+            .foregroundStyle(active == nil && !showsTypes ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.accentColor))
+            .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
         .fixedSize()
         .help("Show only text, images, files or snippets")
         .accessibilityLabel(active.map { "Filter: \($0.title)" } ?? "Filter by type")
+        .accessibilityValue(showsTypes ? "Expanded" : "Collapsed")
+    }
+
+    /// Everything, Text, Images, Files, Snippets. Picking one applies it and folds the row back up.
+    private var typeRow: some View {
+        HStack(spacing: 6) {
+            FilterChip(title: "Everything", symbol: PanelFilter.all.symbol, selected: activeType == nil) {
+                model.groupFilter = nil
+                model.filter = .all
+                setTypesShown(false)
+            }
+            ForEach(PanelFilter.contentTypes) { type in
+                FilterChip(title: type.title, symbol: type.symbol, selected: activeType == type) {
+                    model.groupFilter = nil
+                    model.filter = type
+                    setTypesShown(false)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 8)
     }
 
     // MARK: List
@@ -117,7 +155,7 @@ struct QuickPanelView: View {
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        LazyVStack(spacing: 2) {
+                        LazyVStack(spacing: 1) {
                             ForEach(Array(model.entries.enumerated()), id: \.element.id) { index, entry in
                                 PanelRow(entry: entry, shortcut: model.shortcutNumber(for: entry, at: index),
                                          isSelected: model.isSelected(entry),
@@ -140,7 +178,8 @@ struct QuickPanelView: View {
                                     .contextMenu { contextMenu(for: entry) }
                             }
                         }
-                        .padding(8)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
                     }
                     .onChange(of: model.openToken) {
                         if let first = model.entries.first?.id { proxy.scrollTo(first, anchor: .top) }
@@ -246,7 +285,6 @@ struct FilterChips: View {
     @Binding var groupSelection: String?
     var groups: [SyncGroup] = []
     let thisAppName: String?
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         if groups.isEmpty {
@@ -257,7 +295,7 @@ struct FilterChips: View {
     }
 
     private var chips: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 4) {
             ForEach(PanelFilter.chips) { filter in
                 chip(title(for: filter), symbol: filter.symbol, selected: groupSelection == nil && filter == selection) {
                     groupSelection = nil
@@ -275,32 +313,52 @@ struct FilterChips: View {
     }
 
     private func chip(_ title: String, symbol: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        FilterChip(title: title, symbol: symbol, selected: selected, action: action)
+    }
+
+    private func title(for filter: PanelFilter) -> String {
+        if filter == .thisApp, let thisAppName { return thisAppName }
+        return filter.title
+    }
+}
+
+/// One capsule in the filter rows.
+struct FilterChip: View {
+    let title: String
+    let symbol: String
+    let selected: Bool
+    let action: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
         Button {
             if reduceMotion { action() } else {
                 withAnimation(.snappy(duration: 0.15)) { action() }
             }
         } label: {
-            Label(title, systemImage: symbol)
+            Label {
+                Text(title)
+            } icon: {
+                Image(systemName: symbol).imageScale(.small)
+            }
                 .labelStyle(.titleAndIcon)
-                .font(.callout)
+                .font(.callout.weight(.medium))
                 .lineLimit(1)
-                .padding(.horizontal, 9)
+                .padding(.horizontal, 10)
                 .padding(.vertical, 4)
-                .foregroundStyle(selected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
+                .foregroundStyle(selected ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
                 .background {
-                    Capsule(style: .continuous)
-                        .fill(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.quaternary.opacity(0.7)))
+                    if selected {
+                        Capsule(style: .continuous)
+                            .fill(Color.primary.opacity(0.09))
+                            .overlay(Capsule(style: .continuous).strokeBorder(Color.primary.opacity(0.07)))
+                    }
                 }
                 .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(title) filter")
         .accessibilityAddTraits(selected ? .isSelected : [])
-    }
-
-    private func title(for filter: PanelFilter) -> String {
-        if filter == .thisApp, let thisAppName { return thisAppName }
-        return filter.title
     }
 }
 
@@ -326,6 +384,7 @@ struct PanelRow: View {
             leading
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
+                    .font(.system(size: 13.5))
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
@@ -370,11 +429,15 @@ struct PanelRow: View {
                     .accessibilityHidden(true)
             }
         }
-        .padding(.horizontal, 8)
+        .padding(.horizontal, 9)
         .padding(.vertical, 6)
         .background {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(isSelected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.clear))
+            if isSelected {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.accentColor.gradient)
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(.white.opacity(0.12)))
+            }
         }
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
@@ -388,18 +451,18 @@ struct PanelRow: View {
     private var leading: some View {
         switch entry {
         case .clip(let item):
-            ClipIconView(item: item, size: 26)
+            ClipIconView(item: item, size: 28)
         case .snippet:
             Image(systemName: "text.badge.star")
                 .font(.system(size: 16))
                 .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.tint))
-                .frame(width: 26, height: 26)
+                .frame(width: 28, height: 28)
                 .accessibilityHidden(true)
         case .secret:
             Image(systemName: "key.fill")
                 .font(.system(size: 15))
                 .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.tint))
-                .frame(width: 26, height: 26)
+                .frame(width: 28, height: 28)
                 .accessibilityHidden(true)
         }
     }
@@ -444,6 +507,9 @@ struct HintBar: View {
     let mode: PanelMode
     let notice: String?
     var selectionCount: Int?
+    /// A downloaded update waiting for a relaunch: shown quietly at the trailing end.
+    var updateVersion: String?
+    var onUpdate: () -> Void = {}
 
     var body: some View {
         HStack(spacing: 14) {
@@ -484,6 +550,14 @@ struct HintBar: View {
                 Text(notice)
                     .foregroundStyle(.primary)
                     .transition(.opacity)
+            } else if let updateVersion, mode == .browse {
+                Button(action: onUpdate) {
+                    Label("Restart to Update", systemImage: "arrow.down.circle")
+                        .labelStyle(.titleAndIcon)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tint)
+                .help("Clipboard2 \(updateVersion) is ready. Relaunches in a second; your history stays.")
             } else if mode == .browse {
                 hint("⇥", "Filter")
             }
@@ -492,8 +566,8 @@ struct HintBar: View {
         .font(.caption)
         .foregroundStyle(.secondary)
         .padding(.horizontal, 14)
-        .padding(.vertical, 7)
-        .accessibilityElement(children: .combine)
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .contain)
     }
 
     private func hint(_ key: String, _ label: String) -> some View {
@@ -502,8 +576,20 @@ struct HintBar: View {
                 .font(.caption.weight(.medium))
                 .padding(.horizontal, 5)
                 .padding(.vertical, 1)
-                .background(.quaternary.opacity(0.8), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
             Text(label)
         }
+    }
+}
+
+/// A 1-pt separator that sits quietly on glass.
+struct Hairline: View {
+    var vertical = false
+
+    var body: some View {
+        Rectangle()
+            .fill(Color.primary.opacity(0.08))
+            .frame(width: vertical ? 1 : nil, height: vertical ? nil : 1)
+            .accessibilityHidden(true)
     }
 }

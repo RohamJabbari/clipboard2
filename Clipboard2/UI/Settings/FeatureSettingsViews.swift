@@ -108,17 +108,28 @@ private struct SnippetEditor: View {
     }
 }
 
-// MARK: - Transforms
+// MARK: - Actions (AI + transforms)
 
-struct TransformsSettingsView: View {
+/// Everything ⌘K (and ⌥⌘K) can do: the AI provider, your own prompts, and paste rules per app.
+struct ActionsSettingsView: View {
+    var body: some View {
+        Form {
+            AISettingsSections()
+            TransformRulesSection()
+        }
+        .formStyle(.grouped)
+    }
+}
+
+struct TransformRulesSection: View {
     @Environment(AppEnvironment.self) private var env
 
     var body: some View {
         @Bindable var prefs = env.prefs
-        Form {
+        Group {
             Section {
                 if prefs.appTransforms.isEmpty {
-                    Text("No per-app rules. Items paste with their original formatting everywhere.")
+                    Text("No rules yet: everything pastes with its original formatting.")
                         .foregroundStyle(.secondary)
                 }
                 ForEach($prefs.appTransforms) { $rule in
@@ -145,26 +156,27 @@ struct TransformsSettingsView: View {
                     prefs.appTransforms.append(AppTransformRule(app: app, transform: .plainText))
                 }
             } header: {
-                Text("Default transform per app")
+                Text("Paste rules per app")
             } footer: {
-                Text("Applied automatically when pasting from Clipboard2 into that app — for example, always paste plain text into Mail. Pick a different transform any time with ⌘K in the quick panel.")
+                Text("For example, always paste plain text into Mail. ⌘K in the quick panel still lets you pick another transform.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            Section("Available transforms") {
-                ForEach(Transform.allCases) { transform in
-                    Label(transform.title, systemImage: transform.symbol)
+            Section {
+                DisclosureGroup("Built-in transforms") {
+                    ForEach(Transform.allCases) { transform in
+                        Label(transform.title, systemImage: transform.symbol)
+                    }
                 }
             }
         }
-        .formStyle(.grouped)
     }
 }
 
 // MARK: - AI
 
-struct AISettingsView: View {
+struct AISettingsSections: View {
     @Environment(AppEnvironment.self) private var env
     @State private var keyInput = ""
     @State private var hasKey = false
@@ -182,7 +194,7 @@ struct AISettingsView: View {
     var body: some View {
         @Bindable var prefs = env.prefs
         let provider = prefs.aiProvider
-        Form {
+        Group {
             Section {
                 Picker("Use", selection: modeBinding) {
                     Text("Claude — sign in with your account").tag(Mode.claude)
@@ -223,9 +235,9 @@ struct AISettingsView: View {
                     }
                 }
             } header: {
-                Text("AI")
+                Text("AI provider")
             } footer: {
-                Text("Keys are stored in the macOS Keychain. Text is only sent when you run an action with ⌘K or ⌥⌘K.")
+                Text("Text is only sent when you run an AI action with ⌘K or ⌥⌘K. Keys stay in your Keychain.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -257,14 +269,13 @@ struct AISettingsView: View {
                     prefs.customPrompts.append(CustomPrompt(name: "New Prompt", prompt: ""))
                 }
             } header: {
-                Text("Custom prompts")
+                Text("Your prompts")
             } footer: {
-                Text("Built-in: Translate (English, German, Farsi), Summarize, Fix Grammar, Explain.")
+                Text("They appear in ⌘K next to the built-ins: Translate (English, German, Farsi), Summarize, Fix Grammar and Explain.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
-        .formStyle(.grouped)
         .onAppear { refreshKeyState() }
         .onChange(of: prefs.aiProvider) {
             refreshKeyState()
@@ -572,7 +583,7 @@ struct SecretsSettingsView: View {
         Form {
             Section {
                 if env.secrets.secrets.isEmpty {
-                    Text("No secrets yet. Add one here, or select a copied password in the quick panel and choose ⌘K → Save as Secret.")
+                    Text("No secrets yet. Add one below, or select a copied password in the quick panel and press ⌘K → Save as Secret.")
                         .foregroundStyle(.secondary)
                 }
                 ForEach(env.secrets.secrets) { ref in
@@ -620,7 +631,7 @@ struct SecretsSettingsView: View {
             } header: {
                 Text("Secrets")
             } footer: {
-                Text("Values are stored in your login Keychain — never in Clipboard2's history, and never sent to AI or transforms. With Sync turned on they're end-to-end encrypted on this Mac before upload; the server can't read them.")
+                Text("Kept in your Keychain, never in history, never sent to AI. Sync encrypts them on this Mac first; the server can't read them.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -639,7 +650,7 @@ struct SecretsSettingsView: View {
                 }
             }
 
-            Section("Security") {
+            Section("Touch ID and clipboard") {
                 Picker("Ask for Touch ID", selection: $prefs.secretGraceMinutes) {
                     ForEach(Preferences.secretGraceChoices, id: \.self) { minutes in
                         Text(minutes == 0 ? "Every time" : minutes == 1 ? "Once per minute" : "Once per \(minutes) minutes").tag(minutes)
@@ -650,7 +661,7 @@ struct SecretsSettingsView: View {
                         Text(seconds == 0 ? "Never" : "\(seconds) seconds").tag(seconds)
                     }
                 }
-                Text("The unlock window ends when your Mac sleeps or locks. Pasted secrets are marked concealed, so clipboard managers don't record them.")
+                Text("Unlocking lasts until your Mac sleeps or locks. Pasted secrets are hidden from clipboard managers.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 LabeledContent("Unlock") {

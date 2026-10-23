@@ -132,6 +132,8 @@ final class AppEnvironment {
         }
 
         contextMenu.update()
+        // Build and render the quick panel once, off screen, so the first ⇧⌘V has nothing to set up.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.panel.warmUp() }
         Task {
             await claudeAccount.refresh()
             await chatGPTAccount.refresh()
@@ -350,12 +352,12 @@ final class AppEnvironment {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
             let alert = NSAlert()
             alert.messageText = "⌥⌘C Now Sends Selected Text to a Sync Group"
-            alert.informativeText = "Clipboard2 uses ⌥⌘C to send the selected text to your default sync group. While you're signed in to sync, this replaces ⌥⌘C in other apps: Chrome's Inspect Elements, Safari's JavaScript Console and Finder's Copy as Pathname.\n\nTo change or clear the shortcut, open Settings → General → Send selection to default group."
+            alert.informativeText = "Clipboard2 uses ⌥⌘C to send the selected text to your default sync group. While you're signed in to sync, this replaces ⌥⌘C in other apps: Chrome's Inspect Elements, Safari's JavaScript Console and Finder's Copy as Pathname.\n\nTo change or clear the shortcut, open Settings → Shortcuts → Send selection to default group."
             alert.addButton(withTitle: "OK")
             alert.addButton(withTitle: "Change Shortcut…")
             NSApp.activate()
             if alert.runModal() == .alertSecondButtonReturn {
-                SettingsOpener.open(tab: .general)
+                SettingsOpener.open(tab: .shortcuts)
             }
         }
     }
@@ -459,8 +461,7 @@ final class AppEnvironment {
             if SnippetExpander.customFields(in: snippet.body).isEmpty {
                 pasteSnippet(snippet, values: [:], into: target)
             } else {
-                panel.show()
-                panel.model.activate(entry)
+                panel.show { [weak self] in self?.panel.model.activate(entry) }
             }
         case .secret(let ref):
             pasteSecret(ref, into: target)
@@ -474,8 +475,27 @@ final class AppEnvironment {
     func handle(url: URL) {
         guard url.scheme == "clipboard2" || url.scheme == "clippy" else { return }
         switch url.host() {
-        case "settings": SettingsOpener.open()
-        case "panel": panel.show()
+        case "settings":
+            // clipboard2://settings?tab=history opens a specific tab.
+            let tab = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .first { $0.name == "tab" }?.value.flatMap(SettingsTab.init(stored:))
+            SettingsOpener.open(tab: tab)
+        case "panel":
+            #if DEBUG
+            // Debug aid: clipboard2://panel?origin=left opens from that edge (and keeps it).
+            if let raw = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "origin" })?.value,
+               let origin = PanelOrigin(rawValue: raw) {
+                prefs.panelOrigin = origin
+            }
+            // …&action=open / close / toggle (default), like pressing the shortcut.
+            let action = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "action" })?.value
+            switch action {
+            case "close": panel.close(); return
+            case "open": if panel.isVisible { return }
+            default: if panel.isVisible { panel.close(); return }
+            }
+            #endif
+            panel.show()
         case "accessibility", "permissions": showPermissions()
         #if DEBUG
         case "stress":
@@ -496,6 +516,31 @@ final class AppEnvironment {
                 monitor.stop()
                 stressMonitor = nil
                 Log.app.notice("stress done: \(count) writes, store has \(self.store.count()) items")
+            }
+        case "check-updates":
+            updates.checkForUpdates()
+        case "demo":
+            // Debug aid: neutral sample history for screenshots (Debug builds keep separate data).
+            guard store.count() == 0 else { return }
+            let samples: [(String, String, String, Int)] = [
+                ("Let's move the design review to Thursday at 10 — I'll send a new invite.", "com.apple.mail", "Mail", 2),
+                ("https://developer.apple.com/documentation/quartzcore/caspringanimation", "com.apple.Safari", "Safari", 9),
+                ("func spring(response: Double, dampingRatio: Double) -> Animation", "com.apple.dt.Xcode", "Xcode", 25),
+                ("brew install xcodegen && make debug", "com.apple.Terminal", "Terminal", 48),
+                ("{\n  \"name\": \"Clipboard2\",\n  \"version\": \"1.4.0\"\n}", "com.apple.dt.Xcode", "Xcode", 75),
+                ("Grocery list: oat milk, lemons, basil, sourdough", "com.apple.Notes", "Notes", 130),
+                ("#0A84FF", "com.apple.Safari", "Safari", 200),
+                ("Thanks for the quick turnaround — looks great!", "com.apple.MobileSMS", "Messages", 320),
+                ("Meeting notes: ship the panel motion, simplify Settings, quiet updates.", "com.apple.Notes", "Notes", 600),
+                ("+43 1 234 5678", "com.apple.Safari", "Safari", 1500),
+            ]
+            for (index, sample) in samples.enumerated().reversed() {
+                let item = store.ingest(.text(sample.0, source: AppRef(bundleID: sample.1, name: sample.2)),
+                                        now: .now.addingTimeInterval(-Double(sample.3 * 60)))
+                if index == 5 { store.togglePin(item) }
+            }
+            if snippets.all().isEmpty {
+                _ = snippets.create(name: "Email sign-off", keyword: ";sig", body: "Best,\n{name}")
             }
         case "snapshot":
             // Debug aid: renders the quick panel to a PNG (no Screen Recording permission needed).

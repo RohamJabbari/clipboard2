@@ -1,10 +1,25 @@
 import SwiftUI
 
 /// Settings tabs that can be opened directly (stored, so the window remembers the last one).
-enum SettingsTab: String {
-    case general, appearance, ignoredApps, snippets, secrets, transforms, ai, permissions, sync, about
+enum SettingsTab: String, CaseIterable {
+    case general, history, appearance, shortcuts, snippets, secrets, actions, sync
 
     static let storageKey = "settingsTab"
+
+    /// Also accepts the tab names used before Settings was reorganised, so a remembered tab or an
+    /// old deep link still lands in the right place.
+    init?(stored: String) {
+        if let tab = Self(rawValue: stored) {
+            self = tab
+            return
+        }
+        switch stored {
+        case "ignoredApps": self = .history
+        case "transforms", "ai": self = .actions
+        case "permissions", "about": self = .general
+        default: return nil
+        }
+    }
 }
 
 /// SwiftUI only exposes `openSettings` through the environment. The menu bar label lives for the

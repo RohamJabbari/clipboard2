@@ -78,7 +78,7 @@ API keys/secrets), because those grants are tied to the signing certificate.
 
 | Where | Keys |
 |---|---|
-| Open quick panel | **⌘⇧V** (change in Settings → General) |
+| Open quick panel | **⌘⇧V** (change in Settings → General; where it opens from — top, bottom, left, right or center — in Settings → Appearance) |
 | Navigate / paste | ↑ ↓, **Return** pastes into the app you came from, **⌥Return** pastes as plain text |
 | Quick slots | **⌘1–9** paste the item bound to that slot (or the Nth row if the slot is empty); **⌘⇧1–9** binds the selection |
 | Actions | **⌘K**: transforms, AI actions, Save as Secret, pin, delete |
@@ -107,11 +107,11 @@ the slot a global shortcut to paste it from any app without opening the panel.
 `{name}`, which prompt for a value before pasting.
 
 **AI actions** (Translate EN/DE/FA, Summarize, Fix Grammar, Explain, custom prompts) run
-through the provider chosen in Settings → AI:
+through the provider chosen in Settings → Actions:
 
 - Anthropic (Claude API, default `claude-sonnet-5-5`)
 - OpenAI, DeepSeek, OpenRouter, any OpenAI-compatible endpoint (Ollama, LM Studio, Groq…)
-- Claude subscription (default): click "Sign in with Claude" in Settings → AI (and "Set Up Claude" if
+- Claude subscription (default): click "Sign in with Claude" in Settings → Actions (and "Set Up Claude" if
   Claude Code isn't installed). It drives Anthropic's own Claude Code login, then runs `claude -p`.
   No API key or API billing, but slower to start. Clipboard2 never borrows a subscription token
   itself; that would break Anthropic's terms.

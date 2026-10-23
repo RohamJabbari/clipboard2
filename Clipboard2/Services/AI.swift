@@ -352,16 +352,16 @@ nonisolated enum AIError: LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .missingAPIKey(let provider): "Add your \(provider.title) API key in Settings → AI."
-        case .missingModel: "Choose a model in Settings → AI."
-        case .badURL: "The base URL in Settings → AI isn't valid."
+        case .missingAPIKey(let provider): "Add your \(provider.title) API key in Settings → Actions."
+        case .missingModel: "Choose a model in Settings → Actions."
+        case .badURL: "The base URL in Settings → Actions isn't valid."
         case .http(let status, let message): "Request failed (\(status)): \(message)"
         case .api(let message): message
         case .refusal: "The model declined this request."
         case .invalidResponse: "Unexpected response from the API."
-        case .cliNotFound: "Claude isn't set up yet. Open Settings → AI to install it and sign in."
-        case .notSignedIn: "Sign in with your account in Settings → AI."
-        case .codexNotFound: "ChatGPT isn't set up yet. Open Settings → AI to install it and sign in."
+        case .cliNotFound: "Claude isn't set up yet. Open Settings → Actions to install it and sign in."
+        case .notSignedIn: "Sign in with your account in Settings → Actions."
+        case .codexNotFound: "ChatGPT isn't set up yet. Open Settings → Actions to install it and sign in."
         }
     }
 

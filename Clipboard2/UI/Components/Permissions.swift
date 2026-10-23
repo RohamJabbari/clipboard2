@@ -207,65 +207,66 @@ struct PermissionsView: View {
     }
 }
 
-/// Settings → Permissions: what Clipboard2 needs and what's currently allowed.
-struct PermissionsSettingsView: View {
+/// Settings → General: what Clipboard2 needs from macOS and what's currently allowed.
+struct PermissionsSection: View {
+    /// Open at Login has its own toggle in General, so it's usually left out here.
+    var permissions: [Permission] = Permission.allCases
     @State private var granted: [Permission: Bool] = [:]
 
     var body: some View {
-        Form {
-            Section {
-                ForEach(Permission.allCases) { permission in
-                    let isGranted = granted[permission] == true
-                    HStack(alignment: .top, spacing: 12) {
-                        Image(systemName: permission.symbol)
-                            .font(.title3)
-                            .foregroundStyle(.tint)
-                            .frame(width: 22)
-                            .accessibilityHidden(true)
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 6) {
-                                Text(permission.title).font(.headline)
-                                Text(permission.isRequired ? "Required" : "Optional")
-                                    .font(.caption2.weight(.medium))
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 1)
-                                    .background(.quaternary, in: Capsule())
-                                    .foregroundStyle(.secondary)
-                            }
-                            Text(permission.purpose)
-                                .font(.callout)
+        Section {
+            ForEach(permissions) { permission in
+                let isGranted = granted[permission] == true
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: permission.symbol)
+                        .font(.title3)
+                        .foregroundStyle(.tint)
+                        .frame(width: 22)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(permission.title).font(.headline)
+                            Text(permission.isRequired ? "Required" : "Optional")
+                                .font(.caption2.weight(.medium))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1)
+                                .background(.quaternary, in: Capsule())
                                 .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
                         }
-                        Spacer(minLength: 8)
-                        if isGranted {
-                            Label("Allowed", systemImage: "checkmark.circle.fill")
-                                .foregroundStyle(.green)
-                        } else {
-                            VStack(alignment: .trailing, spacing: 4) {
-                                Label("Not allowed", systemImage: permission.isRequired ? "exclamationmark.triangle.fill" : "circle.dashed")
-                                    .foregroundStyle(permission.isRequired ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
-                                Button(permission == .loginItem ? "Turn On" : "Open Settings") { permission.openSettings() }
-                                if permission == .accessibility {
-                                    Button("Still Not Working? Reset") { AXPermission.resetAndReRegister() }
-                                        .buttonStyle(.link)
-                                        .font(.caption)
-                                        .help("Removes Clipboard2's Accessibility entry and adds it again — needed after the app's signature changed")
-                                }
+                        Text(permission.purpose)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 8)
+                    if isGranted {
+                        Label("Allowed", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    } else {
+                        VStack(alignment: .trailing, spacing: 4) {
+                            Label("Not allowed", systemImage: permission.isRequired ? "exclamationmark.triangle.fill" : "circle.dashed")
+                                .foregroundStyle(permission.isRequired ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+                            Button(permission == .loginItem ? "Turn On" : "Open Settings") { permission.openSettings() }
+                            if permission == .accessibility {
+                                Button("Still Not Working? Reset") { AXPermission.resetAndReRegister() }
+                                    .buttonStyle(.link)
+                                    .font(.caption)
+                                    .help("Removes Clipboard2's Accessibility entry and adds it again — needed after the app's signature changed")
                             }
                         }
                     }
-                    .padding(.vertical, 4)
-                    .accessibilityElement(children: .combine)
-                    .accessibilityValue(isGranted ? "Allowed" : "Not allowed")
                 }
-            } footer: {
-                Text("Status updates automatically. Clipboard2 never needs Full Disk Access, contacts or location. If you just allowed Screen Recording, macOS may ask you to quit and reopen Clipboard2.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                .padding(.vertical, 4)
+                .accessibilityElement(children: .combine)
+                .accessibilityValue(isGranted ? "Allowed" : "Not allowed")
             }
+        } header: {
+            Text("Permissions")
+        } footer: {
+            Text("Status refreshes on its own. Clipboard2 never needs Full Disk Access, contacts or location.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
-        .formStyle(.grouped)
         .task {
             while !Task.isCancelled {
                 var now: [Permission: Bool] = [:]

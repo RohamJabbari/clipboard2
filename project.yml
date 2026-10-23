@@ -55,7 +55,8 @@ targets:
         SUEnableAutomaticChecks: true
         SUScheduledCheckInterval: 3600
         SUAllowsAutomaticUpdates: true
-        SUAutomaticallyUpdate: false
+        # Updates download quietly and install on quit (Settings → General → Updates).
+        SUAutomaticallyUpdate: true
         SUVerifyUpdateBeforeExtraction: true
         NSServices:
           - NSMenuItem:

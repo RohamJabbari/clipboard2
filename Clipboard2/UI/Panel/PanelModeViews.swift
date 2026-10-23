@@ -356,7 +356,7 @@ struct AIResultView: View {
     }
 }
 
-/// Compact menu showing the active provider's models; changing it updates Settings → AI too.
+/// Compact menu showing the active provider's models; changing it updates Settings → Actions too.
 struct ModelPickerMenu: View {
     @Environment(AppEnvironment.self) private var env
     var onChange: (() -> Void)?
