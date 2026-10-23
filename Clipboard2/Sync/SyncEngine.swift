@@ -147,6 +147,15 @@ final class SyncEngine {
             row.ownerUid = space.ownerUid
             row.memberCount = space.memberCount
             row.createdAt = space.createdAt
+            if !row.authorsBackfilled {
+                // Once per group after the update that added "copied by": download everything again
+                // so items synced earlier learn who wrote them. New groups start from 0 anyway.
+                if !space.isPersonal { row.since = 0 }
+                row.authorsBackfilled = true
+            }
+            if let members = space.members {
+                row.memberNames = Dictionary(members.map { ($0.uid, $0.name) }, uniquingKeysWith: { first, _ in first })
+            }
             if space.isPersonal {
                 row.name = "Personal"
             } else if let sealed = space.encryptedName, let key = spaceKeys[space.id] {
@@ -216,7 +225,11 @@ final class SyncEngine {
     /// (after a 409) applies it even over unpushed local changes.
     private func apply(_ remote: RemoteItem, spaceId: String, itemKey: Data, force: Bool) async throws {
         let meta = self.meta(for: remote.id)
-        if !force, let meta, meta.spaceId == spaceId, remote.seq > 0, meta.remoteSeq >= remote.seq { return }
+        if !force, let meta, meta.spaceId == spaceId, remote.seq > 0, meta.remoteSeq >= remote.seq {
+            // Items synced before authors were tracked learn theirs on the one-time re-download.
+            if meta.authorUid == nil, let author = remote.authorUid { meta.authorUid = author }
+            return
+        }
         let isPersonal = spaceId == identity.personalSpaceId
 
         if let deleted = remote.deleted {
@@ -338,7 +351,7 @@ final class SyncEngine {
         let fingerprint = dirty ? ((try? SyncPayload.clip(payload).fingerprint()) ?? "")
                                 : clipFingerprint(item, blobIds: blobIds)
         recordMeta(id: remote.id, spaceId: spaceId, category: payload.category, fingerprint: fingerprint,
-                   seq: remote.seq, updatedAt: remote.updatedAt, blobIds: blobIds)
+                   seq: remote.seq, updatedAt: remote.updatedAt, blobIds: blobIds, authorUid: remote.authorUid)
     }
 
     /// Saves downloaded files as `Synced Files/<item id>/<name>`, replacing an earlier version.
@@ -404,7 +417,7 @@ final class SyncEngine {
         if existing == nil { snippets.insertSynced(snippet) }
         snippets.commitSynced()
         recordMeta(id: remote.id, spaceId: spaceId, category: .snippet, fingerprint: snippetFingerprint(snippet),
-                   seq: remote.seq, updatedAt: remote.updatedAt, blobIds: [])
+                   seq: remote.seq, updatedAt: remote.updatedAt, blobIds: [], authorUid: remote.authorUid)
     }
 
     private func applySecret(_ payload: SecretPayload, remote: RemoteItem, spaceId: String, force: Bool) {
@@ -422,7 +435,7 @@ final class SyncEngine {
         secretsChanged = true
         let fingerprint = secret(withID: remote.id).flatMap(secretFingerprint) ?? ""
         recordMeta(id: remote.id, spaceId: spaceId, category: .secret, fingerprint: fingerprint,
-                   seq: remote.seq, updatedAt: remote.updatedAt, blobIds: [])
+                   seq: remote.seq, updatedAt: remote.updatedAt, blobIds: [], authorUid: remote.authorUid)
     }
 
     private func downloadBlob(spaceId: String, blobId: String, itemKey: Data) async throws -> Data {
@@ -573,7 +586,7 @@ final class SyncEngine {
             switch outcome {
             case .saved(let seq, let trimmed):
                 recordMeta(id: job.id, spaceId: spaceId, category: job.category, fingerprint: job.fingerprint,
-                           seq: seq, updatedAt: job.updatedAt, blobIds: job.blobIds)
+                           seq: seq, updatedAt: job.updatedAt, blobIds: job.blobIds, authorUid: identity.uid)
                 for id in trimmed { handleTrimmed(id, spaceId: spaceId) }
             case .conflict(let current):
                 try await apply(current, spaceId: spaceId, itemKey: itemKey, force: true)
@@ -682,7 +695,7 @@ final class SyncEngine {
     }
 
     private func recordMeta(id: String, spaceId: String, category: SyncCategory, fingerprint: String,
-                            seq: Int64, updatedAt: Int64, blobIds: [String]) {
+                            seq: Int64, updatedAt: Int64, blobIds: [String], authorUid: String?) {
         let meta = self.meta(for: id) ?? {
             let meta = SyncMeta(localId: id, spaceId: spaceId, category: category.rawValue)
             context.insert(meta)
@@ -694,6 +707,7 @@ final class SyncEngine {
         meta.remoteSeq = max(meta.remoteSeq, seq)
         meta.updatedAt = updatedAt
         meta.blobIds = blobIds
+        if let authorUid { meta.authorUid = authorUid }
     }
 
     func meta(for id: String) -> SyncMeta? {

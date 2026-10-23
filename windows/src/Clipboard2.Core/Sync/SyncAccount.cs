@@ -25,7 +25,7 @@ public sealed record InvitePreview(string InviteId, string SpaceId, string Name,
 /// The session token and keys live in the key store (Credential Manager under <c>Clipboard2/sync/…</c>), never in
 /// settings. Use from the UI thread; <see cref="Changed"/> fires there.
 /// </summary>
-public sealed class SyncAccount
+public sealed partial class SyncAccount
 {
     private const string TokenKey = "sync/session-token";
     private const string AccountKey = "sync/account";
@@ -44,11 +44,17 @@ public sealed class SyncAccount
     private string? _token;
     private SyncEngine? _engine;
     private bool _syncing, _again;
+    /// <summary>The account was fetched in this session (a username set on another device shows up).</summary>
+    private bool _accountFresh;
     private Task? _running;
 
     public SyncPhase Phase { get; private set; } = SyncPhase.SignedOut;
     public string? Email { get; private set; }
     public string? Uid { get; private set; }
+    /// <summary>Shown to group members on the items this user copies. Null for accounts made before usernames.</summary>
+    public string? Username { get; private set; }
+    /// <summary>For group badges: who "me" is.</summary>
+    public SyncSelf? Self => Uid is { } uid ? new SyncSelf(uid, Username) : null;
     public bool IsBusy { get; private set; }
     public string? Status { get; private set; }
     public string? Error { get; private set; }
@@ -98,6 +104,7 @@ public sealed class SyncAccount
         var account = Parse(_keys.Read(AccountKey));
         Email = account?["email"]?.GetValue<string>();
         Uid = account?["uid"]?.GetValue<string>();
+        Username = account?["username"] is JsonValue username ? username.GetValue<string>() : null;
         _token = _keys.Read(TokenKey);
         if (account is not null && LoadIdentity(account) is { } identity)
         {
@@ -125,10 +132,12 @@ public sealed class SyncAccount
     // MARK: Account flows
 
     /// <summary>Creates the keys on this PC and the account on the server. There is no password recovery.</summary>
-    public Task<bool> CreateAccountAsync(string email, string password, string confirmation) => Run("Creating your account…", async ct =>
+    public Task<bool> CreateAccountAsync(string email, string username, string password, string confirmation) => Run("Creating your account…", async ct =>
     {
         email = SyncCrypto.NormalizeEmail(email);
         if (!email.Contains('@')) throw new SyncUserException("Enter your email address.");
+        username = NormalizeUsername(username);
+        if (UsernameProblem(username) is { } problem) throw new SyncUserException(problem);
         if (password.Length < MinPasswordLength) throw new SyncUserException($"Use at least {MinPasswordLength} characters for the password.");
         if (password != confirmation) throw new SyncUserException("The passwords don't match.");
         var uid = Guid.NewGuid().ToString("D");
@@ -148,7 +157,7 @@ public sealed class SyncAccount
         try
         {
             session = await _api.SignupAsync(email, m.keys.AuthKey, m.kdf, uid, m.WrappedAK, m.identity.Public, m.WrappedPriv,
-                m.spaceId, m.PersonalKey, DeviceName, ct);
+                m.spaceId, m.PersonalKey, deviceName: DeviceName, username: username, ct: ct);
         }
         catch (SyncApiException ex) when (ex.Code == "conflict")
         {
@@ -208,6 +217,65 @@ public sealed class SyncAccount
         }
         Status = "Password changed. Other devices will ask for the new password.";
     }, keepStatus: true);
+
+    // MARK: Username
+
+    public const int MinUsernameLength = 3, MaxUsernameLength = 24;
+    public const string UsernameRule = "A username has 3–24 letters, digits, _ . or -, and starts with a letter or digit.";
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"^[\p{L}\p{Nd}][\p{L}\p{Nd}_.\-]{2,23}$")]
+    private static partial System.Text.RegularExpressions.Regex UsernamePattern();
+
+    /// <summary>Trimmed and NFC-normalized, as the server stores it.</summary>
+    public static string NormalizeUsername(string username) => username.Trim().Normalize(NormalizationForm.FormC);
+
+    /// <summary>Why a (normalized) username can't be used, or null when it can. Uniqueness is the server's call.</summary>
+    public static string? UsernameProblem(string username) =>
+        username.Length == 0 ? "Choose a username. It's shown to people in your groups."
+        : UsernamePattern().IsMatch(username) ? null : UsernameRule;
+
+    /// <summary>Sets or changes the username; the server's spelling is kept.</summary>
+    public Task<bool> ChangeUsernameAsync(string username) => Run("Saving your username…", async ct =>
+    {
+        username = NormalizeUsername(username);
+        if (UsernameProblem(username) is { } problem) throw new SyncUserException(problem);
+        if (Phase != SyncPhase.SignedIn) throw new SyncUserException("Sign in to sync first.");
+        try { SaveUsername(await _api.SetUsernameAsync(username, ct)); }
+        catch (SyncApiException ex) when (ex.Code == "invalid")
+        {
+            throw new SyncUserException(UsernameRule);
+        }
+        catch (SyncApiException ex) when (ex.Code is "not_found" or "http_404")
+        {
+            throw new SyncUserException("The sync server doesn't support usernames yet.");
+        }
+        Status = $"Your username is now {Username}.";
+    }, keepStatus: true);
+
+    private void SaveUsername(string? username)
+    {
+        Username = username;
+        if (Parse(_keys.Read(AccountKey)) is { } account)
+        {
+            account["username"] = username;
+            _keys.Save(AccountKey, account.ToJsonString(), "Clipboard2 sync – account");
+        }
+    }
+
+    /// <summary>Once per session after a restart: picks up a username set on another device. Failures wait for next time.</summary>
+    private async Task RefreshAccountAsync(CancellationToken ct)
+    {
+        try
+        {
+            var account = await _api.GetAccountAsync(ct);
+            _accountFresh = true;
+            if (account.Uid == Uid && account.Username != Username) SaveUsername(account.Username);
+        }
+        catch (SyncApiException ex) when (ex.Code != "unauthenticated")
+        {
+            Logger?.Invoke("Couldn't refresh the account: " + ex.Message);
+        }
+    }
 
     /// <summary>Ends the session on the server, then removes group data, sync state and keys. Personal history stays.</summary>
     public Task<bool> SignOutAsync() => Run(null, async ct =>
@@ -416,6 +484,7 @@ public sealed class SyncAccount
             {
                 _again = false;
                 if (_engine is not { } engine) break;
+                if (!_accountFresh) await RefreshAccountAsync(ct);
                 var report = await engine.TickAsync(ct);
                 LastSync = _now();
                 Error = null;
@@ -476,10 +545,12 @@ public sealed class SyncAccount
         _keys.Save(IdentityKeyKey, Convert.ToBase64String(priv), "Clipboard2 sync – identity key");
         Uid = account.Uid;
         Email = account.Email.Length > 0 ? account.Email : Email;
+        Username = account.Username;
+        _accountFresh = true;
         _keys.Save(AccountKey, new JsonObject
         {
             ["uid"] = account.Uid, ["email"] = Email, ["personalSpaceId"] = account.PersonalSpaceId,
-            ["publicKey"] = Convert.ToBase64String(account.PublicKey),
+            ["publicKey"] = Convert.ToBase64String(account.PublicKey), ["username"] = Username,
         }.ToJsonString(), "Clipboard2 sync – account");
         StartEngine(new SyncIdentity(account.Uid, Email ?? "", new EcKeyPair(priv, account.PublicKey), account.PersonalSpaceId));
         Phase = SyncPhase.SignedIn;
@@ -498,6 +569,7 @@ public sealed class SyncAccount
         _token = null;
         Email = null;
         Uid = null;
+        Username = null;
         LastSync = null;
         Phase = SyncPhase.SignedOut;
         if (_settings.DefaultGroupId is not null)
@@ -552,6 +624,7 @@ public sealed class SyncAccount
     {
         SyncUserException or SyncAccountGoneException => ex.Message,
         SyncApiException { Code: "invalid_credentials" } => "The email or password is wrong.",
+        SyncApiException { Code: "username_taken" } => "That username is taken. Try another one.",
         SyncApiException { Code: "unauthenticated" } => "Your session ended. Enter your password to keep syncing.",
         SyncApiException { Code: "network" } => ex.Message,
         SyncApiException { Code: "quota_exceeded" or "too_large" or "forbidden" or "not_found" or "invalid" } => ex.Message,

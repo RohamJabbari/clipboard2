@@ -31,6 +31,8 @@ nonisolated struct RemoteAccount: Codable, Sendable, Equatable {
     var publicKey: Data
     var wrappedPrivateKey: Data
     var personalSpaceId: String
+    /// nil for accounts made before usernames, and from servers that don't have them yet.
+    var username: String?
 }
 
 /// `POST /v1/auth/signup`: the verifier plus everything the account's keys need, all wrapped.
@@ -48,6 +50,7 @@ nonisolated struct SignupRequest: Codable, Sendable {
     var wrappedPrivateKey: Data
     var personalSpace: PersonalSpace
     var deviceName: String?
+    var username: String?
 }
 
 /// `PUT /v1/account/password`.
@@ -89,14 +92,23 @@ nonisolated struct RemoteSpace: Codable, Sendable, Equatable {
     var encryptedName: Data?
     var memberCount: Int
     var createdAt: Int64
+    /// Who is in the space, to show who copied an item (absent on servers without usernames).
+    var members: [MemberName]?
 
     var isPersonal: Bool { kind == "personal" }
+}
+
+/// A space member's display name: the username, or the part of the email before the @.
+nonisolated struct MemberName: Codable, Sendable, Equatable {
+    var uid: String
+    var name: String
 }
 
 nonisolated struct RemoteMember: Codable, Sendable, Equatable, Identifiable {
     var uid: String
     var email: String
     var role: String
+    var username: String?
     var id: String { uid }
 }
 
@@ -191,6 +203,8 @@ nonisolated protocol SyncService: Sendable {
     func login(email: String, authKey: Data, deviceName: String?) async throws -> RemoteSession
     func logout() async throws
     func changePassword(_ body: PasswordChange) async throws
+    /// Returns the username as stored. `username_taken` (409) when someone has it.
+    func setUsername(_ username: String) async throws -> String
     func account() async throws -> RemoteAccount
     func deleteAccount(authKey: Data) async throws
 
@@ -265,6 +279,11 @@ nonisolated struct SyncAPI: SyncService {
 
     func changePassword(_ body: PasswordChange) async throws {
         _ = try await send("PUT", "v1/account/password", body: body, as: Empty.self)
+    }
+
+    func setUsername(_ username: String) async throws -> String {
+        struct Body: Codable { var username: String }
+        return try await send("PUT", "v1/account/username", body: Body(username: username), as: Body.self).username
     }
 
     func account() async throws -> RemoteAccount {

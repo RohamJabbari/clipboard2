@@ -370,11 +370,14 @@ actor FakeSyncServer {
         var publicKey: Data
         var wrappedPrivateKey: Data
         var personalSpaceId: String
+        var username: String?
 
         var remote: RemoteAccount {
             RemoteAccount(uid: uid, email: email, kdf: kdf, wrappedAccountKey: wrappedAccountKey, publicKey: publicKey,
-                          wrappedPrivateKey: wrappedPrivateKey, personalSpaceId: personalSpaceId)
+                          wrappedPrivateKey: wrappedPrivateKey, personalSpaceId: personalSpaceId, username: username)
         }
+
+        var displayName: String { username ?? String(email.prefix { $0 != "@" }) }
     }
 
     struct Invite {
@@ -394,6 +397,25 @@ actor FakeSyncServer {
     private(set) var seq: Int64 = 0
     let historyLimit = 200
     private(set) var putCount = 0
+    /// false behaves like a server from before usernames: no `members` in the space list.
+    var listsMembers = true
+
+    func setListsMembers(_ value: Bool) { listsMembers = value }
+
+    static func usernameTaken() -> SyncAPIError {
+        .server(status: 409, code: "username_taken", message: "", retryAfter: nil)
+    }
+
+    private func isTaken(_ username: String, except uid: String? = nil) -> Bool {
+        accounts.values.contains { $0.uid != uid && $0.username?.lowercased() == username.lowercased() }
+    }
+
+    func setUsername(uid: String, _ username: String) throws -> String {
+        guard !isTaken(username, except: uid) else { throw Self.usernameTaken() }
+        guard let email = accounts.first(where: { $0.value.uid == uid })?.key else { throw Self.unauthenticated() }
+        accounts[email]?.username = username
+        return username
+    }
 
     // MARK: Auth
 
@@ -418,9 +440,11 @@ actor FakeSyncServer {
 
     func signup(_ body: SignupRequest) throws -> RemoteSession {
         guard accounts[body.email] == nil else { throw SyncAPIError.server(status: 409, code: "conflict", message: "", retryAfter: nil) }
+        if let name = body.username, isTaken(name) { throw Self.usernameTaken() }
         let account = Account(uid: body.uid, email: body.email, authKey: body.authKey, kdf: body.kdf,
                               wrappedAccountKey: body.wrappedAccountKey, publicKey: body.publicKey,
-                              wrappedPrivateKey: body.wrappedPrivateKey, personalSpaceId: body.personalSpace.id)
+                              wrappedPrivateKey: body.wrappedPrivateKey, personalSpaceId: body.personalSpace.id,
+                              username: body.username)
         accounts[body.email] = account
         createSpace(id: body.personalSpace.id, kind: "personal", owner: body.uid, wrappedKey: body.personalSpace.wrappedKey)
         return RemoteSession(token: issueToken(for: body.uid), expiresAt: nil, account: account.remote)
@@ -521,9 +545,13 @@ actor FakeSyncServer {
     func spaces(for uid: String) -> [RemoteSpace] {
         spaces.values.compactMap { space in
             guard let member = space.members[uid] else { return nil }
+            let names = space.members.keys.sorted().compactMap { uid in
+                accounts.values.first { $0.uid == uid }.map { MemberName(uid: uid, name: $0.displayName) }
+            }
             return RemoteSpace(id: space.id, kind: space.kind, role: member.role, ownerUid: space.owner,
                                wrappedKey: member.wrappedKey, encryptedName: space.encryptedName,
-                               memberCount: space.members.count, createdAt: space.createdAt)
+                               memberCount: space.members.count, createdAt: space.createdAt,
+                               members: listsMembers ? names : nil)
         }
         .sorted { $0.createdAt < $1.createdAt }
     }
@@ -619,6 +647,7 @@ nonisolated struct FakeClient: SyncService {
         try await server.changePassword(uid: try await caller(), token: try await token(), body)
     }
     func account() async throws -> RemoteAccount { try await server.remoteAccount(uid: try await caller()) }
+    func setUsername(_ username: String) async throws -> String { try await server.setUsername(uid: try await caller(), username) }
     func deleteAccount(authKey: Data) async throws { try await server.deleteAccount(uid: try await caller(), authKey: authKey) }
 
     func spaces() async throws -> [RemoteSpace] { await server.spaces(for: try await caller()) }
@@ -1119,7 +1148,7 @@ struct SyncAccountTests {
     @Test func signUpSignInAndWrongPassword() async throws {
         let server = FakeSyncServer()
         let mac1 = try AccountHarness(server)
-        await mac1.account.signUp(email: "  Alice@Example.com ", password: "correct horse")
+        await mac1.account.signUp(email: "  Alice@Example.com ", password: "correct horse", username: "useralice")
         #expect(mac1.account.state == .signedIn(email: "alice@example.com"))
         let stored = try #require(mac1.credentials.saved)
         #expect(stored.token != nil && stored.accountKey.count == 32)
@@ -1136,14 +1165,14 @@ struct SyncAccountTests {
         #expect(mac2.credentials.saved?.accountKey == stored.accountKey)
 
         let mac3 = try AccountHarness(server)
-        await mac3.account.signUp(email: "alice@example.com", password: "another one")
+        await mac3.account.signUp(email: "alice@example.com", password: "another one", username: "useralice")
         #expect(mac3.account.errorMessage == SyncAccountError.emailTaken.errorDescription)
     }
 
     @Test func passwordChangeEndsOtherSessionsAndTheyUnlockWithTheNewOne() async throws {
         let server = FakeSyncServer()
         let mac1 = try AccountHarness(server), mac2 = try AccountHarness(server)
-        await mac1.account.signUp(email: "a@b.at", password: "old password")
+        await mac1.account.signUp(email: "a@b.at", password: "old password", username: "usera")
         await mac2.account.signIn(email: "a@b.at", password: "old password")
         mac1.store.ingest(.text("before the change"))
         await mac1.settle()
@@ -1163,9 +1192,9 @@ struct SyncAccountTests {
     @Test func inviteCodeJoinsAGroupOnce() async throws {
         let server = FakeSyncServer()
         let alice = try AccountHarness(server), bob = try AccountHarness(server), carol = try AccountHarness(server)
-        await alice.account.signUp(email: "alice@x.at", password: "alice password")
-        await bob.account.signUp(email: "bob@x.at", password: "bob password")
-        await carol.account.signUp(email: "carol@x.at", password: "carol password")
+        await alice.account.signUp(email: "alice@x.at", password: "alice password", username: "useralice")
+        await bob.account.signUp(email: "bob@x.at", password: "bob password", username: "userbob")
+        await carol.account.signUp(email: "carol@x.at", password: "carol password", username: "usercarol")
 
         let group = try await alice.account.createGroup(named: "Team Wien")
         #expect(alice.prefs.syncDefaultGroupID == group.id)
@@ -1191,11 +1220,89 @@ struct SyncAccountTests {
         #expect(bob.account.groupName(for: group.id) == "Team Wien")
     }
 
+    @Test func groupItemsShowWhoCopiedThem() async throws {
+        let server = FakeSyncServer()
+        let alice = try AccountHarness(server), bob = try AccountHarness(server)
+        await alice.account.signUp(email: "alice@x.at", password: "alice password", username: "Alice")
+        await bob.account.signUp(email: "bob@x.at", password: "bob password", username: "bobby")
+        #expect(alice.account.username == "Alice")
+        let group = try await alice.account.createGroup(named: "Team")
+        try await bob.account.join(try await bob.account.previewInvite(code: try await alice.account.createInviteCode(for: group)))
+
+        let mine = alice.store.ingest(.text("from alice"), spaceID: group.id)
+        #expect(alice.account.copiedBy(mine) == "Alice")              // not synced yet: still yours
+        #expect(alice.account.copiedBy(alice.store.ingest(.text("personal"))) == nil)
+        await alice.settle()
+        await bob.settle()
+        let received = try #require(bob.store.items(inSpace: group.id).first)
+        #expect(bob.account.copiedBy(received) == "Alice")
+
+        // A new name reaches the other member with the next sync.
+        #expect(await alice.account.setUsername("  Ali  "))
+        await alice.settle()
+        await bob.settle()
+        #expect(bob.account.copiedBy(received) == "Ali")
+
+        // Taken (any case) and invalid names are refused.
+        #expect(await bob.account.setUsername("ALI") == false)
+        #expect(bob.account.errorMessage == SyncAccountError.usernameTaken.localizedDescription)
+        #expect(await bob.account.setUsername("x") == false)
+        #expect(bob.account.username == "bobby")
+
+        // A server without member names: fall back to the group's name.
+        await server.setListsMembers(false)
+        let other = try AccountHarness(server)
+        await other.account.signUp(email: "carol@x.at", password: "carol password", username: "carol")
+        try await other.account.join(try await other.account.previewInvite(code: try await alice.account.createInviteCode(for: group)))
+        await other.settle()
+        let seen = try #require(other.store.items(inSpace: group.id).first)
+        #expect(other.account.copiedBy(seen) == "Team")
+    }
+
+    @Test func itemsSyncedBeforeUsernamesLearnTheirAuthor() async throws {
+        let server = FakeSyncServer()
+        let alice = try AccountHarness(server), bob = try AccountHarness(server)
+        await alice.account.signUp(email: "alice@x.at", password: "alice password", username: "Alice")
+        await bob.account.signUp(email: "bob@x.at", password: "bob password", username: "bobby")
+        let group = try await alice.account.createGroup(named: "Team")
+        try await bob.account.join(try await bob.account.previewInvite(code: try await alice.account.createInviteCode(for: group)))
+        alice.store.ingest(.text("old item"), spaceID: group.id)
+        await alice.settle()
+        await bob.settle()
+        let received = try #require(bob.store.items(inSpace: group.id).first)
+
+        // As on a Mac updated from a version without authors: nothing recorded, no backfill yet.
+        let context = bob.container.mainContext
+        for meta in try context.fetch(FetchDescriptor<SyncMeta>()) { meta.authorUid = nil }
+        for space in try context.fetch(FetchDescriptor<SyncSpace>()) { space.authorsBackfilled = false }
+        try context.save()
+        bob.account.loadGroups()
+        #expect(bob.account.copiedBy(received) == "Team")   // unknown, never shown as bob's own
+
+        await bob.settle()
+        #expect(bob.account.copiedBy(received) == "Alice")
+    }
+
+    @Test func signUpRefusesATakenOrInvalidUsername() async throws {
+        let server = FakeSyncServer()
+        let a = try AccountHarness(server), b = try AccountHarness(server)
+        await a.account.signUp(email: "a@x.at", password: "a password", username: "sam")
+        await b.account.signUp(email: "b@x.at", password: "b password", username: "SAM")
+        #expect(!b.account.isSignedIn)
+        #expect(b.account.errorMessage == SyncAccountError.usernameTaken.localizedDescription)
+        await b.account.signUp(email: "b@x.at", password: "b password", username: "-sam")
+        #expect(!b.account.isSignedIn)
+        #expect(SyncAccount.usernameProblem("ab") != nil)
+        #expect(SyncAccount.usernameProblem("Größe_2.0") == nil)
+        #expect(SyncAccount.usernameProblem("has space") != nil)
+        #expect(SyncAccount.usernameProblem(String(repeating: "a", count: 25)) != nil)
+    }
+
     @Test func revokedInvitesStopWorking() async throws {
         let server = FakeSyncServer()
         let alice = try AccountHarness(server), bob = try AccountHarness(server)
-        await alice.account.signUp(email: "alice@x.at", password: "alice password")
-        await bob.account.signUp(email: "bob@x.at", password: "bob password")
+        await alice.account.signUp(email: "alice@x.at", password: "alice password", username: "useralice")
+        await bob.account.signUp(email: "bob@x.at", password: "bob password", username: "userbob")
         let group = try await alice.account.createGroup(named: "Ops")
         let code = try await alice.account.createInviteCode(for: group)
         let pending = try #require(try await alice.account.pendingInvites(for: group).first)
@@ -1206,7 +1313,7 @@ struct SyncAccountTests {
     @Test func signOutAndDeleteAccount() async throws {
         let server = FakeSyncServer()
         let mac = try AccountHarness(server)
-        await mac.account.signUp(email: "a@b.at", password: "a password")
+        await mac.account.signUp(email: "a@b.at", password: "a password", username: "usera")
         let group = try await mac.account.createGroup(named: "G")
         mac.store.ingest(.text("mine"))
         mac.store.ingest(.text("group item"), spaceID: group.id)

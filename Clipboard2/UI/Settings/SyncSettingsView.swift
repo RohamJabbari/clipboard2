@@ -71,6 +71,7 @@ private struct SyncSignInSection: View {
     let sync: SyncAccount
     @State private var creating = true
     @State private var email = ""
+    @State private var username = ""
     @State private var password = ""
     @State private var confirm = ""
     @State private var understood = false
@@ -82,6 +83,7 @@ private struct SyncSignInSection: View {
         if address.isEmpty || !address.contains("@") { return "Enter your email address." }
         if password.isEmpty { return "Enter a password." }
         guard creating else { return nil }
+        if let problem = SyncAccount.usernameProblem(username) { return problem }
         if password.count < Self.minimumPasswordLength { return "Use at least \(Self.minimumPasswordLength) characters." }
         if confirm != password { return "The passwords don't match." }
         if !understood { return "Confirm that you understand there's no recovery." }
@@ -98,6 +100,10 @@ private struct SyncSignInSection: View {
             .labelsHidden()
             TextField("Email", text: $email, prompt: Text("you@example.com"))
                 .textContentType(.username)
+            if creating {
+                TextField("Username", text: $username, prompt: Text("Shown to your groups"))
+                    .textContentType(.nickname)
+            }
             SecureField("Password", text: $password)
                 .textContentType(creating ? .newPassword : .password)
             if creating {
@@ -128,16 +134,69 @@ private struct SyncSignInSection: View {
 
     private func submit() {
         guard problem == nil else { return }
-        let (email, password) = (email, password)
+        let (email, password, username) = (email, password, username)
         self.password = ""
         confirm = ""
         understood = false
         Task {
             if creating {
-                await sync.signUp(email: email, password: password)
+                await sync.signUp(email: email, password: password, username: username)
             } else {
                 await sync.signIn(email: email, password: password)
             }
+        }
+    }
+}
+
+/// Shows the username and edits it in place. Accounts from before usernames get a prompt to pick one.
+private struct UsernameRow: View {
+    let sync: SyncAccount
+    @State private var editing = false
+    @State private var draft = ""
+    @State private var saving = false
+
+    var body: some View {
+        LabeledContent("Username") {
+            if editing {
+                HStack(spacing: 6) {
+                    TextField("Username", text: $draft, prompt: Text("Shown to your groups"))
+                        .labelsHidden()
+                        .frame(maxWidth: 180)
+                        .onSubmit(save)
+                    Button("Save", action: save)
+                        .disabled(saving || SyncAccount.usernameProblem(draft) != nil)
+                    Button("Cancel") { editing = false }
+                }
+            } else if let name = sync.username {
+                HStack(spacing: 8) {
+                    Text(name)
+                    Button("Change…") { begin() }
+                }
+            } else {
+                Button("Set a Username…") { begin() }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        if editing, !draft.isEmpty, let problem = SyncAccount.usernameProblem(draft) {
+            Text(problem).font(.caption).foregroundStyle(.secondary)
+        } else if sync.username == nil && !editing {
+            Text("Group members see your username on the items you copy.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func begin() {
+        draft = sync.username ?? ""
+        editing = true
+    }
+
+    private func save() {
+        guard SyncAccount.usernameProblem(draft) == nil else { return }
+        saving = true
+        Task {
+            if await sync.setUsername(draft) { editing = false }
+            saving = false
         }
     }
 }
@@ -185,6 +244,7 @@ private struct SyncStatusSection: View {
                     .foregroundStyle(.green)
                     .labelStyle(.titleAndIcon)
             }
+            UsernameRow(sync: sync)
             LabeledContent("Last sync") {
                 HStack(spacing: 8) {
                     if sync.isSyncing {
@@ -328,7 +388,12 @@ private struct GroupManageSheet: View {
                     }
                     ForEach(members) { member in
                         HStack {
-                            Text(member.email)
+                            if let username = member.username {
+                                Text(username)
+                                Text(member.email).font(.caption).foregroundStyle(.secondary)
+                            } else {
+                                Text(member.email)
+                            }
                             Spacer()
                             Text(member.role == "owner" ? "Owner" : "Member").font(.caption).foregroundStyle(.secondary)
                             if group.isOwner && member.role != "owner" {

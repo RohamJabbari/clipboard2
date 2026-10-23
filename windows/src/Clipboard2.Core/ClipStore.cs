@@ -74,7 +74,7 @@ public sealed class ClipStore : IDisposable
     }
 
     /// <summary>Schema version stored in <c>PRAGMA user_version</c>. v0 is the original, unversioned schema.</summary>
-    public const int SchemaVersion = 1;
+    public const int SchemaVersion = 2;
 
     public int UserVersion => Convert.ToInt32(Scalar("PRAGMA user_version"));
 
@@ -100,6 +100,16 @@ public sealed class ClipStore : IDisposable
                     CREATE TABLE IF NOT EXISTS sync_spaces (
                         id TEXT PRIMARY KEY, kind TEXT NOT NULL, role TEXT NOT NULL, name TEXT, owner_uid TEXT NOT NULL,
                         member_count INTEGER NOT NULL);
+                    """);
+            }
+            if (version < 2)
+            {
+                // v2: usernames. Who copied each synced item, and each space's members (uid → name). Groups pull
+                // again from the start once, so items synced before this learn their author.
+                Exec("""
+                    ALTER TABLE sync_meta ADD COLUMN author_uid TEXT;
+                    ALTER TABLE sync_spaces ADD COLUMN members TEXT;
+                    UPDATE sync_cursor SET since = 0 WHERE space_id IN (SELECT id FROM sync_spaces WHERE kind = 'group');
                     """);
             }
             Exec($"PRAGMA user_version = {SchemaVersion}");
@@ -512,7 +522,7 @@ public sealed class ClipStore : IDisposable
     private List<SyncMeta> QueryMeta(string spaceId, string? localId)
     {
         using var cmd = _db.CreateCommand();
-        cmd.CommandText = "SELECT space_id, local_id, category, fingerprint, remote_seq, updated_at, trimmed, blobs FROM sync_meta WHERE space_id = $s"
+        cmd.CommandText = "SELECT space_id, local_id, category, fingerprint, remote_seq, updated_at, trimmed, blobs, author_uid FROM sync_meta WHERE space_id = $s"
             + (localId is null ? "" : " AND local_id = $id");
         cmd.Parameters.AddWithValue("$s", spaceId);
         if (localId is not null) cmd.Parameters.AddWithValue("$id", localId);
@@ -520,18 +530,32 @@ public sealed class ClipStore : IDisposable
         var list = new List<SyncMeta>();
         while (r.Read())
             list.Add(new SyncMeta(r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetInt64(4), r.GetInt64(5),
-                r.GetInt64(6) != 0, r.IsDBNull(7) ? null : JsonSerializer.Deserialize<Dictionary<string, string>>(r.GetString(7))));
+                r.GetInt64(6) != 0, r.IsDBNull(7) ? null : JsonSerializer.Deserialize<Dictionary<string, string>>(r.GetString(7)),
+                r.IsDBNull(8) ? null : r.GetString(8)));
         return list;
     }
 
+    /// <summary>The author of every group item the server knows about, by (space, item id); null where it isn't known.
+    /// Group items missing here haven't been sent yet, so they're this user's own.</summary>
+    public Dictionary<(string Space, string LocalId), string?> GroupAuthors()
+    {
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = "SELECT space_id, local_id, author_uid FROM sync_meta WHERE space_id IN (SELECT id FROM sync_spaces WHERE kind = 'group')";
+        using var r = cmd.ExecuteReader();
+        var authors = new Dictionary<(string, string), string?>();
+        while (r.Read()) authors[(r.GetString(0), r.GetString(1))] = r.IsDBNull(2) ? null : r.GetString(2);
+        return authors;
+    }
+
     public void SaveSyncMeta(SyncMeta meta) => Exec("""
-        INSERT INTO sync_meta (space_id, local_id, category, fingerprint, remote_seq, updated_at, trimmed, blobs)
-        VALUES ($s, $id, $c, $f, $seq, $u, $t, $b)
+        INSERT INTO sync_meta (space_id, local_id, category, fingerprint, remote_seq, updated_at, trimmed, blobs, author_uid)
+        VALUES ($s, $id, $c, $f, $seq, $u, $t, $b, $a)
         ON CONFLICT(space_id, local_id) DO UPDATE SET category = $c, fingerprint = $f, remote_seq = $seq, updated_at = $u,
-            trimmed = $t, blobs = $b
+            trimmed = $t, blobs = $b, author_uid = $a
         """,
         ("$s", meta.SpaceId), ("$id", meta.LocalId), ("$c", meta.Category), ("$f", meta.Fingerprint), ("$seq", meta.RemoteSeq),
-        ("$u", meta.UpdatedAt), ("$t", meta.Trimmed ? 1 : 0), ("$b", meta.Blobs is { Count: > 0 } b ? JsonSerializer.Serialize(b) : null));
+        ("$u", meta.UpdatedAt), ("$t", meta.Trimmed ? 1 : 0), ("$b", meta.Blobs is { Count: > 0 } b ? JsonSerializer.Serialize(b) : null),
+        ("$a", meta.AuthorUid));
 
     public void DeleteSyncMeta(string spaceId, string localId) =>
         Exec("DELETE FROM sync_meta WHERE space_id = $s AND local_id = $id", ("$s", spaceId), ("$id", localId));
@@ -546,11 +570,12 @@ public sealed class ClipStore : IDisposable
     public List<SpaceRecord> SyncSpaces()
     {
         using var cmd = _db.CreateCommand();
-        cmd.CommandText = "SELECT id, kind, role, name, owner_uid, member_count FROM sync_spaces";
+        cmd.CommandText = "SELECT id, kind, role, name, owner_uid, member_count, members FROM sync_spaces";
         using var r = cmd.ExecuteReader();
         var list = new List<SpaceRecord>();
         while (r.Read())
-            list.Add(new SpaceRecord(r.GetString(0), r.GetString(1), r.GetString(2), r.IsDBNull(3) ? null : r.GetString(3), r.GetString(4), r.GetInt32(5)));
+            list.Add(new SpaceRecord(r.GetString(0), r.GetString(1), r.GetString(2), r.IsDBNull(3) ? null : r.GetString(3), r.GetString(4), r.GetInt32(5),
+                r.IsDBNull(6) ? null : JsonSerializer.Deserialize<Dictionary<string, string>>(r.GetString(6))));
         return list.OrderBy(s => s.IsGroup).ThenBy(s => s.DisplayName, StringComparer.CurrentCultureIgnoreCase).ToList();
     }
 
@@ -565,8 +590,9 @@ public sealed class ClipStore : IDisposable
         if (current.Count == list.Count && list.All(current.Contains)) return;
         Exec("DELETE FROM sync_spaces");
         foreach (var s in list)
-            Exec("INSERT INTO sync_spaces (id, kind, role, name, owner_uid, member_count) VALUES ($id, $k, $r, $n, $o, $m)",
-                ("$id", s.Id), ("$k", s.Kind), ("$r", s.Role), ("$n", s.Name), ("$o", s.OwnerUid), ("$m", s.MemberCount));
+            Exec("INSERT INTO sync_spaces (id, kind, role, name, owner_uid, member_count, members) VALUES ($id, $k, $r, $n, $o, $m, $mm)",
+                ("$id", s.Id), ("$k", s.Kind), ("$r", s.Role), ("$n", s.Name), ("$o", s.OwnerUid), ("$m", s.MemberCount),
+                ("$mm", s.Members is null ? null : JsonSerializer.Serialize(s.Members)));
         Commit();
     }
 

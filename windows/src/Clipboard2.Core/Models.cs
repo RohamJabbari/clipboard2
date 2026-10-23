@@ -161,16 +161,42 @@ public sealed record SecretRef(string Id, string Name, DateTime? CreatedAt, stri
 /// <param name="Fingerprint">SHA-256 of the canonical payload last sent or applied.</param>
 /// <param name="Trimmed">The server trimmed it from personal history: keep the local copy and push it again only if it changes.</param>
 /// <param name="Blobs">Local blob file name → remote blob id, for blobs already on the server.</param>
+/// <param name="AuthorUid">Who copied it, as the server reports (null: unknown, e.g. synced before this was kept).</param>
 public sealed record SyncMeta(string SpaceId, string LocalId, string Category, string Fingerprint, long RemoteSeq, long UpdatedAt,
-                              bool Trimmed = false, IReadOnlyDictionary<string, string>? Blobs = null)
+                              bool Trimmed = false, IReadOnlyDictionary<string, string>? Blobs = null, string? AuthorUid = null)
 {
     public IReadOnlyDictionary<string, string> BlobMap => Blobs ?? new Dictionary<string, string>();
 }
 
 /// <summary>A sync space as last seen on the server, cached so group names and badges work offline.</summary>
-public sealed record SpaceRecord(string Id, string Kind, string Role, string? Name, string OwnerUid, int MemberCount)
+/// <param name="Members">Member uid → display name (username, or the email's part before @); null when the server
+/// doesn't send members.</param>
+public sealed record SpaceRecord(string Id, string Kind, string Role, string? Name, string OwnerUid, int MemberCount,
+                                 IReadOnlyDictionary<string, string>? Members = null)
 {
     public bool IsGroup => Kind == "group";
     public bool IsOwner => Role == "owner";
     public string DisplayName => string.IsNullOrWhiteSpace(Name) ? "Untitled group" : Name!;
+
+    /// <summary>The badge for an item of this group: who copied it, or the group's name when that isn't known
+    /// (no author, a server without members, or no username of our own).</summary>
+    public string AuthorName(string? authorUid, SyncSelf? self)
+    {
+        if (authorUid is null) return DisplayName;
+        if (self is not null && authorUid == self.Uid) return string.IsNullOrWhiteSpace(self.Username) ? DisplayName : self.Username!;
+        return Members?.GetValueOrDefault(authorUid) is { Length: > 0 } name ? name : DisplayName;
+    }
+
+    public bool Equals(SpaceRecord? other) =>
+        other is not null && Id == other.Id && Kind == other.Kind && Role == other.Role && Name == other.Name && OwnerUid == other.OwnerUid
+        && MemberCount == other.MemberCount && SameMembers(Members, other.Members);
+
+    public override int GetHashCode() => HashCode.Combine(Id, Kind, Role, Name, OwnerUid, MemberCount, Members?.Count);
+
+    private static bool SameMembers(IReadOnlyDictionary<string, string>? a, IReadOnlyDictionary<string, string>? b) =>
+        a is null || b is null ? a is null && b is null
+            : a.Count == b.Count && a.All(p => b.TryGetValue(p.Key, out var name) && name == p.Value);
 }
+
+/// <summary>The signed-in sync user, for telling own items apart in groups.</summary>
+public sealed record SyncSelf(string Uid, string? Username);

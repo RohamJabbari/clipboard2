@@ -89,7 +89,7 @@ struct QuickPanelView: View {
                                 PanelRow(entry: entry, shortcut: model.shortcutNumber(for: entry, at: index),
                                          isSelected: model.isSelected(entry),
                                          showsCheckmark: model.isMultiSelecting,
-                                         groupName: env.sync.groupName(for: entry.clip?.spaceID))
+                                         groupName: entry.clip.flatMap(env.sync.copiedBy))
                                     .id(entry.id)
                                     // One recogniser reading AppKit's click count: SwiftUI's stacked
                                     // count:2 / count:1 gestures miss double-clicks in a non-activating panel.
@@ -278,7 +278,7 @@ struct PanelRow: View {
     let shortcut: (number: Int, isSlot: Bool)?
     let isSelected: Bool
     var showsCheckmark = false
-    /// Sync group of the item, shown as a badge.
+    /// For a sync group item: who copied it (their username), shown as a badge.
     var groupName: String?
 
     var body: some View {

@@ -7,11 +7,13 @@ namespace Clipboard2.Core.Sync;
 
 // MARK: Wire types (docs/sync/PROTOCOL.md → API)
 
+/// <param name="Username">Null when none was chosen, or the server doesn't know usernames yet.</param>
 public sealed record AccountInfo(string Uid, string Email, byte[] Salt, int Iterations, byte[] WrappedAccountKey,
-                                 byte[] PublicKey, byte[] WrappedPrivateKey, string PersonalSpaceId);
+                                 byte[] PublicKey, byte[] WrappedPrivateKey, string PersonalSpaceId, string? Username = null);
 
+/// <param name="Members">Member uid → name (username, or the email's part before @); null from servers without it.</param>
 public sealed record SpaceInfo(string Id, string Kind, string Role, string OwnerUid, byte[] WrappedKey, byte[]? EncryptedName,
-                               int MemberCount, long CreatedAt)
+                               int MemberCount, long CreatedAt, IReadOnlyDictionary<string, string>? Members = null)
 {
     public bool IsPersonal => Kind == "personal";
 }
@@ -71,7 +73,7 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
 
     public async Task<SessionInfo> SignupAsync(string email, byte[] authKey, Kdf kdf, string uid, byte[] wrappedAccountKey, byte[] publicKey,
                                                byte[] wrappedPrivateKey, string personalSpaceId, byte[] personalWrappedKey,
-                                               string? deviceName = null, CancellationToken ct = default)
+                                               string? deviceName = null, string? username = null, CancellationToken ct = default)
     {
         var body = new JsonObject
         {
@@ -85,6 +87,7 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
             ["personalSpace"] = new JsonObject { ["id"] = personalSpaceId, ["wrappedKey"] = B64(personalWrappedKey) },
         };
         if (deviceName is not null) body["deviceName"] = deviceName;
+        if (username is not null) body["username"] = username;
         var (_, json) = await SendAsync(HttpMethod.Post, "/v1/auth/signup", body, ct, anonymous: true);
         return Session(json!);
     }
@@ -113,6 +116,13 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
     {
         var (_, json) = await SendAsync(HttpMethod.Get, "/v1/account", null, ct);
         return Account(json!);
+    }
+
+    /// <summary>Sets or changes the username; returns it as the server stored it (trimmed, NFC).</summary>
+    public async Task<string> SetUsernameAsync(string username, CancellationToken ct = default)
+    {
+        var (_, json) = await SendAsync(HttpMethod.Put, "/v1/account/username", new JsonObject { ["username"] = username }, ct);
+        return json?["username"] is JsonValue v ? v.GetValue<string>() : username;
     }
 
     public Task DeleteAccountAsync(byte[] authKey, CancellationToken ct = default) =>
@@ -297,7 +307,8 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
     {
         var kdf = KdfFrom(j["kdf"] as JsonObject);
         return new(S(j, "uid"), S(j, "email"), kdf.Salt, kdf.Iterations,
-            Bytes(j, "wrappedAccountKey"), Bytes(j, "publicKey"), Bytes(j, "wrappedPrivateKey"), S(j, "personalSpaceId"));
+            Bytes(j, "wrappedAccountKey"), Bytes(j, "publicKey"), Bytes(j, "wrappedPrivateKey"), S(j, "personalSpaceId"),
+            j["username"] is JsonValue u && u.GetValue<string>() is { Length: > 0 } name ? name : null);
     }
 
     private static SessionInfo Session(JsonObject j) =>
@@ -306,7 +317,16 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
     private static SpaceInfo Space(JsonObject j) => new(
         S(j, "id"), S(j, "kind"), S(j, "role"), S(j, "ownerUid"), Bytes(j, "wrappedKey"),
         j["encryptedName"] is JsonValue ? Bytes(j, "encryptedName") : null,
-        (int)L(j, "memberCount"), L(j, "createdAt"));
+        (int)L(j, "memberCount"), L(j, "createdAt"), Members(j["members"] as JsonArray));
+
+    private static Dictionary<string, string>? Members(JsonArray? members)
+    {
+        if (members is null) return null;
+        var map = new Dictionary<string, string>();
+        foreach (var m in members.OfType<JsonObject>())
+            if (m["uid"] is JsonValue uid && m["name"] is JsonValue name) map[uid.GetValue<string>()] = name.GetValue<string>();
+        return map;
+    }
 
     private static RemoteItem Item(JsonObject j) => new(
         S(j, "id"), S(j, "category"), L(j, "seq"), L(j, "sortAt"), L(j, "updatedAt"),

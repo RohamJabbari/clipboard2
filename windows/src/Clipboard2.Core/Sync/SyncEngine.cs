@@ -19,7 +19,7 @@ public sealed class SyncSpace(SpaceInfo info, byte[] key, string? name)
     public bool IsPersonal => Info.IsPersonal;
     /// <summary>The <c>space_id</c> used locally: null for the personal space.</summary>
     public string? LocalId => IsPersonal ? null : Id;
-    public SpaceRecord Record => new(Id, Info.Kind, Info.Role, Name, Info.OwnerUid, Info.MemberCount);
+    public SpaceRecord Record => new(Id, Info.Kind, Info.Role, Name, Info.OwnerUid, Info.MemberCount, Info.Members);
 }
 
 /// <summary>What one tick did.</summary>
@@ -191,7 +191,12 @@ public sealed partial class SyncEngine(ClipStore store, ISecretVault vault, Sync
     private async Task<Prepared?> PrepareAsync(SyncSpace space, RemoteItem item, CancellationToken ct)
     {
         var meta = store.SyncMetaFor(space.Id, item.Id);
-        if (meta is not null && item.Seq <= meta.RemoteSeq) return null;   // already applied (often our own write)
+        if (meta is not null && item.Seq <= meta.RemoteSeq)   // already applied (often our own write)
+        {
+            // Synced before authors were kept: learn it now (schema v2 pulls groups again once for this).
+            if (meta.AuthorUid is null && item.AuthorUid is not null) store.SaveSyncMeta(meta with { AuthorUid = item.AuthorUid });
+            return null;
+        }
         if (!Guid.TryParse(item.Id, out var id)) return null;
         if (item.Deleted is not null || item.Ciphertext is null) return new Prepared(item, null, []);
         ItemPayload? payload;
@@ -357,7 +362,8 @@ public sealed partial class SyncEngine(ClipStore store, ISecretVault vault, Sync
         // Without a local copy (e.g. Credential Manager refused the write) there's no meta, so nothing is deleted remotely.
         if (Local(space, item.Id, item.Category) is not { } local) return;
         var fingerprint = SyncPayload.Fingerprint(Render(local, p.Blobs).Payload);
-        store.SaveSyncMeta(new SyncMeta(space.Id, item.Id, item.Category, fingerprint, item.Seq, item.UpdatedAt, false, p.Blobs));
+        var author = item.AuthorUid ?? store.SyncMetaFor(space.Id, item.Id)?.AuthorUid;
+        store.SaveSyncMeta(new SyncMeta(space.Id, item.Id, item.Category, fingerprint, item.Seq, item.UpdatedAt, false, p.Blobs, author));
     }
 
     private void DeleteLocal(SyncSpace space, string itemId, string category)
@@ -565,7 +571,9 @@ public sealed partial class SyncEngine(ClipStore store, ISecretVault vault, Sync
         switch (outcome)
         {
             case WriteOutcome.Saved saved:
-                store.SaveSyncMeta(new SyncMeta(space.Id, local.Id, category, SyncPayload.Fingerprint(full.Payload), saved.Seq, updatedAt, false, blobs));
+                // An edit (a pin, a label) keeps the original author; a first upload is ours.
+                store.SaveSyncMeta(new SyncMeta(space.Id, local.Id, category, SyncPayload.Fingerprint(full.Payload), saved.Seq, updatedAt, false, blobs,
+                    meta?.AuthorUid ?? Identity.Uid));
                 foreach (var trimmed in saved.Trimmed) Trim(space, trimmed);
                 return true;
             case WriteOutcome.Conflict conflict:

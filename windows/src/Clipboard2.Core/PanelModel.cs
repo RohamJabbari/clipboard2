@@ -185,6 +185,10 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     public string? GroupFilter { get; private set; }
     /// <summary>Sync groups the user belongs to, by id (badges, filters, sharing).</summary>
     public IReadOnlyDictionary<string, string> GroupNames { get; private set; } = new Dictionary<string, string>();
+    /// <summary>The signed-in sync user (null when signed out), so own group items show the own username.</summary>
+    public Func<SyncSelf?>? Self { get; set; }
+    private Dictionary<string, SpaceRecord> _groups = [];
+    private Dictionary<(string Space, string LocalId), string?> _authors = [];
     /// <summary>In the action menu: picking the group to share with.</summary>
     public bool IsPickingGroup { get; private set; }
     public List<PanelEntry> Entries { get; private set; } = [];
@@ -281,18 +285,28 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         GroupFilterSelected?.Invoke();
     }
 
-    /// <summary>The group badge for an entry, or null for personal items.</summary>
+    /// <summary>The badge for a group entry: the username of whoever copied it, or the group's name when that isn't
+    /// known (older servers). Null for personal items.</summary>
     public string? GroupBadge(PanelEntry entry)
     {
-        var space = entry switch
-        {
-            PanelEntry.Clip c => c.Item.SpaceId,
-            PanelEntry.SnippetEntry s => s.Snippet.SpaceId,
-            PanelEntry.SecretEntry k => k.Secret.SpaceId,
-            _ => null,
-        };
-        return space is null ? null : GroupNames.GetValueOrDefault(space, "Group");
+        if (SpaceOf(entry) is not { } space) return null;
+        if (!_groups.TryGetValue(space, out var group)) return GroupNames.GetValueOrDefault(space, "Group");
+        var self = Self?.Invoke();
+        // Not on the server yet (no sync meta): copied here, so it's ours.
+        var author = _authors.TryGetValue((space, SyncIdOf(entry)), out var uid) ? uid : self?.Uid;
+        return group.AuthorName(author, self);
     }
+
+    /// <summary>The name of the group an entry belongs to, or null for personal items.</summary>
+    public string? GroupName(PanelEntry entry) => SpaceOf(entry) is { } space ? GroupNames.GetValueOrDefault(space, "Group") : null;
+
+    private static string SyncIdOf(PanelEntry entry) => entry switch
+    {
+        PanelEntry.Clip c => ClipStore.SyncId(c.Item.Id),
+        PanelEntry.SnippetEntry s => ClipStore.SyncId(s.Snippet.Id),
+        PanelEntry.SecretEntry k => Guid.TryParse(k.Secret.Id, out var g) ? ClipStore.SyncId(g) : k.Secret.Id,
+        _ => "",
+    };
 
     public void ShowNotice(string text)
     {
@@ -310,7 +324,9 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         }
         var q = Query.Trim();
         var target = TargetApp?.Id;
-        GroupNames = store.Groups().ToDictionary(g => g.Id, g => g.DisplayName);
+        _groups = store.Groups().ToDictionary(g => g.Id);
+        GroupNames = _groups.ToDictionary(g => g.Key, g => g.Value.DisplayName);
+        _authors = _groups.Count == 0 ? [] : store.GroupAuthors();
         if (GroupFilter is not null && !GroupNames.ContainsKey(GroupFilter)) GroupFilter = null;
         var group = GroupFilter;
         var clips = group is not null ? store.ItemsInSpace(group)

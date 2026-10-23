@@ -70,6 +70,7 @@ public sealed class AppServices : IPanelHost
         Panel = new PanelModel(Store, Settings, Slots, Secrets, this);
         Panel.GroupFilterSelected += () => _ = Sync.SyncNowAsync();
         Sync = new SyncAccount(Store, Secrets, Settings, Keys) { Logger = message => Log.Info("Sync: " + message) };
+        Panel.Self = () => Sync.Self;
         Store.Changed += () => StoreChanged?.Invoke();
         Store.Changed += ScheduleSync;
         Secrets.Changed += () =>

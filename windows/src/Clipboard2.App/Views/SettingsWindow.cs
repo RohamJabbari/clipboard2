@@ -754,6 +754,7 @@ public sealed class SettingsWindow : Window
 
     // Form state survives page rebuilds (the page rebuilds on every account change).
     private string _syncEmail = "";
+    private string _syncUsername = "";
     private string _syncPassword = "";
     private string _syncConfirm = "";
     private bool _syncCreating;
@@ -794,13 +795,19 @@ public sealed class SettingsWindow : Window
         "End-to-end encrypted: your history (newest 200 items), images, pinned items, snippets and secrets are encrypted on this PC before upload. " +
         "Your password never leaves this PC. The server only sees your email, sizes and timestamps — never your content, snippet names, secret values or group names.";
 
-    private void SyncCredentialFields(List<UIElement> rows, bool emailEditable = true)
+    private void SyncCredentialFields(List<UIElement> rows, bool emailEditable = true, bool withUsername = false)
     {
         var email = new TextBox { Text = _syncEmail, MinWidth = 280, IsReadOnly = !emailEditable };
         email.TextChanged += (_, _) => _syncEmail = email.Text;
         var password = new PasswordBox { MinWidth = 280, Password = _syncPassword };
         password.PasswordChanged += (_, _) => _syncPassword = password.Password;
         rows.Add(Row("Email", email));
+        if (withUsername)
+        {
+            var username = new TextBox { Text = _syncUsername, MinWidth = 280, MaxLength = 64 };
+            username.TextChanged += (_, _) => _syncUsername = username.Text;
+            rows.Add(Row("Username", username));
+        }
         rows.Add(Row("Password", password));
     }
 
@@ -828,7 +835,7 @@ public sealed class SettingsWindow : Window
     private void BuildSyncCreate(StackPanel page, SyncAccount sync)
     {
         var rows = new List<UIElement>();
-        SyncCredentialFields(rows);
+        SyncCredentialFields(rows, withUsername: true);
         var confirm = new PasswordBox { MinWidth = 280, Password = _syncConfirm };
         confirm.PasswordChanged += (_, _) => _syncConfirm = confirm.Password;
         rows.Add(Row("Confirm password", confirm));
@@ -844,12 +851,14 @@ public sealed class SettingsWindow : Window
         var create = Action("Create Account", async () =>
         {
             if (!_syncUnderstood) { MessageBox.Show(this, "Please confirm that you understand there's no password recovery.", "Create Account"); return; }
-            if (await _services.Sync.CreateAccountAsync(_syncEmail, _syncPassword, _syncConfirm)) ClearSyncPasswords();
+            if (SyncAccount.UsernameProblem(SyncAccount.NormalizeUsername(_syncUsername)) is { } problem) { MessageBox.Show(this, problem, "Create Account"); return; }
+            if (await _services.Sync.CreateAccountAsync(_syncEmail, _syncUsername, _syncPassword, _syncConfirm)) ClearSyncPasswords();
         }, accent: true);
         create.IsEnabled = !sync.IsBusy;
         rows.Add(Row("", create));
         page.Children.Add(Card([.. rows]));
-        page.Children.Add(Hint($"Use at least {SyncAccount.MinPasswordLength} characters — a passphrase of a few words is best. Your email is only your sign-in name; it isn't verified and gets no mail."));
+        page.Children.Add(Hint($"Use at least {SyncAccount.MinPasswordLength} characters — a passphrase of a few words is best. Your email is only your sign-in name; it isn't verified and gets no mail. " +
+            $"Your username is shown to people in your groups on the items you share. {SyncAccount.UsernameRule}"));
     }
 
     private void BuildSyncSignIn(StackPanel page, SyncAccount sync, bool again)
@@ -898,8 +907,11 @@ public sealed class SettingsWindow : Window
         var rows = new List<UIElement>
         {
             Row("Account", Fluent.Label(sync.Email ?? "", 13, Fluent.Secondary)),
+            Row("Username", UsernameControls(sync)),
             Row("Status", statusLabel),
         };
+        if (sync.Username is null)
+            rows.Add(Fluent.Label("Set a username so people in your groups see who copied each item. Until then they see the group's name.", 12, Fluent.Accent, wrap: true));
         foreach (var warning in sync.Warnings.Distinct()) rows.Add(Fluent.Label(warning, 12, Brushes.OrangeRed, wrap: true));
         rows.Add(Row("", syncNow));
         page.Children.Add(Card([.. rows]));
@@ -986,6 +998,23 @@ public sealed class SettingsWindow : Window
                 if (!await sync.DeleteAccountAsync(password) && sync.Error is { } e) MessageBox.Show(this, e, "Delete Account");
             })))));
         page.Children.Add(Hint("Changing your password keeps your synced data; other devices ask for the new one. Your keys are stored in Windows Credential Manager."));
+    }
+
+    /// <summary>The username with a Change button, or a prominent "Set a username" for accounts made before usernames.</summary>
+    private StackPanel UsernameControls(SyncAccount sync)
+    {
+        var panel = new StackPanel { Orientation = Orientation.Horizontal };
+        if (sync.Username is { } name) panel.Children.Add(Fluent.Label(name + "  ", 13, Fluent.Secondary));
+        var button = Action(sync.Username is null ? "Set a Username…" : "Change…", async () =>
+        {
+            var title = sync.Username is null ? "Set a Username" : "Change Username";
+            if (InputDialog.Ask(title, "Shown to people in your groups on the items you copy. " + SyncAccount.UsernameRule, sync.Username ?? "", okTitle: "Save")
+                is not { Length: > 0 } typed) return;
+            if (!await sync.ChangeUsernameAsync(typed) && sync.Error is { } e) MessageBox.Show(this, e, title);
+        }, accent: sync.Username is null);
+        button.IsEnabled = !sync.IsBusy;
+        panel.Children.Add(button);
+        return panel;
     }
 
     private async void JoinGroup()

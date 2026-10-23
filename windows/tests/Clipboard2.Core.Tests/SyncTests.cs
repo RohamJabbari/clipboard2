@@ -475,7 +475,7 @@ public sealed class SyncEngineTests : IDisposable
     private async Task<Device> SignedUp(string email = Email)
     {
         var d = NewDevice();
-        Assert.True(await d.Account.CreateAccountAsync(email, Password, Password), d.Account.Error);
+        Assert.True(await d.Account.CreateAccountAsync(email, email[..email.IndexOf('@')], Password, Password), d.Account.Error);
         Assert.Equal(SyncPhase.SignedIn, d.Account.Phase);
         await d.Sync();
         return d;
@@ -494,9 +494,9 @@ public sealed class SyncEngineTests : IDisposable
     public async Task SignUpAndSignInNeverSendThePassword()
     {
         var d = NewDevice();
-        Assert.False(await d.Account.CreateAccountAsync(Email, Password, "different"));
+        Assert.False(await d.Account.CreateAccountAsync(Email, "roham", Password, "different"));
         Assert.Equal("The passwords don't match.", d.Account.Error);
-        Assert.True(await d.Account.CreateAccountAsync("  Roham@Example.com ", Password, Password), d.Account.Error);
+        Assert.True(await d.Account.CreateAccountAsync("  Roham@Example.com ", " roham ", Password, Password), d.Account.Error);
         Assert.Equal(Email, d.Account.Email);
         Assert.True(_cloud.HasAccount(Email));
         Assert.DoesNotContain(Password, _cloud.LastAuthKey(Email)!);
@@ -504,7 +504,7 @@ public sealed class SyncEngineTests : IDisposable
 
         // Same email again is refused; a wrong password is reported.
         var dup = NewDevice();
-        Assert.False(await dup.Account.CreateAccountAsync(Email, Password, Password));
+        Assert.False(await dup.Account.CreateAccountAsync(Email, "someone", Password, Password));
         Assert.Contains("already exists", dup.Account.Error);
         Assert.False(await dup.Account.SignInAsync(Email, "wrong password"));
         Assert.Equal("The email or password is wrong.", dup.Account.Error);
@@ -699,7 +699,7 @@ public sealed class SyncEngineTests : IDisposable
         for (var i = 1; i < 210; i++) d.Copy($"history {i}", 1000 - i);
         for (var i = 0; i < 3; i++) d.Store.TogglePin(d.Copy($"pinned {i}", 5000 + i));
         d.Store.CreateSnippet("S", "", "body");
-        Assert.True(await d.Account.CreateAccountAsync(Email, Password, Password));
+        Assert.True(await d.Account.CreateAccountAsync(Email, "roham", Password, Password));
         await d.Sync();
 
         var live = _cloud.LiveItems(d.Personal);
@@ -943,7 +943,7 @@ public sealed class SyncEngineTests : IDisposable
         var d = NewDevice(() => now);
         for (var i = 0; i < 20; i++) d.Copy($"item {i}", 100 - i);
         _cloud.RateLimitAfter = 12;
-        Assert.True(await d.Account.CreateAccountAsync(Email, Password, Password));
+        Assert.True(await d.Account.CreateAccountAsync(Email, "roham", Password, Password));
         await d.Sync();
         Assert.NotNull(d.Account.RetryAfter);
         Assert.Null(d.Account.Error);
@@ -977,5 +977,137 @@ public sealed class SyncEngineTests : IDisposable
         await b.Sync();
         Assert.NotNull(b.Account.RetryAfter);
         Assert.Contains(b.Store.ItemsInSpace(group.Id), item => item.Text == "for the team");
+    }
+
+    // MARK: Usernames
+
+    private static PanelModel Panel(Device d)
+    {
+        var panel = new PanelModel(d.Store, d.Settings, new QuickSlots(d.Settings), d.Vault, new FakeHost()) { Self = () => d.Account.Self };
+        panel.PrepareForOpen(null);
+        return panel;
+    }
+
+    private static string? Badge(Device d, string text) =>
+        Panel(d).GroupBadge(new PanelEntry.Clip(d.Store.AllItems().Single(i => i.Text == text && i.SpaceId is not null)));
+
+    [Fact]
+    public async Task UsernameIsCheckedSentAtSignUpAndStored()
+    {
+        var d = NewDevice();
+        foreach (var bad in new[] { "", "ab", "_roham", "roham!", "roham²", "Ⅻroham", new string('x', 25) })
+        {
+            Assert.False(await d.Account.CreateAccountAsync(Email, bad, Password, Password));
+            Assert.NotNull(d.Account.Error);
+        }
+        Assert.Equal(SyncAccount.UsernameRule, d.Account.Error);
+        Assert.False(_cloud.HasAccount(Email));
+
+        // Trimmed and NFC-normalized ("e" + combining diaeresis becomes "ë"), as the server keeps it.
+        Assert.True(await d.Account.CreateAccountAsync(Email, "  Zoëy.b-1 ", Password, Password), d.Account.Error);
+        Assert.Equal("Zoëy.b-1", _cloud.Username(Email));
+        Assert.Equal("Zoëy.b-1", d.Account.Username);
+        var restored = new SyncAccount(d.Store, d.Vault, d.Settings, d.Keys, new HttpClient(_cloud), kdfIterations: 1000);
+        restored.Restore();
+        Assert.Equal("Zoëy.b-1", restored.Username);
+        Assert.Equal("Zoëy.b-1", (await SignedIn()).Account.Username);
+    }
+
+    [Fact]
+    public async Task ATakenUsernameGetsAFriendlyError()
+    {
+        await SignedUp();   // "roham"
+        var d = NewDevice();
+        Assert.False(await d.Account.CreateAccountAsync("friend@example.com", "ROHAM", Password, Password));
+        Assert.Equal("That username is taken. Try another one.", d.Account.Error);
+        Assert.False(_cloud.HasAccount("friend@example.com"));
+        Assert.Equal(SyncPhase.SignedOut, d.Account.Phase);
+    }
+
+    [Fact]
+    public async Task UsernamesChangeAndOtherDevicesPickThemUp()
+    {
+        var a = await SignedUp();
+        var b = await SignedIn();
+        await SignedUp("friend@example.com");
+
+        Assert.True(await a.Account.ChangeUsernameAsync("  Roham_2 "), a.Account.Error);
+        Assert.Equal("Roham_2", a.Account.Username);
+        Assert.Equal("Roham_2", _cloud.Username(Email));
+        Assert.False(await a.Account.ChangeUsernameAsync("FRIEND"));
+        Assert.Equal("That username is taken. Try another one.", a.Account.Error);
+        Assert.False(await a.Account.ChangeUsernameAsync("x"));
+        Assert.Equal(SyncAccount.UsernameRule, a.Account.Error);
+        Assert.Equal("Roham_2", a.Account.Username);
+
+        // The other device learns it once after a restart.
+        Assert.Equal("roham", b.Account.Username);
+        var restarted = new SyncAccount(b.Store, b.Vault, b.Settings, b.Keys, new HttpClient(_cloud), kdfIterations: 1000);
+        restarted.Restore();
+        Assert.Equal("roham", restarted.Username);
+        await restarted.SyncNowAsync();
+        Assert.Equal("Roham_2", restarted.Username);
+    }
+
+    [Fact]
+    public async Task GroupBadgesShowWhoCopiedEachItem()
+    {
+        var a = await SignedUp();
+        var b = await SignedUp("friend@example.com");
+        Assert.True(await a.Account.CreateGroupAsync("Team"));
+        var group = a.Account.Groups.Single();
+        await Invite(a, b, group.Id);
+        a.Copy("from a", 0, group.Id);
+        b.Copy("from b", 0, group.Id);
+        await a.Sync();
+        await b.Sync();
+        await a.Sync();
+        a.Copy("not sent yet", 0, group.Id);
+
+        var members = a.Store.Groups().Single().Members!;
+        Assert.Equal(new Dictionary<string, string> { [a.Account.Uid!] = "roham", [b.Account.Uid!] = "friend" }, members);
+        Assert.Equal("roham", Badge(a, "from a"));
+        Assert.Equal("friend", Badge(a, "from b"));
+        Assert.Equal("roham", Badge(a, "not sent yet"));
+        Assert.Equal("roham", Badge(b, "from a"));
+        Assert.Equal("friend", Badge(b, "from b"));
+        Assert.Equal("Team", Panel(a).GroupName(new PanelEntry.Clip(a.Store.AllItems().Single(i => i.Text == "from b"))));
+
+        // Items synced before authors were kept learn theirs when the group is pulled again (the v2 migration).
+        var fromB = ClipStore.SyncId(a.Store.AllItems().Single(i => i.Text == "from b").Id);
+        a.Store.SaveSyncMeta(a.Store.SyncMetaFor(group.Id, fromB)! with { AuthorUid = null });
+        Assert.Equal("Team", Badge(a, "from b"));
+        a.Store.SetSyncCursor(group.Id, 0);
+        await a.Sync();
+        Assert.Equal("friend", Badge(a, "from b"));
+
+        // Members' names follow username changes.
+        Assert.True(await b.Account.ChangeUsernameAsync("Fritzi"));
+        await a.Sync();
+        Assert.Equal("Fritzi", Badge(a, "from b"));
+    }
+
+    [Fact]
+    public async Task AnOldServerWithoutUsernamesStillWorksAndBadgesShowTheGroup()
+    {
+        _cloud.Legacy = true;
+        var a = await SignedUp();
+        var b = await SignedUp("friend@example.com");
+        Assert.Null(a.Account.Username);
+        Assert.Null((await SignedIn()).Account.Username);
+        Assert.True(await a.Account.CreateGroupAsync("Team"));
+        var group = a.Account.Groups.Single();
+        await Invite(a, b, group.Id);
+        a.Copy("from a", 0, group.Id);
+        b.Copy("from b", 0, group.Id);
+        await a.Sync();
+        await b.Sync();
+        await a.Sync();
+
+        Assert.Null(a.Store.Groups().Single().Members);
+        Assert.Equal("Team", Badge(a, "from a"));
+        Assert.Equal("Team", Badge(a, "from b"));
+        Assert.False(await a.Account.ChangeUsernameAsync("roham"));
+        Assert.Equal("The sync server doesn't support usernames yet.", a.Account.Error);
     }
 }

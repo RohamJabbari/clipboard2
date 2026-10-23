@@ -15,6 +15,8 @@ final class SyncMeta {
     var updatedAt: Int64 = 0
     /// Blob ids of the image and thumbnail already on the server, so re-pushes don't re-upload.
     var blobIds: [String] = []
+    /// Who last wrote the item on the server (shown as "copied by" in groups).
+    var authorUid: String?
 
     init(localId: String, spaceId: String, category: String) {
         self.localId = localId
@@ -33,6 +35,10 @@ final class SyncSpace {
     var name: String = ""
     var memberCount: Int = 1
     var createdAt: Int64 = 0
+    /// uid → display name of the members, from the server's space list.
+    var memberNames: [String: String] = [:]
+    /// Set after the one-time re-download that records item authors.
+    var authorsBackfilled = false
     /// Highest `seq` applied from `/changes`.
     var since: Int64 = 0
 

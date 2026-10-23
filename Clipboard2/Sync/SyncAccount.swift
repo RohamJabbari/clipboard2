@@ -13,6 +13,7 @@ nonisolated struct StoredSyncSession: Codable, Sendable, Equatable {
     var accountKey: Data
     var privateKey: Data
     var personalSpaceId: String
+    var username: String?
 }
 
 protocol SyncSessionStore: AnyObject {
@@ -79,6 +80,7 @@ nonisolated enum SyncAccountError: LocalizedError, Equatable {
     case inviteNotFound
     case alreadyMember(String)
     case emailTaken
+    case usernameTaken
 
     var errorDescription: String? {
         switch self {
@@ -88,6 +90,7 @@ nonisolated enum SyncAccountError: LocalizedError, Equatable {
         case .inviteNotFound: "This invite code is unknown, already used or expired. Ask for a new one."
         case .alreadyMember(let name): "You're already in “\(name)”."
         case .emailTaken: "An account with this email already exists. Sign in instead."
+        case .usernameTaken: "That username is taken. Try another one."
         }
     }
 }
@@ -112,6 +115,12 @@ final class SyncAccount {
     private(set) var lastSyncAt: Date?
     private(set) var lastSyncError: String?
     private(set) var groups: [SyncGroup] = []
+    /// Shown to group members on the items you copy. nil until you pick one.
+    private(set) var username: String?
+    /// Space id → member uid → display name, for "copied by" badges.
+    private(set) var memberNames: [String: [String: String]] = [:]
+    /// Synced item id → uid of whoever last wrote it (nil: synced, author not known yet).
+    @ObservationIgnored private var authors: [String: String?] = [:]
 
     @ObservationIgnored private let credentials: any SyncSessionStore
     @ObservationIgnored private let prefs: Preferences
@@ -169,6 +178,26 @@ final class SyncAccount {
         return groups.first { $0.id == spaceID }?.name ?? "Group"
     }
 
+    /// Who copied a group item: their username. Falls back to the group's name when that isn't
+    /// known (no username yet, or a server that doesn't list member names). Unsynced items are yours.
+    func copiedBy(_ item: ClipItem) -> String? {
+        guard let spaceID = item.spaceID else { return nil }
+        let author = authors[item.id.uuidString.lowercased()] ?? session?.uid
+        if let author, author == session?.uid { return username ?? groupName(for: spaceID) }
+        if let author, let name = memberNames[spaceID]?[author] { return name }
+        return groupName(for: spaceID)
+    }
+
+    /// Why a username can't be used, or nil when it's fine (PROTOCOL.md → Usernames).
+    nonisolated static func usernameProblem(_ raw: String) -> String? {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (3...24).contains(name.count) else { return "Use 3 to 24 characters for your username." }
+        guard name.wholeMatch(of: /[\p{L}\p{Nd}][\p{L}\p{Nd}_.\-]*/) != nil else {
+            return "Use letters, digits, _ . or -, starting with a letter or digit."
+        }
+        return nil
+    }
+
     func clearMessages() {
         errorMessage = nil
         notice = nil
@@ -188,12 +217,14 @@ final class SyncAccount {
             return
         }
         session = saved
+        username = saved.username
         loadGroups()
         if saved.token == nil {
             state = .needsPassword(email: saved.email)
             onSessionChange?(true)
         } else if let identity = identity(from: saved) {
             activate(identity)
+            Task { await refreshAccount() }
         } else {
             state = .needsPassword(email: saved.email)
         }
@@ -230,9 +261,14 @@ final class SyncAccount {
     // MARK: Sign up / sign in
 
     /// Creates the account: every key is made and wrapped here; the server gets only `authKey`.
-    func signUp(email rawEmail: String, password: String) async {
+    func signUp(email rawEmail: String, password: String, username rawUsername: String) async {
         clearMessages()
         let email = Self.normalize(email: rawEmail)
+        let username = rawUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let problem = Self.usernameProblem(username) {
+            errorMessage = problem
+            return
+        }
         state = .working("Creating your account…")
         do {
             let salt = SyncCrypto.randomBytes(16)
@@ -253,11 +289,14 @@ final class SyncAccount {
                 wrappedPrivateKey: try SyncCrypto.seal(priv, key: ak, aad: SyncCrypto.AAD.privateKey(uid: uid)),
                 personalSpace: .init(id: personalId, wrappedKey: try SyncCrypto.wrapSpaceKey(
                     spaceKey, spaceId: personalId, memberUid: uid, memberPublicKey: pub)),
-                deviceName: deviceName
+                deviceName: deviceName,
+                username: username
             )
             let remote: RemoteSession
             do {
                 remote = try await makeAPI().signup(body)
+            } catch let error as SyncAPIError where error.code == "username_taken" {
+                throw SyncAccountError.usernameTaken
             } catch let error as SyncAPIError where error.code == "conflict" {
                 throw SyncAccountError.emailTaken
             }
@@ -301,14 +340,51 @@ final class SyncAccount {
             groups = []
         }
         let stored = StoredSyncSession(uid: account.uid, email: account.email, token: remote.token, accountKey: ak,
-                                       privateKey: priv, personalSpaceId: account.personalSpaceId)
+                                       privateKey: priv, personalSpaceId: account.personalSpaceId, username: account.username)
         session = stored
+        username = account.username
         credentials.save(stored)
         guard let identity = identity(from: stored) else { throw SyncCryptoError.badKey }
         activate(identity, adopting: keys)
     }
 
     // MARK: Account management
+
+    /// Sets or changes the username. False (with `errorMessage`) when it's invalid or taken.
+    func setUsername(_ raw: String) async -> Bool {
+        clearMessages()
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let problem = Self.usernameProblem(name) {
+            errorMessage = problem
+            return false
+        }
+        guard let api = engine?.api else { return false }
+        do {
+            let stored = try await api.setUsername(name)
+            rememberUsername(stored)
+            syncNow()   // refreshes the member names other devices show
+            return true
+        } catch let error as SyncAPIError where error.code == "username_taken" {
+            errorMessage = SyncAccountError.usernameTaken.localizedDescription
+        } catch {
+            fail(error)
+        }
+        return false
+    }
+
+    /// The username as the server has it (another device may have changed it).
+    private func refreshAccount() async {
+        guard let api = engine?.api, let account = try? await api.account() else { return }
+        rememberUsername(account.username)
+    }
+
+    private func rememberUsername(_ name: String?) {
+        username = name
+        guard var current = session, current.username != name else { return }
+        current.username = name
+        session = current
+        credentials.save(current)
+    }
 
     func changePassword(current: String, new: String) async -> Bool {
         clearMessages()
@@ -494,6 +570,10 @@ final class SyncAccount {
             SyncGroup(id: $0.id, name: $0.name.isEmpty ? "Group" : $0.name, isOwner: $0.isOwner, memberCount: $0.memberCount)
         }
         if loaded != groups { groups = loaded }
+        let names = Dictionary(spaces.map { ($0.id, $0.memberNames) }, uniquingKeysWith: { first, _ in first })
+        if names != memberNames { memberNames = names }
+        let metas = (try? context.fetch(FetchDescriptor<SyncMeta>())) ?? []
+        authors = Dictionary(metas.map { ($0.localId, $0.authorUid) }, uniquingKeysWith: { first, _ in first })
         if let id = prefs.syncDefaultGroupID, !groups.isEmpty, !groups.contains(where: { $0.id == id }) {
             prefs.syncDefaultGroupID = nil
         }

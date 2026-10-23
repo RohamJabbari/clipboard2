@@ -15,6 +15,9 @@ internal sealed class FakeCloud : HttpMessageHandler
     private const string Storage = "https://storage.fake";
 
     public int HistoryLimit { get; set; } = 200;
+    /// <summary>Behaves like the server before usernames: ignores <c>username</c>, sends no <c>username</c> or
+    /// <c>members</c>, and has no PUT /v1/account/username.</summary>
+    public bool Legacy { get; set; }
     /// <summary>Answers 429 to the API once this many more API calls have been made (null = never).</summary>
     public int? RateLimitAfter { get; set; }
     public List<string> Log { get; } = [];
@@ -33,6 +36,22 @@ internal sealed class FakeCloud : HttpMessageHandler
         public required string AuthKey;
         public required JsonObject Account;
         public string Uid => Account["uid"]!.GetValue<string>();
+        public string? Username => Account["username"] is JsonValue u ? u.GetValue<string>() : null;
+        /// <summary>The members-list name: the username, or the email's part before @.</summary>
+        public string Name => Username ?? Email[..Email.IndexOf('@')];
+    }
+
+    public string? Username(string email) => _users.GetValueOrDefault(email)?.Username;
+
+    /// <summary>The server's username rule (400 invalid), unique case-insensitively (409 username_taken).</summary>
+    private string ValidUsername(JsonNode? node, User? except)
+    {
+        var name = (node?.GetValue<string>() ?? "").Trim().Normalize(NormalizationForm.FormC);
+        if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^[\p{L}\p{Nd}][\p{L}\p{Nd}_.\-]{2,23}$"))
+            throw new HttpError(HttpStatusCode.BadRequest, "invalid");
+        if (_users.Values.Any(u => u != except && string.Equals(u.Username, name, StringComparison.OrdinalIgnoreCase)))
+            throw new HttpError(HttpStatusCode.Conflict, "username_taken");
+        return name;
     }
 
     private sealed class Invite
@@ -160,6 +179,7 @@ internal sealed class FakeCloud : HttpMessageHandler
             case "signup":
                 if (_users.ContainsKey(email)) throw new HttpError(HttpStatusCode.Conflict, "conflict");
                 if (body["kdf"]!["iterations"]!.GetValue<int>() < 1000) throw new HttpError(HttpStatusCode.BadRequest, "invalid");
+                var username = !Legacy && body["username"] is { } u ? ValidUsername(u, null) : null;
                 var personal = body["personalSpace"]!.AsObject();
                 var spaceId = personal["id"]!.GetValue<string>();
                 var user = new User
@@ -173,6 +193,7 @@ internal sealed class FakeCloud : HttpMessageHandler
                         ["personalSpaceId"] = spaceId,
                     },
                 };
+                if (!Legacy) user.Account["username"] = username;
                 _users[email] = user;
                 var space = new Space { Id = spaceId, Kind = "personal", Owner = user.Uid, CreatedAt = _seq };
                 space.Members[user.Uid] = ("owner", personal["wrappedKey"]!.GetValue<string>());
@@ -234,6 +255,11 @@ internal sealed class FakeCloud : HttpMessageHandler
                 return NoContent();
             case "account" when path.Length == 2 && method == "GET":
                 return Ok(caller.Account.DeepClone());
+            case "account" when path.Length == 3 && path[2] == "username" && method == "PUT" && !Legacy:
+                caller.Account["username"] = ValidUsername(body!["username"], caller);
+                return Ok(new JsonObject { ["username"] = caller.Username });
+            case "account" when path.Length == 3 && path[2] == "username":
+                throw new HttpError(HttpStatusCode.NotFound, "not_found");
             case "account" when path.Length == 3 && method == "PUT":
                 if (B("authKey") != caller.AuthKey) throw new HttpError(HttpStatusCode.Unauthorized, "invalid_credentials");
                 caller.AuthKey = B("newAuthKey");
@@ -329,11 +355,18 @@ internal sealed class FakeCloud : HttpMessageHandler
         foreach (var key in _blobs.Keys.Where(k => k.Space == id).ToList()) _blobs.Remove(key);
     }
 
-    private static JsonObject SpaceJson(Space s, string uid) => new()
+    private JsonObject SpaceJson(Space s, string uid)
     {
-        ["id"] = s.Id, ["kind"] = s.Kind, ["role"] = s.Members[uid].Role, ["ownerUid"] = s.Owner, ["wrappedKey"] = s.Members[uid].Key,
-        ["encryptedName"] = s.Name, ["memberCount"] = s.Members.Count, ["createdAt"] = s.CreatedAt,
-    };
+        var json = new JsonObject
+        {
+            ["id"] = s.Id, ["kind"] = s.Kind, ["role"] = s.Members[uid].Role, ["ownerUid"] = s.Owner, ["wrappedKey"] = s.Members[uid].Key,
+            ["encryptedName"] = s.Name, ["memberCount"] = s.Members.Count, ["createdAt"] = s.CreatedAt,
+        };
+        if (!Legacy)
+            json["members"] = new JsonArray([.. s.Members.Keys.Select(m => UserByUid(m)).OfType<User>()
+                .Select(u => (JsonNode?)new JsonObject { ["uid"] = u.Uid, ["name"] = u.Name })]);
+        return json;
+    }
 
     private static HttpResponseMessage Changes(Space space, long since, int limit)
     {

@@ -357,17 +357,20 @@ public sealed class QuickPanelWindow : Window
         grid.Children.Add(texts);
 
         var trailing = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-        if (Model.GroupBadge(entry) is { } group)
+        var groupName = Model.GroupName(entry);
+        var author = Model.GroupBadge(entry);
+        if (author is not null)
         {
             var badgeContent = new StackPanel { Orientation = Orientation.Horizontal };
             var groupIcon = Glyphs.Icon(Glyphs.Group, 10, sub);
             groupIcon.Margin = new Thickness(0, 0, 4, 0);
             badgeContent.Children.Add(groupIcon);
-            badgeContent.Children.Add(Fluent.Label(group.Length > 18 ? group[..17] + "…" : group, 11, sub));
+            badgeContent.Children.Add(Fluent.Label(author.Length > 18 ? author[..17] + "…" : author, 11, sub));
             trailing.Children.Add(new Border
             {
                 Child = badgeContent, Padding = new Thickness(6, 1, 6, 1), CornerRadius = new CornerRadius(8), Margin = new Thickness(6, 0, 0, 0),
-                Background = selected ? Brushes.Transparent : Fluent.Subtle, ToolTip = $"Shared in “{group}”",
+                Background = selected ? Brushes.Transparent : Fluent.Subtle,
+                ToolTip = author == groupName ? $"Shared in “{groupName}”" : $"Copied by {author} in “{groupName}”",
             });
         }
         if (entry.ClipItem is { IsPinned: true })
@@ -392,7 +395,8 @@ public sealed class QuickPanelWindow : Window
         Grid.SetColumn(trailing, 3);
         grid.Children.Add(trailing);
         border.Child = grid;
-        AutomationName(border, $"{title}, {subtitle}" + (Model.GroupBadge(entry) is { } g ? $", in {g}" : "") + (selected ? ", selected" : ""));
+        var shared = author is null ? "" : author == groupName ? $", in {groupName}" : $", copied by {author} in {groupName}";
+        AutomationName(border, $"{title}, {subtitle}" + shared + (selected ? ", selected" : ""));
     }
 
     private FrameworkElement LeadingVisual(PanelEntry entry, bool selected)
