@@ -305,8 +305,9 @@ final class AppEnvironment {
         }
     }
 
-    /// Copies the selection in the frontmost app and stores it as history in the default sync
-    /// group, then confirms with a HUD. Without a default group it opens Settings → Sync.
+    /// Copies the selection in the frontmost app (text, rich text, images or files) and stores it
+    /// as history in the default sync group, then confirms with a HUD. Without a default group it
+    /// opens Settings → Sync.
     func sendSelectionToGroup() {
         guard sync.isSignedIn, let group = sync.defaultGroup else {
             SettingsOpener.open(tab: .sync)
@@ -320,15 +321,22 @@ final class AppEnvironment {
         Task {
             monitor.isSuspended = true
             let saved = paste.snapshot()
-            let text = await paste.copySelectedText()
+            let raw = await paste.copySelection(source: source)
             paste.restore(saved)
             monitor.acknowledgeCurrentChange()
             monitor.isSuspended = false
-            guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            guard let raw, let capture = await CaptureProcessor.process(raw, blobs: store.blobs) else {
                 NSSound.beep()
                 return
             }
-            store.ingest(.text(text, source: source), spaceID: group.id)
+            if monitor.shouldDiscard?(capture) == true || (capture.kind.isTextual && capture.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
+                // A saved secret (or blank text) never goes to a group this way.
+                store.blobs.delete(capture.imageFile)
+                store.blobs.delete(capture.thumbnailFile)
+                NSSound.beep()
+                return
+            }
+            store.ingest(capture, spaceID: group.id)
             HUD.show("Sent to \(group.name)", symbol: "person.2.fill")
             sync.syncNow()
         }

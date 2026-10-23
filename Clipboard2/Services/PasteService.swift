@@ -244,6 +244,22 @@ final class PasteService {
         return text?.isEmpty == false ? text : nil
     }
 
+    /// Presses ⌘C in the frontmost app and reads what it copied the way history capture does, so a
+    /// document selected in Finder arrives as the file, not its name. Nil when nothing was copied or
+    /// the copy is marked concealed (password managers). Call `restore` afterwards.
+    func copySelection(source: AppRef?) async -> RawCapture? {
+        let before = pasteboard.changeCount
+        Self.postKey(8, flags: .maskCommand)                 // kVK_ANSI_C
+        for _ in 0..<25 {
+            try? await Task.sleep(for: .milliseconds(20))
+            if pasteboard.changeCount != before { break }
+        }
+        guard pasteboard.changeCount != before else { return nil }
+        let types = pasteboard.types?.map(\.rawValue) ?? []
+        guard !types.contains(where: ClipboardFilter.blockedTypes.contains) else { return nil }
+        return PasteboardReader.read(pasteboard, source: source)
+    }
+
     /// Value stamped on every event Clipboard2 synthesises, so Clipboard2's own event tap ignores them.
     static let syntheticEventMarker: Int64 = 0x436C_6970   // "Clip"
 

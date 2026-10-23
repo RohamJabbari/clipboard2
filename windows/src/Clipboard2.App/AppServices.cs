@@ -444,6 +444,25 @@ public sealed class AppServices : IPanelHost
         return text;
     }
 
+    /// <summary>Presses Ctrl+C in the foreground app and reads what it copied the way history capture does,
+    /// so a file selected in Explorer arrives as the file, not its name. Null when nothing (or something
+    /// concealed, or from an ignored app) was copied.</summary>
+    private async Task<RawCapture?> CopySelectionCaptureAsync(AppRef? source)
+    {
+        RawCapture? raw = null;
+        await WithoutCapture(async () =>
+        {
+            var saved = ClipboardIO.Snapshot();
+            var before = Native.GetClipboardSequenceNumber();
+            await InputSender.ReleaseModifiersAsync();
+            InputSender.CtrlPlus('C');
+            for (var i = 0; i < 25 && Native.GetClipboardSequenceNumber() == before; i++) await Task.Delay(20);
+            if (Native.GetClipboardSequenceNumber() != before) raw = ClipboardIO.Read(Settings.IgnoredIds, source, out _);
+            ClipboardIO.Restore(saved);
+        });
+        return raw;
+    }
+
     public async Task ShowSelectionActionsAsync()
     {
         var target = Tracker.TargetWindow;
@@ -467,14 +486,16 @@ public sealed class AppServices : IPanelHost
             return;
         }
         var source = Tracker.AppFor(Tracker.TargetWindow);
-        var text = await CopySelectionAsync();
-        if (string.IsNullOrWhiteSpace(text))
+        var raw = await CopySelectionCaptureAsync(source);
+        var capture = raw is null ? null : await CaptureProcessor.ProcessAsync(raw, Store.Blobs);
+        // A saved secret (or blank text) never goes to a group this way.
+        if (capture is null || (capture.Kind.IsTextual() && (string.IsNullOrWhiteSpace(capture.Text) || Secrets.ValueHashes.Contains(capture.Hash))))
         {
             System.Media.SystemSounds.Beep.Play();
             return;
         }
-        Store.Ingest(ProcessedCapture.ForText(text, source: source), spaceId: group.Id);
-        _tray?.ShowBalloon($"Sent to {group.DisplayName}", TextPreview.Make(text, 120));
+        Store.Ingest(capture, spaceId: group.Id);
+        _tray?.ShowBalloon($"Sent to {group.DisplayName}", capture.Preview);
         _syncDebounce.Stop();
         _ = Sync.SyncNowAsync();
     }
