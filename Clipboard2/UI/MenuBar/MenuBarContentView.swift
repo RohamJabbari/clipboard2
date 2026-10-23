@@ -345,12 +345,12 @@ private struct MenuBarRow: View {
                 VStack(alignment: .leading, spacing: 1) {
                     if let label = item.label {
                         Text(label).fontWeight(.semibold).lineLimit(1)
-                        Text(item.preview.isEmpty ? item.kind.displayName : item.preview)
+                        Text(preview)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     } else {
-                        Text(item.preview.isEmpty ? item.kind.displayName : item.preview)
+                        Text(preview)
                             .lineLimit(2)
                             .truncationMode(.tail)
                     }
@@ -374,7 +374,18 @@ private struct MenuBarRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
-        .accessibilityLabel(item.accessibilityDescription)
+        .accessibilityLabel(hiddenKind.map { "Hidden \($0.inlineName)" } ?? item.accessibilityDescription)
         .accessibilityHint("Pastes into the previous app")
+    }
+
+    /// A confidently recognised credential: masked here like in the quick panel.
+    private var hiddenKind: SensitiveText.Kind? {
+        guard case .sensitive(let kind) = ClipContentCache.content(of: item), kind.isConfident else { return nil }
+        return kind
+    }
+
+    private var preview: String {
+        if let hiddenKind { return SensitiveText.masked(item.text, kind: hiddenKind) }
+        return item.preview.isEmpty ? item.kind.displayName : item.preview
     }
 }
