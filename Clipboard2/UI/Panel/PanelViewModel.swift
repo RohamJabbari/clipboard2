@@ -222,12 +222,15 @@ final class ShareGroupState {
     let secret: SecretRef?
     let groups: [SyncGroup]
     var selection: Int
+    /// Set when a text item looks like a password or key, so the form warns before it's shared.
+    let sensitiveKind: SensitiveText.Kind?
 
     init(items: [ClipItem] = [], secret: SecretRef? = nil, groups: [SyncGroup], defaultGroupID: String?) {
         self.items = items
         self.secret = secret
         self.groups = groups
         self.selection = groups.firstIndex { $0.id == defaultGroupID } ?? 0
+        self.sensitiveKind = items.lazy.filter(\.kind.isTextual).compactMap { SensitiveText.detect($0.text) }.first
     }
 
     var selectedGroup: SyncGroup? { groups.indices.contains(selection) ? groups[selection] : nil }

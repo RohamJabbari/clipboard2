@@ -378,14 +378,14 @@ struct ShortcutsSettingsView: View {
 
             Section {
                 shortcut(.sendToGroup, "Send selection to default group",
-                         "Copies what's selected into your default sync group.")
+                         "Copies what's selected into your default sync group, after a short preview you can undo. Off until you set it.")
                 shortcut(.pasteFromGroup, "Paste from default group",
                          "Pastes the newest item a group member sent.")
             } header: {
                 Text("Sync groups")
             } footer: {
                 Hint(env.sync.isSignedIn
-                     ? "While you're signed in, these replace ⌥⌘C and ⌥⌘V in other apps (e.g. Chrome's Inspect Elements, Finder's Copy as Pathname). Change them here if you use those."
+                     ? "While you're signed in, these replace the same keys in other apps (⌥⌘V is Finder's Move Item Here). Change them here if you use those."
                      : "Only active while you're signed in to Sync.")
             }
 

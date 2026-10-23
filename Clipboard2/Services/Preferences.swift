@@ -102,6 +102,9 @@ final class Preferences {
         static let syncDefaultGroupID = "syncDefaultGroupID"
         static let hasShownSendToGroupWarning = "hasShownSendToGroupWarning"
         static let saveFolder = "saveFolder"
+        static let confirmGroupSends = "confirmGroupSends"
+        static let blockSensitiveGroupSends = "blockSensitiveGroupSends"
+        static let clearedSendToGroupDefault = "clearedSendToGroupDefault"
     }
 
     /// 0 means "ask every time".
@@ -165,6 +168,17 @@ final class Preferences {
             ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: "Downloads")
     }
 
+    /// The send-to-group shortcut waits a few seconds with Undo before anything leaves this Mac.
+    var confirmGroupSends: Bool { didSet { defaults.set(confirmGroupSends, forKey: Key.confirmGroupSends) } }
+    /// Text that looks like a password, key or code is held back from the send-to-group shortcut.
+    var blockSensitiveGroupSends: Bool {
+        didSet { defaults.set(blockSensitiveGroupSends, forKey: Key.blockSensitiveGroupSends) }
+    }
+    /// One-time: ⌥⌘C was the send-to-group default until 1.3; it's opt-in now.
+    var clearedSendToGroupDefault: Bool {
+        didSet { defaults.set(clearedSendToGroupDefault, forKey: Key.clearedSendToGroupDefault) }
+    }
+
     init(defaults: UserDefaults) {
         self.defaults = defaults
         defaults.register(defaults: [
@@ -179,6 +193,8 @@ final class Preferences {
             Key.secretClearSeconds: 30,
             Key.contextMenuEnabled: true,
             Key.contextMenuModifier: ContextMenuModifier.command.rawValue,
+            Key.confirmGroupSends: true,
+            Key.blockSensitiveGroupSends: true,
         ])
         let storedMax = defaults.integer(forKey: Key.maxItems)
         maxItems = storedMax == 0 ? 0 : max(10, storedMax)
@@ -214,6 +230,9 @@ final class Preferences {
         hasShownSendToGroupWarning = defaults.bool(forKey: Key.hasShownSendToGroupWarning)
         saveFolder = defaults.string(forKey: Key.saveFolder).map { URL(filePath: $0, directoryHint: .isDirectory) }
             ?? Self.defaultSaveFolder
+        confirmGroupSends = defaults.bool(forKey: Key.confirmGroupSends)
+        blockSensitiveGroupSends = defaults.bool(forKey: Key.blockSensitiveGroupSends)
+        clearedSendToGroupDefault = defaults.bool(forKey: Key.clearedSendToGroupDefault)
     }
 
     /// The save folder's name as Finder shows it ("Downloads", "Desktop").
