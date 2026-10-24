@@ -155,6 +155,10 @@ private struct TextFieldIconsSection: View {
                 Text("Icon next to selected text")
                 Text("Click it to fix, translate or summarize the selection without leaving the app.")
             }
+            Toggle(isOn: $prefs.pasteIcon) {
+                Text("Paste icon in text fields")
+                Text("Hover it to see your newest copies and paste one where you're typing.")
+            }
             ForEach(prefs.textIconHiddenApps, id: \.bundleID) { app in
                 LabeledContent {
                     Button("Show Again") { prefs.textIconHiddenApps.removeAll { $0.bundleID == app.bundleID } }
@@ -174,6 +178,7 @@ private struct TextFieldIconsSection: View {
             Hint("Never in password fields, or in the apps under History → Never record from these apps. Needs Accessibility.")
         }
         .onChange(of: prefs.selectionIcon) { env.updateTextFieldIcons() }
+        .onChange(of: prefs.pasteIcon) { env.updateTextFieldIcons() }
     }
 }
 

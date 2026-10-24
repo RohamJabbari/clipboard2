@@ -107,6 +107,7 @@ final class Preferences {
         static let clearedSendToGroupDefault = "clearedSendToGroupDefault"
         static let explainSendToGroupChange = "explainSendToGroupChange"
         static let selectionIcon = "selectionIcon"
+        static let pasteIcon = "pasteIcon"
         static let textIconHiddenApps = "textIconHiddenApps"
     }
 
@@ -141,6 +142,8 @@ final class Preferences {
     var panelOrigin: PanelOrigin { didSet { defaults.set(panelOrigin.rawValue, forKey: Key.panelOrigin) } }
     /// The icon beside text selected in other apps.
     var selectionIcon: Bool { didSet { defaults.set(selectionIcon, forKey: Key.selectionIcon) } }
+    /// The paste icon in the corner of the focused text field in other apps.
+    var pasteIcon: Bool { didSet { defaults.set(pasteIcon, forKey: Key.pasteIcon) } }
     /// Apps where the text field icons stay away ("Don't Show in …").
     var textIconHiddenApps: [AppRef] { didSet { store(textIconHiddenApps, Key.textIconHiddenApps) } }
     var ignoredApps: [AppRef] { didSet { store(ignoredApps, Key.ignoredApps) } }
@@ -206,6 +209,7 @@ final class Preferences {
             Key.contextMenuModifier: ContextMenuModifier.command.rawValue,
             Key.confirmGroupSends: true,
             Key.selectionIcon: true,
+            Key.pasteIcon: true,
             Key.blockSensitiveGroupSends: true,
         ])
         let storedMax = defaults.integer(forKey: Key.maxItems)
@@ -222,6 +226,7 @@ final class Preferences {
         panelSize = PanelSize(rawValue: defaults.string(forKey: Key.panelSize) ?? "") ?? .regular
         panelOrigin = PanelOrigin(rawValue: defaults.string(forKey: Key.panelOrigin) ?? "") ?? .top
         selectionIcon = defaults.bool(forKey: Key.selectionIcon)
+        pasteIcon = defaults.bool(forKey: Key.pasteIcon)
         textIconHiddenApps = Self.load([AppRef].self, defaults, Key.textIconHiddenApps) ?? []
         ignoredApps = Self.load([AppRef].self, defaults, Key.ignoredApps) ?? AppRef.defaultIgnored
         appTransforms = Self.load([AppTransformRule].self, defaults, Key.appTransforms) ?? []

@@ -46,6 +46,7 @@ final class AppEnvironment {
     @ObservationIgnored private(set) lazy var contextMenu = ContextMenuController(env: self)
     @ObservationIgnored private(set) lazy var textFieldWatcher = TextFieldWatcher()
     @ObservationIgnored private(set) lazy var selectionIcon = SelectionIconController(env: self)
+    @ObservationIgnored private(set) lazy var pasteIcon = PasteIconController(env: self)
     @ObservationIgnored private var maintenanceRuns = 0
     /// On-device text recognition for image items (search finds screenshots by their words).
     @ObservationIgnored private(set) lazy var imageText = ImageTextIndexer(store: store, blobs: blobs)
@@ -272,18 +273,23 @@ final class AppEnvironment {
 
     /// Watches other apps' text fields while an icon that needs it is on and Accessibility is allowed.
     func updateTextFieldIcons() {
-        guard prefs.selectionIcon, AXPermission.isTrusted else {
+        guard prefs.selectionIcon || prefs.pasteIcon, AXPermission.isTrusted else {
             textFieldWatcher.stop()
             selectionIcon.hideAll()
+            pasteIcon.hide()
             return
         }
         textFieldWatcher.onChange = { [weak self] selection, field in self?.textFieldChanged(selection, field) }
         textFieldWatcher.start()
     }
 
+    /// Selected text gets the action icon; a focused field with nothing selected gets the paste icon.
     private func textFieldChanged(_ selection: TextFieldWatcher.Selection?, _ field: TextFieldWatcher.Field?) {
-        let allowed = !panel.isVisible && !(selection.map { isTextIconHidden(in: $0.app) } ?? false)
-        selectionIcon.update(allowed ? selection : nil)
+        let app = selection?.app ?? field?.app
+        let allowed = !panel.isVisible && !(app.map(isTextIconHidden) ?? false)
+        let shownSelection = allowed && prefs.selectionIcon ? selection : nil
+        selectionIcon.update(shownSelection)
+        pasteIcon.update(allowed && prefs.pasteIcon && shownSelection == nil ? field : nil)
     }
 
     /// Never in apps the user hid it in, nor in apps whose copies aren't recorded (password managers).
