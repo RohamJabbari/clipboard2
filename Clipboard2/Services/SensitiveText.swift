@@ -107,14 +107,17 @@ nonisolated enum SensitiveText {
         return parts.count == 3 && parts.allSatisfy { !$0.isEmpty && $0.unicodeScalars.allSatisfy(base64URL.contains) }
     }
 
-    /// License keys and recovery codes: at least four equal-length groups of capitals and digits,
-    /// like `ABCD-EF12-GH34-IJKL`. UUIDs have unequal groups and are left alone.
+    /// License keys and recovery codes: at least four equal-length groups mixing capitals and digits,
+    /// like `ABCD-EF12-GH34-IJKL`; the last group may be shorter (`…-HR5V-5Q`). UUIDs, whose
+    /// groups differ in length, are left alone.
     private static func isGroupedCode(_ value: String) -> Bool {
         let groups = value.split(separator: "-", omittingEmptySubsequences: false)
-        guard groups.count >= 4, let length = groups.first?.count, (4...6).contains(length) else { return false }
+        guard groups.count >= 4, let length = groups.first?.count, (4...6).contains(length),
+              let last = groups.last, (1...length).contains(last.count) else { return false }
         let capitalsAndDigits = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-        return groups.allSatisfy { $0.count == length && $0.unicodeScalars.allSatisfy(capitalsAndDigits.contains) }
-            && value.contains(where: \.isLetter)
+        return groups.dropLast().allSatisfy { $0.count == length }
+            && groups.allSatisfy { $0.unicodeScalars.allSatisfy(capitalsAndDigits.contains) }
+            && value.contains(where: \.isLetter) && value.contains(where: \.isNumber)
     }
 
     /// Long random-looking strings: mixed case and digits with high entropy. Lower-case hex
