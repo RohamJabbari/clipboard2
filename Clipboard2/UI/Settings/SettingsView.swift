@@ -107,6 +107,8 @@ struct GeneralSettingsView: View {
                 }
             }
 
+            TextFieldIconsSection()
+
             UpdatesSection()
 
             PermissionsSection(permissions: [.accessibility, .screenRecording])
@@ -139,6 +141,39 @@ struct GeneralSettingsView: View {
                 try? await Task.sleep(for: .seconds(2))
             }
         }
+    }
+}
+
+/// The icon beside selected text in other apps, and where it stays away.
+private struct TextFieldIconsSection: View {
+    @Environment(AppEnvironment.self) private var env
+
+    var body: some View {
+        @Bindable var prefs = env.prefs
+        Section {
+            Toggle(isOn: $prefs.selectionIcon) {
+                Text("Icon next to selected text")
+                Text("Click it to fix, translate or summarize the selection without leaving the app.")
+            }
+            ForEach(prefs.textIconHiddenApps, id: \.bundleID) { app in
+                LabeledContent {
+                    Button("Show Again") { prefs.textIconHiddenApps.removeAll { $0.bundleID == app.bundleID } }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(nsImage: AppIconCache.icon(for: app.bundleID))
+                            .resizable()
+                            .frame(width: 18, height: 18)
+                            .accessibilityHidden(true)
+                        Text("Hidden in \(app.name)")
+                    }
+                }
+            }
+        } header: {
+            Text("In other apps")
+        } footer: {
+            Hint("Never in password fields, or in the apps under History → Never record from these apps. Needs Accessibility.")
+        }
+        .onChange(of: prefs.selectionIcon) { env.updateTextFieldIcons() }
     }
 }
 

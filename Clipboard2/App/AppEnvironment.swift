@@ -44,6 +44,8 @@ final class AppEnvironment {
     @ObservationIgnored private var maintenanceTimer: Timer?
     @ObservationIgnored private lazy var serviceProvider = ServiceProvider(env: self)
     @ObservationIgnored private(set) lazy var contextMenu = ContextMenuController(env: self)
+    @ObservationIgnored private(set) lazy var textFieldWatcher = TextFieldWatcher()
+    @ObservationIgnored private(set) lazy var selectionIcon = SelectionIconController(env: self)
     @ObservationIgnored private var maintenanceRuns = 0
     /// On-device text recognition for image items (search finds screenshots by their words).
     @ObservationIgnored private(set) lazy var imageText = ImageTextIndexer(store: store, blobs: blobs)
@@ -180,6 +182,7 @@ final class AppEnvironment {
         }
 
         contextMenu.update()
+        updateTextFieldIcons()
         // Build and render the quick panel once, off screen, so the first ⇧⌘V has nothing to set up.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.panel.warmUp() }
         Task {
@@ -253,6 +256,7 @@ final class AppEnvironment {
 
     func runMaintenance() {
         contextMenu.update()   // starts the right-click tap once Accessibility is granted
+        updateTextFieldIcons()   // and the text field icons
         guard storeOpenError == nil else { return }
         store.enforceRetention(maxItems: prefs.maxItems, maxAge: prefs.maxAge)
         // Sync polls on its own cadence (3 s / 15 s / 60 s).
@@ -262,6 +266,31 @@ final class AppEnvironment {
             store.removeOrphanedBlobs()
             store.removeOrphanedSyncedFiles()
         }
+    }
+
+    // MARK: Icons in other apps' text fields
+
+    /// Watches other apps' text fields while an icon that needs it is on and Accessibility is allowed.
+    func updateTextFieldIcons() {
+        guard prefs.selectionIcon, AXPermission.isTrusted else {
+            textFieldWatcher.stop()
+            selectionIcon.hideAll()
+            return
+        }
+        textFieldWatcher.onChange = { [weak self] selection, field in self?.textFieldChanged(selection, field) }
+        textFieldWatcher.start()
+    }
+
+    private func textFieldChanged(_ selection: TextFieldWatcher.Selection?, _ field: TextFieldWatcher.Field?) {
+        let allowed = !panel.isVisible && !(selection.map { isTextIconHidden(in: $0.app) } ?? false)
+        selectionIcon.update(allowed ? selection : nil)
+    }
+
+    /// Never in apps the user hid it in, nor in apps whose copies aren't recorded (password managers).
+    func isTextIconHidden(in app: NSRunningApplication) -> Bool {
+        guard let bundleID = app.bundleIdentifier else { return true }
+        return prefs.textIconHiddenApps.contains { $0.bundleID == bundleID }
+            || prefs.ignoredApps.contains { $0.bundleID == bundleID }
     }
 
     func applyAppearance() {

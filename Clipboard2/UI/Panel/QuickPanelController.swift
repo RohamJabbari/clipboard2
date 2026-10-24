@@ -143,9 +143,12 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         }
     }
 
-    /// Opens straight into the action menu for text selected in `target`.
-    func showForSelection(_ text: String, target: NSRunningApplication?) {
-        present(target: target) { [model] in model.prepareForSelection(text, target: target) }
+    /// Opens straight into the action menu for text selected in `target`; `then` runs once it's ready.
+    func showForSelection(_ text: String, target: NSRunningApplication?, then: (() -> Void)? = nil) {
+        present(target: target) { [model] in
+            model.prepareForSelection(text, target: target)
+            then?()
+        }
     }
 
     /// Builds the panel and renders it once, invisibly, so the first real open has no setup cost:
@@ -180,6 +183,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
     private func present(target: NSRunningApplication?, prepare: @escaping () -> Void) {
         let t0 = CACurrentMediaTime()
         let interval = Self.signposter.beginInterval("PanelOpen")
+        env.selectionIcon.hideAll()   // the panel takes over from the icon beside selected text
         let panel = self.panel ?? makePanel()
         self.panel = panel
 

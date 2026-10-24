@@ -106,6 +106,8 @@ final class Preferences {
         static let blockSensitiveGroupSends = "blockSensitiveGroupSends"
         static let clearedSendToGroupDefault = "clearedSendToGroupDefault"
         static let explainSendToGroupChange = "explainSendToGroupChange"
+        static let selectionIcon = "selectionIcon"
+        static let textIconHiddenApps = "textIconHiddenApps"
     }
 
     /// 0 means "ask every time".
@@ -137,6 +139,10 @@ final class Preferences {
     var appearance: AppearanceMode { didSet { defaults.set(appearance.rawValue, forKey: Key.appearance) } }
     var panelSize: PanelSize { didSet { defaults.set(panelSize.rawValue, forKey: Key.panelSize) } }
     var panelOrigin: PanelOrigin { didSet { defaults.set(panelOrigin.rawValue, forKey: Key.panelOrigin) } }
+    /// The icon beside text selected in other apps.
+    var selectionIcon: Bool { didSet { defaults.set(selectionIcon, forKey: Key.selectionIcon) } }
+    /// Apps where the text field icons stay away ("Don't Show in …").
+    var textIconHiddenApps: [AppRef] { didSet { store(textIconHiddenApps, Key.textIconHiddenApps) } }
     var ignoredApps: [AppRef] { didSet { store(ignoredApps, Key.ignoredApps) } }
     var appTransforms: [AppTransformRule] { didSet { store(appTransforms, Key.appTransforms) } }
     var aiProvider: AIProviderKind { didSet { defaults.set(aiProvider.rawValue, forKey: Key.aiProvider) } }
@@ -199,6 +205,7 @@ final class Preferences {
             Key.contextMenuEnabled: true,
             Key.contextMenuModifier: ContextMenuModifier.command.rawValue,
             Key.confirmGroupSends: true,
+            Key.selectionIcon: true,
             Key.blockSensitiveGroupSends: true,
         ])
         let storedMax = defaults.integer(forKey: Key.maxItems)
@@ -214,6 +221,8 @@ final class Preferences {
         appearance = AppearanceMode(rawValue: defaults.string(forKey: Key.appearance) ?? "") ?? .system
         panelSize = PanelSize(rawValue: defaults.string(forKey: Key.panelSize) ?? "") ?? .regular
         panelOrigin = PanelOrigin(rawValue: defaults.string(forKey: Key.panelOrigin) ?? "") ?? .top
+        selectionIcon = defaults.bool(forKey: Key.selectionIcon)
+        textIconHiddenApps = Self.load([AppRef].self, defaults, Key.textIconHiddenApps) ?? []
         ignoredApps = Self.load([AppRef].self, defaults, Key.ignoredApps) ?? AppRef.defaultIgnored
         appTransforms = Self.load([AppTransformRule].self, defaults, Key.appTransforms) ?? []
         aiProvider = AIProviderKind(rawValue: defaults.string(forKey: Key.aiProvider) ?? "") ?? .claudeCode
