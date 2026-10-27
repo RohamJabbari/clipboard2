@@ -59,6 +59,9 @@ public sealed class ClipItem
     public int CopyCount { get; set; } = 1;
     /// <summary>The sync group this item belongs to; null is the personal space (and every item when signed out).</summary>
     public string? SpaceId { get; set; }
+    /// <summary>Images: text recognised on this PC (local only, never synced). Null until the image has been read;
+    /// empty when it has no text.</summary>
+    public string? OcrText { get; set; }
 
     public AppRef? Source => SourceId is null ? null : new AppRef(SourceId, SourceName ?? SourceId);
 
@@ -67,7 +70,7 @@ public sealed class ClipItem
 
     public string SearchableText => (Label is null ? "" : Label + " ") + Kind switch
     {
-        ClipKind.Image => $"Image {ImageWidth}×{ImageHeight}",
+        ClipKind.Image => $"Image {ImageWidth}×{ImageHeight}" + (string.IsNullOrEmpty(OcrText) ? "" : " " + OcrText),
         ClipKind.File => string.Join(" ", Files.Select(Path.GetFileName)) + " " + Text,
         _ => Text,
     };

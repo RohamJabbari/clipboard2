@@ -16,11 +16,20 @@ namespace Clipboard2.App.Platform;
 /// <summary>On-device text recognition (Windows.Media.Ocr). Nothing is uploaded.</summary>
 public static class TextRecognizer
 {
-    public static async Task<string> RecognizeAsync(BitmapSource image)
+    public static async Task<string> RecognizeAsync(BitmapSource image) => await RecognizePngAsync(ImageTools.EncodePng(image)) ?? "";
+
+    /// <summary>Reads a PNG (or any format WIC decodes) from disk; null when no OCR language is installed.
+    /// Safe on a worker thread.</summary>
+    public static async Task<string?> RecognizeFileAsync(string path) => await RecognizePngAsync(await File.ReadAllBytesAsync(path));
+
+    private static OcrEngine? CreateEngine() =>
+        OcrEngine.TryCreateFromUserProfileLanguages() ?? OcrEngine.TryCreateFromLanguage(new Windows.Globalization.Language("en-US"));
+
+    /// <summary>Null when no OCR engine is available.</summary>
+    public static async Task<string?> RecognizePngAsync(byte[] png)
     {
-        var engine = OcrEngine.TryCreateFromUserProfileLanguages() ?? OcrEngine.TryCreateFromLanguage(new Windows.Globalization.Language("en-US"));
-        if (engine is null) return "";
-        var png = ImageTools.EncodePng(image);
+        var engine = CreateEngine();
+        if (engine is null) return null;
         using var stream = new InMemoryRandomAccessStream();
         using (var writer = new DataWriter(stream.GetOutputStreamAt(0)))
         {

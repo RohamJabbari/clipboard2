@@ -16,7 +16,7 @@ using Transform = Clipboard2.Core.Transform;
 namespace Clipboard2.App.Views;
 
 /// <summary>Settings: General, Appearance, Ignored Apps, Snippets, Secrets, Transforms, AI, Sync, About.</summary>
-public sealed class SettingsWindow : Window
+public sealed partial class SettingsWindow : Window
 {
     private readonly AppServices _services;
     private readonly TabControl _tabs = new() { Margin = new Thickness(12) };
@@ -216,6 +216,7 @@ public sealed class SettingsWindow : Window
                 count.Text = $"{_services.Store.Count()} items";
             }))));
         page.Children.Add(Hint("Measured from the last time an item was copied. Pinned and labelled items and secrets never expire."));
+        AddBackupSection(page);
         return page;
     }
 
@@ -848,6 +849,7 @@ public sealed class SettingsWindow : Window
         understood.Checked += (_, _) => _syncUnderstood = true;
         understood.Unchecked += (_, _) => _syncUnderstood = false;
         rows.Add(understood);
+        rows.Add(PrivacyNoticeLink());
         var create = Action("Create Account", async () =>
         {
             if (!_syncUnderstood) { MessageBox.Show(this, "Please confirm that you understand there's no password recovery.", "Create Account"); return; }
@@ -1164,6 +1166,7 @@ public sealed class SettingsWindow : Window
         page.Children.Add(Card(
             Row("History and images", Action("Open Folder", () => Process.Start(new ProcessStartInfo(AppServices.DataDirectory) { UseShellExecute = true }))),
             Row("Settings", Action("Open Folder", () => Process.Start(new ProcessStartInfo(Path.GetDirectoryName(AppServices.SettingsPath)!) { UseShellExecute = true })))));
+        AddLegalSection(page);
         return page;
     }
 }
