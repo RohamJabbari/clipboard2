@@ -12,8 +12,7 @@ final class ClipStore {
     private(set) var revision = 0
     /// Called after every commit (sync schedules a push from it).
     @ObservationIgnored var onCommit: (() -> Void)?
-    /// Called with the ids retention removed, so sync stops tracking them instead of deleting
-    /// them on other devices.
+    /// Called with the ids retention removed (their sync metadata is already gone).
     @ObservationIgnored var onExpire: (([UUID]) -> Void)?
 
     init(context: ModelContext, blobs: BlobStore) {
@@ -127,6 +126,7 @@ final class ClipStore {
         }
         blobs.delete(item.imageFile)
         blobs.delete(item.thumbnailFile)
+        if item.kind == .file { removeSyncedFiles(of: item.id) }
         item.kind = .text
         item.text = text
         item.preview = TextPreview.make(text)
@@ -238,8 +238,21 @@ final class ClipStore {
 
         if !removed.isEmpty {
             Log.store.info("Retention removed \(removed.count) items")
+            forgetSyncState(of: removed)
             onExpire?(removed)
             commit()
+        }
+    }
+
+    /// Retention only stops tracking items; it never deletes them on other devices. Done here
+    /// rather than by sync, so it also holds while no sync session is running (signed out of
+    /// the server, waiting for the password): a missing meta row never turns into a DELETE.
+    private func forgetSyncState(of ids: [UUID]) {
+        let keys = ids.map { $0.uuidString.lowercased() }
+        let clipCategories = [SyncCategory.history.rawValue, SyncCategory.pinned.rawValue]
+        let descriptor = FetchDescriptor<SyncMeta>(predicate: #Predicate { keys.contains($0.localId) })
+        for meta in (try? context.fetch(descriptor)) ?? [] where clipCategories.contains(meta.category) {
+            context.delete(meta)
         }
     }
 
@@ -255,12 +268,33 @@ final class ClipStore {
         }
     }
 
+    /// Deletes `Synced Files/<id>` folders whose item is gone or no longer a file clip. Young
+    /// folders are left alone: sync writes a folder just before inserting its item.
+    func removeOrphanedSyncedFiles(in directory: URL = AppPaths.syncedFilesDirectory,
+                                   olderThan age: TimeInterval = SyncConfig.orphanedFilesAge, now: Date = .now) {
+        let fm = FileManager.default
+        guard let folders = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey],
+                                                         options: [.skipsHiddenFiles]) else { return }
+        let fileClips = FetchDescriptor<ClipItem>(predicate: #Predicate { $0.kindRaw == "file" })
+        let live = Set(((try? context.fetch(fileClips)) ?? []).map { $0.id.uuidString.lowercased() })
+        for folder in folders where !live.contains(folder.lastPathComponent.lowercased()) {
+            let modified = (try? folder.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            guard now.timeIntervalSince(modified) > age else { continue }
+            try? fm.removeItem(at: folder)
+        }
+    }
+
+    /// Removes the folder of files sync received for an item (only ever inside Synced Files).
+    func removeSyncedFiles(of id: UUID) {
+        try? FileManager.default.removeItem(at: AppPaths.syncedFilesFolder(for: id))
+    }
+
     // MARK: Sync
 
-    /// Copies an item into a sync group with a new id (images get their own blob files, so
-    /// deleting one copy never breaks the other).
+    /// Copies an item into a sync group (or, for nil, the personal space) with a new id. Images
+    /// and synced files get their own copies, so deleting one item never breaks the other.
     @discardableResult
-    func shareCopy(of item: ClipItem, toSpace spaceID: String, now: Date = .now) -> ClipItem {
+    func shareCopy(of item: ClipItem, toSpace spaceID: String?, now: Date = .now) -> ClipItem {
         if let existing = self.item(withHash: item.contentHash, inSpace: spaceID), !item.contentHash.isEmpty {
             existing.lastCopiedAt = now
             existing.copyCount += 1
@@ -287,9 +321,32 @@ final class ClipStore {
         let base = UUID().uuidString
         copy.imageFile = copyBlob(item.imageFile, to: base + ".png")
         copy.thumbnailFile = copyBlob(item.thumbnailFile, to: base + "-thumb.png")
+        if item.kind == .file { copySyncedFiles(from: item, to: copy) }
         context.insert(copy)
         commit()
         return copy
+    }
+
+    /// Files sync received live in the item's own folder, which goes when the item does: give
+    /// the copy its own folder and point it there.
+    private func copySyncedFiles(from item: ClipItem, to copy: ClipItem) {
+        let fm = FileManager.default
+        let source = AppPaths.syncedFilesFolder(for: item.id).standardizedFileURL
+        guard fm.fileExists(atPath: source.path) else { return }
+        let destination = AppPaths.syncedFilesFolder(for: copy.id)
+        do {
+            try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.copyItem(at: source, to: destination)
+        } catch {
+            Log.store.error("Can't copy synced files: \(error.localizedDescription, privacy: .public)")
+            return
+        }
+        let urls = item.fileURLs.map { url in
+            url.standardizedFileURL.deletingLastPathComponent().path == source.path
+                ? destination.appending(path: url.lastPathComponent) : url
+        }
+        copy.fileURLStrings = urls.map(\.absoluteString)
+        copy.text = urls.map(\.path).joined(separator: "\n")
     }
 
     private func copyBlob(_ name: String?, to newName: String) -> String? {

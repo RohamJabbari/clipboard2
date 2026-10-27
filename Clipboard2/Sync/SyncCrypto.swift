@@ -185,9 +185,9 @@ nonisolated enum SyncCrypto {
                 .joined(separator: "-")
         }
 
-        /// Lenient: ignores spaces, dashes and case, and reads 0/1/8 as O/I/B. nil if it isn't a code.
-        static func parse(_ typed: String) -> Data? {
-            let cleaned = typed.uppercased().filter { !$0.isWhitespace && $0 != "-" }.map { (c: Character) -> Character in
+        /// Spaces and dashes removed, uppercased, 0/1/8 read as O/I/B.
+        static func clean(_ typed: String) -> [Character] {
+            typed.uppercased().filter { !$0.isWhitespace && $0 != "-" }.map { (c: Character) -> Character in
                 switch c {
                 case "0": "O"
                 case "1": "I"
@@ -195,6 +195,19 @@ nonisolated enum SyncCrypto {
                 default: c
                 }
             }
+        }
+
+        /// A sign-up code (80 server-made bits, `XXXX-XXXX-XXXX-XXXX`) normalised the same way
+        /// as group codes: 16 characters of the alphabet, no dashes. nil if it isn't one.
+        static func normalizeSignupCode(_ typed: String) -> String? {
+            let cleaned = clean(typed)
+            guard cleaned.count == 16, cleaned.allSatisfy(alphabet.contains) else { return nil }
+            return String(cleaned)
+        }
+
+        /// Lenient: ignores spaces, dashes and case, and reads 0/1/8 as O/I/B. nil if it isn't a code.
+        static func parse(_ typed: String) -> Data? {
+            let cleaned = clean(typed)
             guard cleaned.count == 26 else { return nil }
             var bits = 0, value = 0
             var bytes = Data()

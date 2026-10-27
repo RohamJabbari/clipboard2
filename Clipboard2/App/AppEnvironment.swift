@@ -48,10 +48,16 @@ final class AppEnvironment {
     @ObservationIgnored private var stressMonitor: ClipboardMonitor?
     #endif
 
+    /// Why the history database couldn't be opened. While set, the app runs on an empty
+    /// in-memory store and never captures, sweeps files or syncs, so nothing on disk is touched.
+    let storeOpenError: String?
+
     private init() {
         prefs = Preferences(defaults: .standard)
         blobs = BlobStore(directory: AppPaths.blobsDirectory)
-        container = Self.makeContainer(url: AppPaths.storeURL)
+        let opened = Self.openContainer(url: AppPaths.storeURL)
+        container = opened.container
+        storeOpenError = opened.error
         store = ClipStore(context: container.mainContext, blobs: blobs)
         appTracker = FrontmostAppTracker()
         monitor = ClipboardMonitor(store: store, prefs: prefs, tracker: appTracker, blobs: blobs)
@@ -62,21 +68,43 @@ final class AppEnvironment {
         sync = SyncAccount(prefs: prefs, context: container.mainContext, store: store, snippets: snippets, secrets: secrets)
     }
 
-    /// Every persisted model; tests build in-memory containers from the same list.
-    static let schema = Schema([ClipItem.self, Snippet.self, SyncMeta.self, SyncSpace.self])
+    /// Every persisted model (the newest store version); tests build in-memory containers from it.
+    static let schema = Schema(versionedSchema: StoreSchemaV2.self)
 
-    private static func makeContainer(url: URL) -> ModelContainer {
+    /// Opens the store with the migration plan. Stores from before the versioned schema (older
+    /// than 1.3.0) match no version, so they get the automatic lightweight migration they always
+    /// had. If neither works, an in-memory store and the error, never a wiped history.
+    static func openContainer(url: URL) -> (container: ModelContainer, error: String?) {
         let schema = Self.schema
+        let configuration = ModelConfiguration(schema: schema, url: url)
         do {
-            return try ModelContainer(for: schema, configurations: ModelConfiguration(schema: schema, url: url))
+            return (try ModelContainer(for: schema, migrationPlan: StoreMigrationPlan.self, configurations: configuration), nil)
         } catch {
-            Log.store.error("Failed to open store at \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public). Falling back to in-memory.")
+            Log.store.error("Opening the store with the migration plan failed: \(error.localizedDescription, privacy: .public)")
+        }
+        do {
+            return (try ModelContainer(for: schema, configurations: configuration), nil)
+        } catch {
+            Log.store.error("Failed to open store at \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public). Running without history.")
             do {
-                return try ModelContainer(for: schema, configurations: ModelConfiguration(schema: schema, isStoredInMemoryOnly: true))
+                let memory = try ModelContainer(for: schema, configurations: ModelConfiguration(schema: schema, isStoredInMemoryOnly: true))
+                return (memory, error.localizedDescription)
             } catch {
                 fatalError("SwiftData is unavailable: \(error)")
             }
         }
+    }
+
+    /// The history couldn't be opened: say so instead of quietly starting over.
+    private func showStoreOpenError(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Clipboard2 Can't Open Your History"
+        alert.informativeText = "Your history, images and files are untouched, but Clipboard2 won't record or sync anything until it can open them. Quit and open Clipboard2 again; if this keeps happening, restart your Mac or contact support.\n\n\(message)"
+        alert.addButton(withTitle: "Quit")
+        alert.addButton(withTitle: "Continue Without History")
+        NSApp.activate()
+        if alert.runModal() == .alertFirstButtonReturn { NSApp.terminate(nil) }
     }
 
     // MARK: Lifecycle
@@ -95,14 +123,20 @@ final class AppEnvironment {
         removeHistoryCopiesOfSecrets()
         store.onCommit = { [weak self] in self?.sync.localChange() }
         snippets.onCommit = { [weak self] in self?.sync.localChange() }
-        // Retention only stops tracking items; it never deletes them on other devices.
-        store.onExpire = { [weak self] ids in self?.sync.engine?.forget(ids) }
+        // Retention only stops tracking items (ClipStore drops their sync metadata itself), so
+        // they're never deleted on other devices.
         sync.onSessionChange = { [weak self] active in self?.setSendToGroupShortcut(active: active) }
-        sync.start()
-        migrateDedupeIfNeeded()
+        sync.onItemSentHere = { device in HUD.show("Sent from \(device)", symbol: "arrow.down.circle.fill") }
         applyAppearance()
-        monitor.start()
-        runMaintenance()
+        if let storeOpenError {
+            // On the stand-in store: no capture, no sync, no sweeps (they'd delete every file).
+            DispatchQueue.main.async { [weak self] in self?.showStoreOpenError(storeOpenError) }
+        } else {
+            sync.start()
+            migrateDedupeIfNeeded()
+            monitor.start()
+            runMaintenance()
+        }
 
         // Every minute so short expiry times (15 min, 1 h) are honoured promptly; the work is a
         // single indexed fetch when nothing has expired.
@@ -204,11 +238,15 @@ final class AppEnvironment {
     }
 
     func runMaintenance() {
-        store.enforceRetention(maxItems: prefs.maxItems, maxAge: prefs.maxAge)
-        sync.periodicSync()
         contextMenu.update()   // starts the right-click tap once Accessibility is granted
+        guard storeOpenError == nil else { return }
+        store.enforceRetention(maxItems: prefs.maxItems, maxAge: prefs.maxAge)
+        // Sync polls on its own cadence (3 s / 15 s / 60 s).
         maintenanceRuns &+= 1
-        if maintenanceRuns % 30 == 1 { store.removeOrphanedBlobs() }   // directory scan: every ~30 min
+        if maintenanceRuns % 30 == 1 {   // directory scans: every ~30 min
+            store.removeOrphanedBlobs()
+            store.removeOrphanedSyncedFiles()
+        }
     }
 
     func applyAppearance() {

@@ -43,6 +43,13 @@ nonisolated struct ClipPayload: Codable, Equatable, Sendable {
     var createdAt: Int64
     var lastCopiedAt: Int64
     var contentHash: String
+    /// The `updatedAt` the writer sent with this version (rollback protection); nil from older apps.
+    var rev: Int64?
+    /// A session id from `/v1/sessions`: that device shows "Sent from ‹fromDevice›" and puts the
+    /// item at the top. Everyone else treats it as a normal item.
+    var toDevice: String?
+    /// The sending device's name, for that notice (an extension; readers ignore unknown fields).
+    var fromDevice: String?
 
     init(kind: String, text: String? = nil, preview: String? = nil, isPinned: Bool = false, copyCount: Int = 1,
          createdAt: Int64, lastCopiedAt: Int64, contentHash: String) {
@@ -81,6 +88,9 @@ nonisolated struct ClipPayload: Codable, Equatable, Sendable {
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
         lastCopiedAt = try c.decodeIfPresent(Int64.self, forKey: .lastCopiedAt) ?? createdAt
         contentHash = try c.decodeIfPresent(String.self, forKey: .contentHash) ?? ""
+        rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
+        toDevice = try c.decodeIfPresent(String.self, forKey: .toDevice)
+        fromDevice = try c.decodeIfPresent(String.self, forKey: .fromDevice)
     }
 
     var category: SyncCategory { isPinned ? .pinned : .history }
@@ -103,6 +113,7 @@ nonisolated struct SnippetPayload: Codable, Equatable, Sendable {
     var body: String
     var createdAt: Int64
     var updatedAt: Int64
+    var rev: Int64?
 
     init(name: String, keyword: String, body: String, createdAt: Int64, updatedAt: Int64) {
         self.name = name
@@ -121,6 +132,7 @@ nonisolated struct SnippetPayload: Codable, Equatable, Sendable {
         body = try c.decodeIfPresent(String.self, forKey: .body) ?? ""
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
         updatedAt = try c.decodeIfPresent(Int64.self, forKey: .updatedAt) ?? createdAt
+        rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
     }
 }
 
@@ -131,6 +143,7 @@ nonisolated struct SecretPayload: Codable, Equatable, Sendable {
     var name: String
     var value: String
     var createdAt: Int64
+    var rev: Int64?
 
     init(name: String, value: String, createdAt: Int64) {
         self.name = name
@@ -145,6 +158,7 @@ nonisolated struct SecretPayload: Codable, Equatable, Sendable {
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Untitled"
         value = try c.decodeIfPresent(String.self, forKey: .value) ?? ""
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
+        rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
     }
 }
 
@@ -181,8 +195,50 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         }
     }
 
+    /// SHA-256 of the canonical JSON without the per-write fields (`rev`, `toDevice`,
+    /// `fromDevice`), so it only changes when the content does.
     func fingerprint() throws -> String {
-        SyncCrypto.sha256Hex(try canonicalJSON())
+        SyncCrypto.sha256Hex(try content.canonicalJSON())
+    }
+
+    /// The payload without the per-write fields.
+    var content: SyncPayload {
+        switch self {
+        case .clip(var p):
+            p.rev = nil
+            p.toDevice = nil
+            p.fromDevice = nil
+            return .clip(p)
+        case .snippet(var p):
+            p.rev = nil
+            return .snippet(p)
+        case .secret(var p):
+            p.rev = nil
+            return .secret(p)
+        }
+    }
+
+    var rev: Int64? {
+        switch self {
+        case .clip(let p): p.rev
+        case .snippet(let p): p.rev
+        case .secret(let p): p.rev
+        }
+    }
+
+    /// The payload as written with this `updatedAt`.
+    func withRev(_ rev: Int64) -> SyncPayload {
+        switch self {
+        case .clip(var p):
+            p.rev = rev
+            return .clip(p)
+        case .snippet(var p):
+            p.rev = rev
+            return .snippet(p)
+        case .secret(var p):
+            p.rev = rev
+            return .secret(p)
+        }
     }
 
     var category: SyncCategory {
@@ -230,7 +286,8 @@ extension ClipPayload {
 
     /// Writes the payload into a local item. Image files are set by the caller. A file clip stays a
     /// file clip when its contents arrived (`localFiles`); otherwise it arrives as the names, as text.
-    func apply(to item: ClipItem, localFiles: [URL] = []) {
+    /// Times are clamped to `arrivedAt`, so an item can't claim to come from the future.
+    func apply(to item: ClipItem, localFiles: [URL] = [], arrivedAt: Date = .now) {
         var kind = ClipKind(rawValue: self.kind) ?? .text
         item.text = text ?? ""
         item.preview = preview ?? TextPreview.make(item.text)
@@ -259,8 +316,9 @@ extension ClipPayload {
         item.pinnedAt = isPinned ? pinnedAt.map(Date.init(syncMillis:)) ?? item.pinnedAt ?? .now : nil
         item.label = label
         item.copyCount = max(1, copyCount)
-        item.createdAt = Date(syncMillis: createdAt)
-        item.lastCopiedAt = Date(syncMillis: lastCopiedAt)
+        let arrived = arrivedAt.syncMillis
+        item.createdAt = Date(syncMillis: min(createdAt, arrived))
+        item.lastCopiedAt = Date(syncMillis: min(lastCopiedAt, arrived))
     }
 }
 
@@ -270,12 +328,13 @@ extension SnippetPayload {
                   createdAt: snippet.createdAt.syncMillis, updatedAt: snippet.updatedAt.syncMillis)
     }
 
-    func apply(to snippet: Snippet) {
+    func apply(to snippet: Snippet, arrivedAt: Date = .now) {
+        let arrived = arrivedAt.syncMillis
         snippet.name = name
         snippet.keyword = keyword
         snippet.body = body
-        snippet.createdAt = Date(syncMillis: createdAt)
-        snippet.updatedAt = Date(syncMillis: updatedAt)
+        snippet.createdAt = Date(syncMillis: min(createdAt, arrived))
+        snippet.updatedAt = Date(syncMillis: min(updatedAt, arrived))
     }
 }
 

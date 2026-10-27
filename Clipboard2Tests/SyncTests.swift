@@ -387,8 +387,22 @@ actor FakeSyncServer {
         var used = false
     }
 
+    struct Session {
+        var id: String
+        var uid: String
+        var deviceName: String?
+        var createdAt: Int64
+    }
+
+    struct SignupCodeRecord {
+        var id: String
+        var owner: String
+        var createdAt: Int64
+        var used = false
+    }
+
     private(set) var accounts: [String: Account] = [:]      // by email
-    private var tokens: [String: String] = [:]               // token → uid
+    private var tokens: [String: Session] = [:]              // token → session
     private var invites: [String: Invite] = [:]
     private(set) var spaces: [String: Space] = [:]
     private var items: [String: [String: RemoteItem]] = [:]
@@ -400,7 +414,80 @@ actor FakeSyncServer {
     /// false behaves like a server from before usernames: no `members` in the space list.
     var listsMembers = true
 
+    // The October 2026 contract (docs/sync/HARDENING-2026-10.md).
+    /// Sign-up needs a sign-up code or an open group invite.
+    private(set) var requireInvites = false
+    private var signupCodes: [String: SignupCodeRecord] = [:]   // by normalised code
+    /// Item writes more than 10 minutes in the future get `400 clock_skew`.
+    private var checksClock = false
+    /// Item id → the error every PUT of it gets.
+    private var refusals: [String: SyncAPIError] = [:]
+    /// Every item upload (PUT) gets `429` while set.
+    private var rateLimited = false
+    /// The next `/changes` request gets `resetRequired` (if its `since` > 0) and the one after it this error.
+    private var resetNext: Set<String> = []
+    private var failChangesAfterReset: (space: String, error: SyncAPIError)?
+    private var kdfOverrides: [String: KDFParams] = [:]
+    private(set) var putAttempts: [String: Int] = [:]
+    private(set) var deleteRequests: [String] = []
+    private(set) var registrations = 0
+
     func setListsMembers(_ value: Bool) { listsMembers = value }
+    func setRequireInvites(_ value: Bool) { requireInvites = value }
+    func setChecksClock(_ value: Bool) { checksClock = value }
+    func refuse(_ id: String, with error: SyncAPIError) { refusals[id] = error }
+    func clearRefusal(_ id: String) { refusals[id] = nil }
+    func setRateLimited(_ value: Bool) { rateLimited = value }
+    func setKDF(_ kdf: KDFParams, for email: String) { kdfOverrides[email] = kdf }
+
+    /// Forgets an item entirely, as if its tombstone had passed the purge horizon.
+    func purge(space: String, id: String) { items[space]?[id] = nil }
+
+    /// The space's next `/changes` answers `resetRequired`; optionally the one after that fails.
+    func requireReset(space: String, thenFail error: SyncAPIError? = nil) {
+        resetNext.insert(space)
+        failChangesAfterReset = error.map { (space, $0) }
+    }
+
+    /// Serves an older version again with a new seq, as a server rolling an item back would.
+    func replay(_ old: RemoteItem, space: String) {
+        seq += 1
+        var item = old
+        item.seq = seq
+        items[space, default: [:]][old.id] = item
+    }
+
+    /// Changes an item's `updatedAt` without touching its ciphertext.
+    func tamperUpdatedAt(space: String, id: String, to updatedAt: Int64) {
+        guard var item = items[space]?[id] else { return }
+        seq += 1
+        item.seq = seq
+        item.updatedAt = updatedAt
+        items[space]?[id] = item
+    }
+
+    /// Replaces the key a member's wrap opens to (a server swapping in its own key).
+    func rewrap(space: String, uid: String, wrappedKey: Data) {
+        spaces[space]?.members[uid]?.wrappedKey = wrappedKey
+    }
+
+    func endSessions(uid: String) { tokens = tokens.filter { $0.value.uid != uid } }
+
+    private static let forbidden = SyncAPIError.server(status: 403, code: "forbidden", message: "", retryAfter: nil)
+    private static let clockSkew = SyncAPIError.server(status: 400, code: "clock_skew", message: "", retryAfter: nil)
+    private static let rateLimit = SyncAPIError.server(status: 429, code: "rate_limited", message: "", retryAfter: 1)
+
+    private func checkClock(_ updatedAt: Int64, sortAt: Int64 = 0) throws {
+        let limit = Date.now.addingTimeInterval(600).syncMillis
+        if checksClock && (updatedAt > limit || sortAt > limit) { throw Self.clockSkew }
+    }
+
+    /// In a group, only the author or the owner may overwrite or delete an existing item.
+    private func checkMayOverwrite(space: String, id: String, uid: String) throws {
+        guard let group = spaces[space], group.kind == "group", let existing = items[space]?[id],
+              existing.deleted == nil, let author = existing.authorUid else { return }
+        if author != uid && group.owner != uid { throw Self.forbidden }
+    }
 
     static func usernameTaken() -> SyncAPIError {
         .server(status: 409, code: "username_taken", message: "", retryAfter: nil)
@@ -423,22 +510,67 @@ actor FakeSyncServer {
         .server(status: 401, code: "unauthenticated", message: "", retryAfter: nil)
     }
 
-    func issueToken(for uid: String) -> String {
+    func issueToken(for uid: String, deviceName: String? = nil) -> String {
         let token = "token-\(uid)-\(UUID().uuidString)"
-        tokens[token] = uid
+        tokens[token] = Session(id: SyncCrypto.newID(), uid: uid, deviceName: deviceName, createdAt: Date.now.syncMillis)
         return token
     }
 
     func uid(forToken token: String) throws -> String {
-        guard let uid = tokens[token] else { throw Self.unauthenticated() }
-        return uid
+        guard let session = tokens[token] else { throw Self.unauthenticated() }
+        return session.uid
     }
 
     func prelogin(email: String) -> KDFParams {
-        accounts[email]?.kdf ?? KDFParams(salt: Data(SHA256Fake.bytes(email).prefix(16)), iterations: 600_000)
+        kdfOverrides[email] ?? accounts[email]?.kdf ?? KDFParams(salt: Data(SHA256Fake.bytes(email).prefix(16)), iterations: 600_000)
+    }
+
+    // MARK: Sign-up codes and sessions
+
+    func createSignupCode(uid: String) -> SignupCode {
+        let code = SyncCrypto.Invite.format(SyncCrypto.randomBytes(10))
+        let record = SignupCodeRecord(id: SyncCrypto.newID(), owner: uid, createdAt: Date.now.syncMillis)
+        signupCodes[SyncCrypto.Invite.normalizeSignupCode(code)!] = record
+        return SignupCode(id: record.id, code: code, expiresAt: Date.now.addingTimeInterval(14 * 86_400).syncMillis)
+    }
+
+    func signupCodes(uid: String) -> [OpenSignupCode] {
+        signupCodes.values.filter { $0.owner == uid && !$0.used }
+            .map { OpenSignupCode(id: $0.id, createdAt: $0.createdAt, expiresAt: $0.createdAt + 14 * 86_400_000) }
+    }
+
+    func revokeSignupCode(uid: String, id: String) {
+        signupCodes = signupCodes.filter { !($0.value.id == id && $0.value.owner == uid) }
+    }
+
+    func sessions(token: String) throws -> [RemoteDevice] {
+        let uid = try uid(forToken: token)
+        return tokens.filter { $0.value.uid == uid }.map { key, session in
+            RemoteDevice(id: session.id, deviceName: session.deviceName, createdAt: session.createdAt,
+                         lastUsedAt: session.createdAt, current: key == token)
+        }
+    }
+
+    func revokeSession(token: String, id: String) throws {
+        let uid = try uid(forToken: token)
+        tokens = tokens.filter { !($0.value.uid == uid && $0.value.id == id) }
     }
 
     func signup(_ body: SignupRequest) throws -> RemoteSession {
+        if requireInvites {
+            if let code = body.signupCode {
+                guard let key = SyncCrypto.Invite.normalizeSignupCode(code), let record = signupCodes[key], !record.used else {
+                    throw SyncAPIError.server(status: 403, code: "invite_invalid", message: "", retryAfter: nil)
+                }
+                signupCodes[key]?.used = true
+            } else if let inviteId = body.groupInviteId {
+                guard let invite = invites[inviteId], !invite.used else {
+                    throw SyncAPIError.server(status: 403, code: "invite_invalid", message: "", retryAfter: nil)
+                }
+            } else {
+                throw SyncAPIError.server(status: 403, code: "invite_required", message: "", retryAfter: nil)
+            }
+        }
         guard accounts[body.email] == nil else { throw SyncAPIError.server(status: 409, code: "conflict", message: "", retryAfter: nil) }
         if let name = body.username, isTaken(name) { throw Self.usernameTaken() }
         let account = Account(uid: body.uid, email: body.email, authKey: body.authKey, kdf: body.kdf,
@@ -447,14 +579,14 @@ actor FakeSyncServer {
                               username: body.username)
         accounts[body.email] = account
         createSpace(id: body.personalSpace.id, kind: "personal", owner: body.uid, wrappedKey: body.personalSpace.wrappedKey)
-        return RemoteSession(token: issueToken(for: body.uid), expiresAt: nil, account: account.remote)
+        return RemoteSession(token: issueToken(for: body.uid, deviceName: body.deviceName), expiresAt: nil, account: account.remote)
     }
 
-    func login(email: String, authKey: Data) throws -> RemoteSession {
+    func login(email: String, authKey: Data, deviceName: String? = nil) throws -> RemoteSession {
         guard let account = accounts[email], account.authKey == authKey else {
             throw SyncAPIError.server(status: 401, code: "invalid_credentials", message: "", retryAfter: nil)
         }
-        return RemoteSession(token: issueToken(for: account.uid), expiresAt: nil, account: account.remote)
+        return RemoteSession(token: issueToken(for: account.uid, deviceName: deviceName), expiresAt: nil, account: account.remote)
     }
 
     func logout(token: String) { tokens[token] = nil }
@@ -477,7 +609,7 @@ actor FakeSyncServer {
         account.kdf = body.kdf
         account.wrappedAccountKey = body.wrappedAccountKey
         accounts[account.email] = account
-        tokens = tokens.filter { $0.value != uid || $0.key == token }   // other sessions end
+        tokens = tokens.filter { $0.value.uid != uid || $0.key == token }   // other sessions end
     }
 
     func deleteAccount(uid: String, authKey: Data) throws {
@@ -486,7 +618,7 @@ actor FakeSyncServer {
             throw SyncAPIError.server(status: 401, code: "invalid_credentials", message: "", retryAfter: nil)
         }
         accounts[account.email] = nil
-        tokens = tokens.filter { $0.value != uid }
+        tokens = tokens.filter { $0.value.uid != uid }
         for (id, space) in spaces where space.owner == uid { spaces[id] = nil }
         for id in spaces.keys { spaces[id]?.members[uid] = nil }
     }
@@ -556,7 +688,15 @@ actor FakeSyncServer {
         .sorted { $0.createdAt < $1.createdAt }
     }
 
-    func changes(space: String, since: Int64, limit: Int) -> ChangesPage {
+    func changes(space: String, since: Int64, limit: Int) throws -> ChangesPage {
+        if resetNext.contains(space) && since > 0 {
+            resetNext.remove(space)
+            return ChangesPage(items: [], nextSince: since, hasMore: false, resetRequired: true)
+        }
+        if let (failing, error) = failChangesAfterReset, failing == space, !resetNext.contains(space) {
+            failChangesAfterReset = nil
+            throw error
+        }
         let all = (items[space] ?? [:]).values.filter { $0.seq > since }.sorted { $0.seq < $1.seq }
         let page = Array(all.prefix(limit))
         return ChangesPage(items: page, nextSince: page.last?.seq ?? since, hasMore: all.count > limit, resetRequired: false)
@@ -564,6 +704,11 @@ actor FakeSyncServer {
 
     func put(space: String, id: String, body: ItemUpload, uid: String) throws -> WriteOutcome {
         guard spaces[space]?.members[uid] != nil else { throw SyncAPIError.server(status: 404, code: "not_found", message: "", retryAfter: nil) }
+        putAttempts[id, default: 0] += 1
+        if rateLimited { throw Self.rateLimit }
+        if let refusal = refusals[id] { throw refusal }
+        try checkClock(body.updatedAt, sortAt: body.sortAt)
+        try checkMayOverwrite(space: space, id: id, uid: uid)
         if let existing = items[space]?[id], existing.updatedAt > body.updatedAt { return .conflict(existing) }
         for blob in body.blobIds where !registered.contains("\(space)/\(blob)") {
             throw SyncAPIError.server(status: 400, code: "invalid", message: "Upload the item's blobs first", retryAfter: nil)
@@ -585,7 +730,10 @@ actor FakeSyncServer {
         return .saved(seq: seq, trimmed: trimmed)
     }
 
-    func delete(space: String, id: String, updatedAt: Int64) -> WriteOutcome {
+    func delete(space: String, id: String, updatedAt: Int64, uid: String) throws -> WriteOutcome {
+        deleteRequests.append(id)
+        try checkClock(updatedAt)
+        try checkMayOverwrite(space: space, id: id, uid: uid)
         guard let existing = items[space]?[id] else { return .saved(seq: 0, trimmed: []) }
         if existing.deleted == "user" { return .saved(seq: existing.seq, trimmed: []) }
         if existing.deleted == nil && existing.updatedAt > updatedAt { return .conflict(existing) }
@@ -606,6 +754,7 @@ actor FakeSyncServer {
     }
 
     func register(space: String, blob: String) -> BlobUploadTicket {
+        registrations += 1
         registered.insert("\(space)/\(blob)")
         return BlobUploadTicket(url: URL(string: "fake://\(space)/\(blob)")!, method: "PUT", headers: [:], expiresAt: nil)
     }
@@ -635,12 +784,16 @@ nonisolated struct FakeClient: SyncService {
     let server: FakeSyncServer
     let token: @Sendable () async throws -> String
 
-    private func caller() async throws -> String { try await server.uid(forToken: try await token()) }
+    /// Like URLSession, every call throws once its task is cancelled.
+    private func caller() async throws -> String {
+        try Task.checkCancellation()
+        return try await server.uid(forToken: try await token())
+    }
 
     func prelogin(email: String) async throws -> KDFParams { await server.prelogin(email: email) }
     func signup(_ body: SignupRequest) async throws -> RemoteSession { try await server.signup(body) }
     func login(email: String, authKey: Data, deviceName: String?) async throws -> RemoteSession {
-        try await server.login(email: email, authKey: authKey)
+        try await server.login(email: email, authKey: authKey, deviceName: deviceName)
     }
     func logout() async throws { await server.logout(token: try await token()) }
     func changePassword(_ body: PasswordChange) async throws {
@@ -649,6 +802,18 @@ nonisolated struct FakeClient: SyncService {
     func account() async throws -> RemoteAccount { try await server.remoteAccount(uid: try await caller()) }
     func setUsername(_ username: String) async throws -> String { try await server.setUsername(uid: try await caller(), username) }
     func deleteAccount(authKey: Data) async throws { try await server.deleteAccount(uid: try await caller(), authKey: authKey) }
+
+    func createSignupCode() async throws -> SignupCode { await server.createSignupCode(uid: try await caller()) }
+    func signupCodes() async throws -> [OpenSignupCode] { await server.signupCodes(uid: try await caller()) }
+    func revokeSignupCode(id: String) async throws { await server.revokeSignupCode(uid: try await caller(), id: id) }
+    func sessions() async throws -> [RemoteDevice] {
+        _ = try await caller()
+        return try await server.sessions(token: try await token())
+    }
+    func revokeSession(id: String) async throws {
+        _ = try await caller()
+        try await server.revokeSession(token: try await token(), id: id)
+    }
 
     func spaces() async throws -> [RemoteSpace] { await server.spaces(for: try await caller()) }
     func createGroup(id: String, encryptedName: Data, wrappedKey: Data) async throws -> RemoteSpace {
@@ -676,20 +841,25 @@ nonisolated struct FakeClient: SyncService {
 
     func changes(spaceId: String, since: Int64, limit: Int) async throws -> ChangesPage {
         _ = try await caller()
-        return await server.changes(space: spaceId, since: since, limit: limit)
+        return try await server.changes(space: spaceId, since: since, limit: limit)
     }
     func putItem(spaceId: String, itemId: String, _ body: ItemUpload) async throws -> WriteOutcome {
         try await server.put(space: spaceId, id: itemId, body: body, uid: try await caller())
     }
     func deleteItem(spaceId: String, itemId: String, updatedAt: Int64) async throws -> WriteOutcome {
-        await server.delete(space: spaceId, id: itemId, updatedAt: updatedAt)
+        try await server.delete(space: spaceId, id: itemId, updatedAt: updatedAt, uid: try await caller())
     }
     func registerBlob(spaceId: String, blobId: String, size: Int) async throws -> BlobUploadTicket {
-        await server.register(space: spaceId, blob: blobId)
+        _ = try await caller()
+        return await server.register(space: spaceId, blob: blobId)
     }
-    func uploadBlob(_ ticket: BlobUploadTicket, data: Data) async throws { await server.upload(ticket, data: data) }
+    func uploadBlob(_ ticket: BlobUploadTicket, data: Data) async throws {
+        try Task.checkCancellation()
+        await server.upload(ticket, data: data)
+    }
     func downloadBlob(spaceId: String, blobId: String) async throws -> Data {
-        try await server.download(space: spaceId, blob: blobId)
+        _ = try await caller()
+        return try await server.download(space: spaceId, blob: blobId)
     }
 }
 
@@ -769,8 +939,12 @@ final class FakeDevice {
 /// Creates a group owned by `owner` with `members`; returns its id.
 @MainActor
 func makeGroup(_ name: String, owner: FakeUser, members: [FakeUser] = []) async throws -> String {
+    try await makeGroup(name, owner: owner, members: members, key: SyncCrypto.randomBytes(32))
+}
+
+@MainActor
+func makeGroup(_ name: String, owner: FakeUser, members: [FakeUser] = [], key: Data) async throws -> String {
     let id = SyncCrypto.newID()
-    let key = SyncCrypto.randomBytes(32)
     await owner.server.createSpace(id: id, kind: "group", owner: owner.identity.uid,
                                    wrappedKey: try SyncCrypto.wrapSpaceKey(key, spaceId: id, memberUid: owner.identity.uid,
                                                                           memberPublicKey: owner.identity.publicKey),
@@ -1072,7 +1246,6 @@ struct SyncEngineTests {
         let server = FakeSyncServer()
         let user = try await FakeUser.make("alice", on: server)
         let mac = try FakeDevice(user)
-        mac.store.onExpire = { [engine = mac.engine] ids in engine.forget(ids) }
         let now = Date(timeIntervalSince1970: 1_000_000)
         mac.store.ingest(.text("old"), now: now.addingTimeInterval(-40 * 86_400))
         try await mac.engine.tick()
@@ -1103,9 +1276,12 @@ struct SyncEngineTests {
 
 final class MemoryCredentials: SyncSessionStore {
     var saved: StoredSyncSession?
+    var floors: [String: Int] = [:]
     func load() -> StoredSyncSession? { saved }
     func save(_ session: StoredSyncSession) { saved = session }
     func clear() { saved = nil }
+    func kdfFloors() -> [String: Int] { floors }
+    func saveKDFFloors(_ floors: [String: Int]) { self.floors = floors }
 }
 
 /// One Mac's SyncAccount wired to the fake server.
@@ -1133,6 +1309,9 @@ final class AccountHarness {
                               secrets: FakeSecrets(), credentials: credentials) { token in
             FakeClient(server: server, token: token)
         }
+        // As AppEnvironment wires them: every commit is a possible local change.
+        store.onCommit = { [account] in account.localChange() }
+        snippets.onCommit = { [account] in account.localChange() }
     }
 
     /// Waits for background ticks, then runs one more to completion.
@@ -1329,5 +1508,600 @@ struct SyncAccountTests {
         #expect(await mac.account.deleteAccount(password: "a password"))
         #expect(mac.account.state == .signedOut)
         #expect(await server.accounts["a@b.at"] == nil)
+    }
+}
+
+// MARK: - October 2026 hardening (docs/sync/HARDENING-2026-10.md)
+
+/// An image clip with its own (fake) PNG and thumbnail.
+@MainActor
+@discardableResult
+func ingestImage(_ store: ClipStore, seed: Int, spaceID: String? = nil, now: Date = .now) throws -> ClipItem {
+    let name = "img-\(UUID().uuidString)"
+    try store.blobs.write(Data((0..<2_000).map { UInt8(($0 * (seed + 3)) % 251) }), name: name + ".png")
+    try store.blobs.write(Data([UInt8(seed % 256), 1, 2]), name: name + "-thumb.png")
+    return store.ingest(ProcessedCapture(kind: .image, text: "", preview: "Image", fileURLs: [], hash: "image:px:2x2:\(seed)",
+                                         imageFile: name + ".png", thumbnailFile: name + "-thumb.png", imageWidth: 2, imageHeight: 2),
+                        spaceID: spaceID, now: now)
+}
+
+private func lower(_ id: UUID) -> String { id.uuidString.lowercased() }
+
+private func quarantine(of url: URL) -> String? {
+    let size = getxattr(url.path, "com.apple.quarantine", nil, 0, 0, 0)
+    guard size > 0 else { return nil }
+    var buffer = [UInt8](repeating: 0, count: size)
+    guard getxattr(url.path, "com.apple.quarantine", &buffer, size, 0, 0) == size else { return nil }
+    return String(decoding: buffer, as: UTF8.self)
+}
+
+@MainActor
+struct SyncHardeningTests {
+    // Bug 1: a tick's own commits (and the user's) used to cancel the running tick.
+    @Test func aTickWithThreeImagesWhileLocalChangesFireLandsThemAll() async throws {
+        let server = FakeSyncServer()
+        let mac1 = try AccountHarness(server), mac2 = try AccountHarness(server)
+        await mac1.account.signUp(email: "a@x.at", password: "a password", username: "usera")
+        await mac2.account.signIn(email: "a@x.at", password: "a password")
+        await mac2.settle()
+        for seed in 0..<3 { try ingestImage(mac1.store, seed: seed) }
+        await mac1.settle()
+        let personal = try #require(mac1.credentials.saved?.personalSpaceId)
+        #expect(await server.live(space: personal).count == 3)
+
+        // One sync on mac2 while local changes keep firing: every image lands in that one tick.
+        let spam = Task { @MainActor in
+            for _ in 0..<400 {
+                mac2.account.localChange()
+                try? await Task.sleep(for: .milliseconds(2))
+            }
+        }
+        await mac2.account.syncAndWait(timeout: .seconds(10))
+        spam.cancel()
+        let images = mac2.store.items(inSpace: nil)
+        #expect(images.count == 3)
+        #expect(images.allSatisfy { $0.kind == .image && $0.imageFile != nil })
+        #expect(mac2.account.lastSyncError == nil)
+        #expect(mac2.account.status != .offline)
+    }
+
+    // Bug 2 and 3: refused items are sent once, and deletions go out first.
+    @Test func refusedItemsUploadOnceAndDeletionsStillGoOut() async throws {
+        let server = FakeSyncServer()
+        let user = try await FakeUser.make("alice", on: server)
+        let mac = try FakeDevice(user)
+        let doomed = mac.store.ingest(.text("delete me later"))
+        let other = mac.store.ingest(.text("also deleted later"))
+        try await mac.engine.tick()
+
+        let refusedText = mac.store.ingest(.text("the server refuses this"))
+        let refusedImage = try ingestImage(mac.store, seed: 7)
+        await server.refuse(lower(refusedText.id), with: .server(status: 400, code: "invalid", message: "", retryAfter: nil))
+        await server.refuse(lower(refusedImage.id), with: .server(status: 413, code: "too_large", message: "", retryAfter: nil))
+        let registrationsBefore = await server.registrations
+        for _ in 0..<3 { try await mac.engine.tick() }
+        #expect(await server.putAttempts[lower(refusedText.id)] == 1)
+        #expect(await server.putAttempts[lower(refusedImage.id)] == 1)
+        #expect(await server.registrations - registrationsBefore == 2)   // image and thumbnail, once
+
+        // A rate limit on uploads doesn't hold back deletions: they go first.
+        mac.store.delete(doomed)
+        mac.store.ingest(.text("new while rate limited"))
+        await server.setRateLimited(true)
+        await #expect(throws: SyncAPIError.self) { try await mac.engine.tick() }
+        #expect(await server.item(space: user.personal, id: lower(doomed.id))?.deleted == "user")
+        await server.setRateLimited(false)
+
+        // Over quota: refused once, retried after a deletion frees space.
+        let overQuota = mac.store.ingest(.text("over quota"))
+        await server.refuse(lower(overQuota.id), with: .server(status: 413, code: "quota_exceeded", message: "", retryAfter: nil, scope: "group"))
+        try await mac.engine.tick()
+        try await mac.engine.tick()
+        #expect(await server.putAttempts[lower(overQuota.id)] == 1)
+        #expect(mac.engine.problem?.contains("group's sync storage is full") == true)
+        await server.clearRefusal(lower(overQuota.id))
+        mac.store.delete(other)
+        try await mac.engine.tick()
+        #expect(await server.item(space: user.personal, id: lower(overQuota.id))?.deleted == nil)
+        #expect(await server.putAttempts[lower(overQuota.id)] == 2)
+    }
+
+    // Bug 4: retention while the session has ended must not become DELETEs later.
+    @Test func retentionWhileWaitingForThePasswordSendsNoDelete() async throws {
+        let server = FakeSyncServer()
+        let mac = try AccountHarness(server)
+        await mac.account.signUp(email: "a@x.at", password: "a password", username: "usera")
+        mac.store.ingest(.text("old"), now: .now.addingTimeInterval(-40 * 86_400))
+        await mac.settle()
+        let personal = try #require(mac.credentials.saved?.personalSpaceId)
+        #expect(await server.live(space: personal).count == 1)
+
+        let uid = try #require(mac.credentials.saved?.uid)
+        await server.endSessions(uid: uid)
+        await mac.account.runTick()
+        #expect(mac.account.state == .needsPassword(email: "a@x.at"))
+        #expect(mac.account.engine == nil)
+        mac.store.enforceRetention(maxItems: 0, maxAge: 30 * 86_400)
+        #expect(mac.store.count() == 0)
+
+        await mac.account.unlock(password: "a password")
+        await mac.settle()
+        #expect(await server.deleteRequests.isEmpty)
+        #expect(await server.live(space: personal).count == 1)
+    }
+
+    // Bug 6: files map to blobs by path and size, never by position.
+    @Test func fileClipKeepsEachFilesOwnBytesAfterOneIsDeleted() async throws {
+        let server = FakeSyncServer()
+        let user = try await FakeUser.make("alice", on: server)
+        let mac1 = try FakeDevice(user)
+        let dir = FileManager.default.temporaryDirectory.appending(path: "SyncIntegrity-\(UUID())", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let a = dir.appending(path: "A.bin"), b = dir.appending(path: "B.txt")
+        try Data((0..<4_000).map { UInt8($0 % 199) }).write(to: a)
+        let bBytes = Data("bytes of B".utf8)
+        try bBytes.write(to: b)
+        let item = mac1.store.ingest(ProcessedCapture(kind: .file, text: [a, b].map(\.path).joined(separator: "\n"), preview: "2 files",
+                                                      fileURLs: [a, b], hash: ContentHasher.hash(fileURLs: [a, b])))
+        try await mac1.engine.tick()
+        #expect(await server.live(space: user.personal).first?.blobIds.count == 2)
+
+        try FileManager.default.removeItem(at: a)
+        mac1.store.togglePin(item)
+        try await mac1.engine.tick()
+        let remote = try #require(await server.item(space: user.personal, id: lower(item.id)))
+        #expect(remote.category == "pinned" && remote.blobIds.count == 1)
+
+        let fresh = try FakeDevice(user)
+        try await fresh.engine.tick()
+        let received = try #require(fresh.store.item(withID: item.id))
+        defer { fresh.store.delete(received) }
+        #expect(received.kind == .file)
+        #expect(received.fileURLs.map(\.lastPathComponent) == ["B.txt"])
+        #expect(try Data(contentsOf: received.fileURLs[0]) == bBytes)
+        // Received files are marked as downloaded, naming Clipboard2.
+        #expect(quarantine(of: received.fileURLs[0])?.contains("Clipboard2") == true)
+
+        // The receiver re-pushes without uploading the file again.
+        let registrations = await server.registrations
+        fresh.store.setLabel("Kept", for: received)
+        try await fresh.engine.tick()
+        #expect(await server.registrations == registrations)
+        #expect(await server.item(space: user.personal, id: lower(item.id))?.blobIds == remote.blobIds)
+    }
+
+    // Bug 7: a full resync resumes after an interruption and never resurrects deleted items.
+    @Test func interruptedResyncResumesAndKeepsDeletionsDeleted() async throws {
+        let server = FakeSyncServer()
+        let user = try await FakeUser.make("alice", on: server)
+        let group = try await makeGroup("Team", owner: user)
+        let mac1 = try FakeDevice(user), mac2 = try FakeDevice(user)
+        let history = mac1.store.ingest(.text("history deleted long ago"))
+        let kept = mac1.store.ingest(.text("still on the server"))
+        let pinned = mac1.store.ingest(.text("pinned deleted long ago"))
+        mac1.store.togglePin(pinned)
+        let groupItem = mac1.store.ingest(.text("group item deleted long ago"), spaceID: group)
+        try await mac1.engine.tick()
+        try await mac2.engine.tick()
+        #expect(mac2.store.count() == 4)
+
+        // Deleted elsewhere more than 90 days ago: even the tombstones are gone.
+        for id in [history.id, pinned.id] { await server.purge(space: user.personal, id: lower(id)) }
+        await server.purge(space: group, id: lower(groupItem.id))
+        await server.requireReset(space: user.personal, thenFail: .network("offline"))
+        await #expect(throws: SyncAPIError.self) { try await mac2.engine.tick() }
+        #expect(mac2.engine.allSpaces().first { $0.id == user.personal }?.resyncing == true)
+
+        try await mac2.engine.tick()
+        #expect(mac2.engine.allSpaces().first { $0.id == user.personal }?.resyncing == false)
+        #expect(mac2.store.item(withID: pinned.id) == nil)
+        #expect(mac2.store.item(withID: kept.id) != nil)
+        #expect(mac2.store.item(withID: history.id) != nil)              // personal history stays here…
+        #expect(mac2.engine.meta(for: lower(history.id))?.detached == true)
+        try await mac2.engine.tick()
+        #expect(await server.item(space: user.personal, id: lower(history.id)) == nil)   // …but isn't pushed back
+
+        await server.requireReset(space: group)
+        try await mac2.engine.tick()
+        #expect(mac2.store.item(withID: groupItem.id) == nil)            // group history goes
+    }
+
+    // Bug 9: Synced Files folders don't outlive their file clip.
+    @Test func syncedFilesFoldersAreRemovedAndSwept() throws {
+        let container = try ModelContainer(for: AppEnvironment.schema,
+                                           configurations: ModelConfiguration(schema: AppEnvironment.schema, isStoredInMemoryOnly: true))
+        let store = ClipStore(context: container.mainContext,
+                              blobs: BlobStore(directory: FileManager.default.temporaryDirectory.appending(path: "Leak-\(UUID())")))
+        let fm = FileManager.default
+        let item = ClipItem(syncID: UUID(), spaceID: nil)
+        let folder = AppPaths.syncedFilesFolder(for: item.id)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appending(path: "Report.pdf")
+        try Data("pdf".utf8).write(to: file)
+        item.kind = .file
+        item.fileURLStrings = [file.absoluteString]
+        item.text = file.path
+        store.insertSynced(item)
+        store.commitSynced()
+
+        // A copy shared to a group gets its own folder.
+        let copy = store.shareCopy(of: item, toSpace: "group-1")
+        #expect(copy.fileURLs.first?.deletingLastPathComponent().standardizedFileURL.path
+                == AppPaths.syncedFilesFolder(for: copy.id).standardizedFileURL.path)
+        #expect(try Data(contentsOf: try #require(copy.fileURLs.first)) == Data("pdf".utf8))
+
+        store.replaceText(of: item, with: "now text")
+        #expect(!fm.fileExists(atPath: folder.path))
+        #expect(fm.fileExists(atPath: try #require(copy.fileURLs.first).path))   // the copy keeps its files
+        store.delete(copy)
+
+        // The sweep: old orphans go, young ones and live file clips' folders stay.
+        let root = fm.temporaryDirectory.appending(path: "Sweep-\(UUID())", directoryHint: .isDirectory)
+        defer { try? fm.removeItem(at: root) }
+        let live = ClipItem(syncID: UUID(), spaceID: nil)
+        live.kind = .file
+        store.insertSynced(live)
+        store.commitSynced()
+        let names = ["old-orphan": true, "young-orphan": false, lower(live.id): true]
+        for (name, old) in names {
+            let dir = root.appending(path: name)
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            if old { try fm.setAttributes([.modificationDate: Date.now.addingTimeInterval(-7_200)], ofItemAtPath: dir.path) }
+        }
+        store.removeOrphanedSyncedFiles(in: root)
+        #expect(!fm.fileExists(atPath: root.appending(path: "old-orphan").path))
+        #expect(fm.fileExists(atPath: root.appending(path: "young-orphan").path))
+        #expect(fm.fileExists(atPath: root.appending(path: lower(live.id)).path))
+    }
+
+    // Bug 5: the store opens through the versioned schema and keeps its items; a failure is reported.
+    @Test func storeFromTheLastReleaseMigratesAndAFailureIsReported() throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "Store-\(UUID())").appending(path: "Clipboard2.store")
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        do {
+            let v1 = Schema(versionedSchema: StoreSchemaV1.self)
+            let old = try ModelContainer(for: v1, configurations: ModelConfiguration(schema: v1, url: url))
+            let item = StoreSchemaV1.ClipItem()
+            item.text = "kept across the update"
+            old.mainContext.insert(item)
+            let meta = StoreSchemaV1.SyncMeta()
+            meta.localId = "m1"
+            old.mainContext.insert(meta)
+            try old.mainContext.save()
+        }
+        let opened = AppEnvironment.openContainer(url: url)
+        #expect(opened.error == nil)
+        let context = opened.container.mainContext
+        #expect(try context.fetch(FetchDescriptor<ClipItem>()).map(\.text) == ["kept across the update"])
+        let meta = try #require(try context.fetch(FetchDescriptor<SyncMeta>()).first)
+        #expect(meta.localId == "m1" && meta.fileBlobs.isEmpty && !meta.detached)
+
+        // A store file that isn't a database: reported, never replaced.
+        let broken = url.deletingLastPathComponent().appending(path: "Broken.store")
+        let garbage = Data(repeating: 0x5A, count: 8_192)
+        try garbage.write(to: broken)
+        let failed = AppEnvironment.openContainer(url: broken)
+        #expect(failed.error != nil)
+        #expect(try Data(contentsOf: broken) == garbage)
+        #expect(try failed.container.mainContext.fetch(FetchDescriptor<ClipItem>()).isEmpty)
+    }
+
+    // Main-thread work: unchanged items aren't rebuilt and hashed every tick.
+    @Test func unchangedItemsAreSkippedByTheirStamp() async throws {
+        let server = FakeSyncServer()
+        let user = try await FakeUser.make("alice", on: server)
+        let mac = try FakeDevice(user)
+        let item = mac.store.ingest(.text("stamp me"))
+        try await mac.engine.tick()
+        let meta = try #require(mac.engine.meta(for: lower(item.id)))
+        #expect(meta.localStamp == SyncEngine.stamp(item))
+        mac.store.touch(item)
+        #expect(SyncEngine.stamp(item) != meta.localStamp)
+        try await mac.engine.tick()
+        #expect(mac.engine.meta(for: lower(item.id))?.localStamp == SyncEngine.stamp(item))
+    }
+
+    // MARK: Security
+
+    @Test func kdfParametersOutsideTheBoundsOrWeakerThanBeforeAreRefused() async throws {
+        let server = FakeSyncServer()
+        let mac = try AccountHarness(server)
+        let email = "a@x.at"
+        await mac.account.signUp(email: email, password: "a password", username: "usera")
+        #expect(mac.credentials.floors[SyncAccount.kdfKey(email: email)] == 600_000)
+        mac.account.signOut()
+        let real = try #require(await server.accounts[email]?.kdf)
+
+        for iterations in [100_000, 20_000_000] {
+            await server.setKDF(KDFParams(salt: real.salt, iterations: iterations), for: email)
+            await mac.account.signIn(email: email, password: "a password")
+            #expect(!mac.account.isSignedIn)
+            #expect(mac.account.errorMessage == SyncAccountError.unsafePasswordSettings.errorDescription)
+        }
+        await server.setKDF(real, for: email)
+        mac.credentials.floors[SyncAccount.kdfKey(email: email)] = 800_000   // this Mac saw stronger settings before
+        await mac.account.signIn(email: email, password: "a password")
+        #expect(!mac.account.isSignedIn)
+        #expect(mac.account.errorMessage == SyncAccountError.weakerPasswordSettings.errorDescription)
+
+        mac.credentials.floors[SyncAccount.kdfKey(email: email)] = 600_000
+        await mac.account.signIn(email: email, password: "a password")
+        #expect(mac.account.isSignedIn)
+    }
+
+    @Test func aSpaceKeyThatChangesIsNotAdoptedUntilLeftAndRejoined() async throws {
+        let server = FakeSyncServer()
+        let alice = try await FakeUser.make("alice", on: server)
+        let bob = try await FakeUser.make("bob", on: server)
+        let key = SyncCrypto.randomBytes(32)
+        let group = try await makeGroup("Team", owner: alice, members: [bob], key: key)
+        let aliceMac = try FakeDevice(alice), bobMac = try FakeDevice(bob)
+        var pins: [String: String] = [:]
+        bobMac.engine.onPinsChanged = { pins = $0 }
+        aliceMac.store.ingest(.text("before"), spaceID: group)
+        try await aliceMac.engine.tick()
+        try await bobMac.engine.tick()
+        #expect(bobMac.texts(inSpace: group) == ["before"])
+        #expect(pins[group] == SyncCrypto.sha256Hex(key))
+
+        // The server hands bob a wrap of a different key.
+        let other = SyncCrypto.randomBytes(32)
+        await server.rewrap(space: group, uid: bob.identity.uid,
+                            wrappedKey: try SyncCrypto.wrapSpaceKey(other, spaceId: group, memberUid: bob.identity.uid,
+                                                                   memberPublicKey: bob.identity.publicKey))
+        aliceMac.store.ingest(.text("after"), spaceID: group)
+        try await aliceMac.engine.tick()
+        try await bobMac.engine.tick()
+        #expect(bobMac.engine.keyMismatches == [group])
+        #expect(bobMac.engine.problem?.contains("This group's key changed unexpectedly") == true)
+        #expect(bobMac.texts(inSpace: group) == ["before"])    // not wiped, nothing new taken in
+        #expect(bobMac.engine.allSpaces().contains { $0.id == group })
+
+        // Leaving clears the pin; joining again starts over.
+        await server.removeMember(space: group, uid: bob.identity.uid)
+        try await bobMac.engine.tick()
+        #expect(pins[group] == nil && bobMac.engine.keyMismatches.isEmpty)
+        await server.addMember(space: group, uid: bob.identity.uid,
+                               wrappedKey: try SyncCrypto.wrapSpaceKey(key, spaceId: group, memberUid: bob.identity.uid,
+                                                                      memberPublicKey: bob.identity.publicKey))
+        try await bobMac.engine.tick()
+        #expect(bobMac.texts(inSpace: group) == ["before", "after"])
+    }
+
+    @Test func revMustMatchAndNeverGoesBack() async throws {
+        let server = FakeSyncServer()
+        let user = try await FakeUser.make("alice", on: server)
+        let mac1 = try FakeDevice(user), mac2 = try FakeDevice(user)
+        let snippet = mac1.snippets.create(name: "Sig", body: "v1")
+        snippet.updatedAt = Date(timeIntervalSince1970: 1_000)
+        try await mac1.engine.tick()
+        let id = lower(snippet.id)
+        let v1 = try #require(await server.item(space: user.personal, id: id))
+
+        // Every payload carries `rev`, the updatedAt it was written with.
+        let key = SyncCrypto.itemKey(spaceKey: try #require(mac1.engine.spaceKey(for: user.personal)))
+        let plaintext = try SyncCrypto.open(try #require(v1.ciphertext), key: key,
+                                            aad: SyncCrypto.AAD.item(spaceId: user.personal, itemId: id, category: "snippet"))
+        #expect(try SyncPayload.decode(plaintext).rev == v1.updatedAt)
+
+        snippet.body = "v2"
+        snippet.updatedAt = Date(timeIntervalSince1970: 2_000)
+        try await mac1.engine.tick()
+        try await mac2.engine.tick()
+        #expect(mac2.snippets.snippet(withID: snippet.id)?.body == "v2")
+
+        // A server serving the older version again (with a new seq) is ignored.
+        await server.replay(v1, space: user.personal)
+        try await mac2.engine.tick()
+        #expect(mac2.snippets.snippet(withID: snippet.id)?.body == "v2")
+
+        // So is an updatedAt that doesn't match the rev inside.
+        await server.tamperUpdatedAt(space: user.personal, id: id, to: 9_000_000)
+        try await mac2.engine.tick()
+        #expect(mac2.engine.meta(for: id)?.updatedAt == Date(timeIntervalSince1970: 2_000).syncMillis)
+
+        // Payloads without rev (older apps) are still accepted.
+        let legacy = try SyncCrypto.seal(try SyncPayload.snippet(SnippetPayload(name: "Sig", keyword: "", body: "from an old app",
+                                                                                createdAt: 1, updatedAt: 3_000_000)).canonicalJSON(),
+                                         key: key, aad: SyncCrypto.AAD.item(spaceId: user.personal, itemId: id, category: "snippet"))
+        await server.replay(RemoteItem(id: id, category: "snippet", seq: 0, sortAt: 3_000_000, updatedAt: 3_000_000, deleted: nil,
+                                       ciphertext: legacy, blobIds: [], authorUid: user.identity.uid), space: user.personal)
+        try await mac2.engine.tick()
+        #expect(mac2.snippets.snippet(withID: snippet.id)?.body == "from an old app")
+    }
+
+    @Test func receivedTimesAreClampedAndNotPushedBack() async throws {
+        let server = FakeSyncServer()
+        let user = try await FakeUser.make("alice", on: server)
+        let mac1 = try FakeDevice(user), mac2 = try FakeDevice(user)
+        let future = Date.now.addingTimeInterval(365 * 86_400)
+        let item = mac1.store.ingest(.text("from the future"), now: future)
+        try await mac1.engine.tick()
+        try await mac2.engine.tick()
+        let received = try #require(mac2.store.item(withID: item.id))
+        #expect(received.lastCopiedAt <= .now && received.createdAt <= .now)
+        let puts = await server.putCount
+        try await mac2.engine.tick()
+        try await mac2.engine.tick()
+        #expect(await server.putCount == puts)
+    }
+
+    @Test func clockSkewAndForbiddenAreItemPermanent() async throws {
+        let server = FakeSyncServer()
+        let alice = try await FakeUser.make("alice", on: server)
+        let bob = try await FakeUser.make("bob", on: server)
+        let group = try await makeGroup("Team", owner: alice, members: [bob])
+        let aliceMac = try FakeDevice(alice), bobMac = try FakeDevice(bob)
+
+        await server.setChecksClock(true)
+        let skewed = aliceMac.store.ingest(.text("clock is off"), now: .now.addingTimeInterval(86_400))
+        try await aliceMac.engine.tick()
+        try await aliceMac.engine.tick()
+        #expect(await server.putAttempts[lower(skewed.id)] == 1)
+        #expect(aliceMac.engine.problem?.contains("Your clock is off") == true)
+        aliceMac.store.delete(skewed)
+
+        let shared = aliceMac.store.ingest(.text("alice's"), spaceID: group)
+        try await aliceMac.engine.tick()
+        #expect(aliceMac.engine.problem == nil)
+        try await bobMac.engine.tick()
+        let mine = try #require(bobMac.store.item(withID: shared.id))
+        bobMac.store.togglePin(mine)                                    // not bob's to change
+        try await bobMac.engine.tick()
+        try await bobMac.engine.tick()
+        #expect(await server.putAttempts[lower(shared.id)] == 2)        // alice's one, bob's one
+        #expect(bobMac.store.item(withID: shared.id)?.isPinned == true)  // the edit stays here
+        bobMac.store.delete(try #require(bobMac.store.item(withID: shared.id)))
+        try await bobMac.engine.tick()
+        try await bobMac.engine.tick()
+        #expect(await server.deleteRequests.filter { $0 == lower(shared.id) }.count == 1)
+        #expect(await server.item(space: group, id: lower(shared.id))?.deleted == nil)
+    }
+
+    // MARK: Features
+
+    @Test func signUpIsInviteOnly() async throws {
+        let server = FakeSyncServer()
+        let alice = try AccountHarness(server), bob = try AccountHarness(server), carol = try AccountHarness(server)
+        await alice.account.signUp(email: "alice@x.at", password: "alice password", username: "alice")
+        #expect(alice.credentials.saved?.spaceKeyPins?.keys.contains(try #require(alice.credentials.saved?.personalSpaceId)) == true)
+        await server.setRequireInvites(true)
+
+        await bob.account.signUp(email: "bob@x.at", password: "bob password", username: "bob")
+        #expect(!bob.account.isSignedIn)
+        #expect(bob.account.errorMessage?.contains("Sign-up needs an invite code") == true)
+        await bob.account.signUp(email: "bob@x.at", password: "bob password", username: "bob", inviteCode: " ")
+        #expect(bob.account.errorMessage == SyncAccountError.inviteRequired.errorDescription)
+        await bob.account.signUp(email: "bob@x.at", password: "bob password", username: "bob", inviteCode: "nonsense")
+        #expect(bob.account.errorMessage == SyncAccountError.invalidInviteCode.errorDescription)
+
+        let code = try await alice.account.createSignupCode()
+        #expect(code.code.count == 19)
+        #expect(try await alice.account.openSignupCodes().count == 1)
+        await bob.account.signUp(email: "bob@x.at", password: "bob password", username: "bob",
+                                 inviteCode: code.code.lowercased().replacingOccurrences(of: "-", with: " "))
+        #expect(bob.account.isSignedIn)
+        #expect(try await alice.account.openSignupCodes().isEmpty)
+
+        await carol.account.signUp(email: "carol@x.at", password: "carol password", username: "carol", inviteCode: code.code)
+        #expect(!carol.account.isSignedIn)
+        #expect(carol.account.errorMessage?.contains("unknown, already used or expired") == true)
+
+        // A group's invite code works too, and the new account joins that group right away.
+        let group = try await alice.account.createGroup(named: "Team")
+        let groupCode = try await alice.account.createInviteCode(for: group)
+        await carol.account.signUp(email: "carol@x.at", password: "carol password", username: "carol", inviteCode: groupCode)
+        #expect(carol.account.isSignedIn)
+        #expect(carol.account.groups.map(\.name) == ["Team"])
+
+        let spare = try await alice.account.createSignupCode()
+        let open = try #require(try await alice.account.openSignupCodes().first { $0.id == spare.id })
+        try await alice.account.revoke(open)
+        #expect(try await alice.account.openSignupCodes().isEmpty)
+    }
+
+    @Test func devicesListSignOutAndSendToDevice() async throws {
+        let server = FakeSyncServer()
+        let mac1 = try AccountHarness(server), mac2 = try AccountHarness(server)
+        await mac1.account.signUp(email: "a@x.at", password: "a password", username: "usera")
+        await mac2.account.signIn(email: "a@x.at", password: "a password")
+        await mac1.account.refreshDevices()
+        await mac2.account.refreshDevices()
+        #expect(mac1.account.devices.count == 2)
+        #expect(mac1.account.devices.first?.isCurrent == true)
+        let mac2Device = try #require(mac2.account.devices.first { $0.isCurrent })
+        #expect(mac2.credentials.saved?.deviceId == mac2Device.id)
+
+        var sentFrom: String?
+        mac2.account.onItemSentHere = { sentFrom = $0 }
+        let item = mac1.store.ingest(.text("for the other Mac"), now: .now.addingTimeInterval(-3_600))
+        await mac1.settle()
+        await mac2.settle()
+        #expect(sentFrom == nil)                       // arrived normally: no notice
+        mac2.store.ingest(.text("newer on mac2"))
+
+        await #expect(throws: SyncAccountError.cantSendToThisDevice) {
+            try await mac1.account.send(item, toDevice: try #require(mac1.account.devices.first?.id))
+        }
+        #expect(try await mac1.account.send(item, toDevice: mac2Device.id))
+        await mac2.settle()
+        #expect(sentFrom != nil)
+        #expect(mac2.store.items(inSpace: nil).first?.id == item.id)
+
+        // Signing out another device ends its session.
+        try await mac1.account.signOut(try #require(mac1.account.devices.first { !$0.isCurrent }))
+        #expect(mac1.account.devices.count == 1)
+        await mac2.settle()
+        #expect(mac2.account.state == .needsPassword(email: "a@x.at"))
+    }
+
+    @Test func pollingFollowsThePanelAndActivityAndStatusIsSimple() async throws {
+        let server = FakeSyncServer()
+        let mac = try AccountHarness(server)
+        #expect(mac.account.status == .signedOut)
+        await mac.account.signUp(email: "a@x.at", password: "a password", username: "usera")
+        await mac.settle()
+        #expect(mac.account.status == .idle)
+        #expect(mac.account.lastSyncAt != nil)
+
+        var now = Date.now.addingTimeInterval(86_400)
+        mac.account.clock = { now }
+        #expect(mac.account.pollInterval == .seconds(60))
+        mac.account.reportActivity()
+        #expect(mac.account.pollInterval == .seconds(15))
+        now = now.addingTimeInterval(4 * 60)
+        #expect(mac.account.pollInterval == .seconds(15))
+        now = now.addingTimeInterval(2 * 60)
+        #expect(mac.account.pollInterval == .seconds(60))
+        mac.account.setPanelOpen(true)
+        #expect(mac.account.pollInterval == .seconds(3))
+        mac.account.setPanelOpen(false)
+        #expect(mac.account.pollInterval == .seconds(15))   // opening the panel was activity
+        await mac.settle()
+    }
+}
+
+struct SyncAPIHardeningTests {
+    @Test func blobUploadsNeverOverwriteAndAnExistingBlobIsFine() async throws {
+        let transport = StubTransport(status: 412, body: "")
+        let api = SyncAPI(base: URL(string: "https://api.example")!, transport: transport) { "T" }
+        try await api.uploadBlob(BlobUploadTicket(url: URL(string: "https://storage.example/b")!, method: "PUT",
+                                                  headers: ["x-goog-content-length-range": "0,10"], expiresAt: nil),
+                                 data: Data([1]))
+        let request = try #require(transport.requests.first)
+        #expect(request.value(forHTTPHeaderField: "x-goog-if-generation-match") == "0")
+    }
+
+    @Test func quotaScopeAndNewCodesAreUnderstood() async {
+        let api = SyncAPI(base: URL(string: "https://api.example")!,
+                          transport: StubTransport(status: 413, body: #"{"error":"quota_exceeded","message":"","scope":"group"}"#)) { "T" }
+        do {
+            _ = try await api.putItem(spaceId: "s", itemId: "i", ItemUpload(category: "history", sortAt: 1, updatedAt: 1,
+                                                                            ciphertext: Data([1]), blobIds: []))
+            Issue.record("expected an error")
+        } catch let error as SyncAPIError {
+            #expect(error.scope == "group" && error.isPermanentForItem)
+            #expect(error.errorDescription?.contains("group") == true)
+        } catch {
+            Issue.record("unexpected \(error)")
+        }
+        for code in ["clock_skew", "forbidden"] {
+            #expect(SyncAPIError.server(status: 400, code: code, message: "", retryAfter: nil).isPermanentForItem)
+        }
+        #expect(SyncAPIError.server(status: 429, code: "rate_limited", message: "", retryAfter: 5).isRateLimited)
+    }
+
+    @Test func signupCodesNormaliseLikeInviteCodes() {
+        #expect(SyncCrypto.Invite.normalizeSignupCode("abcd-efgh-ijkl-mn01") == "ABCDEFGHIJKLMNOI")
+        #expect(SyncCrypto.Invite.normalizeSignupCode("ABCD-EFGH") == nil)
+        #expect(SyncCrypto.Invite.normalizeSignupCode("ABCD-EFGH-IJKL-MN9!") == nil)
+    }
+
+    @Test func membersWithoutEmailShowTheirName() throws {
+        let json = Data(#"{"uid":"u","username":null,"name":"sam","role":"member"}"#.utf8)
+        let member = try JSONDecoder().decode(RemoteMember.self, from: json)
+        #expect(member.email == nil && member.displayName == "sam")
     }
 }

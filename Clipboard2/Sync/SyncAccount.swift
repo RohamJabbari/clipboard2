@@ -14,35 +14,43 @@ nonisolated struct StoredSyncSession: Codable, Sendable, Equatable {
     var privateKey: Data
     var personalSpaceId: String
     var username: String?
+    /// SHA-256 (hex) of each space key as first unwrapped, by space id (key pinning).
+    var spaceKeyPins: [String: String]?
+    /// This Mac's session id from `/v1/sessions`.
+    var deviceId: String?
 }
 
 protocol SyncSessionStore: AnyObject {
     func load() -> StoredSyncSession?
     func save(_ session: StoredSyncSession)
     func clear()
+    /// The PBKDF2 iterations last used successfully, by email digest. Survives sign-out.
+    func kdfFloors() -> [String: Int]
+    func saveKDFFloors(_ floors: [String: Int])
 }
 
-/// One generic-password item (service `<bundle id>.sync`), readable only on this device.
+/// Generic-password items (service `<bundle id>.sync`), readable only on this device: the session,
+/// and the remembered KDF parameters.
 final class KeychainSyncSessionStore: SyncSessionStore {
-    private let account = "session"
+    private let sessionAccount = "session"
+    private let kdfAccount = "kdf"
 
-    private var baseQuery: [CFString: Any] {
+    private func query(_ account: String) -> [CFString: Any] {
         [kSecClass: kSecClassGenericPassword, kSecAttrService: SyncConfig.keychainService, kSecAttrAccount: account]
     }
 
-    func load() -> StoredSyncSession? {
-        var query = baseQuery
+    private func read(_ account: String) -> Data? {
+        var query = query(account)
         query[kSecReturnData] = true
         query[kSecMatchLimit] = kSecMatchLimitOne
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess, let data = result as? Data else { return nil }
-        return try? JSONDecoder().decode(StoredSyncSession.self, from: data)
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
+        return result as? Data
     }
 
-    func save(_ session: StoredSyncSession) {
-        guard let data = try? JSONEncoder().encode(session) else { return }
-        clear()
-        var attributes = baseQuery
+    private func write(_ data: Data, account: String) {
+        SecItemDelete(query(account) as CFDictionary)
+        var attributes = query(account)
         attributes[kSecAttrLabel] = "Clipboard2 Sync"
         attributes[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         attributes[kSecValueData] = data
@@ -50,8 +58,26 @@ final class KeychainSyncSessionStore: SyncSessionStore {
         if status != errSecSuccess { Log.sync.error("Keychain save failed: \(status)") }
     }
 
+    func load() -> StoredSyncSession? {
+        read(sessionAccount).flatMap { try? JSONDecoder().decode(StoredSyncSession.self, from: $0) }
+    }
+
+    func save(_ session: StoredSyncSession) {
+        guard let data = try? JSONEncoder().encode(session) else { return }
+        write(data, account: sessionAccount)
+    }
+
     func clear() {
-        SecItemDelete(baseQuery as CFDictionary)
+        SecItemDelete(query(sessionAccount) as CFDictionary)
+    }
+
+    func kdfFloors() -> [String: Int] {
+        read(kdfAccount).flatMap { try? JSONDecoder().decode([String: Int].self, from: $0) } ?? [:]
+    }
+
+    func saveKDFFloors(_ floors: [String: Int]) {
+        guard let data = try? JSONEncoder().encode(floors) else { return }
+        write(data, account: kdfAccount)
     }
 }
 
@@ -61,6 +87,24 @@ nonisolated struct SyncGroup: Identifiable, Hashable, Sendable {
     var name: String
     var isOwner: Bool
     var memberCount: Int
+}
+
+/// A device signed in to the account (one session).
+nonisolated struct SyncDevice: Identifiable, Hashable, Sendable {
+    var id: String
+    var name: String
+    var createdAt: Date
+    var lastUsedAt: Date
+    /// This Mac.
+    var isCurrent: Bool
+
+    init(_ remote: RemoteDevice) {
+        id = remote.id
+        name = remote.deviceName?.isEmpty == false ? remote.deviceName! : "Unnamed device"
+        createdAt = Date(syncMillis: remote.createdAt)
+        lastUsedAt = Date(syncMillis: remote.lastUsedAt)
+        isCurrent = remote.current
+    }
 }
 
 /// A pasted invite code, opened: enough to ask "Join ‹name›?" and then join.
@@ -81,6 +125,11 @@ nonisolated enum SyncAccountError: LocalizedError, Equatable {
     case alreadyMember(String)
     case emailTaken
     case usernameTaken
+    case inviteRequired
+    case unsafePasswordSettings
+    case weakerPasswordSettings
+    case cantSendToThisDevice
+    case notSaved
 
     var errorDescription: String? {
         switch self {
@@ -91,6 +140,13 @@ nonisolated enum SyncAccountError: LocalizedError, Equatable {
         case .alreadyMember(let name): "You're already in “\(name)”."
         case .emailTaken: "An account with this email already exists. Sign in instead."
         case .usernameTaken: "That username is taken. Try another one."
+        case .inviteRequired: "Enter the invite code you were sent. Sign-up is by invitation only."
+        case .unsafePasswordSettings:
+            "The sync service asked for password settings outside the safe range, so your password wasn't used. Try again later."
+        case .weakerPasswordSettings:
+            "The sync service asked for weaker password protection than this Mac used before, so your password wasn't used."
+        case .cantSendToThisDevice: "That's this Mac. Pick another device."
+        case .notSaved: "Only items in your history can be sent."
         }
     }
 }
@@ -108,13 +164,26 @@ final class SyncAccount {
         case signedIn(email: String)
     }
 
+    /// One line of sync health for the menu bar and the panel.
+    enum Status: Equatable, Sendable {
+        case idle
+        case syncing
+        /// The last tick couldn't reach the server.
+        case offline
+        case error(String)
+        case signedOut
+    }
+
     private(set) var state: State = .signedOut
     private(set) var errorMessage: String?
     private(set) var notice: String?
     private(set) var isSyncing = false
+    private(set) var isOffline = false
     private(set) var lastSyncAt: Date?
     private(set) var lastSyncError: String?
     private(set) var groups: [SyncGroup] = []
+    /// The account's signed-in devices, after `refreshDevices()`; this Mac first.
+    private(set) var devices: [SyncDevice] = []
     /// Shown to group members on the items you copy. nil until you pick one.
     private(set) var username: String?
     /// Space id → member uid → display name, for "copied by" badges.
@@ -132,12 +201,26 @@ final class SyncAccount {
 
     @ObservationIgnored private(set) var engine: SyncEngine?
     @ObservationIgnored private var session: StoredSyncSession?
-    @ObservationIgnored private var scheduled: Task<Void, Never>?
+    /// The 3 s debounce after local changes (and the wait out of a rate limit). Cancelling it
+    /// never touches a running tick.
+    @ObservationIgnored private var debounceTask: Task<Void, Never>?
+    @ObservationIgnored private var pollTask: Task<Void, Never>?
     @ObservationIgnored private var isTicking = false
+    /// A tick task was created and hasn't started yet.
+    @ObservationIgnored private var tickPending = false
     @ObservationIgnored private var tickRequested = false
+    @ObservationIgnored private var startedTicks = 0
     @ObservationIgnored private var finishedTicks = 0
+    /// After a 429: no tick starts before this.
+    @ObservationIgnored private(set) var backoffUntil: Date?
+    @ObservationIgnored private(set) var isPanelOpen = false
+    @ObservationIgnored private var lastActivity: Date = .distantPast
+    /// The time source for polling and back-off (tests move it).
+    @ObservationIgnored var clock: () -> Date = { .now }
     /// true once a session is active, false after sign-out (drives the ⌥⌘C shortcut).
     @ObservationIgnored var onSessionChange: ((Bool) -> Void)?
+    /// Another device sent an item here; the argument is that device's name.
+    @ObservationIgnored var onItemSentHere: ((String) -> Void)?
 
     /// `makeService` builds the API client from a token provider (tests pass an in-memory server).
     init(prefs: Preferences, context: ModelContext, store: ClipStore, snippets: SnippetStore,
@@ -166,6 +249,19 @@ final class SyncAccount {
     var isWorking: Bool {
         if case .working = state { return true }
         return false
+    }
+
+    var status: Status {
+        switch state {
+        case .signedOut: return .signedOut
+        case .working: return .syncing
+        case .needsPassword: return .error("Enter your password to keep syncing.")
+        case .signedIn:
+            if isSyncing { return .syncing }
+            if isOffline { return .offline }
+            if let lastSyncError { return .error(lastSyncError) }
+            return .idle
+        }
     }
 
     var defaultGroup: SyncGroup? {
@@ -224,7 +320,10 @@ final class SyncAccount {
             onSessionChange?(true)
         } else if let identity = identity(from: saved) {
             activate(identity)
-            Task { await refreshAccount() }
+            Task {
+                await refreshAccount()
+                await refreshDevices()
+            }
         } else {
             state = .needsPassword(email: saved.email)
         }
@@ -238,12 +337,19 @@ final class SyncAccount {
     private func activate(_ identity: SyncIdentity, adopting keys: [String: Data] = [:]) {
         self.engine?.stop()
         let engine = SyncEngine(api: makeAPI(), identity: identity, context: context, store: store,
-                                snippets: snippets, secrets: secrets)
+                                snippets: snippets, secrets: secrets, keyPins: session?.spaceKeyPins ?? [:])
+        engine.deviceId = session?.deviceId
+        engine.deviceName = deviceName
+        engine.onPinsChanged = { [weak self] pins in self?.rememberPins(pins) }
+        engine.onSentToThisDevice = { [weak self] _, from in self?.onItemSentHere?(from ?? "another device") }
         for (space, key) in keys { engine.adoptSpaceKey(key, for: space) }
         self.engine = engine
+        backoffUntil = nil
+        isOffline = false
         state = .signedIn(email: session?.email ?? "")
         onSessionChange?(true)
-        scheduleSync(after: .zero)
+        requestTick(after: .zero)
+        restartPolling()
     }
 
     /// The API client, authenticated with the current session token.
@@ -258,16 +364,65 @@ final class SyncAccount {
 
     private var deviceName: String? { Host.current().localizedName }
 
+    private func rememberPins(_ pins: [String: String]) {
+        guard var current = session, current.spaceKeyPins != pins else { return }
+        current.spaceKeyPins = pins
+        session = current
+        credentials.save(current)
+    }
+
+    // MARK: KDF parameters
+
+    nonisolated static func kdfKey(email: String) -> String { SyncCrypto.sha256Hex(Data(email.utf8)) }
+
+    /// Refuses KDF parameters outside the safe range, or weaker than the ones this Mac last used
+    /// for the account, before the password is put through them.
+    private func checkedKDF(_ kdf: KDFParams, email: String) throws -> KDFParams {
+        guard kdf.alg == nil || kdf.alg == "pbkdf2-sha256",
+              SyncConfig.kdfIterationRange.contains(kdf.iterations),
+              kdf.salt.count >= 16
+        else { throw SyncAccountError.unsafePasswordSettings }
+        if let last = credentials.kdfFloors()[Self.kdfKey(email: email)], kdf.iterations < last {
+            throw SyncAccountError.weakerPasswordSettings
+        }
+        return kdf
+    }
+
+    /// The parameters that just worked (the account key opened with them, or we chose them).
+    private func rememberKDF(iterations: Int, email: String) {
+        var floors = credentials.kdfFloors()
+        guard floors[Self.kdfKey(email: email)] != iterations else { return }
+        floors[Self.kdfKey(email: email)] = iterations
+        credentials.saveKDFFloors(floors)
+    }
+
     // MARK: Sign up / sign in
 
     /// Creates the account: every key is made and wrapped here; the server gets only `authKey`.
-    func signUp(email rawEmail: String, password: String, username rawUsername: String) async {
+    /// `inviteCode` is a sign-up code or a group invite code (then the new account joins that
+    /// group right away). nil sends none, for servers from before invite-only sign-up.
+    func signUp(email rawEmail: String, password: String, username rawUsername: String, inviteCode: String? = nil) async {
         clearMessages()
         let email = Self.normalize(email: rawEmail)
         let username = rawUsername.trimmingCharacters(in: .whitespacesAndNewlines)
         if let problem = Self.usernameProblem(username) {
             errorMessage = problem
             return
+        }
+        var signupCode: String?
+        var groupCode: Data?
+        if let typed = inviteCode {
+            if typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                errorMessage = SyncAccountError.inviteRequired.errorDescription
+                return
+            } else if let code = SyncCrypto.Invite.parse(typed) {
+                groupCode = code
+            } else if let code = SyncCrypto.Invite.normalizeSignupCode(typed) {
+                signupCode = code
+            } else {
+                errorMessage = SyncAccountError.invalidInviteCode.errorDescription
+                return
+            }
         }
         state = .working("Creating your account…")
         do {
@@ -290,7 +445,9 @@ final class SyncAccount {
                 personalSpace: .init(id: personalId, wrappedKey: try SyncCrypto.wrapSpaceKey(
                     spaceKey, spaceId: personalId, memberUid: uid, memberPublicKey: pub)),
                 deviceName: deviceName,
-                username: username
+                username: username,
+                signupCode: signupCode,
+                groupInviteId: groupCode.map(SyncCrypto.Invite.id)
             )
             let remote: RemoteSession
             do {
@@ -301,8 +458,19 @@ final class SyncAccount {
                 throw SyncAccountError.emailTaken
             }
             try adopt(remote, wrapKey: keys.wrapKey, adopting: [remote.account.personalSpaceId: spaceKey])
+            rememberKDF(iterations: SyncConfig.kdfIterations, email: email)
         } catch {
             fail(error)
+            return
+        }
+        if let groupCode {
+            do {
+                let preview = try await previewInvite(code: SyncCrypto.Invite.format(groupCode))
+                try await join(preview)
+                notice = "You joined “\(preview.name)”."
+            } catch {
+                errorMessage = "Your account is ready, but joining the group didn't work: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -312,10 +480,11 @@ final class SyncAccount {
         state = .working("Signing in…")
         do {
             let api = makeAPI()
-            let kdf = try await api.prelogin(email: email)
+            let kdf = try checkedKDF(try await api.prelogin(email: email), email: email)
             let keys = try await SyncCrypto.derivePasswordKeys(password: password, salt: kdf.salt, iterations: kdf.iterations)
             let remote = try await api.login(email: email, authKey: keys.authKey, deviceName: deviceName)
             try adopt(remote, wrapKey: keys.wrapKey)
+            rememberKDF(iterations: kdf.iterations, email: email)
         } catch {
             fail(error)
         }
@@ -332,20 +501,25 @@ final class SyncAccount {
         let account = remote.account
         let ak = try SyncCrypto.open(account.wrappedAccountKey, key: wrapKey, aad: SyncCrypto.AAD.accountKey(uid: account.uid))
         let priv = try SyncCrypto.open(account.wrappedPrivateKey, key: ak, aad: SyncCrypto.AAD.privateKey(uid: account.uid))
-        if let previous = session, previous.uid != account.uid {
+        let previous = session
+        if let previous, previous.uid != account.uid {
             // A different account: nothing of the old one may stay.
             engine?.stop()
             engine = nil
             SyncEngine.wipeLocalState(context: context, store: store, snippets: snippets, secrets: secrets)
             groups = []
         }
+        let sameAccount = previous?.uid == account.uid
         let stored = StoredSyncSession(uid: account.uid, email: account.email, token: remote.token, accountKey: ak,
-                                       privateKey: priv, personalSpaceId: account.personalSpaceId, username: account.username)
+                                       privateKey: priv, personalSpaceId: account.personalSpaceId, username: account.username,
+                                       spaceKeyPins: sameAccount ? previous?.spaceKeyPins : nil,
+                                       deviceId: nil)
         session = stored
         username = account.username
         credentials.save(stored)
         guard let identity = identity(from: stored) else { throw SyncCryptoError.badKey }
         activate(identity, adopting: keys)
+        Task { await refreshDevices() }
     }
 
     // MARK: Account management
@@ -390,7 +564,7 @@ final class SyncAccount {
         clearMessages()
         guard let session, let api = engine?.api else { return false }
         do {
-            let kdf = try await api.prelogin(email: session.email)
+            let kdf = try checkedKDF(try await api.prelogin(email: session.email), email: session.email)
             let currentKeys = try await SyncCrypto.derivePasswordKeys(password: current, salt: kdf.salt, iterations: kdf.iterations)
             let salt = SyncCrypto.randomBytes(16)
             let newKeys = try await SyncCrypto.derivePasswordKeys(password: new, salt: salt, iterations: SyncConfig.kdfIterations)
@@ -407,6 +581,7 @@ final class SyncAccount {
                 errorMessage = "The current password is wrong."
                 return false
             }
+            rememberKDF(iterations: SyncConfig.kdfIterations, email: session.email)
             notice = "Password changed. Your other devices will ask for the new password."
             return true
         } catch {
@@ -421,7 +596,7 @@ final class SyncAccount {
         guard let session else { return false }
         do {
             let api = makeAPI()
-            let kdf = try await api.prelogin(email: session.email)
+            let kdf = try checkedKDF(try await api.prelogin(email: session.email), email: session.email)
             let keys = try await SyncCrypto.derivePasswordKeys(password: password, salt: kdf.salt, iterations: kdf.iterations)
             do {
                 try await api.deleteAccount(authKey: keys.authKey)
@@ -449,65 +624,209 @@ final class SyncAccount {
     }
 
     private func forgetLocally() {
-        scheduled?.cancel()
+        debounceTask?.cancel()
+        pollTask?.cancel()
         engine?.stop()
         engine = nil
         SyncEngine.wipeLocalState(context: context, store: store, snippets: snippets, secrets: secrets)
         credentials.clear()
         session = nil
         groups = []
+        devices = []
         lastSyncAt = nil
         lastSyncError = nil
+        isOffline = false
+        backoffUntil = nil
         prefs.syncDefaultGroupID = nil
         clearMessages()
         state = .signedOut
         onSessionChange?(false)
     }
 
-    // MARK: Scheduling
+    // MARK: Devices
 
-    /// A local store changed: sync after the debounce.
-    func localChange() {
+    /// Loads the signed-in devices and learns this Mac's session id.
+    func refreshDevices() async {
         guard engine != nil else { return }
-        scheduleSync(after: SyncConfig.debounce)
+        do {
+            let remote = try await call { try await $0.api.sessions() }
+            devices = remote.map(SyncDevice.init).sorted {
+                $0.isCurrent != $1.isCurrent ? $0.isCurrent : $0.lastUsedAt > $1.lastUsedAt
+            }
+            if let current = remote.first(where: \.current) {
+                engine?.deviceId = current.id
+                if var stored = session, stored.deviceId != current.id {
+                    stored.deviceId = current.id
+                    session = stored
+                    credentials.save(stored)
+                }
+            }
+        } catch {
+            Log.sync.notice("Can't load devices: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
-    /// The 60 s timer and panel opens.
+    /// Signs a device out. This Mac signs out the usual way (its group items are removed here).
+    func signOut(_ device: SyncDevice) async throws {
+        if device.isCurrent {
+            signOut()
+            return
+        }
+        try await call { try await $0.api.revokeSession(id: device.id) }
+        devices.removeAll { $0.id == device.id }
+    }
+
+    /// Pushes the item (a personal copy, for a group item) with `toDevice`, so that device shows
+    /// "Sent from ‹this Mac›" and puts it at the top. Returns at once; a failure lands in
+    /// `errorMessage`.
+    func sendToDevice(_ item: ClipItem, deviceId: String) {
+        Task {
+            do {
+                if try await send(item, toDevice: deviceId) == false {
+                    notice = "Not sent yet. It goes out with the next sync."
+                }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    /// `sendToDevice`, awaitable: waits briefly for the push; false when it hasn't gone out yet
+    /// (it will with a later sync).
+    @discardableResult
+    func send(_ item: ClipItem, toDevice deviceId: String) async throws -> Bool {
+        let engine = try requireEngine()
+        guard item.modelContext != nil else { throw SyncAccountError.notSaved }
+        if let mine = engine.deviceId, mine == deviceId { throw SyncAccountError.cantSendToThisDevice }
+        let target = item.spaceID == nil ? item : store.shareCopy(of: item, toSpace: nil)
+        let id = target.id
+        engine.send(itemID: id, toDevice: deviceId)
+        store.touch(target)
+        await syncAndWait(timeout: .seconds(8))
+        return self.engine.map { !$0.isSendPending(itemID: id) } ?? false
+    }
+
+    // MARK: Invite someone (sign-up codes)
+
+    /// A new sign-up code, shown once (the server keeps only its hash).
+    func createSignupCode() async throws -> SignupCode {
+        try await call { try await $0.api.createSignupCode() }
+    }
+
+    func openSignupCodes() async throws -> [OpenSignupCode] {
+        try await call { try await $0.api.signupCodes() }
+    }
+
+    func revoke(_ code: OpenSignupCode) async throws {
+        try await call { try await $0.api.revokeSignupCode(id: code.id) }
+    }
+
+    // MARK: Scheduling
+
+    /// A local store changed: sync after the debounce. Commits sync makes itself don't count.
+    func localChange() {
+        guard let engine, !engine.isApplyingRemote else { return }
+        reportActivity()
+        requestTick(after: SyncConfig.debounce)
+    }
+
+    /// Panel opens (and a manual nudge): sync now unless a tick is already running.
     func periodicSync() {
         guard engine != nil, !isTicking else { return }
-        scheduleSync(after: .zero)
+        requestTick(after: .zero)
     }
 
     func syncNow() {
         guard engine != nil else { return }
-        scheduleSync(after: .zero)
+        requestTick(after: .zero)
     }
 
-    /// Syncs now and waits up to `timeout` for it to finish, e.g. before pasting from a group.
-    /// Downloads run before uploads, so new group items usually land well inside the timeout.
+    /// The user did something (a copy, paste, panel or menu): poll faster for a while.
+    func reportActivity() {
+        let before = pollInterval
+        lastActivity = clock()
+        if pollInterval < before { restartPolling() }
+    }
+
+    /// The quick panel opened or closed. Opening syncs at once and polls every 3 s while open.
+    func setPanelOpen(_ open: Bool) {
+        guard open != isPanelOpen else { return }
+        isPanelOpen = open
+        if open {
+            lastActivity = clock()
+            syncNow()
+        }
+        restartPolling()
+    }
+
+    /// 3 s while the panel is open, 15 s after recent activity, otherwise 60 s.
+    var pollInterval: Duration {
+        if isPanelOpen { return SyncConfig.pollWhilePanelOpen }
+        if clock().timeIntervalSince(lastActivity) < SyncConfig.activeWindow { return SyncConfig.pollWhileActive }
+        return SyncConfig.pollWhileIdle
+    }
+
+    private func restartPolling() {
+        pollTask?.cancel()
+        guard engine != nil else { return }
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let interval = self?.pollInterval else { return }
+                try? await Task.sleep(for: interval)
+                guard !Task.isCancelled, let self, self.engine != nil else { return }
+                if !self.isTicking { self.startTick() }
+            }
+        }
+    }
+
+    /// Syncs now and waits up to `timeout` for a tick that started after this call (so its pull is
+    /// fresh) to finish, e.g. before pasting from a group.
     func syncAndWait(timeout: Duration) async {
         guard engine != nil else { return }
-        let start = finishedTicks
-        scheduleSync(after: .zero)
+        let target = startedTicks + 1
+        requestTick(after: .zero)
         let deadline = ContinuousClock.now + timeout
-        while finishedTicks == start, engine != nil, ContinuousClock.now < deadline {
+        while finishedTicks < target, engine != nil, ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(40))
         }
     }
 
-    private func scheduleSync(after delay: Duration) {
-        scheduled?.cancel()
-        scheduled = Task { [weak self] in
-            if delay > .zero {
-                try? await Task.sleep(for: delay)
-                guard !Task.isCancelled else { return }
-            }
-            await self?.runTick()
+    private func requestTick(after delay: Duration) {
+        guard delay > .zero else {
+            startTick()
+            return
+        }
+        debounceTask?.cancel()
+        debounceTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            self?.startTick()
         }
     }
 
-    /// One tick at a time; changes that arrive mid-tick get one more.
+    /// Starts a tick, or asks the running one for another pass. Never cancels a running tick.
+    private func startTick() {
+        guard engine != nil else { return }
+        if let until = backoffUntil {
+            let wait = until.timeIntervalSince(clock())
+            if wait > 0 {
+                requestTick(after: .milliseconds(Int((wait * 1000).rounded(.up))))
+                return
+            }
+            backoffUntil = nil
+        }
+        if isTicking {
+            tickRequested = true
+            return
+        }
+        guard !tickPending else { return }
+        tickPending = true
+        Task { [weak self] in await self?.runTick() }
+    }
+
+    /// One tick at a time; requests that arrive mid-tick get one more pass.
     func runTick() async {
+        tickPending = false
         guard let engine else { return }
         if isTicking {
             tickRequested = true
@@ -515,36 +834,47 @@ final class SyncAccount {
         }
         isTicking = true
         isSyncing = true
-        defer {
-            isTicking = false
-            isSyncing = false
-            finishedTicks &+= 1
-        }
         repeat {
             tickRequested = false
+            startedTicks &+= 1
             do {
                 try await engine.tick()
                 lastSyncAt = .now
-                lastSyncError = nil
+                isOffline = false
+                lastSyncError = engine.problem
             } catch {
+                finishedTicks = startedTicks
                 handleSyncError(error)
                 break
             }
+            finishedTicks = startedTicks
             loadGroups()
         } while tickRequested && self.engine === engine
-        // A new session started while the old one's tick was winding down: give it its own tick.
-        if tickRequested, let current = self.engine, current !== engine {
+        isTicking = false
+        isSyncing = false
+        // A request that arrived while this tick failed, or a new session started meanwhile.
+        if tickRequested, self.engine != nil {
             tickRequested = false
-            scheduleSync(after: .zero)
+            startTick()
         }
     }
 
     private func handleSyncError(_ error: any Error) {
         if error is CancellationError { return }
         Log.sync.error("Sync failed: \(String(describing: error), privacy: .public)")
-        if let api = error as? SyncAPIError, api.code == "unauthenticated" || api.code == "no_account" {
-            sessionEnded()
-            return
+        if let api = error as? SyncAPIError {
+            if api.code == "unauthenticated" || api.code == "no_account" {
+                sessionEnded()
+                return
+            }
+            if api.isRateLimited {
+                // Wait it out; the next tick starts with deletions, so nothing starves.
+                let seconds = max(1, api.retryAfter ?? 30)
+                backoffUntil = clock().addingTimeInterval(TimeInterval(seconds))
+                requestTick(after: .seconds(seconds))
+                return
+            }
+            isOffline = api.isNetwork
         }
         lastSyncError = error.localizedDescription
     }
@@ -553,6 +883,8 @@ final class SyncAccount {
     private func sessionEnded() {
         engine?.stop()
         engine = nil
+        debounceTask?.cancel()
+        pollTask?.cancel()
         guard var current = session else { return }
         current.token = nil
         session = current
@@ -584,7 +916,7 @@ final class SyncAccount {
         return engine
     }
 
-    /// Runs a group call and turns `401` into the needs-password state.
+    /// Runs a server call and turns `401` into the needs-password state.
     private func call<T>(_ operation: (SyncEngine) async throws -> T) async throws -> T {
         let engine = try requireEngine()
         do {
