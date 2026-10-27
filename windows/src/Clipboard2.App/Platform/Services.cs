@@ -102,7 +102,7 @@ public sealed class UpdateService
     public const string FeedUrl = "https://github.com/RohamJabbari/clipboard2-macOS/releases/download/windows-latest/";
     /// <summary>The Ed25519 public key (base64) of the feed signing key in the developer's Keychain, as printed by
     /// scripts/sign-windows-feed.sh. Empty: this build refuses every update.</summary>
-    public const string FeedPublicKey = "";
+    public const string FeedPublicKey = "p7Q2nzlRDyjBzcx4pLaJe6ejcPPZIlavkQ0sRtydLZg=";
     public const string NotVerifiedMessage = "Update couldn't be verified";
     private readonly UpdateManager _manager = new(new SignedFeedSource(FeedUrl, FeedPublicKey));
     private UpdateInfo? _pending;
