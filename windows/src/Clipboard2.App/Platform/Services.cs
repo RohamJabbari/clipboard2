@@ -1,9 +1,13 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Media.Imaging;
+using Clipboard2.Core;
 using Velopack;
+using Velopack.Logging;
 using Velopack.Sources;
 using Windows.Graphics.Imaging;
 using BitmapDecoder = Windows.Graphics.Imaging.BitmapDecoder;
@@ -52,14 +56,46 @@ public static class TextRecognizer
     }
 }
 
+/// <summary>
+/// Velopack's web source, but the feed (<c>releases.&lt;channel&gt;.json</c>) is only trusted with a valid Ed25519
+/// signature (<c>….json.sig</c>) from <see cref="UpdateService.FeedPublicKey"/>. The packages are then checked
+/// against the SHA-256 in that verified feed by Velopack. Fails closed: no key, no signature or a bad one means no update.
+/// </summary>
+public sealed class SignedFeedSource(string baseUrl, string publicKey) : IUpdateSource
+{
+    private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(30) };
+    private readonly SimpleWebSource _packages = new(baseUrl);
+
+    public async Task<VelopackAssetFeed> GetReleaseFeed(IVelopackLogger logger, string appId, string channel, Guid? stagingId = null,
+                                                        VelopackAsset? latestLocalRelease = null)
+    {
+        if (string.IsNullOrWhiteSpace(publicKey)) throw new UpdateFeed.VerificationException("No update signing key is built into this app.");
+        var name = $"releases.{(string.IsNullOrEmpty(channel) ? "win" : channel)}.json";
+        var feed = await Http.GetByteArrayAsync(baseUrl + name);
+        string signature;
+        try { signature = await Http.GetStringAsync(baseUrl + name + ".sig"); }
+        catch (HttpRequestException ex) { throw new UpdateFeed.VerificationException("The update feed isn't signed: " + ex.Message); }
+        return VelopackAssetFeed.FromJson(UpdateFeed.Verify(feed, signature, publicKey));
+    }
+
+    public Task DownloadReleaseEntry(IVelopackLogger logger, VelopackAsset releaseEntry, string localFile, Action<int> progress,
+                                     CancellationToken cancelToken = default) =>
+        _packages.DownloadReleaseEntry(logger, releaseEntry, localFile, progress, cancelToken);
+}
+
 /// <summary>In-place updates from GitHub Releases (Velopack): checks hourly, the user confirms, the
-/// app updates and restarts. Velopack also builds the Setup.exe installer.</summary>
+/// app updates and restarts. Velopack also builds the Setup.exe installer. Only feeds signed with the
+/// offline update key are used (README → Windows → Update signing).</summary>
 public sealed class UpdateService
 {
     /// <summary>CI keeps the newest Windows build in this one release, so the Mac releases in the same
     /// repo never get in the way of the Windows update feed.</summary>
     public const string FeedUrl = "https://github.com/RohamJabbari/clipboard2-macOS/releases/download/windows-latest/";
-    private readonly UpdateManager _manager = new(new SimpleWebSource(FeedUrl));
+    /// <summary>The Ed25519 public key (base64) of the feed signing key in the developer's Keychain, as printed by
+    /// scripts/sign-windows-feed.sh. Empty: this build refuses every update.</summary>
+    public const string FeedPublicKey = "";
+    public const string NotVerifiedMessage = "Update couldn't be verified";
+    private readonly UpdateManager _manager = new(new SignedFeedSource(FeedUrl, FeedPublicKey));
     private UpdateInfo? _pending;
     public string? AvailableVersion => _pending?.TargetFullRelease.Version.ToString();
     public DateTime? LastCheck { get; private set; }
@@ -79,6 +115,14 @@ public sealed class UpdateService
             LastCheck = DateTime.Now;
             Changed?.Invoke();
             if (_pending is not null && installAutomatically) await InstallAsync();
+        }
+        catch (UpdateFeed.VerificationException ex)
+        {
+            // Quiet: no balloon, just LastError and the log.
+            _pending = null;
+            LastError = NotVerifiedMessage;
+            Log.Info($"{NotVerifiedMessage}: {ex.Message}");
+            Changed?.Invoke();
         }
         catch (Exception ex)
         {

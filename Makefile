@@ -56,12 +56,14 @@ windows-test:
 	dotnet test windows/tests/Clipboard2.Core.Tests
 
 # make windows-release VERSION=1.1.0 — tags windows-v<version>; GitHub Actions builds the installer,
-# publishes the release and updates the feed installed copies check every hour.
+# publishes the release and the update feed; then the feed is signed here with the offline key in your
+# Keychain (scripts/sign-windows-feed.sh). Installed copies only update from a signed feed.
 windows-release:
 	@test -n "$(VERSION)" || (echo "usage: make windows-release VERSION=x.y.z" && exit 1)
+	scripts/sign-windows-feed.sh --check
 	git tag "windows-v$(VERSION)"
 	git push origin "windows-v$(VERSION)"
-	@echo "Building on GitHub: gh run watch --repo RohamJabbari/clipboard2-macOS"
+	scripts/sign-windows-feed.sh --wait $(VERSION)
 
 # Sync API (server/): integration tests run against an embedded Postgres; deploy goes to Cloud Run.
 server-test:

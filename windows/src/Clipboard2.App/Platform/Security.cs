@@ -186,24 +186,44 @@ public sealed class SecretVault : ISecretVault
         catch { return false; }
     }
 
-    /// <summary>Windows Hello (face, fingerprint or PIN). Without Hello set up, secrets aren't gated.</summary>
+    public const string HelloRequiredMessage =
+        "Secrets need Windows Hello. Set up a PIN, face or fingerprint in Windows Settings → Accounts → Sign-in options, then try again.";
+
+    /// <summary>Why the last check refused, for callers that want to say so; null after a success.</summary>
+    public string? LastDenial { get; private set; }
+
+    /// <summary>Windows Hello (face, fingerprint or PIN). Fails closed: without Hello, or when it can't be asked,
+    /// secrets stay locked.</summary>
     private async Task<bool> VerifyAsync(string reason)
     {
+        LastDenial = null;
         if (!await HelloAvailableAsync())
         {
-            Log.Info("Windows Hello isn't available; secrets are not gated");
-            return true;
+            Log.Info("Windows Hello isn't available; secrets stay locked");
+            LastDenial = HelloRequiredMessage;
+            TellUser(HelloRequiredMessage);
+            return false;
         }
         try
         {
             var result = await UserConsentVerifier.RequestVerificationAsync($"Clipboard2 wants to {reason}.");
-            return result == UserConsentVerificationResult.Verified;
+            if (result == UserConsentVerificationResult.Verified) return true;
+            LastDenial = result == UserConsentVerificationResult.Canceled ? null : $"Windows Hello didn't confirm it's you ({result}).";
+            return false;
         }
         catch (Exception ex)
         {
             Log.Error("Windows Hello failed", ex);
+            LastDenial = "Windows Hello couldn't be asked, so the secret stays locked.";
             return false;
         }
+    }
+
+    /// <summary>Says why, so a missing Windows Hello doesn't look like a broken button.</summary>
+    private static void TellUser(string message)
+    {
+        System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
+            System.Windows.MessageBox.Show(message, "Clipboard2", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information));
     }
 
     public async Task<bool> AuthenticateAsync(string reason)

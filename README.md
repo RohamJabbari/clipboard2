@@ -43,12 +43,37 @@ system hooks), `tests/Clipboard2.Core.Tests`.
 
 ```sh
 make windows-test                       # unit tests (needs .NET 10; runs on macOS too)
-make windows-release VERSION=1.1.0      # tag → GitHub Actions builds Setup.exe, publishes, updates feed
+make windows-release VERSION=1.1.0      # tag → GitHub Actions builds Setup.exe and the feed → signed here
 ```
 
 Data: `%LOCALAPPDATA%\Softmaze\Clipboard2` (history, images, log), settings in
 `%APPDATA%\Softmaze\Clipboard2\settings.json`, keys and secrets in Credential Manager.
 The installer isn't code-signed yet, so SmartScreen asks once ("More info → Run anyway").
+
+### Update signing
+
+Installed copies only apply an update when the feed (`releases.win.json` on the `windows-latest`
+release) carries a valid Ed25519 signature (`releases.win.json.sig`) from the key built into the
+app; the feed in turn pins every package's SHA-256. The private key never leaves your Mac: it lives
+in the login Keychain (Sparkle's `generate_keys`/`sign_update`, account
+`at.softmaze.Clipboard2.windows-feed`, separate from the Mac app's Sparkle key), so access to the
+GitHub repository alone can't ship an update. A feed that doesn't verify is skipped quietly
+("Update couldn't be verified" in `clipboard2.log`, no balloon).
+
+One-time setup (needs `make build` once, for Sparkle's tools):
+
+1. `scripts/sign-windows-feed.sh --key` creates the key (macOS asks to allow Keychain access) and
+   prints the public key.
+2. Put it in `windows/src/Clipboard2.App/Platform/Services.cs` as `FeedPublicKey`, commit.
+3. Back up the private key (`build/SourcePackages/artifacts/sparkle/Sparkle/bin/generate_keys
+   --account at.softmaze.Clipboard2.windows-feed -x <file>`) somewhere offline. Without it, installed
+   copies can't take any further update; everyone would have to run a new installer by hand.
+
+Each `make windows-release` then checks the key is embedded, tags, waits for the GitHub build,
+verifies every package in the published feed against its hashes, signs the feed and uploads the
+signature. To sign by hand: `scripts/sign-windows-feed.sh <version>`. Copies installed before
+update signing (no `FeedPublicKey`) don't check signatures; once they've updated to a version that
+embeds the key, every later update must be signed.
 
 ## Installer
 

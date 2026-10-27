@@ -31,7 +31,17 @@ public sealed record PendingInvite(string InviteId, long CreatedAt, long Expires
 
 public sealed record InviteInfo(string SpaceId, byte[] SealedKey, byte[]? EncryptedName, int MemberCount, long ExpiresAt);
 
-public sealed record GroupMember(string Uid, string Email, string Role);
+/// <param name="Name">The username, or the email's part before @ (servers before October 2026 send only the email).</param>
+public sealed record GroupMember(string Uid, string Name, string Role, string? Username = null);
+
+/// <summary>A sign-up code just created: <see cref="Code"/> is shown once.</summary>
+public sealed record SignupCode(string Id, string Code, long ExpiresAt);
+
+/// <summary>An unused sign-up code (the code itself is never sent again).</summary>
+public sealed record OpenSignupCode(string Id, long CreatedAt, long ExpiresAt);
+
+/// <summary>One signed-in session of this account: a device. Times are UTC.</summary>
+public sealed record SyncDevice(string Id, string Name, DateTime CreatedAt, DateTime LastUsedAt, bool IsCurrent);
 
 public sealed record BlobUpload(string Url, string Method, IReadOnlyDictionary<string, string> Headers);
 
@@ -73,7 +83,8 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
 
     public async Task<SessionInfo> SignupAsync(string email, byte[] authKey, Kdf kdf, string uid, byte[] wrappedAccountKey, byte[] publicKey,
                                                byte[] wrappedPrivateKey, string personalSpaceId, byte[] personalWrappedKey,
-                                               string? deviceName = null, string? username = null, CancellationToken ct = default)
+                                               string? deviceName = null, string? username = null, string? signupCode = null,
+                                               string? groupInviteId = null, CancellationToken ct = default)
     {
         var body = new JsonObject
         {
@@ -88,6 +99,8 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
         };
         if (deviceName is not null) body["deviceName"] = deviceName;
         if (username is not null) body["username"] = username;
+        if (signupCode is not null) body["signupCode"] = signupCode;
+        if (groupInviteId is not null) body["groupInviteId"] = groupInviteId;
         var (_, json) = await SendAsync(HttpMethod.Post, "/v1/auth/signup", body, ct, anonymous: true);
         return Session(json!);
     }
@@ -128,6 +141,37 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
     public Task DeleteAccountAsync(byte[] authKey, CancellationToken ct = default) =>
         SendAsync(HttpMethod.Delete, "/v1/account", new JsonObject { ["authKey"] = B64(authKey) }, ct);
 
+    // MARK: Sign-up codes and devices
+
+    public async Task<SignupCode> CreateSignupCodeAsync(CancellationToken ct = default)
+    {
+        var (_, json) = await SendAsync(HttpMethod.Post, "/v1/signup-codes", new JsonObject(), ct);
+        return new SignupCode(S(json!, "id"), S(json!, "code"), L(json!, "expiresAt"));
+    }
+
+    public async Task<List<OpenSignupCode>> SignupCodesAsync(CancellationToken ct = default)
+    {
+        var (_, json) = await SendAsync(HttpMethod.Get, "/v1/signup-codes", null, ct);
+        return (json?["codes"] as JsonArray ?? json?["signupCodes"] as JsonArray ?? []).OfType<JsonObject>()
+            .Select(c => new OpenSignupCode(S(c, "id"), L(c, "createdAt"), L(c, "expiresAt"))).ToList();
+    }
+
+    public Task RevokeSignupCodeAsync(string id, CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Delete, $"/v1/signup-codes/{Uri.EscapeDataString(id)}", null, ct);
+
+    public async Task<List<SyncDevice>> SessionsAsync(CancellationToken ct = default)
+    {
+        var (_, json) = await SendAsync(HttpMethod.Get, "/v1/sessions", null, ct);
+        return (json?["sessions"] as JsonArray ?? []).OfType<JsonObject>()
+            .Select(d => new SyncDevice(S(d, "id"), Str(d, "deviceName") ?? "Unnamed device",
+                SyncPayload.FromMillis(L(d, "createdAt")), SyncPayload.FromMillis(L(d, "lastUsedAt")),
+                d["current"] is JsonValue c && c.TryGetValue<bool>(out var current) && current)).ToList();
+    }
+
+    /// <summary>Ends one session; it may be the calling one.</summary>
+    public Task RevokeSessionAsync(string id, CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Delete, $"/v1/sessions/{Uri.EscapeDataString(id)}", null, ct);
+
     // MARK: Spaces and groups
 
     public async Task<List<SpaceInfo>> GetSpacesAsync(CancellationToken ct = default)
@@ -152,7 +196,8 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
     {
         var (_, json) = await SendAsync(HttpMethod.Get, $"/v1/groups/{groupId}/members", null, ct);
         return (json?["members"] as JsonArray ?? []).OfType<JsonObject>()
-            .Select(m => new GroupMember(S(m, "uid"), S(m, "email"), S(m, "role"))).ToList();
+            .Select(m => new GroupMember(S(m, "uid"),
+                Str(m, "name") ?? Str(m, "username") ?? Str(m, "email") ?? "", S(m, "role"), Str(m, "username"))).ToList();
     }
 
     public Task RemoveMemberAsync(string groupId, string uid, CancellationToken ct = default) =>
@@ -233,9 +278,25 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
 
     public async Task<BlobUpload> RegisterBlobAsync(string spaceId, string blobId, long size, CancellationToken ct = default)
     {
-        var (_, json) = await SendAsync(HttpMethod.Post, $"/v1/spaces/{spaceId}/blobs", new JsonObject { ["id"] = blobId, ["size"] = size }, ct);
-        var headers = (json?["headers"] as JsonObject ?? []).ToDictionary(p => p.Key, p => p.Value?.ToString() ?? "");
+        // ifGenerationMatch: the signed PUT may only create the object, never overwrite one.
+        var (_, json) = await SendAsync(HttpMethod.Post, $"/v1/spaces/{spaceId}/blobs",
+            new JsonObject { ["id"] = blobId, ["size"] = size, ["ifGenerationMatch"] = true }, ct);
+        var headers = (json?["headers"] as JsonObject ?? []).ToDictionary(p => p.Key, p => p.Value?.ToString() ?? "", StringComparer.OrdinalIgnoreCase);
+        headers.TryAdd(GenerationMatchHeader, "0");   // the server signs it whether or not it lists it
         return new BlobUpload(S(json!, "url"), json?["method"]?.GetValue<string>() ?? "PUT", headers);
+    }
+
+    public const string GenerationMatchHeader = "x-goog-if-generation-match";
+
+    /// <summary>Registers and uploads a blob. A blob id the server already has content for (409 on register, 412 on
+    /// the create-only PUT) counts as uploaded.</summary>
+    public async Task RegisterAndUploadBlobAsync(string spaceId, string blobId, byte[] ciphertext, CancellationToken ct = default)
+    {
+        BlobUpload upload;
+        try { upload = await RegisterBlobAsync(spaceId, blobId, ciphertext.Length, ct); }
+        catch (SyncApiException ex) when (ex.Code == "conflict") { return; }
+        try { await UploadBlobAsync(upload, ciphertext, ct); }
+        catch (SyncApiException ex) when (ex.Status == HttpStatusCode.PreconditionFailed) { }
     }
 
     public async Task<string> BlobUrlAsync(string spaceId, string blobId, CancellationToken ct = default)
@@ -290,12 +351,14 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
         if (response.IsSuccessStatusCode || (allow?.Contains(response.StatusCode) ?? false)) return (response.StatusCode, json);
         var code = json?["error"] is JsonValue c ? c.GetValue<string>() : $"http_{(int)response.StatusCode}";
         var message = json?["message"]?.GetValue<string>() ?? $"The sync server answered {(int)response.StatusCode}.";
-        TimeSpan? retry = response.Headers.RetryAfter?.Delta;
+        TimeSpan? retry = response.Headers.RetryAfter?.Delta
+            ?? (json?["retryAfter"] is JsonValue r && r.TryGetValue<double>(out var seconds) ? TimeSpan.FromSeconds(seconds) : null);
         throw new SyncApiException(response.StatusCode, code, message, retry);
     }
 
     private static string B64(byte[] bytes) => Convert.ToBase64String(bytes);
     private static string S(JsonObject json, string key) => json[key]?.GetValue<string>() ?? "";
+    private static string? Str(JsonObject json, string key) => json[key] is JsonValue v && v.TryGetValue<string>(out var s) && s.Length > 0 ? s : null;
     private static long L(JsonObject json, string key) => json[key] is JsonValue v && v.TryGetValue<double>(out var d) ? (long)d : 0;
     private static byte[] Bytes(JsonObject json, string key) => json[key] is JsonValue v && v.GetValue<string>() is { } s ? Convert.FromBase64String(s) : [];
 

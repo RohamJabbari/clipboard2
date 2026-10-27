@@ -7,6 +7,8 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.9" />
+    <!-- Ed25519 for the signed update feed (the BCL has no Ed25519). -->
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Clipboard2.Core.Tests" />

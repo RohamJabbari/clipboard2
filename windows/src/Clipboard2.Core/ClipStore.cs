@@ -74,7 +74,7 @@ public sealed class ClipStore : IDisposable
     }
 
     /// <summary>Schema version stored in <c>PRAGMA user_version</c>. v0 is the original, unversioned schema.</summary>
-    public const int SchemaVersion = 2;
+    public const int SchemaVersion = 4;
 
     public int UserVersion => Convert.ToInt32(Scalar("PRAGMA user_version"));
 
@@ -110,6 +110,19 @@ public sealed class ClipStore : IDisposable
                     ALTER TABLE sync_meta ADD COLUMN author_uid TEXT;
                     ALTER TABLE sync_spaces ADD COLUMN members TEXT;
                     UPDATE sync_cursor SET since = 0 WHERE space_id IN (SELECT id FROM sync_spaces WHERE kind = 'group');
+                    """);
+            }
+            // v3 (OCR text) comes from the features branch and goes here, before v4.
+            if (version < 4)
+            {
+                // v4: a full re-sync survives an interruption (the flag and the ids seen so far), and items the server
+                // refused for good are remembered by fingerprint, so they aren't uploaded again on every launch.
+                Exec("""
+                    ALTER TABLE sync_cursor ADD COLUMN resync INTEGER NOT NULL DEFAULT 0;
+                    CREATE TABLE IF NOT EXISTS sync_resync_seen (space_id TEXT NOT NULL, local_id TEXT NOT NULL, PRIMARY KEY (space_id, local_id));
+                    CREATE TABLE IF NOT EXISTS sync_rejected (
+                        space_id TEXT NOT NULL, local_id TEXT NOT NULL, fingerprint TEXT NOT NULL, reason TEXT NOT NULL,
+                        PRIMARY KEY (space_id, local_id));
                     """);
             }
             Exec($"PRAGMA user_version = {SchemaVersion}");
@@ -468,6 +481,8 @@ public sealed class ClipStore : IDisposable
         Exec("DELETE FROM snippets WHERE space_id = $s", ("$s", spaceId));
         Exec("DELETE FROM sync_meta WHERE space_id = $s", ("$s", spaceId));
         Exec("DELETE FROM sync_cursor WHERE space_id = $s", ("$s", spaceId));
+        Exec("DELETE FROM sync_resync_seen WHERE space_id = $s", ("$s", spaceId));
+        Exec("DELETE FROM sync_rejected WHERE space_id = $s", ("$s", spaceId));
         Exec("DELETE FROM sync_spaces WHERE id = $s", ("$s", spaceId));
         Commit();
     }
@@ -477,7 +492,7 @@ public sealed class ClipStore : IDisposable
     {
         foreach (var item in Query("SELECT * FROM clips WHERE space_id IS NOT NULL")) Remove(item);
         Exec("DELETE FROM snippets WHERE space_id IS NOT NULL");
-        Exec("DELETE FROM sync_meta; DELETE FROM sync_cursor; DELETE FROM sync_spaces;");
+        Exec("DELETE FROM sync_meta; DELETE FROM sync_cursor; DELETE FROM sync_spaces; DELETE FROM sync_resync_seen; DELETE FROM sync_rejected;");
         Commit();
     }
 
@@ -566,6 +581,64 @@ public sealed class ClipStore : IDisposable
     public void SetSyncCursor(string spaceId, long since) => Exec(
         "INSERT INTO sync_cursor (space_id, since) VALUES ($s, $n) ON CONFLICT(space_id) DO UPDATE SET since = $n",
         ("$s", spaceId), ("$n", since));
+
+    // A full re-sync (resetRequired) in progress: the flag and the ids pulled so far live next to the cursor, so an
+    // interrupted one carries on where it stopped and still reconciles at the end.
+
+    public bool IsResyncing(string spaceId) =>
+        Scalar("SELECT resync FROM sync_cursor WHERE space_id = $s", ("$s", spaceId)) is long flag && flag != 0;
+
+    /// <summary>Starts (or restarts) a re-sync from <c>since=0</c>.</summary>
+    public void BeginResync(string spaceId)
+    {
+        Exec("INSERT INTO sync_cursor (space_id, since, resync) VALUES ($s, 0, 1) ON CONFLICT(space_id) DO UPDATE SET since = 0, resync = 1", ("$s", spaceId));
+        Exec("DELETE FROM sync_resync_seen WHERE space_id = $s", ("$s", spaceId));
+    }
+
+    public void MarkResyncSeen(string spaceId, IEnumerable<string> ids)
+    {
+        foreach (var id in ids) Exec("INSERT OR IGNORE INTO sync_resync_seen (space_id, local_id) VALUES ($s, $id)", ("$s", spaceId), ("$id", id));
+    }
+
+    public HashSet<string> ResyncSeen(string spaceId)
+    {
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = "SELECT local_id FROM sync_resync_seen WHERE space_id = $s";
+        cmd.Parameters.AddWithValue("$s", spaceId);
+        using var r = cmd.ExecuteReader();
+        var seen = new HashSet<string>();
+        while (r.Read()) seen.Add(r.GetString(0));
+        return seen;
+    }
+
+    public void EndResync(string spaceId)
+    {
+        Exec("UPDATE sync_cursor SET resync = 0 WHERE space_id = $s", ("$s", spaceId));
+        Exec("DELETE FROM sync_resync_seen WHERE space_id = $s", ("$s", spaceId));
+    }
+
+    // Items the server refused for good (too large, invalid, not allowed), by the fingerprint that was refused:
+    // they're tried again only once they change.
+
+    /// <summary>Local id → refused fingerprint, for one space.</summary>
+    public Dictionary<string, string> SyncRejections(string spaceId)
+    {
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = "SELECT local_id, fingerprint FROM sync_rejected WHERE space_id = $s";
+        cmd.Parameters.AddWithValue("$s", spaceId);
+        using var r = cmd.ExecuteReader();
+        var map = new Dictionary<string, string>();
+        while (r.Read()) map[r.GetString(0)] = r.GetString(1);
+        return map;
+    }
+
+    public void SetSyncRejected(string spaceId, string localId, string fingerprint, string reason) => Exec("""
+        INSERT INTO sync_rejected (space_id, local_id, fingerprint, reason) VALUES ($s, $id, $f, $r)
+        ON CONFLICT(space_id, local_id) DO UPDATE SET fingerprint = $f, reason = $r
+        """, ("$s", spaceId), ("$id", localId), ("$f", fingerprint), ("$r", reason));
+
+    public void ClearSyncRejected(string spaceId, string localId) =>
+        Exec("DELETE FROM sync_rejected WHERE space_id = $s AND local_id = $id", ("$s", spaceId), ("$id", localId));
 
     public List<SpaceRecord> SyncSpaces()
     {

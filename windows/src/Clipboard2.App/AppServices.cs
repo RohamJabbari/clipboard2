@@ -51,6 +51,8 @@ public sealed class AppServices : IPanelHost
     private readonly DispatcherTimer _updateTimer = new() { Interval = TimeSpan.FromHours(1) };
     /// <summary>Sync runs 3 s after the last local change.</summary>
     private readonly DispatcherTimer _syncDebounce = new() { Interval = TimeSpan.FromSeconds(3) };
+    /// <summary>Asks sync every second whether its poll is due (3 s / 15 s / 60 s, see SyncAccount.PollInterval).</summary>
+    private readonly DispatcherTimer _syncPoll = new() { Interval = TimeSpan.FromSeconds(1) };
     private int _maintenanceRuns;
 
     public event Action? StoreChanged;
@@ -111,10 +113,13 @@ public sealed class AppServices : IPanelHost
             if (Sync.IsSignedIn == _sendToGroupRegistered) return;
             UpdateSendToGroupHotkey();
         };
+        Sync.ReceivedFromDevice += (item, from) => _tray?.ShowBalloon($"Sent from {from}", item.Preview);
         RunMaintenance();
         ScheduleSync();
         _maintenance.Tick += (_, _) => RunMaintenance();
         _maintenance.Start();
+        _syncPoll.Tick += (_, _) => Sync.PollIfDue();
+        _syncPoll.Start();
 
         RegisterHotkeys();
         _tray = new TrayIcon(this);
@@ -205,7 +210,6 @@ public sealed class AppServices : IPanelHost
             if (_maintenanceRuns++ % 30 == 0) Store.RemoveOrphanedBlobs();
         }
         catch (Exception ex) { Log.Error("Maintenance failed", ex); }
-        if (Sync.IsSignedIn) _ = Sync.SyncNowAsync();
     }
 
     // MARK: Capture
@@ -226,6 +230,7 @@ public sealed class AppServices : IPanelHost
                 return;   // a saved secret: never in history
             Store.Ingest(processed);
             Store.EnforceRetention(Settings.MaxItems, Settings.MaxAge);
+            Sync.ReportActivity();
         }
         catch (Exception ex)
         {
@@ -258,7 +263,7 @@ public sealed class AppServices : IPanelHost
         _panelTarget = Tracker.TargetWindow;
         Panel.PrepareForOpen(Tracker.AppFor(_panelTarget));
         PanelWindow.ShowNear(_panelTarget);
-        _ = Sync.SyncNowAsync();
+        Sync.SetPanelOpen(true);   // syncs once, then polls every 3 s while open
     }
 
     private QuickPanelWindow PanelWindow => _panelWindow ??= new QuickPanelWindow(this);
@@ -267,6 +272,7 @@ public sealed class AppServices : IPanelHost
     {
         _panelWindow?.HidePanel();
         Panel.DidClose();
+        Sync.SetPanelOpen(false);
     }
 
     public void ShowFlyout(Point nearScreenPoint)
