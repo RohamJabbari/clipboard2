@@ -787,6 +787,23 @@ describe("items", () => {
     expect(full).toMatchObject({ items: [], resetRequired: false });
   });
 
+  it("lets a full re-walk page past the purge horizon", async () => {
+    const alice = await signUp("alice");
+    const space = alice.personalSpaceId;
+    const first = await putItem(alice, space, alice.personalKey);
+    await putItem(alice, space, alice.personalKey);
+    const gone = await putItem(alice, space, alice.personalKey);
+    await call(alice, "DELETE", `/v1/spaces/${space}/items/${gone.id}?updatedAt=${Date.now() + 1}`);
+    await pool.query("UPDATE items SET deleted_at = now() - interval '100 days' WHERE deleted IS NOT NULL");
+    rebuild(); // fresh purge throttle
+    // A client paging from 0 sits below the horizon after its first page: without `full` it would be sent back to 0.
+    const behind = (await call(alice, "GET", `/v1/spaces/${space}/changes?since=${first.body.seq}`)).body;
+    expect(behind.resetRequired).toBe(true);
+    const page = (await call(alice, "GET", `/v1/spaces/${space}/changes?since=${first.body.seq}&full=1`)).body;
+    expect(page.resetRequired).toBe(false);
+    expect(page.items).toHaveLength(1);
+  });
+
   it("rejects uppercase ids and unknown categories", async () => {
     const alice = await signUp("alice");
     const upper = randomUUID().toUpperCase();

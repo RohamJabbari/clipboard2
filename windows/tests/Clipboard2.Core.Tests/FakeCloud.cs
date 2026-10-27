@@ -461,7 +461,7 @@ internal sealed class FakeCloud : HttpMessageHandler
                 invSpace.Members[caller.Uid] = ("member", B("wrappedKey"));
                 return Json(HttpStatusCode.Created, SpaceJson(invSpace, caller.Uid));
             case "spaces" when path[3] == "changes":
-                return Changes(Member(path[2], caller.Uid), long.Parse(query["since"] ?? "0"), Math.Min(PageLimit, int.Parse(query["limit"] ?? "500")));
+                return Changes(Member(path[2], caller.Uid), long.Parse(query["since"] ?? "0"), Math.Min(PageLimit, int.Parse(query["limit"] ?? "500")), query["full"] == "1");
             case "spaces" when path[3] == "items" && method == "PUT":
                 return Put(Member(path[2], caller.Uid), path[4], body!, caller.Uid);
             case "spaces" when path[3] == "items" && method == "DELETE":
@@ -507,9 +507,9 @@ internal sealed class FakeCloud : HttpMessageHandler
         return json;
     }
 
-    private HttpResponseMessage Changes(Space space, long since, int limit)
+    private HttpResponseMessage Changes(Space space, long since, int limit, bool full = false)
     {
-        if (since > 0 && since < space.PurgedSeq)
+        if (!full && since > 0 && since < space.PurgedSeq)
             return Ok(new JsonObject { ["items"] = new JsonArray(), ["nextSince"] = 0, ["hasMore"] = false, ["resetRequired"] = true });
         var rows = space.Items.Values.Where(i => i.Seq > since && !HiddenFromChanges.Contains(i.Id)).OrderBy(i => i.Seq).Take(limit + 1).ToList();
         var page = rows.Take(limit).ToList();

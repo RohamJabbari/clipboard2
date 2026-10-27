@@ -116,6 +116,8 @@ const acceptBody = z.object({ wrappedKey: sealed });
 const changesQuery = z.object({
   since: z.coerce.number().int().nonnegative().default(0),
   limit: z.coerce.number().int().min(1).max(500).default(500),
+  /** `1` while the client walks the whole space from 0 after a reset: purged tombstones don't matter then. */
+  full: z.literal("1").optional(),
 });
 const blobBody = z.object({ id: uuid, size: z.number().int().positive(), ifGenerationMatch: z.boolean().optional() });
 const deleteQuery = z.object({ updatedAt: z.coerce.number().int().nonnegative() });
@@ -845,7 +847,7 @@ export function buildApp(deps: Deps): FastifyInstance {
     return tx(pool, async (db) => {
       await db.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
       const space = await db.query<{ purged_seq: number }>("SELECT purged_seq FROM spaces WHERE id = $1", [id]);
-      if (query.since > 0 && query.since < (space.rows[0]?.purged_seq ?? 0)) {
+      if (!query.full && query.since > 0 && query.since < (space.rows[0]?.purged_seq ?? 0)) {
         return { items: [], nextSince: 0, hasMore: false, resetRequired: true };
       }
       const { rows } = await db.query<ItemRow>(`SELECT ${ITEM_COLUMNS} FROM items WHERE space_id = $1 AND seq > $2 ORDER BY seq LIMIT $3`, [

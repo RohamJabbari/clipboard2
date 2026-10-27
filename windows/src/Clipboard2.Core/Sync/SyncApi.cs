@@ -239,9 +239,11 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
 
     // MARK: Items
 
-    public async Task<ChangesPage> ChangesAsync(string spaceId, long since, int limit = 500, CancellationToken ct = default)
+    /// <param name="fullResync">Walking the space from 0 after a reset: the server then doesn't ask for another reset
+    /// when the walk passes the purge horizon.</param>
+    public async Task<ChangesPage> ChangesAsync(string spaceId, long since, int limit = 500, CancellationToken ct = default, bool fullResync = false)
     {
-        var (_, json) = await SendAsync(HttpMethod.Get, $"/v1/spaces/{spaceId}/changes?since={since}&limit={limit}", null, ct);
+        var (_, json) = await SendAsync(HttpMethod.Get, $"/v1/spaces/{spaceId}/changes?since={since}&limit={limit}{(fullResync ? "&full=1" : "")}", null, ct);
         return new ChangesPage(
             (json?["items"] as JsonArray ?? []).OfType<JsonObject>().Select(Item).ToList(),
             L(json!, "nextSince"),

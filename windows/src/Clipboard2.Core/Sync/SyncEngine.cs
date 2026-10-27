@@ -230,7 +230,7 @@ public sealed partial class SyncEngine
         var complete = false;
         while (true)
         {
-            var page = await api.ChangesAsync(space.Id, since, PageSize, ct);
+            var page = await api.ChangesAsync(space.Id, since, PageSize, ct, fullResync: resync);
             if (page.ResetRequired)
             {
                 if (restarted) break;   // the server keeps asking: give up for this tick
