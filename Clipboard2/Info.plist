@@ -93,5 +93,35 @@
 	<integer>3600</integer>
 	<key>SUVerifyUpdateBeforeExtraction</key>
 	<true/>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Clipboard2 Backup</string>
+			<key>UTTypeIdentifier</key>
+			<string>at.softmaze.clippy.backup</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>clipboard2backup</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Clipboard2 Item</string>
+			<key>UTTypeIdentifier</key>
+			<string>at.softmaze.clippy.clip-reference</string>
+		</dict>
+	</array>
 </dict>
 </plist>

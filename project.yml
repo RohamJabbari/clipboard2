@@ -49,6 +49,17 @@ targets:
         CFBundleURLTypes:
           - CFBundleURLName: at.softmaze.Clippy
             CFBundleURLSchemes: [clipboard2, clippy]
+        UTExportedTypeDeclarations:
+          # Encrypted backups (docs/BACKUP-FORMAT.md).
+          - UTTypeIdentifier: at.softmaze.clippy.backup
+            UTTypeDescription: Clipboard2 Backup
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [clipboard2backup]
+          # A history item dragged within the quick panel (its id; never leaves the app).
+          - UTTypeIdentifier: at.softmaze.clippy.clip-reference
+            UTTypeDescription: Clipboard2 Item
+            UTTypeConformsTo: [public.data]
         # Sparkle: hourly update checks against the appcast in the GitHub repo.
         SUFeedURL: https://raw.githubusercontent.com/RohamJabbari/clipboard2-macOS/main/appcast.xml
         SUPublicEDKey: EYXl4+z6FlFfMyGuKf4+WHXcB3c8WHA6ThmEj4pPwwI=
