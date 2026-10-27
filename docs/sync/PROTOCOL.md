@@ -251,7 +251,7 @@ Space = {"id","kind":"personal|group","role":"owner|member","ownerUid",
 
 | Request | Response |
 |---|---|
-| `GET /v1/spaces/:id/changes?since=<seq>&limit=<≤500>` | `{items: [Item], nextSince, hasMore, resetRequired}` |
+| `GET /v1/spaces/:id/changes?since=<seq>&limit=<≤500>[&full=1]` | `{items: [Item], nextSince, hasMore, resetRequired}` |
 | `PUT /v1/spaces/:id/items/:itemId` `{category, sortAt, updatedAt, ciphertext, blobIds}` | `200 {seq, trimmed: [itemId]}` or `409 {error: "conflict", current: Item}` |
 | `DELETE /v1/spaces/:id/items/:itemId?updatedAt=<ms>` | `200 {seq}`, idempotent. Writes a `user` tombstone and deletes the item's blobs. Returns `409 {current}` if the live item has a newer `updatedAt`. |
 
@@ -279,7 +279,7 @@ Item = {"id","category":"history|pinned|snippet|secret","seq","sortAt","updatedA
 **Retention:**
 - `pinned`, `snippet` and `secret` items stay until deleted.
 - After any `history` upsert, the server keeps the newest **200** `history` items in that space by `sortAt`, ties broken by `id`. All others become `trimmed` tombstones, their blobs are deleted, and the `PUT` response lists them.
-- Tombstones are kept for **90 days**. A `since` older than the space's purge horizon returns `{resetRequired: true}`, and the client re-syncs from `since=0`.
+- Tombstones are kept for **90 days**. A `since` older than the space's purge horizon returns `{resetRequired: true}`, and the client re-syncs from `since=0`. While re-walking from 0, the client sends `full=1` so pages below the horizon don't ask for another reset.
 
 ### Blobs
 

@@ -54,7 +54,7 @@ must follow it exactly; PROTOCOL.md gets updated to match.
   that id (rollback protection). Payloads without `rev` (older apps) are accepted.
 - **`toDevice`:** a clip payload may carry this, a session `id` from `/v1/sessions`. The named
   device shows a "Sent from ‹device›" notice and puts the item at the top. Everyone else treats it
-  as a normal item.
+  as a normal item. The sender also writes `"fromDevice"` (its own device name) for that notice.
 - **Received times:** `createdAt`/`lastCopiedAt` from the payload are clamped to the time the
   item arrived.
 
