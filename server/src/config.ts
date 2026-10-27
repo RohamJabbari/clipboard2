@@ -19,6 +19,12 @@ export interface Limits {
   invitesPerMinute: number;
   pendingInvitesPerGroup: number;
   tombstoneDays: number;
+  groupBytes: number;
+  groupItems: number;
+  totalBytes: number;
+  signupCodesPerUser: number;
+  scryptConcurrency: number;
+  scryptQueue: number;
 }
 
 export const limits = (): Limits => ({
@@ -35,6 +41,12 @@ export const limits = (): Limits => ({
   invitesPerMinute: int("RATE_INVITES_PER_MINUTE", 20),
   pendingInvitesPerGroup: int("LIMIT_PENDING_INVITES_PER_GROUP", 20),
   tombstoneDays: int("TOMBSTONE_DAYS", 90),
+  groupBytes: int("LIMIT_GROUP_BYTES", 2 * 1024 * 1024 * 1024),
+  groupItems: int("LIMIT_GROUP_ITEMS", 5000),
+  totalBytes: int("LIMIT_TOTAL_BYTES", 20 * 1024 * 1024 * 1024),
+  signupCodesPerUser: int("LIMIT_SIGNUP_CODES_PER_USER", 10),
+  scryptConcurrency: int("SCRYPT_CONCURRENCY", 2),
+  scryptQueue: int("SCRYPT_QUEUE", 8),
 });
 
 export const config = () => ({

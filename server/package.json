@@ -11,7 +11,8 @@
     "dev": "tsx watch src/index.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "vectors": "tsx scripts/vectors.ts"
+    "vectors": "tsx scripts/vectors.ts",
+    "signup-code": "tsx scripts/signup-code.ts"
   },
   "dependencies": {
     "@google-cloud/cloud-sql-connector": "^1.12.1",

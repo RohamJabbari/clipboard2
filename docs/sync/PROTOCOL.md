@@ -91,6 +91,22 @@ sealedKey = AEAD(inviteKey, SK, "c2/invite/v1/" + spaceId)
 2. Map `0`→`O`, `1`→`I` and `8`→`B`, to forgive misreadings.
 3. Require exactly 26 characters and base32-decode them to 16 bytes. The last 2 bits must be zero.
 
+### Sign-up codes
+
+Sign-up is invite-only. A **sign-up code** is made by the server (`POST /v1/signup-codes`), not the
+client, and isn't key material:
+
+```
+code       = 80 random bits in the invite-code alphabet: 16 characters,
+             shown as 4 groups of 4 joined by "-" (XXXX-XXXX-XXXX-XXXX)
+normalised = the typed code with spaces and "-" removed, uppercased, 0→O, 1→I, 8→B; exactly 16 characters
+stored     = SHA-256(utf8(normalised))                     the server keeps only this
+```
+
+The app's "Invite code" field takes either kind: 16 characters after normalising is a sign-up code
+(sent as typed, as `signupCode`), 26 is a group invite code (sent as `groupInviteId` = its `inviteId`,
+and joined right after the account exists).
+
 ### Known v1 limits
 - Removing a member doesn't rotate the space key. Their access ends because the server refuses them, not because of crypto.
 - Emails are never verified. Someone can register an address they don't own, which only matters as a display name.
@@ -138,27 +154,36 @@ Pinning or unpinning changes the category, and the category is part of the AAD, 
 | `unauthenticated` | 401: missing, unknown, revoked or expired session |
 | `invalid_credentials` | 401 |
 | `forbidden` | 403 |
+| `invite_required` | 403: sign-up without `signupCode` or `groupInviteId` |
+| `invite_invalid` | 403: that sign-up code or group invite is unknown, used or expired |
 | `not_found` | 404 |
 | `no_account` | 404 |
 | `conflict` | 409 |
 | `username_taken` | 409 |
 | `invalid` | 400 |
+| `clock_skew` | 400: an item time is more than 10 minutes ahead of the server's clock |
 | `too_large` | 413 |
-| `quota_exceeded` | 403 |
-| `rate_limited` | 429, with `Retry-After` in seconds |
+| `quota_exceeded` | 403 for per-user and per-space limits; 413 with `"scope": "group"` or `"scope": "server"` for group and server storage (see [Limits](#limits)) |
+| `rate_limited` | 429, with `Retry-After` in seconds and `retryAfter` in the body |
+| `too_many_codes` | 429: already 10 open sign-up codes |
 
 ### Auth and sessions
 
 | Request | Response |
 |---|---|
 | `POST /v1/auth/prelogin` `{email}` | `{kdf: {alg: "pbkdf2-sha256", salt, iterations}}`. Unknown emails get a deterministic fake salt (`HMAC-SHA256(serverKey, email)[0..16]`, 600 000 iterations), so this can't be used to find accounts. |
-| `POST /v1/auth/signup` `{email, authKey, kdf: {salt, iterations}, uid, wrappedAccountKey, publicKey, wrappedPrivateKey, personalSpace: {id, wrappedKey}, deviceName?, username?}` | `201 Session`; `409 conflict` if the email is taken, `409 username_taken` if the username is |
+| `POST /v1/auth/signup` `{email, authKey, kdf: {salt, iterations}, uid, wrappedAccountKey, publicKey, wrappedPrivateKey, personalSpace: {id, wrappedKey}, deviceName?, username?, signupCode?, groupInviteId?}` | `201 Session`; `403 invite_required` without either invite, `403 invite_invalid` if it's unknown, used or expired; `409 conflict` if the email is taken, `409 username_taken` if the username is |
 | `POST /v1/auth/login` `{email, authKey, deviceName?}` | `200 Session`; `401 invalid_credentials` |
 | `POST /v1/auth/logout` | `204`, revokes the calling session |
 | `PUT /v1/account/password` `{authKey, newAuthKey, kdf: {salt, iterations}, wrappedAccountKey}` | `204`. Checks the current `authKey`, replaces the password verifier and `wrappedAK` (AK itself doesn't change), and revokes every other session. |
 | `GET /v1/account` | `Account` |
 | `PUT /v1/account/username` `{username}` | `200 {username}`; `409 username_taken` |
-| `DELETE /v1/account` `{authKey}` | `204`. Deletes sessions, the personal space, owned groups (items, blobs, invites) and memberships. Items the user wrote in other people's groups stay. |
+| `DELETE /v1/account` `{authKey}` | `204`. Deletes sessions, sign-up codes, the personal space, owned groups (items, blobs, invites) and memberships. Every live item the user wrote in other people's groups becomes a `user` tombstone (its `updatedAt` raised to the deletion time, `authorUid` then `null`), and their blobs there are deleted. |
+| `GET /v1/sessions` | `{sessions: [{id, deviceName, createdAt, lastUsedAt, current}]}`, the caller's unexpired sessions, most recently used first. `id` is a UUID; `current` marks the calling session. |
+| `DELETE /v1/sessions/:id` | `204`, signs that device out (it may be the calling session); `404` if it isn't one of the caller's |
+| `POST /v1/signup-codes` | `201 {id, code, expiresAt}`. A new [sign-up code](#sign-up-codes), valid 14 days, single use. `code` is shown only here. `429 too_many_codes` with 10 open (unused, unexpired) codes. |
+| `GET /v1/signup-codes` | `{codes: [{id, createdAt, expiresAt}]}`, the caller's open codes |
+| `DELETE /v1/signup-codes/:id` | `204`, revokes an open code; `404` otherwise |
 
 ```jsonc
 Session = {"token","expiresAt","account": Account}
@@ -173,7 +198,15 @@ Account = {"uid","email","kdf":{"alg":"pbkdf2-sha256","salt","iterations"},
 - **Session ended:** on `401 unauthenticated` the client asks for the password again (prelogin, then login), unlocks AK from the fresh `Account`, and carries on.
 - **Signup:** `kdf.iterations` must be at least 100 000.
 - **Usernames:** optional; trimmed and NFC-normalized, then 3–24 Unicode letters, digits, `_`, `.` or `-`, starting with a letter or digit (`invalid` otherwise). Stored as typed, unique case-insensitively. Accounts without one have `username: null`.
-- **Rate limits:** prelogin, signup and login share one limit per IP and one per email.
+- **Sign-up invites:** `signupCode` (as typed; the server normalises it) is consumed by the sign-up.
+  `groupInviteId` must be an unused, unexpired group invite; sign-up doesn't consume it, joining does.
+  The invite is checked before the email, so sign-up can't be used to find accounts without one.
+  New servers get their first code from `npm run signup-code` (an operator code that belongs to nobody).
+- **Rate limits:** prelogin, signup and login (and the password checks of password change and account
+  deletion) share one limit per IP and one per email, counted in Postgres in fixed one-minute windows,
+  so they hold across instances. The client IP is the last `X-Forwarded-For` hop (Cloud Run's front
+  end); earlier entries are ignored. Password hashing runs at most 2 at a time per instance with a
+  short queue; beyond it the answer is `429 rate_limited` with `retryAfter`.
 
 ### Spaces and groups
 
@@ -185,7 +218,7 @@ Account = {"uid","email","kdf":{"alg":"pbkdf2-sha256","salt","iterations"},
 | `POST /v1/groups` `{id, encryptedName, wrappedKey}` | `201 Space`. The caller becomes owner; `wrappedKey` is SK wrapped to the caller. |
 | `PATCH /v1/groups/:id` `{encryptedName}` | `204`, owner only |
 | `DELETE /v1/groups/:id` | `204`, owner only. Removes all items, blobs and invites. |
-| `GET /v1/groups/:id/members` | `{members: [{uid, email, username, role}]}`, members only; `username` may be `null` |
+| `GET /v1/groups/:id/members` | `{members: [{uid, username, name, role}]}`, members only, owner first. `username` may be `null`; `name` is as in `Space.members`. No emails. |
 | `DELETE /v1/groups/:id/members/:uid` | `204`. The owner can remove others; a member can remove themselves (leave). The owner can't leave and has to delete the group instead. |
 
 ```jsonc
@@ -223,11 +256,20 @@ Space = {"id","kind":"personal|group","role":"owner|member","ownerUid",
 | `DELETE /v1/spaces/:id/items/:itemId?updatedAt=<ms>` | `200 {seq}`, idempotent. Writes a `user` tombstone and deletes the item's blobs. Returns `409 {current}` if the live item has a newer `updatedAt`. |
 
 **Changes:** `nextSince` is the highest `seq` returned. `since=0` returns the full current state. Each item's `seq` is a server-global, strictly increasing number that is assigned again on every change.
+- Within a space, `seq` order is commit order: every item write locks the space row before taking a `seq`, so a cursor never moves past a change that becomes visible later.
+- The purge horizon and the page are read in one REPEATABLE READ snapshot.
 
 **Upsert rule:** last write wins on `updatedAt`.
 - The incoming version is kept when `incoming.updatedAt >= stored.updatedAt`.
 - A `user` tombstone counts as a stored version.
-- Every id in `blobIds` must be a blob already registered in the same space.
+- Every id in `blobIds` must be a blob already registered in the same space. `blobIds` holds at most 12 ids.
+
+**Write checks** (`PUT` and `DELETE`):
+- `sortAt` or `updatedAt` more than 10 minutes ahead of the server's clock → `400 clock_skew`.
+- In a group, an existing item (tombstones included) may be overwritten or deleted only by its
+  author (`authorUid`) or the group owner; anyone else gets `403 forbidden`. Creating new items is
+  open to every member. Deleting an item that is already a `user` tombstone stays an idempotent `200`.
+- The writer becomes the item's `authorUid`.
 
 ```jsonc
 Item = {"id","category":"history|pinned|snippet|secret","seq","sortAt","updatedAt",
@@ -243,10 +285,12 @@ Item = {"id","category":"history|pinned|snippet|secret","seq","sortAt","updatedA
 
 | Request | Response |
 |---|---|
-| `POST /v1/spaces/:id/blobs` `{id, size}` | `{url, method: "PUT", headers, expiresAt}`. Registers the blob and checks quota. Upload the ciphertext with exactly those headers; they include `x-goog-content-length-range`. |
+| `POST /v1/spaces/:id/blobs` `{id, size, ifGenerationMatch?}` | `{url, method: "PUT", headers, expiresAt}`. Registers the blob and checks quota. Upload the ciphertext with exactly those headers; they include `x-goog-content-length-range`. |
 | `GET /v1/spaces/:id/blobs/:blobId` | `{url, expiresAt}`, a signed GET valid for 15 minutes |
 
 - The GCS object path is `<spaceId>/<blobId>`.
+- **`ifGenerationMatch: true`** (current clients always send it): the signed PUT also requires `x-goog-if-generation-match: 0`, which is in `headers`, so the URL can create the object but never overwrite one.
+- Asking again for your own pending blob (same size) returns a fresh URL. Once an item references the blob, no URL is issued again: `409 conflict`.
 - A blob no item references 24 hours after registration may be garbage-collected.
 
 ### Limits
@@ -255,13 +299,19 @@ Item = {"id","category":"history|pinned|snippet|secret","seq","sortAt","updatedA
 |---|---|---|
 | Item ciphertext | 2 MB | `too_large` |
 | Blob | 25 MB | `too_large` |
-| Bytes per user (items + blobs they wrote) | 1 GB | `quota_exceeded` |
-| Non-history items per space | 5 000 | `quota_exceeded` |
-| Groups owned | 20 | `quota_exceeded` |
-| Members per group | 50 | `quota_exceeded` |
-| Pending invites per group | 20 | `quota_exceeded` |
+| Blob ids per item | 12 | `invalid` |
+| Bytes per user (items + blobs they wrote) | 1 GB | 403 `quota_exceeded` |
+| Non-history items per space | 5 000 | 403 `quota_exceeded` |
+| Bytes per group (live items + blobs) | 2 GB | 413 `quota_exceeded`, `"scope": "group"` |
+| Live items per group (history counted after trimming) | 5 000 | 413 `quota_exceeded`, `"scope": "group"` |
+| Bytes on the server (`LIMIT_TOTAL_BYTES`) | 20 GB | 413 `quota_exceeded`, `"scope": "server"` |
+| Groups owned | 20 | 403 `quota_exceeded` |
+| Members per group | 50 | 403 `quota_exceeded` |
+| Pending invites per group | 20 | 403 `quota_exceeded` |
+| Open sign-up codes per user | 10 | `too_many_codes` |
 | Requests | 120/min per user | `rate_limited` |
 | Prelogin, signup and login | 20/min per IP; 10/min per email | `rate_limited` |
+| Password hashing | 2 at a time per instance, short queue | `rate_limited` |
 
 ## What the server sees
 
@@ -269,10 +319,15 @@ Item = {"id","category":"history|pinned|snippet|secret","seq","sortAt","updatedA
 - email and username
 - the scrypt of `authKey`
 - KDF salt and iterations
-- session hashes
+- session hashes, device names and last use
 - group membership and roles
 - invite ids and expiry
+- sign-up code hashes, who made and used each, and expiry
+- for about two minutes, auth attempt counts keyed by an HMAC of the IP or email
 - per item: category, `sortAt`, `updatedAt`, size, author, blob ids and sizes
+
+Request logs record method, URL and status only: no IPs or emails. Members see each other's
+username or email local part (`name`), never the email.
 
 **Never visible to the server:** the password, `wrapKey`, invite codes, item contents, group names, snippet and secret names and values, and every key except public keys.
 

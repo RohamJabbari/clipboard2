@@ -2,7 +2,8 @@
 import { Storage } from "@google-cloud/storage";
 
 export interface BlobStorage {
-  signedPutUrl(path: string, size: number): Promise<{ url: string; headers: Record<string, string>; expiresAt: number }>;
+  /** With ifGenerationMatch the URL can only create: it requires `x-goog-if-generation-match: 0`, so an existing object can't be overwritten. */
+  signedPutUrl(path: string, size: number, options?: { ifGenerationMatch?: boolean }): Promise<{ url: string; headers: Record<string, string>; expiresAt: number }>;
   signedGetUrl(path: string): Promise<{ url: string; expiresAt: number }>;
   delete(paths: string[]): Promise<void>;
 }
@@ -14,15 +15,17 @@ const GET_TTL_MS = 15 * 60 * 1000;
 export function gcsStorage(bucketName: string): BlobStorage {
   const bucket = new Storage().bucket(bucketName);
   return {
-    async signedPutUrl(path, size) {
+    async signedPutUrl(path, size, options = {}) {
       const expiresAt = Date.now() + PUT_TTL_MS;
-      const headers = { "content-type": "application/octet-stream", "x-goog-content-length-range": `0,${size}` };
+      const extensionHeaders: Record<string, string> = { "x-goog-content-length-range": `0,${size}` };
+      if (options.ifGenerationMatch) extensionHeaders["x-goog-if-generation-match"] = "0";
+      const headers = { "content-type": "application/octet-stream", ...extensionHeaders };
       const [url] = await bucket.file(path).getSignedUrl({
         version: "v4",
         action: "write",
         expires: expiresAt,
         contentType: headers["content-type"],
-        extensionHeaders: { "x-goog-content-length-range": headers["x-goog-content-length-range"] },
+        extensionHeaders,
       });
       return { url, headers, expiresAt };
     },

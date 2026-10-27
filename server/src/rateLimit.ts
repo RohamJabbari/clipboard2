@@ -1,4 +1,36 @@
-/** Per-key token buckets, in memory. With max 3 instances the effective limit is at most 3× the configured rate. */
+/** At most `max` tasks at once (scrypt, which would otherwise fill the libuv pool), `queue` more waiting, the rest refused. */
+export class Semaphore {
+  private active = 0;
+  private readonly waiting: (() => void)[] = [];
+
+  constructor(
+    private readonly max: number,
+    private readonly queue: number,
+  ) {}
+
+  /** Runs `fn` when a slot is free; null when the queue is full as well. */
+  run<T>(fn: () => Promise<T>): Promise<T> | null {
+    if (this.active < this.max) {
+      this.active++;
+      return this.finish(fn);
+    }
+    if (this.waiting.length >= this.queue) return null;
+    return new Promise<void>((resolve) => this.waiting.push(resolve)).then(() => this.finish(fn));
+  }
+
+  private async finish<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } finally {
+      // Hand the slot straight to the next waiter, or give it back.
+      const next = this.waiting.shift();
+      if (next) next();
+      else this.active--;
+    }
+  }
+}
+
+/** Per-key token buckets, in memory. With max 3 instances the effective limit is at most 3× the configured rate. Auth limits live in Postgres instead (app.ts). */
 export class RateLimiter {
   private readonly buckets = new Map<string, { tokens: number; at: number }>();
 

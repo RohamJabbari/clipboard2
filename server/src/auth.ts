@@ -1,6 +1,7 @@
 // Password-less-on-the-wire auth: clients send authKey = HKDF(PBKDF2(password)), never the password.
 // We store scrypt(authKey) and hand out opaque session tokens, keeping only their SHA-256.
 import { createHash, createHmac, randomBytes, scrypt as scryptCb, timingSafeEqual, type ScryptOptions } from "node:crypto";
+import type pg from "pg";
 import type { Db } from "./db.js";
 
 const scryptAsync = (key: Buffer, salt: Buffer, length: number, options: ScryptOptions) =>
@@ -38,3 +39,46 @@ export async function preloginKey(pool: Db): Promise<Buffer> {
 
 /** Deterministic per email, so repeated prelogins for a non-account look exactly like a real one. */
 export const fakeSalt = (key: Buffer, email: string) => createHmac("sha256", key).update(email, "utf8").digest().subarray(0, 16);
+
+/** HMAC of a rate-limit key ("ip:…", "email:…") under the same server key, so the attempts table holds no addresses. */
+export const rateKey = (key: Buffer, name: string) => createHmac("sha256", key).update(name, "utf8").digest();
+
+// MARK: Sign-up codes
+
+const CODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+export const SIGNUP_CODE_DAYS = 14;
+
+/** 80 random bits in the invite-code alphabet: 16 characters shown as XXXX-XXXX-XXXX-XXXX. */
+export function newSignupCode(): string {
+  let bits = 0;
+  let value = 0;
+  let out = "";
+  for (const byte of randomBytes(10)) {
+    value = ((value << 8) | byte) & 0xffff;
+    bits += 8;
+    while (bits >= 5) {
+      out += CODE_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  return out.match(/.{4}/g)!.join("-");
+}
+
+/** Forgives spaces, dashes, case and 0/1/8 misreadings like invite codes; null unless exactly 16 code characters remain. */
+export function normalizeSignupCode(typed: string): string | null {
+  const clean = typed.replace(/[\s-]/g, "").toUpperCase().replace(/0/g, "O").replace(/1/g, "I").replace(/8/g, "B");
+  return /^[A-Z2-7]{16}$/.test(clean) ? clean : null;
+}
+
+export const signupCodeHash = (normalized: string) => createHash("sha256").update(normalized, "utf8").digest();
+
+/** Stores a new code (only its hash) for `createdBy`, or for nobody when an operator issues it. */
+export async function issueSignupCode(db: Pick<pg.PoolClient, "query">, createdBy: string | null) {
+  const code = newSignupCode();
+  const { rows } = await db.query<{ id: string; expires_at: Date }>(
+    `INSERT INTO signup_codes (id, code_hash, created_by, expires_at) VALUES (gen_random_uuid(), $1, $2, now() + make_interval(days => $3))
+     RETURNING id, expires_at`,
+    [signupCodeHash(normalizeSignupCode(code)!), createdBy, SIGNUP_CODE_DAYS],
+  );
+  return { id: rows[0]!.id, code, expiresAt: rows[0]!.expires_at.getTime() };
+}

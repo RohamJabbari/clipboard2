@@ -12,6 +12,8 @@ import { limits as defaultLimits, type Limits } from "../src/config.js";
 import { migrate } from "../src/db.js";
 import { cpSync, writeFileSync } from "node:fs";
 import type { BlobStorage } from "../src/services.js";
+import { issueSignupCode } from "../src/auth.js";
+import { Semaphore } from "../src/rateLimit.js";
 import * as cc from "../src/clientCrypto.js";
 
 let embedded: EmbeddedPostgres;
@@ -22,8 +24,10 @@ let currentLimits: Limits;
 const deletedPaths: string[] = [];
 
 const storage: BlobStorage = {
-  async signedPutUrl(path, size) {
-    return { url: `https://storage.test/${path}?put`, headers: { "x-goog-content-length-range": `0,${size}` }, expiresAt: Date.now() + 1000 };
+  async signedPutUrl(path, size, options = {}) {
+    const headers: Record<string, string> = { "x-goog-content-length-range": `0,${size}` };
+    if (options.ifGenerationMatch) headers["x-goog-if-generation-match"] = "0";
+    return { url: `https://storage.test/${path}?put`, headers, expiresAt: Date.now() + 1000 };
   },
   async signedGetUrl(path) {
     return { url: `https://storage.test/${path}?get`, expiresAt: Date.now() + 1000 };
@@ -46,7 +50,7 @@ beforeAll(async () => {
   await embedded.start();
   await embedded.createDatabase("c2test");
   pool = new pg.Pool({ connectionString: `postgres://postgres:postgres@localhost:${port}/c2test`, max: 4 });
-  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql"]);
+  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql", "003_hardening.sql"]);
   expect(await migrate(pool)).toEqual([]);
 }, 120_000);
 
@@ -58,7 +62,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await pool.query("TRUNCATE users, sessions, spaces, space_members, items, blobs, invites CASCADE");
+  await pool.query("TRUNCATE users, sessions, spaces, space_members, items, blobs, invites, signup_codes, auth_attempts CASCADE");
   deletedPaths.length = 0;
   rebuild();
 });
@@ -117,6 +121,8 @@ async function trySignUp(name: string, password = "pw-" + name, extra: Record<st
     wrappedPrivateKey: b64(cc.aeadSeal(ak, id.priv, cc.aad.privateKey(uid))),
     personalSpace: { id: personalSpaceId, wrappedKey: b64(cc.wrapSpaceKey(personalKey, personalSpaceId, uid, id.pub)) },
     deviceName: "test",
+    // Sign-up is invite-only: unless the test brings its own, use a fresh operator code.
+    ...("signupCode" in extra || "groupInviteId" in extra ? {} : { signupCode: (await issueSignupCode(pool, null)).code }),
     ...extra,
   });
   return { res, user: { uid, email, password, id, ak, personalSpaceId, personalKey } };
@@ -124,7 +130,7 @@ async function trySignUp(name: string, password = "pw-" + name, extra: Record<st
 
 /** A second device: prelogin, derive, login. */
 async function logIn(email: string, password: string, ip?: string) {
-  const pre = await call(null, "POST", "/v1/auth/prelogin", { email }, undefined, ip);
+  const pre = await call(null, "POST", "/v1/auth/prelogin", { email }, ip);
   expect(pre.status).toBe(200);
   const keys = cc.passwordKeys(password, Buffer.from(pre.body.kdf.salt, "base64"), pre.body.kdf.iterations);
   return { ...(await call(null, "POST", "/v1/auth/login", { email, authKey: b64(keys.authKey) }, ip)), keys };
@@ -189,6 +195,40 @@ async function invite(owner: TestUser, group: { id: string; sk: Buffer }, member
   const created = await createInvite(owner, group);
   expect(created.status).toBe(201);
   return redeem(member, created.code);
+}
+
+/** The authKey a client would derive again for a password check (account deletion). */
+async function authKeyOf(user: TestUser) {
+  const pre = await call(null, "POST", "/v1/auth/prelogin", { email: user.email });
+  return b64(cc.passwordKeys(user.password, Buffer.from(pre.body.kdf.salt, "base64"), ITERATIONS).authKey);
+}
+
+/** An item of exactly `bytes` ciphertext bytes; the server never looks inside. */
+function rawPut(user: TestUser, spaceId: string, bytes: number, opts: { id?: string; category?: string; updatedAt?: number } = {}) {
+  const now = Date.now();
+  return call(user, "PUT", `/v1/spaces/${spaceId}/items/${opts.id ?? randomUUID()}`, {
+    category: opts.category ?? "pinned",
+    sortAt: now,
+    updatedAt: opts.updatedAt ?? now,
+    ciphertext: b64(randomBytes(bytes)),
+    blobIds: [],
+  });
+}
+
+/** Auth limits use fixed one-minute windows in Postgres; don't start a counting test in a window's last 3 s (it takes well under 1 s). */
+async function freshAuthWindow() {
+  const intoMinute = Date.now() % 60_000;
+  if (intoMinute > 57_000) await new Promise((r) => setTimeout(r, 60_000 - intoMinute + 100));
+}
+
+/** True once some query in this database waits on a lock, false after ~5 s. */
+async function waitForLockWait() {
+  for (let i = 0; i < 200; i++) {
+    const waiting = await pool.query("SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()");
+    if (waiting.rowCount) return true;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return false;
 }
 
 // MARK: Tests
@@ -337,6 +377,7 @@ describe("auth", () => {
       publicKey: b64(cc.keyPair().pub),
       wrappedPrivateKey: b64(randomBytes(61)),
       personalSpace: { id: randomUUID(), wrappedKey: b64(randomBytes(126)) },
+      signupCode: (await issueSignupCode(pool, null)).code,
     };
     expect((await call(null, "POST", "/v1/auth/signup", { ...base, email: alice.email.toUpperCase() })).status).toBe(409);
     const weak = await call(null, "POST", "/v1/auth/signup", { ...base, email: "weak@example.com", kdf: { ...base.kdf, iterations: 1000 } });
@@ -345,6 +386,7 @@ describe("auth", () => {
   });
 
   it("rate limits auth per email and per IP, and requests per user", async () => {
+    await freshAuthWindow();
     rebuild({ authPerMinutePerEmail: 3, authPerMinutePerIp: 5 });
     for (let i = 0; i < 3; i++) expect((await call(null, "POST", "/v1/auth/prelogin", { email: "a@example.com" })).status).toBe(200);
     const byEmail = await call(null, "POST", "/v1/auth/prelogin", { email: "a@example.com" }, "10.9.9.9");
@@ -492,16 +534,17 @@ describe("usernames", () => {
     expect(after.members[1]).toEqual({ uid: bob.uid, name: "bobby" });
   });
 
-  it("includes usernames in the group member list", async () => {
+  it("lists group members with usernames and names but no emails", async () => {
     const alice = await signUp("alice", "pw", { username: "Alice" });
     const bob = await signUp("bob");
     const group = await createGroup(alice);
     await invite(alice, group, bob);
-    const members = (await call(bob, "GET", `/v1/groups/${group.id}/members`)).body.members;
-    expect(members).toEqual([
-      { uid: alice.uid, email: alice.email, username: "Alice", role: "owner" },
-      { uid: bob.uid, email: bob.email, username: null, role: "member" },
+    const res = await call(bob, "GET", `/v1/groups/${group.id}/members`);
+    expect(res.body.members).toEqual([
+      { uid: alice.uid, username: "Alice", name: "Alice", role: "owner" },
+      { uid: bob.uid, username: null, name: bob.email.split("@")[0], role: "member" },
     ]);
+    expect(JSON.stringify(res.body)).not.toContain("@");
   });
 });
 
@@ -749,5 +792,430 @@ describe("items", () => {
     const upper = randomUUID().toUpperCase();
     expect((await call(alice, "PUT", `/v1/spaces/${alice.personalSpaceId}/items/${upper}`, { category: "history", sortAt: 1, updatedAt: 1, ciphertext: "AAAA" })).status).toBe(400);
     expect((await call(alice, "PUT", `/v1/spaces/${alice.personalSpaceId}/items/${randomUUID()}`, { category: "misc", sortAt: 1, updatedAt: 1, ciphertext: "AAAA" })).status).toBe(400);
+  });
+
+  it("accepts up to 12 blob ids", async () => {
+    const alice = await signUp("alice");
+    const space = alice.personalSpaceId;
+    const blobIds: string[] = [];
+    for (let i = 0; i < 13; i++) {
+      const id = randomUUID();
+      expect((await call(alice, "POST", `/v1/spaces/${space}/blobs`, { id, size: 10 })).status).toBe(200);
+      blobIds.push(id);
+    }
+    expect((await putItem(alice, space, alice.personalKey, { blobIds })).status).toBe(400);
+    const twelve = await putItem(alice, space, alice.personalKey, { blobIds: blobIds.slice(0, 12) });
+    expect(twelve.status).toBe(200);
+    expect((await call(alice, "GET", `/v1/spaces/${space}/changes`)).body.items[0].blobIds).toHaveLength(12);
+  });
+
+  it("refuses times more than 10 minutes ahead with clock_skew", async () => {
+    const alice = await signUp("alice");
+    const space = alice.personalSpaceId;
+    const ahead = Date.now() + 11 * 60_000;
+    for (const times of [{ updatedAt: ahead }, { sortAt: ahead }, { updatedAt: 9999 * 365 * 86_400_000 }]) {
+      const res = await putItem(alice, space, alice.personalKey, times);
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe("clock_skew");
+    }
+    const slightlyAhead = await putItem(alice, space, alice.personalKey, { updatedAt: Date.now() + 5 * 60_000, sortAt: Date.now() + 5 * 60_000 });
+    expect(slightlyAhead.status).toBe(200);
+    const del = await call(alice, "DELETE", `/v1/spaces/${space}/items/${slightlyAhead.id}?updatedAt=${ahead}`);
+    expect(del.status).toBe(400);
+    expect(del.body.error).toBe("clock_skew");
+    expect((await call(alice, "DELETE", `/v1/spaces/${space}/items/${slightlyAhead.id}?updatedAt=${Date.now() + 6 * 60_000}`)).status).toBe(200);
+  });
+
+  it("lets only the author or the group owner overwrite or delete a group item", async () => {
+    const alice = await signUp("alice");
+    const bob = await signUp("bob");
+    const carol = await signUp("carol");
+    const group = await createGroup(alice);
+    await invite(alice, group, bob);
+    await invite(alice, group, carol);
+    const item = await putItem(bob, group.id, group.sk, { updatedAt: 1000 });
+    expect(item.status).toBe(200);
+
+    const overwrite = await putItem(carol, group.id, group.sk, { id: item.id, updatedAt: 2000 });
+    expect(overwrite.status).toBe(403);
+    expect(overwrite.body.error).toBe("forbidden");
+    const remove = await call(carol, "DELETE", `/v1/spaces/${group.id}/items/${item.id}?updatedAt=2000`);
+    expect(remove.status).toBe(403);
+    expect(remove.body.error).toBe("forbidden");
+    // New items are anyone's to create.
+    expect((await putItem(carol, group.id, group.sk)).status).toBe(200);
+
+    // The author and the owner can.
+    expect((await putItem(bob, group.id, group.sk, { id: item.id, updatedAt: 1500 })).status).toBe(200);
+    expect((await putItem(alice, group.id, group.sk, { id: item.id, updatedAt: 1600 })).status).toBe(200);
+    expect((await call(alice, "DELETE", `/v1/spaces/${group.id}/items/${item.id}?updatedAt=1800`)).status).toBe(200);
+    // A tombstone isn't up for grabs either, though deleting it again is a harmless no-op.
+    expect((await putItem(carol, group.id, group.sk, { id: item.id, updatedAt: 3000 })).status).toBe(403);
+    expect((await call(carol, "DELETE", `/v1/spaces/${group.id}/items/${item.id}?updatedAt=3000`)).status).toBe(200);
+
+    const own = await putItem(bob, group.id, group.sk);
+    expect((await call(bob, "DELETE", `/v1/spaces/${group.id}/items/${own.id}?updatedAt=${Date.now()}`)).status).toBe(200);
+  });
+
+  it("never lets a cursor pass a write that commits later", async () => {
+    const alice = await signUp("alice");
+    const space = alice.personalSpaceId;
+    await putItem(alice, space, alice.personalKey);
+    const cursor = (await call(alice, "GET", `/v1/spaces/${space}/changes?since=0`)).body.nextSince;
+
+    // A second instance whose item INSERT stops right after its nextval, transaction still open.
+    const slowPool = new pg.Pool({ connectionString: pool.options.connectionString, max: 2 });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let reached!: () => void;
+    const paused = new Promise<void>((resolve) => (reached = resolve));
+    let armed = true;
+    slowPool.on("connect", (client) => {
+      const query = client.query.bind(client) as (...args: unknown[]) => unknown;
+      (client as unknown as { query: (...args: unknown[]) => unknown }).query = (...args: unknown[]) => {
+        const result = query(...args);
+        if (!armed || typeof args[0] !== "string" || !args[0].startsWith("INSERT INTO items")) return result;
+        armed = false;
+        return (result as Promise<unknown>).then(async (res) => {
+          reached();
+          await gate;
+          return res;
+        });
+      };
+    });
+    const slowApp = buildApp({ pool: slowPool, storage, limits: currentLimits });
+    try {
+      const firstId = randomUUID();
+      const first = slowApp.inject({
+        method: "PUT",
+        url: `/v1/spaces/${space}/items/${firstId}`,
+        headers: { authorization: `Bearer ${alice.token}` },
+        payload: { category: "history", sortAt: Date.now(), updatedAt: Date.now(), ciphertext: b64(randomBytes(40)), blobIds: [] },
+      });
+      await paused;
+      // T2 starts after T1 took its seq. Without the space lock it would commit first with a higher seq.
+      const second = putItem(alice, space, alice.personalKey);
+      await Promise.race([second, waitForLockWait()]);
+      const mid = (await call(alice, "GET", `/v1/spaces/${space}/changes?since=${cursor}`)).body;
+      release();
+      const [t1, t2] = await Promise.all([first, second]);
+      expect(t1.statusCode).toBe(200);
+      expect(t2.status).toBe(200);
+      const rest = (await call(alice, "GET", `/v1/spaces/${space}/changes?since=${mid.nextSince}`)).body;
+      const seen = [...mid.items, ...rest.items].map((i: { id: string }) => i.id);
+      expect(seen).toContain(firstId);
+      expect(seen).toContain(t2.id);
+    } finally {
+      release();
+      await slowApp.close();
+      await slowPool.end();
+    }
+  });
+});
+
+describe("sign-up invites", () => {
+  it("needs a sign-up code or an open group invite", async () => {
+    const none = await trySignUp("nobody", "pw", { signupCode: undefined });
+    expect(none.res.status).toBe(403);
+    expect(none.res.body.error).toBe("invite_required");
+    for (const bad of ["AAAA-AAAA-AAAA-AAAA", "not a code", ""]) {
+      const res = (await trySignUp("guess", "pw", { signupCode: bad })).res;
+      expect(res.status, bad).toBe(403);
+      expect(res.body.error).toBe("invite_invalid");
+    }
+    expect((await trySignUp("guess", "pw", { groupInviteId: "0".repeat(64) })).res.body.error).toBe("invite_invalid");
+    expect((await pool.query("SELECT 1 FROM users")).rowCount).toBe(0);
+  });
+
+  it("consumes a sign-up code, typed sloppily, exactly once", async () => {
+    const alice = await signUp("alice");
+    const created = await call(alice, "POST", "/v1/signup-codes");
+    const sloppy = created.body.code.toLowerCase().replace(/-/g, " ").replace(/O/gi, "0");
+    const { res, user } = await trySignUp("bob", "pw", { signupCode: sloppy });
+    expect(res.status).toBe(201);
+    const used = await trySignUp("carol", "pw", { signupCode: created.body.code });
+    expect(used.res.status).toBe(403);
+    expect(used.res.body.error).toBe("invite_invalid");
+    const { rows } = await pool.query("SELECT used_by FROM signup_codes WHERE id = $1", [created.body.id]);
+    expect(rows[0].used_by).toBe(user.uid);
+  });
+
+  it("refuses expired codes, and a failed sign-up doesn't use the code up", async () => {
+    const alice = await signUp("alice");
+    const code = (await call(alice, "POST", "/v1/signup-codes")).body.code;
+    expect((await trySignUp("taken", "pw", { signupCode: code, email: alice.email })).res.status).toBe(409);
+    expect((await call(alice, "GET", "/v1/signup-codes")).body.codes).toHaveLength(1);
+    await pool.query("UPDATE signup_codes SET expires_at = now() - interval '1 second'");
+    expect((await trySignUp("late", "pw", { signupCode: code })).res.body.error).toBe("invite_invalid");
+  });
+
+  it("accepts an open group invite without consuming it, so the new account can join", async () => {
+    const alice = await signUp("alice");
+    const group = await createGroup(alice);
+    const created = await createInvite(alice, group);
+    const id = cc.inviteId(cc.parseInviteCode(created.code)!);
+    const { res, user } = await trySignUp("bob", "pw", { groupInviteId: id });
+    expect(res.status).toBe(201);
+    const bob = { ...user, token: res.body.token };
+    expect((await redeem(bob, created.code)).status).toBe(201);
+    // Joined, so the invite is gone and can't let anyone else in.
+    expect((await trySignUp("carol", "pw", { groupInviteId: id })).res.body.error).toBe("invite_invalid");
+    await createInvite(alice, group);
+    await pool.query("UPDATE invites SET expires_at = now() - interval '1 second'");
+    const expired = (await pool.query<{ id: string }>("SELECT id FROM invites")).rows[0]!.id;
+    expect((await trySignUp("dave", "pw", { groupInviteId: expired })).res.body.error).toBe("invite_invalid");
+  });
+});
+
+describe("sign-up codes", () => {
+  it("creates, lists and revokes codes, storing only a hash", async () => {
+    const alice = await signUp("alice");
+    const bob = await signUp("bob");
+    const created = await call(alice, "POST", "/v1/signup-codes");
+    expect(created.status).toBe(201);
+    expect(created.body.code).toMatch(/^[A-Z2-7]{4}(-[A-Z2-7]{4}){3}$/);
+    expect(created.body.expiresAt).toBeGreaterThan(Date.now() + 13.9 * 86_400_000);
+    expect(created.body.expiresAt).toBeLessThan(Date.now() + 14.1 * 86_400_000);
+    const stored = await pool.query("SELECT * FROM signup_codes WHERE id = $1", [created.body.id]);
+    expect(JSON.stringify(stored.rows)).not.toContain(created.body.code.replace(/-/g, ""));
+
+    const listed = (await call(alice, "GET", "/v1/signup-codes")).body.codes;
+    expect(listed).toEqual([{ id: created.body.id, createdAt: expect.any(Number), expiresAt: created.body.expiresAt }]);
+    expect((await call(bob, "GET", "/v1/signup-codes")).body.codes).toEqual([]);
+
+    expect((await call(bob, "DELETE", `/v1/signup-codes/${created.body.id}`)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/signup-codes/${created.body.id}`)).status).toBe(204);
+    expect((await call(alice, "DELETE", `/v1/signup-codes/${created.body.id}`)).status).toBe(404);
+    expect((await call(alice, "GET", "/v1/signup-codes")).body.codes).toEqual([]);
+    expect((await trySignUp("late", "pw", { signupCode: created.body.code })).res.body.error).toBe("invite_invalid");
+  });
+
+  it("allows at most 10 open codes per user", async () => {
+    const alice = await signUp("alice");
+    const codes: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      const res = await call(alice, "POST", "/v1/signup-codes");
+      expect(res.status).toBe(201);
+      codes.push(res.body.code);
+    }
+    const eleventh = await call(alice, "POST", "/v1/signup-codes");
+    expect(eleventh.status).toBe(429);
+    expect(eleventh.body.error).toBe("too_many_codes");
+    // A used code no longer counts, and neither does an expired one.
+    expect((await trySignUp("bob", "pw", { signupCode: codes[0] })).res.status).toBe(201);
+    expect((await call(alice, "GET", "/v1/signup-codes")).body.codes).toHaveLength(9);
+    expect((await call(alice, "POST", "/v1/signup-codes")).status).toBe(201);
+    await pool.query(
+      "UPDATE signup_codes SET expires_at = now() - interval '1 second' WHERE id = (SELECT id FROM signup_codes WHERE created_by = $1 AND used_at IS NULL LIMIT 1)",
+      [alice.uid],
+    );
+    expect((await call(alice, "POST", "/v1/signup-codes")).status).toBe(201);
+    expect((await call(alice, "POST", "/v1/signup-codes")).status).toBe(429);
+  });
+});
+
+describe("sessions", () => {
+  it("lists devices and revokes others or the current one", async () => {
+    const alice = await signUp("alice");
+    const bob = await signUp("bob");
+    const second = await logIn(alice.email, alice.password);
+    await call(second.body.token, "GET", "/v1/account");
+    const listed = (await call(alice, "GET", "/v1/sessions")).body.sessions;
+    expect(listed).toHaveLength(2);
+    for (const s of listed) {
+      expect(Object.keys(s).sort()).toEqual(["createdAt", "current", "deviceName", "id", "lastUsedAt"]);
+      expect(s.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    }
+    const mine = listed.find((s: { current: boolean }) => s.current);
+    const other = listed.find((s: { current: boolean }) => !s.current);
+    expect(mine.deviceName).toBe("test");
+    expect(other.deviceName).toBeNull();
+
+    // Someone else's session id is unknown to you.
+    expect((await call(bob, "DELETE", `/v1/sessions/${other.id}`)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/sessions/${randomUUID()}`)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/sessions/${other.id}`)).status).toBe(204);
+    expect((await call(second.body.token, "GET", "/v1/account")).status).toBe(401);
+    expect((await call(alice, "GET", "/v1/sessions")).body.sessions).toHaveLength(1);
+    expect((await call(alice, "DELETE", `/v1/sessions/${mine.id}`)).status).toBe(204);
+    expect((await call(alice, "GET", "/v1/account")).status).toBe(401);
+    expect((await call(bob, "GET", "/v1/sessions")).body.sessions).toHaveLength(1);
+  });
+});
+
+describe("quotas", () => {
+  it("caps a group's bytes, with scope group", async () => {
+    rebuild({ groupBytes: 1000 });
+    const alice = await signUp("alice");
+    const bob = await signUp("bob");
+    const group = await createGroup(alice);
+    await invite(alice, group, bob);
+    const first = randomUUID();
+    expect((await rawPut(bob, group.id, 600, { id: first })).status).toBe(200);
+    const over = await rawPut(alice, group.id, 500);
+    expect(over.status).toBe(413);
+    expect(over.body).toMatchObject({ error: "quota_exceeded", scope: "group" });
+    const blob = await call(alice, "POST", `/v1/spaces/${group.id}/blobs`, { id: randomUUID(), size: 500 });
+    expect(blob.status).toBe(413);
+    expect(blob.body.scope).toBe("group");
+    // Replacing an item only counts the difference; personal spaces aren't group-limited.
+    expect((await rawPut(bob, group.id, 900, { id: first })).status).toBe(200);
+    expect((await rawPut(alice, alice.personalSpaceId, 1500)).status).toBe(200);
+  });
+
+  it("caps a group's live items, counting history after the trim", async () => {
+    rebuild({ groupItems: 3, historyPerSpace: 2 });
+    const alice = await signUp("alice");
+    const group = await createGroup(alice);
+    for (let i = 0; i < 2; i++) expect((await putItem(alice, group.id, group.sk, { sortAt: i + 1 })).status).toBe(200);
+    const pinned = await putItem(alice, group.id, group.sk, { category: "pinned" });
+    expect(pinned.status).toBe(200);
+    const over = await putItem(alice, group.id, group.sk, { category: "snippet" });
+    expect(over.status).toBe(413);
+    expect(over.body).toMatchObject({ error: "quota_exceeded", scope: "group" });
+    // History still flows: the oldest is trimmed, so the count stays at 3.
+    expect((await putItem(alice, group.id, group.sk, { sortAt: 10 })).body.trimmed).toHaveLength(1);
+    // Updating a live item is fine; after a deletion there's room again.
+    expect((await putItem(alice, group.id, group.sk, { id: pinned.id, category: "pinned" })).status).toBe(200);
+    await call(alice, "DELETE", `/v1/spaces/${group.id}/items/${pinned.id}?updatedAt=${Date.now() + 1000}`);
+    expect((await putItem(alice, group.id, group.sk, { category: "snippet" })).status).toBe(200);
+    for (let i = 0; i < 4; i++) expect((await putItem(alice, alice.personalSpaceId, alice.personalKey, { category: "pinned" })).status).toBe(200);
+  });
+
+  it("caps the whole server, with scope server", async () => {
+    rebuild({ totalBytes: 1000 });
+    const alice = await signUp("alice");
+    const bob = await signUp("bob");
+    expect((await rawPut(alice, alice.personalSpaceId, 600)).status).toBe(200);
+    const over = await rawPut(bob, bob.personalSpaceId, 500);
+    expect(over.status).toBe(413);
+    expect(over.body).toMatchObject({ error: "quota_exceeded", scope: "server" });
+    const blob = await call(bob, "POST", `/v1/spaces/${bob.personalSpaceId}/blobs`, { id: randomUUID(), size: 500 });
+    expect(blob.status).toBe(413);
+    expect(blob.body.scope).toBe("server");
+    expect((await rawPut(bob, bob.personalSpaceId, 300)).status).toBe(200);
+  });
+});
+
+describe("account deletion in groups", () => {
+  it("tombstones items the user wrote in other people's groups and drops their blobs", async () => {
+    const alice = await signUp("alice");
+    const bob = await signUp("bob");
+    const group = await createGroup(alice);
+    await invite(alice, group, bob);
+    const used = randomUUID();
+    const pending = randomUUID();
+    await call(bob, "POST", `/v1/spaces/${group.id}/blobs`, { id: used, size: 10 });
+    await call(bob, "POST", `/v1/spaces/${group.id}/blobs`, { id: pending, size: 10 });
+    const bobs = await putItem(bob, group.id, group.sk, { blobIds: [used], updatedAt: 1000 });
+    const alices = await putItem(alice, group.id, group.sk);
+    const before = (await call(alice, "GET", `/v1/spaces/${group.id}/changes`)).body.nextSince;
+
+    expect((await call(bob, "DELETE", "/v1/account", { authKey: await authKeyOf(bob) })).status).toBe(204);
+    expect(deletedPaths.sort()).toEqual([`${group.id}/${used}`, `${group.id}/${pending}`].sort());
+    const changes = (await call(alice, "GET", `/v1/spaces/${group.id}/changes?since=${before}`)).body.items;
+    expect(changes).toHaveLength(1);
+    expect(changes[0]).toMatchObject({ id: bobs.id, deleted: "user", ciphertext: null, blobIds: [], authorUid: null });
+    expect(changes[0].updatedAt).toBeGreaterThan(1000);
+    const live = await pool.query("SELECT id FROM items WHERE space_id = $1 AND deleted IS NULL", [group.id]);
+    expect(live.rows.map((r) => r.id)).toEqual([alices.id]);
+    expect((await pool.query("SELECT 1 FROM blobs")).rowCount).toBe(0);
+    // A stale client can't bring it back with its old version.
+    expect((await putItem(alice, group.id, group.sk, { id: bobs.id, updatedAt: 1000 })).status).toBe(409);
+  });
+});
+
+describe("blob upload URLs", () => {
+  it("adds the create-only header on request and won't re-issue a URL for a blob in use", async () => {
+    const alice = await signUp("alice");
+    const space = alice.personalSpaceId;
+    const plain = await call(alice, "POST", `/v1/spaces/${space}/blobs`, { id: randomUUID(), size: 10 });
+    expect(plain.body.headers).not.toHaveProperty("x-goog-if-generation-match");
+    const blobId = randomUUID();
+    const guarded = await call(alice, "POST", `/v1/spaces/${space}/blobs`, { id: blobId, size: 10, ifGenerationMatch: true });
+    expect(guarded.body.headers).toMatchObject({ "x-goog-if-generation-match": "0", "x-goog-content-length-range": "0,10" });
+    // Still pending: asking again is fine.
+    expect((await call(alice, "POST", `/v1/spaces/${space}/blobs`, { id: blobId, size: 10, ifGenerationMatch: true })).status).toBe(200);
+    expect((await putItem(alice, space, alice.personalKey, { blobIds: [blobId] })).status).toBe(200);
+    const again = await call(alice, "POST", `/v1/spaces/${space}/blobs`, { id: blobId, size: 10, ifGenerationMatch: true });
+    expect(again.status).toBe(409);
+    expect(again.body.error).toBe("conflict");
+  });
+});
+
+describe("client IPs, auth limits and logs", () => {
+  it("uses the last X-Forwarded-For hop, so a client can't spoof its IP", async () => {
+    await freshAuthWindow();
+    rebuild({ authPerMinutePerIp: 2 });
+    for (const [i, spoof] of ["1.1.1.1", "2.2.2.2"].entries()) {
+      expect((await call(null, "POST", "/v1/auth/prelogin", { email: `s${i}@example.com` }, `${spoof}, 10.0.0.7`)).status).toBe(200);
+    }
+    expect((await call(null, "POST", "/v1/auth/prelogin", { email: "s3@example.com" }, "3.3.3.3, 10.0.0.7")).status).toBe(429);
+    expect((await call(null, "POST", "/v1/auth/prelogin", { email: "s4@example.com" }, "10.0.0.7, 10.0.0.8")).status).toBe(200);
+  });
+
+  it("counts auth attempts across instances, keyed by HMAC", async () => {
+    await freshAuthWindow();
+    rebuild({ authPerMinutePerEmail: 2 });
+    const other = buildApp({ pool, storage, limits: currentLimits });
+    try {
+      expect((await call(null, "POST", "/v1/auth/prelogin", { email: "x@example.com" })).status).toBe(200);
+      const res = await other.inject({ method: "POST", url: "/v1/auth/prelogin", payload: { email: "x@example.com" }, headers: { "x-forwarded-for": "10.1.1.1" } });
+      expect(res.statusCode).toBe(200);
+      const third = await call(null, "POST", "/v1/auth/prelogin", { email: "x@example.com" }, "10.2.2.2");
+      expect(third.status).toBe(429);
+      expect(third.body.retryAfter).toBeGreaterThan(0);
+      expect(third.body.retryAfter).toBeLessThanOrEqual(60);
+    } finally {
+      await other.close();
+    }
+    const stored = await pool.query<{ key: Buffer }>("SELECT key FROM auth_attempts");
+    expect(stored.rows.length).toBeGreaterThan(0);
+    expect(stored.rows.map((r) => r.key.toString("latin1")).join()).not.toMatch(/example\.com|10\.0\.0\.1/);
+  });
+
+  it("runs scrypt a few at a time and turns away the overflow", async () => {
+    const alice = await signUp("alice");
+    rebuild({ scryptConcurrency: 1, scryptQueue: 1 });
+    const pre = await call(null, "POST", "/v1/auth/prelogin", { email: alice.email });
+    const authKey = b64(cc.passwordKeys(alice.password, Buffer.from(pre.body.kdf.salt, "base64"), ITERATIONS).authKey);
+    const results = await Promise.all(
+      Array.from({ length: 6 }, (_, i) => call(null, "POST", "/v1/auth/login", { email: alice.email, authKey }, `10.3.0.${i}`)),
+    );
+    const statuses = results.map((r) => r.status);
+    expect(statuses.filter((s) => s === 200).length).toBeGreaterThanOrEqual(2);
+    const busy = results.filter((r) => r.status === 429);
+    expect(busy.length).toBeGreaterThan(0);
+    expect(busy[0]!.body.error).toBe("rate_limited");
+    expect(Number(busy[0]!.headers["retry-after"])).toBeGreaterThan(0);
+  });
+
+  it("queues semaphore work in order and refuses beyond the queue", async () => {
+    const gate = new Semaphore(1, 1);
+    const order: number[] = [];
+    let open!: () => void;
+    const first = gate.run(() => new Promise<void>((resolve) => (open = resolve)).then(() => order.push(1)));
+    const second = gate.run(async () => order.push(2));
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    expect(gate.run(async () => order.push(3))).toBeNull();
+    open();
+    await Promise.all([first, second]);
+    expect(order).toEqual([1, 2]);
+    expect(await gate.run(async () => "free again")).toBe("free again");
+  });
+
+  it("keeps IPs and emails out of request logs", async () => {
+    const lines: string[] = [];
+    app = buildApp({ pool, storage, limits: currentLimits, logger: true, logStream: { write: (line) => lines.push(line) } });
+    const alice = await signUp("alice");
+    await logIn(alice.email, alice.password, "10.4.4.4");
+    await call(alice, "GET", "/v1/account");
+    const log = lines.join("");
+    expect(log).toContain("/v1/auth/login");
+    expect(log).not.toContain("10.4.4.4");
+    expect(log).not.toContain("10.0.0.1");
+    expect(log).not.toContain("127.0.0.1");
+    expect(log).not.toContain("example.com");
   });
 });
