@@ -233,7 +233,7 @@ struct APIKeyDetectorTests {
         ("gsk_abc", [.groq]),
         ("xai-abc", [.xai]),
         ("sk-proj-abc", [.openAI]),
-        ("sk-0123456789abcdef0123456789abcdef", [.deepSeek, .openAI]),
+        ("sk-" + String(repeating: "0123456789abcdef", count: 2), [.deepSeek, .openAI]),
         ("sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv", [.openAI, .deepSeek]),
         ("Ab3dEfGhIjKlMnOpQrStUvWxYz012345", [.mistral]),
         ("hello world", []),

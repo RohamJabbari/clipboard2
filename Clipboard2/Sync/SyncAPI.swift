@@ -51,6 +51,32 @@ nonisolated struct SignupRequest: Codable, Sendable {
     var personalSpace: PersonalSpace
     var deviceName: String?
     var username: String?
+    /// Sign-up is invite-only: a sign-up code, or the `inviteId` of an open group invite.
+    var signupCode: String?
+    var groupInviteId: String?
+}
+
+/// `POST /v1/signup-codes`: a fresh code, shown once.
+nonisolated struct SignupCode: Codable, Sendable, Equatable {
+    var id: String
+    var code: String
+    var expiresAt: Int64
+}
+
+/// `GET /v1/signup-codes`: an unused code (the code itself is never listed again).
+nonisolated struct OpenSignupCode: Codable, Sendable, Equatable, Identifiable {
+    var id: String
+    var createdAt: Int64
+    var expiresAt: Int64
+}
+
+/// `GET /v1/sessions`: one signed-in device of the account.
+nonisolated struct RemoteDevice: Codable, Sendable, Equatable, Identifiable {
+    var id: String
+    var deviceName: String?
+    var createdAt: Int64
+    var lastUsedAt: Int64
+    var current: Bool
 }
 
 /// `PUT /v1/account/password`.
@@ -104,12 +130,17 @@ nonisolated struct MemberName: Codable, Sendable, Equatable {
     var name: String
 }
 
+/// A group member as the server lists them. No email (servers from before October 2026 still
+/// send one); `name` is the username or the email's part before the @.
 nonisolated struct RemoteMember: Codable, Sendable, Equatable, Identifiable {
     var uid: String
-    var email: String
+    var email: String?
     var role: String
     var username: String?
+    var name: String?
     var id: String { uid }
+
+    var displayName: String { username ?? name ?? email.map { String($0.prefix { $0 != "@" }) } ?? "Member" }
 }
 
 nonisolated struct RemoteItem: Codable, Sendable, Equatable {
@@ -158,35 +189,66 @@ nonisolated struct BlobDownloadTicket: Codable, Sendable, Equatable {
 }
 
 nonisolated enum SyncAPIError: LocalizedError, Equatable {
-    case server(status: Int, code: String, message: String, retryAfter: Int?)
+    /// `scope` says which quota a `quota_exceeded` hit: `user` (absent), `group` or `server`.
+    case server(status: Int, code: String, message: String, retryAfter: Int?, scope: String? = nil)
     case network(String)
     case invalidResponse
 
     var code: String? {
-        if case .server(_, let code, _, _) = self { return code }
+        if case .server(_, let code, _, _, _) = self { return code }
         return nil
     }
 
     var status: Int? {
-        if case .server(let status, _, _, _) = self { return status }
+        if case .server(let status, _, _, _, _) = self { return status }
         return nil
     }
 
-    /// Retrying the same request won't help (too big, over quota, rejected).
+    var retryAfter: Int? {
+        if case .server(_, _, _, let retryAfter, _) = self { return retryAfter }
+        return nil
+    }
+
+    var scope: String? {
+        if case .server(_, _, _, _, let scope) = self { return scope }
+        return nil
+    }
+
+    var isRateLimited: Bool { status == 429 }
+
+    var isNetwork: Bool {
+        if case .network = self { return true }
+        return false
+    }
+
+    /// Retrying the same item write won't help (too big, over quota, rejected, clock off, or
+    /// someone else's item in a group). `forbidden` on a read means the space is gone instead.
     var isPermanentForItem: Bool {
-        ["too_large", "quota_exceeded", "invalid"].contains(code ?? "")
+        ["too_large", "quota_exceeded", "invalid", "clock_skew", "forbidden"].contains(code ?? "")
     }
 
     var errorDescription: String? {
         switch self {
         case .network(let message): "Can't reach the sync service (\(message))."
         case .invalidResponse: "The sync service sent an unexpected response."
-        case .server(let status, let code, let message, _):
+        case .server(let status, let code, let message, let retryAfter, let scope):
             switch code {
-            case "quota_exceeded": message.isEmpty ? "Your sync storage is full." : message
-            case "rate_limited": "Too many requests. Try again in a minute."
+            case "quota_exceeded":
+                switch scope {
+                case "group": "This group's sync storage is full. Delete some of its items to make room."
+                case "server": "The sync service is full right now. Try again later."
+                default: message.isEmpty ? "Your sync storage is full." : message
+                }
+            case "rate_limited":
+                retryAfter.map { "Too many requests. Try again in \($0 < 60 ? "\($0) seconds" : "\(($0 + 59) / 60) minutes")." }
+                    ?? "Too many requests. Try again in a minute."
             case "invalid_credentials": "Wrong email or password."
             case "unauthenticated": "Your sync session ended. Enter your password again."
+            case "clock_skew": "Your clock is off, so sync can't save changes. Turn on “Set time and date automatically” in System Settings → General → Date & Time."
+            case "forbidden": "Only the person who shared an item, or the group's owner, can change or delete it."
+            case "invite_required": "Sign-up needs an invite code. Ask someone who uses Clipboard2 Sync for one."
+            case "invite_invalid": "This invite code is unknown, already used or expired. Ask for a new one."
+            case "too_many_codes": "You already have 10 open invite codes. Revoke one or wait until one is used."
             default: message.isEmpty ? "Sync failed (\(status) \(code))." : message
             }
         }
@@ -207,6 +269,14 @@ nonisolated protocol SyncService: Sendable {
     func setUsername(_ username: String) async throws -> String
     func account() async throws -> RemoteAccount
     func deleteAccount(authKey: Data) async throws
+
+    // Sign-up codes and devices
+    func createSignupCode() async throws -> SignupCode
+    func signupCodes() async throws -> [OpenSignupCode]
+    func revokeSignupCode(id: String) async throws
+    func sessions() async throws -> [RemoteDevice]
+    /// Signs that device out. It may be this one.
+    func revokeSession(id: String) async throws
 
     func spaces() async throws -> [RemoteSpace]
     func createGroup(id: String, encryptedName: Data, wrappedKey: Data) async throws -> RemoteSpace
@@ -246,7 +316,7 @@ nonisolated struct SyncAPI: SyncService {
     nonisolated private struct MembersBody: Codable { var members: [RemoteMember] }
     nonisolated private struct SavedBody: Codable { var seq: Int64; var trimmed: [String]? }
     nonisolated private struct ConflictBody: Codable { var current: RemoteItem }
-    nonisolated private struct ErrorBody: Codable { var error: String?; var message: String? }
+    nonisolated private struct ErrorBody: Codable { var error: String?; var message: String?; var scope: String?; var retryAfter: Int? }
     nonisolated private struct GroupBody: Codable { var id: String; var encryptedName: Data; var wrappedKey: Data }
     nonisolated private struct RenameBody: Codable { var encryptedName: Data }
     nonisolated private struct EmailBody: Codable { var email: String }
@@ -256,7 +326,9 @@ nonisolated struct SyncAPI: SyncService {
     nonisolated private struct InviteBody: Codable { var inviteId: String; var sealedKey: Data }
     nonisolated private struct InvitesBody: Codable { var invites: [PendingInvite] }
     nonisolated private struct AcceptBody: Codable { var wrappedKey: Data }
-    nonisolated private struct BlobBody: Codable { var id: String; var size: Int }
+    nonisolated private struct BlobBody: Codable { var id: String; var size: Int; var ifGenerationMatch = true }
+    nonisolated private struct SignupCodesBody: Codable { var codes: [OpenSignupCode] }
+    nonisolated private struct SessionsBody: Codable { var sessions: [RemoteDevice] }
 
     // MARK: Auth and account
 
@@ -292,6 +364,32 @@ nonisolated struct SyncAPI: SyncService {
 
     func deleteAccount(authKey: Data) async throws {
         _ = try await send("DELETE", "v1/account", body: AuthKeyBody(authKey: authKey), as: Empty.self)
+    }
+
+    // MARK: Sign-up codes and devices
+
+    func createSignupCode() async throws -> SignupCode {
+        try await send("POST", "v1/signup-codes", body: Empty(), as: SignupCode.self)
+    }
+
+    func signupCodes() async throws -> [OpenSignupCode] {
+        try await send("GET", "v1/signup-codes", as: SignupCodesBody.self).codes
+    }
+
+    func revokeSignupCode(id: String) async throws {
+        _ = try await send("DELETE", "v1/signup-codes/\(Self.escaped(id))", as: Empty.self)
+    }
+
+    func sessions() async throws -> [RemoteDevice] {
+        try await send("GET", "v1/sessions", as: SessionsBody.self).sessions
+    }
+
+    func revokeSession(id: String) async throws {
+        _ = try await send("DELETE", "v1/sessions/\(Self.escaped(id))", as: Empty.self)
+    }
+
+    private static func escaped(_ id: String) -> String {
+        id.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-_"))) ?? id
     }
 
     // MARK: Spaces and groups
@@ -340,7 +438,7 @@ nonisolated struct SyncAPI: SyncService {
     func invite(id: String) async throws -> InviteDetails? {
         do {
             return try await send("GET", "v1/invites/\(id)", as: InviteDetails.self)
-        } catch SyncAPIError.server(404, _, _, _) {
+        } catch SyncAPIError.server(404, _, _, _, _) {
             return nil
         }
     }
@@ -382,14 +480,21 @@ nonisolated struct SyncAPI: SyncService {
     }
 
     /// PUT to the signed GCS URL with exactly the headers the server returned.
+    static let generationMatchHeader = "x-goog-if-generation-match"
+
     func uploadBlob(_ ticket: BlobUploadTicket, data: Data) async throws {
         var request = URLRequest(url: ticket.url)
         request.httpMethod = ticket.method
         for (name, value) in ticket.headers { request.setValue(value, forHTTPHeaderField: name) }
+        // Registered with `ifGenerationMatch`: the signed URL requires this, so a blob is never overwritten.
+        if request.value(forHTTPHeaderField: Self.generationMatchHeader) == nil {
+            request.setValue("0", forHTTPHeaderField: Self.generationMatchHeader)
+        }
         request.httpBody = data
         request.timeoutInterval = 120
         let (_, response) = try await perform(request)
-        guard (200..<300).contains(response.statusCode) else {
+        // 412: this blob id is already uploaded, which is all we wanted.
+        guard (200..<300).contains(response.statusCode) || response.statusCode == 412 else {
             throw SyncAPIError.server(status: response.statusCode, code: "upload_failed", message: "Blob upload failed", retryAfter: nil)
         }
     }
@@ -453,9 +558,9 @@ nonisolated struct SyncAPI: SyncService {
         }
         guard (200..<300).contains(status) else {
             let body = try? Self.decoder.decode(ErrorBody.self, from: data)
-            let retryAfter = response.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init)
-            throw SyncAPIError.server(status: status, code: body?.error ?? "http_\(status)",
-                                      message: body?.message ?? "", retryAfter: retryAfter)
+            let retryAfter = response.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init) ?? body?.retryAfter
+            throw SyncAPIError.server(status: status, code: body?.error ?? (status == 429 ? "rate_limited" : "http_\(status)"),
+                                      message: body?.message ?? "", retryAfter: retryAfter, scope: body?.scope)
         }
         if status == 204 || data.isEmpty, let empty = Empty() as? T { return empty }
         do {

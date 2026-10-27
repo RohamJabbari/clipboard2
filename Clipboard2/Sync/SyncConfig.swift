@@ -18,6 +18,8 @@ nonisolated enum SyncConfig {
     static let keychainService = (Bundle.main.bundleIdentifier ?? "at.softmaze.Clippy") + ".sync"
 
     static let kdfIterations = 600_000
+    /// PBKDF2 iterations a prelogin may ask for; anything else is refused before deriving.
+    static let kdfIterationRange = 600_000...10_000_000
     /// Newest history items kept per space, on the server and locally for groups.
     static let historyLimit = 200
     static let maxItemCiphertext = 2 * 1024 * 1024
@@ -26,4 +28,12 @@ nonisolated enum SyncConfig {
     static let maxFilesPerItem = 10
     static let changesPageSize = 500
     static let debounce: Duration = .seconds(3)
+    /// Polling cadence: while the quick panel is open, while the user was active in the last
+    /// `activeWindow` (a copy, paste, panel or menu), and otherwise.
+    static let pollWhilePanelOpen: Duration = .seconds(3)
+    static let pollWhileActive: Duration = .seconds(15)
+    static let pollWhileIdle: Duration = .seconds(60)
+    static let activeWindow: TimeInterval = 5 * 60
+    /// Synced Files folders without an item are swept once they are this old.
+    static let orphanedFilesAge: TimeInterval = 60 * 60
 }

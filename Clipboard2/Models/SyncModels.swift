@@ -17,6 +17,15 @@ final class SyncMeta {
     var blobIds: [String] = []
     /// Who last wrote the item on the server (shown as "copied by" in groups).
     var authorUid: String?
+    /// File clips: `path|size` of each local file → the blob holding its contents. A file whose
+    /// size changed no longer matches, so it's uploaded again; one that's gone drops out.
+    var fileBlobs: [String: String] = [:]
+    /// A cheap digest of the local item's fields when it was last pushed or applied. While it
+    /// matches, a tick skips the item without building and hashing its payload.
+    var localStamp: String = ""
+    /// Personal history the server no longer has after a full resync. It stays on this Mac but is
+    /// never pushed (that would bring back items deleted elsewhere), unless it's copied again.
+    var detached = false
 
     init(localId: String, spaceId: String, category: String) {
         self.localId = localId
@@ -41,6 +50,10 @@ final class SyncSpace {
     var authorsBackfilled = false
     /// Highest `seq` applied from `/changes`.
     var since: Int64 = 0
+    /// A full resync (`resetRequired`) is under way: the ids seen so far, kept across launches so
+    /// an interrupted one resumes instead of starting over or forgetting what it saw.
+    var resyncing = false
+    var resyncSeen: [String] = []
 
     init(id: String, kind: String) {
         self.id = id

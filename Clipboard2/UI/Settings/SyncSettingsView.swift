@@ -24,6 +24,8 @@ struct SyncSettingsView: View {
             case .signedIn(let email):
                 SyncStatusSection(sync: sync, email: email)
                 SyncGroupsSection(sync: sync)
+                SyncDevicesSection(sync: sync)
+                InviteSomeoneSection(sync: sync)
                 SyncAccountSection(sync: sync)
             }
         }
@@ -75,6 +77,7 @@ private struct SyncSignInSection: View {
     @State private var password = ""
     @State private var confirm = ""
     @State private var understood = false
+    @State private var inviteCode = ""
 
     private static let minimumPasswordLength = 8
 
@@ -83,6 +86,7 @@ private struct SyncSignInSection: View {
         if address.isEmpty || !address.contains("@") { return "Enter your email address." }
         if password.isEmpty { return "Enter a password." }
         guard creating else { return nil }
+        if inviteCode.trimmingCharacters(in: .whitespaces).isEmpty { return "Enter your invite code." }
         if let problem = SyncAccount.usernameProblem(username) { return problem }
         if password.count < Self.minimumPasswordLength { return "Use at least \(Self.minimumPasswordLength) characters." }
         if confirm != password { return "The passwords don't match." }
@@ -98,6 +102,10 @@ private struct SyncSignInSection: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
+            if creating {
+                TextField("Invite code", text: $inviteCode, prompt: Text("From someone who uses Sync"))
+                    .font(.body.monospaced())
+            }
             TextField("Email", text: $email, prompt: Text("you@example.com"))
                 .textContentType(.username)
             if creating {
@@ -125,22 +133,27 @@ private struct SyncSignInSection: View {
         } header: {
             Text("Sync")
         } footer: {
-            Text("Keeps recent history (newest 200 items), pinned items, snippets and secrets in step across your Macs and PCs, and shares items with groups. Everything is encrypted on this Mac before upload — the server can't read it.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Keeps recent history (newest 200 items), pinned items, snippets and secrets in step across your Macs and PCs, and shares items with groups. Everything is encrypted on this Mac before upload — the server can't read it. New accounts need an invite code: a sign-up code, or a group's invite code (you join that group right away).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if creating {
+                    // TODO(merge): PrivacyNoticeLink()
+                }
+            }
         }
         .onChange(of: creating) { sync.clearMessages() }
     }
 
     private func submit() {
         guard problem == nil else { return }
-        let (email, password, username) = (email, password, username)
+        let (email, password, username, inviteCode) = (email, password, username, inviteCode)
         self.password = ""
         confirm = ""
         understood = false
         Task {
             if creating {
-                await sync.signUp(email: email, password: password, username: username)
+                await sync.signUp(email: email, password: password, username: username, inviteCode: inviteCode)
             } else {
                 await sync.signIn(email: email, password: password)
             }
@@ -388,12 +401,7 @@ private struct GroupManageSheet: View {
                     }
                     ForEach(members) { member in
                         HStack {
-                            if let username = member.username {
-                                Text(username)
-                                Text(member.email).font(.caption).foregroundStyle(.secondary)
-                            } else {
-                                Text(member.email)
-                            }
+                            Text(member.displayName)
                             Spacer()
                             Text(member.role == "owner" ? "Owner" : "Member").font(.caption).foregroundStyle(.secondary)
                             if group.isOwner && member.role != "owner" {
@@ -406,7 +414,7 @@ private struct GroupManageSheet: View {
                                     Image(systemName: "minus.circle")
                                 }
                                 .buttonStyle(.borderless)
-                                .accessibilityLabel("Remove \(member.email)")
+                                .accessibilityLabel("Remove \(member.displayName)")
                             }
                         }
                     }
@@ -456,7 +464,7 @@ private struct GroupManageSheet: View {
                     } header: {
                         Text("Invites")
                     } footer: {
-                        Text("Anyone with the code can join, so send it privately. They need their own Clipboard2 Sync account and enter it under Settings → Sync → Join a Group.")
+                        Text("Anyone with the code can join, so send it privately. With an account, they enter it under Settings → Sync → Join a Group; someone new uses it as the invite code when creating their account.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -589,6 +597,153 @@ private struct JoinGroupSheet: View {
     private func look() {
         guard !code.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         run { preview = try await sync.previewInvite(code: code) }
+    }
+
+    private func run(_ operation: @escaping () async throws -> Void) {
+        busy = true
+        error = nil
+        Task {
+            do {
+                try await operation()
+            } catch {
+                self.error = error.localizedDescription
+            }
+            busy = false
+        }
+    }
+}
+
+/// Every device signed in to the account, with Sign Out for each.
+private struct SyncDevicesSection: View {
+    let sync: SyncAccount
+    @State private var confirming: SyncDevice?
+    @State private var error: String?
+
+    var body: some View {
+        Section {
+            if sync.devices.isEmpty {
+                Text("Loading devices…").foregroundStyle(.secondary)
+            }
+            ForEach(sync.devices) { device in
+                HStack {
+                    Image(systemName: device.isCurrent ? "laptopcomputer" : "desktopcomputer")
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 6) {
+                            Text(device.name)
+                            if device.isCurrent {
+                                Text("This Mac").font(.caption).foregroundStyle(.tint)
+                            }
+                        }
+                        Text("Last used \(device.lastUsedAt.formatted(.relative(presentation: .named)))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Sign Out…") { confirming = device }
+                }
+                .accessibilityElement(children: .combine)
+            }
+            if let error {
+                Text(error).font(.caption).foregroundStyle(.orange)
+            }
+        } header: {
+            Text("Devices")
+        } footer: {
+            Text("Signing out a device stops it syncing until someone signs in there again with your password.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .task { await sync.refreshDevices() }
+        .confirmationDialog("Sign out “\(confirming?.name ?? "")”?", isPresented: Binding(
+            get: { confirming != nil }, set: { if !$0 { confirming = nil } })) {
+            Button("Sign Out", role: .destructive) {
+                guard let device = confirming else { return }
+                error = nil
+                Task {
+                    do {
+                        try await sync.signOut(device)
+                    } catch {
+                        self.error = error.localizedDescription
+                    }
+                }
+            }
+        } message: {
+            Text(confirming?.isCurrent == true
+                 ? "Group items are removed from this Mac. Your own history stays."
+                 : "That device stops syncing right away.")
+        }
+    }
+}
+
+/// Sign-up is invite-only: make a code for someone, copy it, and see or revoke open ones.
+private struct InviteSomeoneSection: View {
+    let sync: SyncAccount
+    @State private var newCode: String?
+    @State private var codes: [OpenSignupCode] = []
+    @State private var busy = false
+    @State private var error: String?
+    @State private var copied = false
+
+    var body: some View {
+        Section {
+            if let newCode {
+                HStack {
+                    Text(newCode)
+                        .font(.body.monospaced())
+                        .textSelection(.enabled)
+                    Spacer()
+                    Button(copied ? "Copied" : "Copy") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(newCode, forType: .string)
+                        copied = true
+                    }
+                }
+                Text("Shown only once. Works for one new account, for 14 days.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(codes) { code in
+                HStack {
+                    Text("Code created \(Date(syncMillis: code.createdAt).formatted(date: .abbreviated, time: .shortened))")
+                    Spacer()
+                    Text("expires \(Date(syncMillis: code.expiresAt).formatted(.relative(presentation: .named)))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Revoke") {
+                        run {
+                            try await sync.revoke(code)
+                            codes.removeAll { $0.id == code.id }
+                        }
+                    }
+                }
+            }
+            if let error {
+                Text(error).font(.caption).foregroundStyle(.orange)
+            }
+            HStack {
+                Spacer()
+                if busy { ProgressView().controlSize(.small) }
+                Button("Create Invite Code") {
+                    run {
+                        newCode = try await sync.createSignupCode().code
+                        copied = false
+                        codes = try await sync.openSignupCodes()
+                    }
+                }
+                .disabled(busy)
+            }
+        } header: {
+            Text("Invite Someone")
+        } footer: {
+            Text("New accounts need an invite. Send the code privately; it creates one account. To share a group, use its own invite code under Manage….")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .task {
+            codes = (try? await sync.openSignupCodes()) ?? []
+        }
     }
 
     private func run(_ operation: @escaping () async throws -> Void) {
