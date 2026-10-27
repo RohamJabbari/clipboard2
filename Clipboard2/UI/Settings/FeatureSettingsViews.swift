@@ -237,9 +237,15 @@ struct AISettingsSections: View {
             } header: {
                 Text("AI provider")
             } footer: {
-                Text("Text is only sent when you run an AI action with ⌘K or ⌥⌘K. Keys stay in your Keychain.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Text is only sent when you run an AI action with ⌘K or ⌥⌘K, straight from this Mac to the provider you picked. Keys stay in your Keychain.")
+                    if provider == .chatGPT {
+                        Text("Codex runs with command execution and its computer and browser tools turned off, so text you send can't make it read files on this Mac. Clipboard2 refuses to start a Codex version that can't turn them off.")
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             }
 
             Section {
@@ -406,9 +412,8 @@ struct AISettingsSections: View {
             if let provider {
                 save(key, as: provider)
             } else {
-                detectError = APIKeyDetector.candidates(for: key).isEmpty
-                    ? "Couldn't tell which provider this key is for."
-                    : "The key was rejected. Check it, or pick the provider:"
+                detectError = APIKeyDetector.provider(for: key).map { "\($0.title) rejected the key. Check it, or pick the provider:" }
+                    ?? "Couldn't tell which provider this key is for."
             }
         }
     }

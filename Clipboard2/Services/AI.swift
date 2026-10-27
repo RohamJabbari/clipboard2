@@ -159,35 +159,39 @@ nonisolated enum AIProviderKind: String, CaseIterable, Codable, Identifiable, Se
     var apiKey: String? { Keychain.read(account: keychainAccount) }
 }
 
-/// Works out which provider an API key belongs to: prefix first, then a live check.
+/// Works out which provider an API key belongs to from its prefix, then confirms it with that
+/// provider only. A key is never tried against a second provider: an OpenAI key whose check
+/// fails must not end up at DeepSeek (or anyone else).
 nonisolated enum APIKeyDetector {
-    /// Providers to try, most likely first. Empty means the key format is unknown.
-    static func candidates(for rawKey: String) -> [AIProviderKind] {
+    /// The provider whose key format matches, or nil if the format is unknown.
+    static func provider(for rawKey: String) -> AIProviderKind? {
         let key = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if key.hasPrefix("sk-ant-") { return [.anthropic] }
-        if key.hasPrefix("sk-or-") { return [.openRouter] }
-        if key.hasPrefix("AIza") { return [.gemini] }
-        if key.hasPrefix("gsk_") { return [.groq] }
-        if key.hasPrefix("xai-") { return [.xai] }
-        if key.hasPrefix("sk-proj-") || key.hasPrefix("sk-svcacct-") || key.hasPrefix("sk-admin-") { return [.openAI] }
+        if key.hasPrefix("sk-ant-") { return .anthropic }
+        if key.hasPrefix("sk-or-") { return .openRouter }
+        if key.hasPrefix("AIza") { return .gemini }
+        if key.hasPrefix("gsk_") { return .groq }
+        if key.hasPrefix("xai-") { return .xai }
+        if key.hasPrefix("sk-proj-") || key.hasPrefix("sk-svcacct-") || key.hasPrefix("sk-admin-") { return .openAI }
         if key.hasPrefix("sk-") {
             // DeepSeek keys are "sk-" + 32 hex characters; OpenAI's legacy keys are longer.
             let body = key.dropFirst(3)
             let isHex32 = body.count == 32 && body.allSatisfy(\.isHexDigit)
-            return isHex32 ? [.deepSeek, .openAI] : [.openAI, .deepSeek]
+            return isHex32 ? .deepSeek : .openAI
         }
-        if key.count == 32, key.allSatisfy({ $0.isLetter || $0.isNumber }) { return [.mistral] }
-        return []
+        if key.count == 32, key.allSatisfy({ $0.isLetter || $0.isNumber }) { return .mistral }
+        return nil
     }
 
-    /// Returns the first candidate whose `/models` endpoint accepts the key.
-    static func identify(_ key: String) async -> AIProviderKind? {
-        for provider in candidates(for: key) {
-            if (try? await AIModelLister.fetch(provider: provider, customBaseURL: "", apiKey: key)) != nil {
-                return provider
-            }
-        }
-        return nil
+    /// The matching provider if its `/models` endpoint accepts the key, otherwise nil — there is
+    /// no fallback to other providers. `check` is injectable for tests.
+    static func identify(_ key: String,
+                         check: (AIProviderKind, String) async -> Bool = { await APIKeyDetector.accepts($0, $1) }) async -> AIProviderKind? {
+        guard let provider = provider(for: key) else { return nil }
+        return await check(provider, key) ? provider : nil
+    }
+
+    static func accepts(_ provider: AIProviderKind, _ key: String) async -> Bool {
+        (try? await AIModelLister.fetch(provider: provider, customBaseURL: "", apiKey: key)) != nil
     }
 }
 
@@ -781,9 +785,23 @@ nonisolated struct CodexCLIClient: AIStreamingClient {
         return environment
     }
 
+    /// Codex is an agent: even in the read-only sandbox it may run shell commands, and those can
+    /// read the whole disk (~/.ssh included). Clipboard text is untrusted input, so a prompt
+    /// injection could exfiltrate files through the reply. Command execution is therefore turned
+    /// off entirely. `--disable` fails closed: a Codex that doesn't know these features exits with
+    /// an error instead of running with commands enabled.
+    static let disabledFeatures = ["shell_tool", "unified_exec"]
+    /// Other tools that act outside the prompt. Best effort (`-c` ignores names a version lacks).
+    static let disabledExtras = ["computer_use", "browser_use", "browser_use_external", "in_app_browser",
+                                 "apps", "plugins", "multi_agent", "image_generation", "hooks"]
+
+    static let noAnswerMessage = "Codex didn't answer. Clipboard2 runs it with command execution turned off, which needs a recent Codex CLI — update it with “npm install -g @openai/codex”."
+
     func arguments(image: URL? = nil) -> [String] {
         var args = ["exec", "--skip-git-repo-check", "--ephemeral", "--sandbox", "read-only",
                     "--ignore-rules", "--ignore-user-config", "--json"]
+        for feature in Self.disabledFeatures { args += ["--disable", feature] }
+        for feature in Self.disabledExtras { args += ["-c", "features.\(feature)=false"] }
         if !model.isEmpty { args += ["-m", model] }
         if let image { args += ["-i", image.path] }
         return args + ["-"]   // prompt from stdin
@@ -833,9 +851,11 @@ nonisolated struct CodexCLIClient: AIStreamingClient {
                                                              environment: Self.environment(for: executable))
                     stdin.write(Data(prompt.utf8))
                     try? stdin.close()
+                    var answered = false
                     for try await line in stdout.bytes.lines {
                         switch Self.parse(line: line) {
                         case .message(let text):
+                            answered = true
                             continuation.yield(text)
                         case .failure(let message):
                             let lower = message.lowercased()
@@ -847,6 +867,9 @@ nonisolated struct CodexCLIClient: AIStreamingClient {
                             break
                         }
                     }
+                    // Nothing at all usually means Codex refused the arguments before starting,
+                    // e.g. a version too old to turn command execution off. Never retry without it.
+                    if !answered { throw AIError.api(Self.noAnswerMessage) }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
