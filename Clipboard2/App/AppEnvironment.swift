@@ -44,6 +44,8 @@ final class AppEnvironment {
     @ObservationIgnored private lazy var serviceProvider = ServiceProvider(env: self)
     @ObservationIgnored private(set) lazy var contextMenu = ContextMenuController(env: self)
     @ObservationIgnored private var maintenanceRuns = 0
+    /// On-device text recognition for image items (search finds screenshots by their words).
+    @ObservationIgnored private(set) lazy var imageText = ImageTextIndexer(store: store, blobs: blobs)
     #if DEBUG
     @ObservationIgnored private var stressMonitor: ClipboardMonitor?
     #endif
@@ -115,6 +117,11 @@ final class AppEnvironment {
             guard let self, capture.kind.isTextual else { return false }
             return self.secrets.valueHashes.contains(capture.hash)
         }
+        monitor.onCapture = { [weak self] item in
+            self?.sync.reportActivity()
+            self?.imageText.enqueue(item)
+        }
+        paste.onPaste = { [weak self] in self?.sync.reportActivity() }
         secrets.onChange = { [weak self] in
             guard let self else { return }
             self.removeHistoryCopiesOfSecrets()
@@ -242,6 +249,7 @@ final class AppEnvironment {
         guard storeOpenError == nil else { return }
         store.enforceRetention(maxItems: prefs.maxItems, maxAge: prefs.maxAge)
         // Sync polls on its own cadence (3 s / 15 s / 60 s).
+        if maintenanceRuns > 0 { imageText.scheduleBacklog() }   // older images; not during launch
         maintenanceRuns &+= 1
         if maintenanceRuns % 30 == 1 {   // directory scans: every ~30 min
             store.removeOrphanedBlobs()

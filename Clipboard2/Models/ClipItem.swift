@@ -58,6 +58,9 @@ final class ClipItem {
     var copyCount: Int = 1
     /// The sync group this item belongs to; nil is the personal space (also when not signed in).
     var spaceID: String?
+    /// Text recognised on this Mac in an image item, for search. nil = not looked at yet;
+    /// "" = looked at, no text. Never synced; each device recognises its own copy.
+    var imageText: String?
 
     init(capture: ProcessedCapture, now: Date = .now) {
         id = UUID()
@@ -107,7 +110,7 @@ final class ClipItem {
 
     private var contentSearchText: String {
         switch kind {
-        case .image: "Image \(imageWidth)×\(imageHeight)"
+        case .image: "Image \(imageWidth)×\(imageHeight)" + (imageText.map { " " + $0 } ?? "")
         case .file: fileURLs.map(\.lastPathComponent).joined(separator: " ") + " " + text
         default: text
         }

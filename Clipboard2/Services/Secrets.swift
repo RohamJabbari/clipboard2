@@ -214,6 +214,11 @@ final class SecretStore {
         unlockedUntil = nil
     }
 
+    /// Always asks, even inside the unlock window (e.g. before exporting every secret at once).
+    func authenticateNow(reason: String) async -> Bool {
+        await evaluate(reason: reason)
+    }
+
     /// Touch ID (or the login password) unless still inside the unlock window.
     func authenticate(reason: String) async -> Bool {
         if isUnlocked { return true }

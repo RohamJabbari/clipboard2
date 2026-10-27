@@ -302,7 +302,7 @@ final class SyncEngine {
         let spaceId = space.id
         while true {
             let since = space.since
-            let page = try await api.changes(spaceId: spaceId, since: since, limit: SyncConfig.changesPageSize)
+            let page = try await api.changes(spaceId: spaceId, since: since, limit: SyncConfig.changesPageSize, full: space.resyncing)
             try checkActive()
             if page.resetRequired {
                 guard since > 0 else { break }

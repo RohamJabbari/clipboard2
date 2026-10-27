@@ -138,7 +138,7 @@ private struct SyncSignInSection: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if creating {
-                    // TODO(merge): PrivacyNoticeLink()
+                    PrivacyNoticeLink()
                 }
             }
         }

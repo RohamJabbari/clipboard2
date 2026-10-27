@@ -84,6 +84,7 @@ enum PanelAction: Identifiable, Hashable {
     case saveAsSecret
     case setLabel
     case shareToGroup
+    case sendToDevice(DeviceTarget)
     case setUpAI
     case clearSlot(Int)
     case togglePin
@@ -99,6 +100,7 @@ enum PanelAction: Identifiable, Hashable {
         case .saveAsSecret: "saveAsSecret"
         case .setLabel: "setLabel"
         case .shareToGroup: "shareToGroup"
+        case .sendToDevice(let device): "sendToDevice-" + device.id
         case .setUpAI: "setUpAI"
         case .clearSlot(let n): "clearSlot-\(n)"
         case .togglePin: "pin"
@@ -111,6 +113,7 @@ enum PanelAction: Identifiable, Hashable {
         case .paste, .pastePlain, .copy: "Paste"
         case .transform: "Transform & Paste"
         case .ai, .setUpAI: "Ask \(aiName)"
+        case .sendToDevice: "Send"
         case .saveAsSecret, .setLabel, .shareToGroup, .clearSlot, .togglePin, .delete: "Item"
         }
     }
@@ -126,6 +129,7 @@ enum PanelAction: Identifiable, Hashable {
         case .saveAsSecret: "Save as Secret…"
         case .setLabel: "Label…"
         case .shareToGroup: "Share to Group…"
+        case .sendToDevice(let device): "Send to \(device.name)"
         case .setUpAI: "Set Up AI…"
         case .clearSlot(let n): "Remove from Quick Slot ⌘\(n)"
         case .togglePin: isPinned ? "Unpin" : "Pin"
@@ -143,6 +147,7 @@ enum PanelAction: Identifiable, Hashable {
         case .saveAsSecret: "key"
         case .setLabel: "tag"
         case .shareToGroup: "person.2"
+        case .sendToDevice: "laptopcomputer.and.arrow.down"
         case .setUpAI: "sparkles"
         case .clearSlot: "number.square"
         case .togglePin: "pin"
@@ -758,6 +763,65 @@ final class PanelViewModel {
         }
     }
 
+    // MARK: Send to device
+
+    func send(_ item: ClipItem, to device: DeviceTarget) {
+        env.sync.sendToDevice(item, deviceId: device.id)
+        if mode == .actions { mode = .browse }
+        showNotice("Sent to \(device.name)")
+    }
+
+    // MARK: Drag and drop
+
+    /// Called after a drop was accepted, so the panel takes keyboard focus back (a drag from
+    /// Finder makes Finder the key app on the way in).
+    @ObservationIgnored var onDropFinished: () -> Void = {}
+
+    /// A history item dragged onto a group chip: share it (with the rest of the selection, if it
+    /// was part of one) to that group.
+    @discardableResult
+    func dropClip(id: UUID, onGroup groupID: String) -> Bool {
+        guard canShareToGroup, let group = env.sync.groups.first(where: { $0.id == groupID }),
+              let item = env.store.item(withID: id)
+        else { return false }
+        let dragged = PanelEntry.clip(item).id
+        let items = isMultiSelecting && selectedIDs.contains(dragged) ? selectedClips : [item]
+        let toShare = items.filter { $0.spaceID != group.id }
+        onDropFinished()
+        guard !toShare.isEmpty else {
+            showNotice("Already in \(group.name)")
+            return true
+        }
+        share(toShare, to: group)
+        return true
+    }
+
+    /// Files dragged in from Finder. On a group chip they're shared to that group; on the list
+    /// they're added to history (or to the group being shown).
+    func dropFiles(_ urls: [URL], onGroup groupID: String? = nil) {
+        let files = urls.filter(\.isFileURL)
+        guard !files.isEmpty else { return }
+        let target = groupID ?? groupFilter
+        let group = target.flatMap { id in env.sync.groups.first { $0.id == id } }
+        if target != nil && group == nil { return }
+        onDropFinished()
+        let raw = RawCapture(kind: .file, fileURLs: files)
+        Task {
+            guard let capture = await CaptureProcessor.process(raw, blobs: env.blobs) else { return }
+            env.store.ingest(capture, spaceID: group?.id)
+            env.sync.reportActivity()
+            let what = files.count == 1 ? "“\(files[0].lastPathComponent)”" : "\(files.count) files"
+            if let group {
+                env.sync.syncNow()
+                showNotice(groupID == nil ? "Added \(what) to \(group.name)" : "Shared \(what) to \(group.name)")
+            } else {
+                if filter != .all && filter != .files { filter = .all }
+                showNotice("Added \(what) to history")
+            }
+            refresh(resetSelection: true)
+        }
+    }
+
     // MARK: Action menu
 
     func openActions() {
@@ -814,6 +878,7 @@ final class PanelViewModel {
             }
             actions.append(.setLabel)
             if canShareToGroup { actions.append(.shareToGroup) }
+            actions += PanelAction.sendToDeviceActions(for: item, multiSelecting: false, targets: DeviceTarget.others(in: env.sync))
             actions.append(.togglePin)
         case .snippet:
             break
@@ -909,6 +974,9 @@ final class PanelViewModel {
             } else if case .secret(let ref) = entry {
                 beginShareSecret(ref)
             }
+        case .sendToDevice(let device):
+            guard let item = entry.clip else { return }
+            send(item, to: device)
         case .setUpAI:
             onClose()
             SettingsOpener.open()

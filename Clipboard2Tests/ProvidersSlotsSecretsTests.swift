@@ -227,19 +227,46 @@ struct ModelCatalogTests {
 
 struct APIKeyDetectorTests {
     @Test(arguments: [
-        ("sk-ant-api03-abc", [AIProviderKind.anthropic]),
-        ("sk-or-v1-abc", [.openRouter]),
-        ("AIzaSyD-abc", [.gemini]),
-        ("gsk_abc", [.groq]),
-        ("xai-abc", [.xai]),
-        ("sk-proj-abc", [.openAI]),
-        ("sk-" + String(repeating: "0123456789abcdef", count: 2), [.deepSeek, .openAI]),
-        ("sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv", [.openAI, .deepSeek]),
-        ("Ab3dEfGhIjKlMnOpQrStUvWxYz012345", [.mistral]),
-        ("hello world", []),
+        ("sk-ant-api03-abc", AIProviderKind.anthropic as AIProviderKind?),
+        ("sk-or-v1-abc", .openRouter),
+        ("AIzaSyD-abc", .gemini),
+        ("gsk_abc", .groq),
+        ("xai-abc", .xai),
+        ("sk-proj-abc", .openAI),
+        ("sk-" + String(repeating: "0123456789abcdef", count: 2), .deepSeek),
+        ("sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv", .openAI),
+        ("Ab3dEfGhIjKlMnOpQrStUvWxYz012345", .mistral),
+        ("hello world", nil),
     ])
-    func candidatesFromPrefix(key: String, expected: [AIProviderKind]) {
-        #expect(APIKeyDetector.candidates(for: "  \(key)\n") == expected)
+    func providerFromPrefix(key: String, expected: AIProviderKind?) {
+        #expect(APIKeyDetector.provider(for: "  \(key)\n") == expected)
+    }
+
+    /// An OpenAI key whose check fails is never offered to DeepSeek (or anyone else).
+    @Test func identifyOnlyAsksTheMatchingProvider() async {
+        let asked = AskedProviders()
+        let openAIKey = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv"
+        let rejected = await APIKeyDetector.identify(openAIKey) { provider, _ in
+            await asked.add(provider)
+            return false
+        }
+        #expect(rejected == nil)
+        #expect(await asked.all == [.openAI])
+
+        let deepSeekKey = "sk-" + String(repeating: "0123456789abcdef", count: 2)
+        let accepted = await APIKeyDetector.identify(deepSeekKey) { provider, _ in
+            await asked.add(provider)
+            return true
+        }
+        #expect(accepted == .deepSeek)
+        #expect(await asked.all == [.openAI, .deepSeek])
+
+        let unknown = await APIKeyDetector.identify("hello world") { provider, _ in
+            await asked.add(provider)
+            return true
+        }
+        #expect(unknown == nil)
+        #expect(await asked.all.count == 2)
     }
 
     @Test func preferredModelUsesHints() {
@@ -290,6 +317,17 @@ struct CodexProviderTests {
         #expect(args.contains("--ephemeral") && args.contains("--ignore-user-config"))
         #expect(args.firstIndex(of: "--sandbox").map { args[$0 + 1] } == "read-only")
         #expect(args.last == "-")
+    }
+
+    /// Clipboard text is untrusted: Codex must not be able to run commands (which could read ~/.ssh).
+    @Test func execArgumentsTurnOffCommandExecution() {
+        let args = CodexCLIClient(model: "").arguments()
+        let disabled = args.indices.filter { args[$0] == "--disable" }.map { args[$0 + 1] }
+        #expect(Set(disabled).isSuperset(of: ["shell_tool", "unified_exec"]))
+        let overrides = args.indices.filter { args[$0] == "-c" }.map { args[$0 + 1] }
+        #expect(overrides.contains("features.computer_use=false"))
+        #expect(!args.contains("--dangerously-bypass-approvals-and-sandbox"))
+        #expect(!args.contains("danger-full-access") && !args.contains("workspace-write"))
     }
 
     @Test func subscriptionProvidersAreNotAPIProviders() {
@@ -349,4 +387,9 @@ struct ImageAndSignInTests {
         let text = try String(contentsOf: shim.urlFile, encoding: .utf8)
         #expect(text == "https://claude.com/x?redirect_uri=http%3A%2F%2Flocalhost%3A1%2Fcallback\n")
     }
+}
+
+private actor AskedProviders {
+    private(set) var all: [AIProviderKind] = []
+    func add(_ provider: AIProviderKind) { all.append(provider) }
 }

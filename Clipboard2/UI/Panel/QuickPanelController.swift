@@ -59,6 +59,9 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
     private var panel: QuickPanel?
     private var keyMonitor: Any?
     private var authObserver: NSObjectProtocol?
+    /// While the mouse is held down in another app after the panel lost focus (a possible drag in).
+    private var resignWatch: Timer?
+    private var lastDropAt: Date?
 
     // View tree: root → [shadowView (our own layers), morphView → shell (material) → hosting].
     private var root: PanelRootView?
@@ -103,6 +106,12 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         self.model = PanelViewModel(env: env)
         super.init()
         model.onClose = { [weak self] in self?.close() }
+        // A drag from Finder makes Finder key on the way in; take focus back once the drop lands.
+        model.onDropFinished = { [weak self] in
+            guard let self, let panel = self.panel, self.isVisible else { return }
+            self.lastDropAt = .now
+            panel.makeKey()
+        }
         // Touch ID takes key focus; take it back afterwards if the panel is still meant to be up.
         authObserver = NotificationCenter.default.addObserver(forName: SecretStore.authenticationEnded, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
@@ -177,6 +186,8 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         }
         generation &+= 1
         let gen = generation
+        env.sync.setPanelOpen(true)
+        env.sync.reportActivity()
 
         switch phase {
         case .opening, .open:
@@ -229,6 +240,9 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         }
         removeKeyMonitor()
         model.didClose()
+        env.sync.setPanelOpen(false)
+        resignWatch?.invalidate()
+        resignWatch = nil
         generation &+= 1
         phase = .closing
         // Hand keyboard focus straight back to the app underneath (a paste follows within ~90 ms),
@@ -504,10 +518,38 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
     func windowDidResignKey(_ notification: Notification) {
         // The Touch ID / password sheet steals focus; that isn't the user leaving the panel.
         if env.secrets.isAuthenticating { return }
-        if isVisible {
-            Log.panel.debug("panel lost key focus; closing")
-            close()
+        guard isVisible else { return }
+        // A mouse button is down in another app: maybe the start of a drag from Finder into the
+        // panel. Decide when the button comes up; a drop takes focus back by then.
+        if NSEvent.pressedMouseButtons & 1 != 0 {
+            watchForDragEnd()
+            return
         }
+        Log.panel.debug("panel lost key focus; closing")
+        close()
+    }
+
+    private func watchForDragEnd() {
+        resignWatch?.invalidate()
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, NSEvent.pressedMouseButtons & 1 == 0 else { return }
+                self.resignWatch?.invalidate()
+                self.resignWatch = nil
+                // Give a drop's async loading a moment to land and refocus the panel.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                    guard let self, self.isVisible, let panel = self.panel, !panel.isKeyWindow else { return }
+                    if let lastDropAt = self.lastDropAt, Date.now.timeIntervalSince(lastDropAt) < 2 {
+                        panel.makeKey()
+                    } else {
+                        Log.panel.debug("panel lost key focus; closing")
+                        self.close()
+                    }
+                }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        resignWatch = timer
     }
 
     // MARK: Building

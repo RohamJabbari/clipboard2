@@ -688,8 +688,8 @@ actor FakeSyncServer {
         .sorted { $0.createdAt < $1.createdAt }
     }
 
-    func changes(space: String, since: Int64, limit: Int) throws -> ChangesPage {
-        if resetNext.contains(space) && since > 0 {
+    func changes(space: String, since: Int64, limit: Int, full: Bool = false) throws -> ChangesPage {
+        if resetNext.contains(space) && since > 0 && !full {
             resetNext.remove(space)
             return ChangesPage(items: [], nextSince: since, hasMore: false, resetRequired: true)
         }
@@ -839,9 +839,9 @@ nonisolated struct FakeClient: SyncService {
         try await server.accept(uid: try await caller(), inviteId: id, wrappedKey: wrappedKey)
     }
 
-    func changes(spaceId: String, since: Int64, limit: Int) async throws -> ChangesPage {
+    func changes(spaceId: String, since: Int64, limit: Int, full: Bool) async throws -> ChangesPage {
         _ = try await caller()
-        return try await server.changes(space: spaceId, since: since, limit: limit)
+        return try await server.changes(space: spaceId, since: since, limit: limit, full: full)
     }
     func putItem(spaceId: String, itemId: String, _ body: ItemUpload) async throws -> WriteOutcome {
         try await server.put(space: spaceId, id: itemId, body: body, uid: try await caller())

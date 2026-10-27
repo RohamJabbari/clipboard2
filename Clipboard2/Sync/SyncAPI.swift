@@ -293,7 +293,8 @@ nonisolated protocol SyncService: Sendable {
     func invite(id: String) async throws -> InviteDetails?
     func acceptInvite(id: String, wrappedKey: Data) async throws -> RemoteSpace
 
-    func changes(spaceId: String, since: Int64, limit: Int) async throws -> ChangesPage
+    /// `full` while walking a space from 0 after a reset, so passing the purge horizon doesn't reset again.
+    func changes(spaceId: String, since: Int64, limit: Int, full: Bool) async throws -> ChangesPage
     func putItem(spaceId: String, itemId: String, _ body: ItemUpload) async throws -> WriteOutcome
     func deleteItem(spaceId: String, itemId: String, updatedAt: Int64) async throws -> WriteOutcome
 
@@ -449,8 +450,8 @@ nonisolated struct SyncAPI: SyncService {
 
     // MARK: Items
 
-    func changes(spaceId: String, since: Int64, limit: Int) async throws -> ChangesPage {
-        try await send("GET", "v1/spaces/\(spaceId)/changes", query: ["since": "\(since)", "limit": "\(limit)"],
+    func changes(spaceId: String, since: Int64, limit: Int, full: Bool) async throws -> ChangesPage {
+        try await send("GET", "v1/spaces/\(spaceId)/changes", query: ["since": "\(since)", "limit": "\(limit)"].merging(full ? ["full": "1"] : [:]) { a, _ in a },
                        as: ChangesPage.self)
     }
 

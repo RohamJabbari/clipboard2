@@ -111,7 +111,7 @@ struct GeneralSettingsView: View {
 
             PermissionsSection(permissions: [.accessibility, .screenRecording])
 
-            Section("Your data") {
+            Section {
                 LabeledContent {
                     Button("Show in Finder") {
                         NSWorkspace.shared.activateFileViewerSelecting([AppPaths.supportDirectory])
@@ -123,6 +123,13 @@ struct GeneralSettingsView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
+                BackupRows()
+            } header: {
+                Text("Your data")
+            } footer: {
+                LegalLinks()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 6)
             }
         }
         .formStyle(.grouped)
