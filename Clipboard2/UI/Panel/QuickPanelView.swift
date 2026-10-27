@@ -7,6 +7,31 @@ struct QuickPanelView: View {
     @FocusState private var searchFocused: Bool
     /// The content-type row that drops down from under the search bar.
     @State private var showsTypes = false
+    /// Files from Finder hovering over the list.
+    @State private var listDropTargeted = false
+
+    /// Tells the user a drop here adds to history.
+    @ViewBuilder
+    private var listDropHighlight: some View {
+        if listDropTargeted {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.08))
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(Color.accentColor.opacity(0.7), lineWidth: 1.5)
+                Label(model.groupFilter.flatMap(env.sync.groupName(for:)).map { "Add to \($0)" } ?? "Add to History",
+                      systemImage: "plus.circle.fill")
+                    .font(.callout.weight(.medium))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.regularMaterial, in: Capsule(style: .continuous))
+            }
+            .padding(6)
+            .allowsHitTesting(false)
+            .transition(.opacity)
+            .accessibilityHidden(true)
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -17,13 +42,16 @@ struct QuickPanelView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
             FilterChips(selection: $model.filter, groupSelection: $model.groupFilter, groups: env.sync.groups,
-                        thisAppName: model.targetRef?.name)
+                        thisAppName: model.targetRef?.name, dropModel: model)
                 .padding(.horizontal, 14)
                 .padding(.bottom, 10)
             Hairline()
             HStack(spacing: 0) {
                 resultsList
                     .frame(width: listWidth)
+                    .overlay { listDropHighlight }
+                    .onDrop(of: [.fileURL, .clipboard2Clip],
+                            delegate: PanelDropDelegate(target: .list, model: model, isTargeted: $listDropTargeted))
                 Hairline(vertical: true)
                 detailPane
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -33,6 +61,7 @@ struct QuickPanelView: View {
             HintBar(entry: model.selectedEntry, mode: model.mode, notice: model.notice,
                     selectionCount: model.isMultiSelecting ? model.selectedClips.count : nil,
                     updateVersion: env.updates.readyVersion,
+                    syncIndicator: env.sync.indicator,
                     onUpdate: { env.updates.installNow() })
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -176,6 +205,8 @@ struct QuickPanelView: View {
                                         }
                                     }
                                     .contextMenu { contextMenu(for: entry) }
+                                    .modifier(ClipDragSource(item: entry.clip.flatMap { $0.isTransient ? nil : $0 },
+                                                             blobs: env.blobs))
                             }
                         }
                         .padding(.horizontal, 8)
@@ -225,6 +256,13 @@ struct QuickPanelView: View {
             Button(item.label == nil ? "Label…" : "Edit Label…") { model.beginLabel(entry) }
             if item.kind.isTextual {
                 Button("Save as Secret…") { model.beginSaveSecret(item) }
+            }
+            let sends = PanelAction.sendToDeviceActions(for: item, multiSelecting: false,
+                                                        targets: DeviceTarget.others(in: env.sync))
+            ForEach(sends) { action in
+                if case .sendToDevice(let device) = action {
+                    Button("Send to \(device.name)") { model.send(item, to: device) }
+                }
             }
             if model.canShareToGroup {
                 Menu("Share to Group") {
@@ -288,6 +326,8 @@ struct FilterChips: View {
     @Binding var groupSelection: String?
     var groups: [SyncGroup] = []
     let thisAppName: String?
+    /// When set, group chips accept dropped history items and files and share them to the group.
+    var dropModel: PanelViewModel?
 
     var body: some View {
         if groups.isEmpty {
@@ -306,9 +346,14 @@ struct FilterChips: View {
                 }
             }
             ForEach(groups) { group in
-                chip(group.name, symbol: "person.2", selected: groupSelection == group.id) {
+                let select = {
                     groupSelection = group.id
                     selection = .all
+                }
+                if let dropModel {
+                    GroupDropChip(group: group, selected: groupSelection == group.id, model: dropModel, action: select)
+                } else {
+                    chip(group.name, symbol: "person.2", selected: groupSelection == group.id, action: select)
                 }
             }
             Spacer(minLength: 0)
@@ -325,11 +370,31 @@ struct FilterChips: View {
     }
 }
 
+/// A group chip that's also a drop target: drag a row (or files from Finder) onto it to share.
+private struct GroupDropChip: View {
+    let group: SyncGroup
+    let selected: Bool
+    let model: PanelViewModel
+    let action: () -> Void
+    @State private var targeted = false
+
+    var body: some View {
+        FilterChip(title: group.name, symbol: targeted ? "person.2.fill" : "person.2", selected: selected,
+                   dropHighlighted: targeted, action: action)
+            .onDrop(of: [.clipboard2Clip, .fileURL],
+                    delegate: PanelDropDelegate(target: .group(group.id), model: model, isTargeted: $targeted))
+            .help("Click to show \(group.name). Drop an item or a file here to share it.")
+            .accessibilityHint("Drop items here to share them with \(group.name)")
+    }
+}
+
 /// One capsule in the filter rows.
 struct FilterChip: View {
     let title: String
     let symbol: String
     let selected: Bool
+    /// Something droppable is hovering over this chip.
+    var dropHighlighted = false
     let action: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -349,15 +414,21 @@ struct FilterChip: View {
                 .lineLimit(1)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
-                .foregroundStyle(selected ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                .foregroundStyle(dropHighlighted ? AnyShapeStyle(Color.accentColor)
+                                 : selected ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
                 .background {
-                    if selected {
+                    if dropHighlighted {
+                        Capsule(style: .continuous)
+                            .fill(Color.accentColor.opacity(0.16))
+                            .overlay(Capsule(style: .continuous).strokeBorder(Color.accentColor.opacity(0.8), lineWidth: 1.5))
+                    } else if selected {
                         Capsule(style: .continuous)
                             .fill(Color.primary.opacity(0.09))
                             .overlay(Capsule(style: .continuous).strokeBorder(Color.primary.opacity(0.07)))
                     }
                 }
                 .contentShape(Capsule())
+                .scaleEffect(dropHighlighted && !reduceMotion ? 1.06 : 1)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(title) filter")
@@ -512,6 +583,8 @@ struct HintBar: View {
     var selectionCount: Int?
     /// A downloaded update waiting for a relaunch: shown quietly at the trailing end.
     var updateVersion: String?
+    /// Sync state, shown as a dot and a few words at the trailing end while signed in.
+    var syncIndicator: SyncIndicator = .hidden
     var onUpdate: () -> Void = {}
 
     var body: some View {
@@ -561,8 +634,14 @@ struct HintBar: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.tint)
                 .help("Clipboard2 \(updateVersion) is ready. Relaunches in a second; your history stays.")
-            } else if mode == .browse {
+            } else if mode == .browse && !syncIndicator.isVisible {
                 hint("⇥", "Filter")
+            }
+            if notice == nil && syncIndicator.isVisible {
+                // Quiet by design: the dot carries the state, the text says when.
+                SyncStatusLabel(indicator: syncIndicator)
+                    .layoutPriority(-1)
+                    .help(syncIndicator.offersSyncNow ? "\(syncIndicator.title()) — use Sync Now in the menu bar menu" : syncIndicator.title())
             }
             hint("esc", mode == .browse ? "Close" : "Back")
         }

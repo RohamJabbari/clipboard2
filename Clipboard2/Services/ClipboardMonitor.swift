@@ -83,6 +83,8 @@ final class ClipboardMonitor {
     private(set) var captureCount = 0
     /// Lets the app veto a processed capture (e.g. text that equals a saved secret).
     @ObservationIgnored var shouldDiscard: ((ProcessedCapture) -> Bool)?
+    /// Called with every item a copy saved (sync activity, image text recognition).
+    @ObservationIgnored var onCapture: ((ClipItem) -> Void)?
 
     init(store: ClipStore, prefs: Preferences, tracker: FrontmostAppTracker, blobs: BlobStore, pasteboard: NSPasteboard = .general) {
         self.store = store
@@ -149,9 +151,10 @@ final class ClipboardMonitor {
                 blobs.delete(processed.thumbnailFile)
                 return
             }
-            self.store.ingest(processed)
+            let item = self.store.ingest(processed)
             self.store.enforceRetention(maxItems: self.prefs.maxItems, maxAge: self.prefs.maxAge)
             self.captureCount += 1
+            if item.modelContext != nil { self.onCapture?(item) }
         }
     }
 }

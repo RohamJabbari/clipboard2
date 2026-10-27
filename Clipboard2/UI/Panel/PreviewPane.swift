@@ -22,7 +22,13 @@ struct PreviewPane: View {
             case .text, .richText:
                 TextPreviewView(text: item.text)
             case .image:
-                ImagePreviewView(item: item)
+                VStack(spacing: 0) {
+                    ImagePreviewView(item: item)
+                    if let text = item.imageText, !text.isEmpty {
+                        Divider()
+                        ImageTextView(text: text)
+                    }
+                }
             case .file:
                 FilePreviewView(urls: item.fileURLs)
             }
@@ -146,6 +152,40 @@ struct ImagePreviewView: View {
     @concurrent
     private static func load(_ url: URL) async -> NSImage? {
         NSImage(contentsOf: url)
+    }
+}
+
+/// The words recognised in an image, selectable, under the picture.
+struct ImageTextView: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Text in image", systemImage: "text.viewfinder")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .accessibilityAddTraits(.isHeader)
+            // Short text sits at its own height; longer text scrolls inside a fixed strip.
+            ViewThatFits(in: .vertical) {
+                textBlock(text)
+                ScrollView { textBlock(text) }
+                    .frame(height: Self.maxHeight)
+            }
+            .frame(maxHeight: Self.maxHeight)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .help("Recognised on this Mac, so search finds this image by its words")
+    }
+
+    private static let maxHeight: CGFloat = 110
+
+    private func textBlock(_ text: String) -> some View {
+        Text(text)
+            .font(.callout)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 

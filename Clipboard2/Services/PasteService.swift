@@ -10,6 +10,8 @@ final class PasteService {
 
     /// Called when a paste needed Accessibility but it isn't granted (the item is still copied).
     var onAccessibilityMissing: (() -> Void)?
+    /// Called on every paste (sync polls more often while the user is active).
+    var onPaste: (() -> Void)?
 
     init(store: ClipStore, prefs: Preferences, tracker: FrontmostAppTracker, pasteboard: NSPasteboard = .general) {
         self.store = store
@@ -169,6 +171,7 @@ final class PasteService {
     }
 
     private func sendPasteKeystroke(to target: NSRunningApplication?, cursorOffsetFromEnd: Int = 0) {
+        onPaste?()
         guard AXPermission.isTrusted else {
             Log.paste.info("Accessibility not granted; copied only")
             onAccessibilityMissing?()

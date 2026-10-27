@@ -6,8 +6,13 @@ struct MenuBarLabel: View {
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        Image(systemName: env.prefs.isPaused ? "clipboard" : "list.clipboard")
-            .accessibilityLabel(env.prefs.isPaused ? "Clipboard2, capture paused" : "Clipboard2")
+        let indicator = env.sync.indicator
+        let description = [env.prefs.isPaused ? "Clipboard2, capture paused" : "Clipboard2",
+                           indicator.badge.map { $0 == .ring ? "sync offline" : "sync problem" }]
+            .compactMap { $0 }.joined(separator: ", ")
+        Image(nsImage: MenuBarIcon.image(symbol: env.prefs.isPaused ? "clipboard" : "list.clipboard",
+                                         badge: indicator.badge, description: description))
+            .accessibilityLabel(description)
             .onAppear { SettingsOpener.register(openSettings) }
     }
 }
@@ -68,6 +73,11 @@ struct MenuBarContentView: View {
                 Divider()
             }
 
+            if env.sync.indicator.isVisible {
+                SyncStatusRow(sync: env.sync)
+                Divider()
+            }
+
             if results.isEmpty {
                 ContentUnavailableView {
                     Label(search.isEmpty ? "No Clipboard History" : "No Results", systemImage: search.isEmpty ? "list.clipboard" : "magnifyingglass")
@@ -102,7 +112,10 @@ struct MenuBarContentView: View {
             }
         }
         .frame(width: 380, height: 520)
-        .onAppear { searchFocused = true }
+        .onAppear {
+            searchFocused = true
+            env.sync.reportActivity()
+        }
         .onDisappear {
             confirmClear = false
             savingSecret = nil
@@ -174,6 +187,16 @@ struct MenuBarContentView: View {
                         }
                     }
                 }
+                let devices = DeviceTarget.others(in: env.sync)
+                if !devices.isEmpty {
+                    Divider()
+                    ForEach(devices) { device in
+                        Button("Send to \(device.name)") {
+                            env.sync.sendToDevice(item, deviceId: device.id)
+                        }
+                    }
+                }
+                Divider()
                 Button("Delete", role: .destructive) { env.store.delete(item) }
             }
         }
