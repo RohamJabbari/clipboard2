@@ -757,6 +757,7 @@ public sealed class SettingsWindow : Window
     private string _syncUsername = "";
     private string _syncPassword = "";
     private string _syncConfirm = "";
+    private string _syncInvite = "";
     private bool _syncCreating;
     private bool _syncUnderstood;
 
@@ -835,6 +836,9 @@ public sealed class SettingsWindow : Window
     private void BuildSyncCreate(StackPanel page, SyncAccount sync)
     {
         var rows = new List<UIElement>();
+        var invite = new TextBox { Text = _syncInvite, MinWidth = 280, MaxLength = 64, FontFamily = new FontFamily("Cascadia Mono, Consolas") };
+        invite.TextChanged += (_, _) => _syncInvite = invite.Text;
+        rows.Add(Row("Invite code", invite));
         SyncCredentialFields(rows, withUsername: true);
         var confirm = new PasswordBox { MinWidth = 280, Password = _syncConfirm };
         confirm.PasswordChanged += (_, _) => _syncConfirm = confirm.Password;
@@ -852,12 +856,17 @@ public sealed class SettingsWindow : Window
         {
             if (!_syncUnderstood) { MessageBox.Show(this, "Please confirm that you understand there's no password recovery.", "Create Account"); return; }
             if (SyncAccount.UsernameProblem(SyncAccount.NormalizeUsername(_syncUsername)) is { } problem) { MessageBox.Show(this, problem, "Create Account"); return; }
-            if (await _services.Sync.CreateAccountAsync(_syncEmail, _syncUsername, _syncPassword, _syncConfirm)) ClearSyncPasswords();
+            if (await _services.Sync.CreateAccountAsync(_syncEmail, _syncUsername, _syncPassword, _syncConfirm, _syncInvite))
+            {
+                ClearSyncPasswords();
+                _syncInvite = "";
+            }
         }, accent: true);
         create.IsEnabled = !sync.IsBusy;
         rows.Add(Row("", create));
         page.Children.Add(Card([.. rows]));
-        page.Children.Add(Hint($"Use at least {SyncAccount.MinPasswordLength} characters — a passphrase of a few words is best. Your email is only your sign-in name; it isn't verified and gets no mail. " +
+        page.Children.Add(Hint("Sync is invite-only. Enter the code someone gave you: an invite to Clipboard2, or to their group (you join it right away). " +
+            $"Use at least {SyncAccount.MinPasswordLength} characters — a passphrase of a few words is best. Your email is only your sign-in name; it isn't verified and gets no mail. " +
             $"Your username is shown to people in your groups on the items you share. {SyncAccount.UsernameRule}"));
     }
 
@@ -898,6 +907,7 @@ public sealed class SettingsWindow : Window
     {
         var state = sync.IsSyncing ? "Syncing…"
             : sync.RetryAfter is { } retry && retry > DateTime.UtcNow ? $"Paused until {retry.ToLocalTime():t} (server busy)"
+            : sync.CurrentStatus == SyncStatus.Offline ? "Offline — " + (sync.Error ?? "the sync server can't be reached.")
             : sync.Error is { } error ? error
             : sync.LastSync is { } last ? $"Up to date · synced {last.ToLocalTime():t}" : "Not synced yet";
         var statusLabel = Fluent.Label(state, 13, sync.Error is null ? Fluent.Secondary : Brushes.OrangeRed, wrap: true);
@@ -915,7 +925,7 @@ public sealed class SettingsWindow : Window
         foreach (var warning in sync.Warnings.Distinct()) rows.Add(Fluent.Label(warning, 12, Brushes.OrangeRed, wrap: true));
         rows.Add(Row("", syncNow));
         page.Children.Add(Card([.. rows]));
-        page.Children.Add(Hint(WhatSyncs + " Files sync as paths only."));
+        page.Children.Add(Hint(WhatSyncs));
 
         // Groups
         page.Children.Add(Header("Groups"));
@@ -973,6 +983,42 @@ public sealed class SettingsWindow : Window
             page.Children.Add(Card(Row("Default group", Choice(groups, sync.DefaultGroup ?? groups[0], g => g.DisplayName, g => sync.SetDefaultGroup(g.Id)))));
             page.Children.Add(Hint($"Select text anywhere and press {hotkey} to send it to the default group. Share any item with Ctrl+K → Share to Group, or right-click it."));
         }
+
+        // Invite someone to Clipboard2 (sign-up codes)
+        page.Children.Add(Header("Invite Someone"));
+        page.Children.Add(Card(Row("", Buttons(
+            Action("Create an Invite Code…", async () =>
+            {
+                if (await sync.CreateSignupCodeAsync() is { } code) ShowSignupCode(code);
+                else if (sync.Error is { } e) MessageBox.Show(this, e, "Invite Someone");
+            }),
+            Action("Open Invites…", ShowSignupCodes)))));
+        page.Children.Add(Hint("Sync is invite-only. A code lets one person create an account; it works once and expires in 14 days. " +
+            "To share a group with someone, use Invite… next to the group instead — that code also works for signing up."));
+
+        // Devices
+        page.Children.Add(Header("Devices"));
+        var deviceRows = new List<UIElement>();
+        foreach (var device in sync.Devices)
+        {
+            var id = device.Id;
+            var label = $"{device.Name}{(device.IsCurrent ? " (this PC)" : "")}";
+            var controls = new StackPanel { Orientation = Orientation.Horizontal };
+            controls.Children.Add(Fluent.Label($"Last used {device.LastUsedAt.ToLocalTime():g}  ", 12, Fluent.Secondary));
+            controls.Children.Add(Action("Sign Out…", async () =>
+            {
+                var question = device.IsCurrent
+                    ? "Sign out of sync on this PC? Group items are removed from this PC; your personal history stays."
+                    : $"Sign out “{device.Name}”? It stops syncing until someone signs in there again.";
+                if (MessageBox.Show(this, question, "Sign Out Device", MessageBoxButton.OKCancel, MessageBoxImage.Question) != MessageBoxResult.OK) return;
+                if (!await sync.SignOutDeviceAsync(id) && sync.Error is { } e) MessageBox.Show(this, e, "Sign Out Device");
+            }));
+            deviceRows.Add(Row(label, controls));
+        }
+        if (deviceRows.Count == 0) deviceRows.Add(Fluent.Label("No devices listed yet. Refresh to load them.", 13, Fluent.Secondary));
+        deviceRows.Add(Row("", Action("Refresh", () => _ = sync.RefreshDevicesAsync())));
+        page.Children.Add(Card([.. deviceRows]));
+        page.Children.Add(Hint("Every PC and Mac signed in to your account. An item sent to this PC from another device appears at the top, with a notice."));
 
         // Account
         page.Children.Add(Header("Account"));
@@ -1061,6 +1107,70 @@ public sealed class SettingsWindow : Window
         window.ShowDialog();
     }
 
+    /// <summary>A sign-up code, shown once (only its hash is on the server).</summary>
+    private void ShowSignupCode(string code)
+    {
+        var window = new Window
+        {
+            Title = "Invite Someone", Width = 460, SizeToContent = SizeToContent.Height, Owner = this,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, ResizeMode = ResizeMode.NoResize,
+        };
+        var stack = new StackPanel { Margin = new Thickness(20) };
+        stack.Children.Add(Fluent.Label("Send this code to the person you want to invite. They enter it as the invite code when they create their sync account.", 13, null, wrap: true));
+        stack.Children.Add(new TextBox
+        {
+            Text = code, IsReadOnly = true, FontFamily = new FontFamily("Cascadia Mono, Consolas"), FontSize = 20,
+            HorizontalContentAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 14, 0, 10),
+        });
+        stack.Children.Add(Fluent.Label("It works once and expires in 14 days. You won't see it again; you can revoke it under Open Invites.", 12, Fluent.Secondary, wrap: true));
+        // Copied like a secret: kept out of the history (and so out of sync) and out of Win+V.
+        var buttons = Buttons(Action("Copy", () => ClipboardIO.WriteSecret(code), accent: true), Action("Done", window.Close));
+        buttons.HorizontalAlignment = HorizontalAlignment.Right;
+        buttons.Margin = new Thickness(0, 14, 0, 0);
+        stack.Children.Add(buttons);
+        window.Content = stack;
+        window.ShowDialog();
+    }
+
+    /// <summary>Open (unused) sign-up codes, each with Revoke.</summary>
+    private async void ShowSignupCodes()
+    {
+        var sync = _services.Sync;
+        var window = new Window
+        {
+            Title = "Open Invites", Width = 460, SizeToContent = SizeToContent.Height, Owner = this,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, ResizeMode = ResizeMode.NoResize,
+        };
+        var list = new StackPanel { Margin = new Thickness(20) };
+        list.Children.Add(Fluent.Label("Loading…", 13, Fluent.Secondary));
+        window.Content = list;
+        window.Show();
+
+        async Task Fill()
+        {
+            var codes = await sync.SignupCodesAsync();
+            list.Children.Clear();
+            foreach (var code in codes)
+            {
+                var row = new DockPanel { LastChildFill = false, MinHeight = 30 };
+                row.Children.Add(Fluent.Label($"Created {SyncPayload.FromMillis(code.CreatedAt).ToLocalTime():g} · expires {SyncPayload.FromMillis(code.ExpiresAt).ToLocalTime():g}", 12, Fluent.Secondary));
+                var id = code.Id;
+                var revoke = Action("Revoke", async () =>
+                {
+                    await sync.RevokeSignupCodeAsync(id);
+                    await Fill();
+                });
+                DockPanel.SetDock(revoke, Dock.Right);
+                row.Children.Add(revoke);
+                list.Children.Add(row);
+            }
+            if (codes.Count == 0) list.Children.Add(Fluent.Label(sync.Error ?? "No open invites.", 13, Fluent.Secondary, wrap: true));
+            list.Children.Add(new Border { Height = 10 });
+            list.Children.Add(Fluent.Label("Codes that were used or expired aren't listed. You can have up to 10 open at once.", 12, Fluent.Secondary, wrap: true));
+        }
+        await Fill();
+    }
+
     private async void ShowMembers(SpaceRecord group)
     {
         var sync = _services.Sync;
@@ -1081,13 +1191,13 @@ public sealed class SettingsWindow : Window
             foreach (var member in members)
             {
                 var row = new DockPanel { LastChildFill = false, MinHeight = 32 };
-                row.Children.Add(Fluent.Label(member.Email + (member.Role == "owner" ? "  (owner)" : "") + (member.Uid == sync.Uid ? "  — you" : ""), 13));
+                row.Children.Add(Fluent.Label(member.Name + (member.Role == "owner" ? "  (owner)" : "") + (member.Uid == sync.Uid ? "  — you" : ""), 13));
                 if (group.IsOwner && member.Role != "owner")
                 {
                     var uid = member.Uid;
                     var remove = Action("Remove", async () =>
                     {
-                        if (MessageBox.Show(window, $"Remove {member.Email} from the group? They keep anything they already copied.", "Remove Member",
+                        if (MessageBox.Show(window, $"Remove {member.Name} from the group? They keep anything they already copied.", "Remove Member",
                                 MessageBoxButton.OKCancel) != MessageBoxResult.OK) return;
                         await sync.RemoveMemberAsync(group.Id, uid);
                         await Fill();

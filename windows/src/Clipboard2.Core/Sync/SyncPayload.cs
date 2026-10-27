@@ -14,8 +14,17 @@ public static class SyncCategory
 /// <summary>A decrypted item payload (docs/sync/PROTOCOL.md → Item payloads).</summary>
 public abstract record ItemPayload
 {
+    /// <summary>The <c>updatedAt</c> the writer sent with this payload; null from apps before October 2026.</summary>
+    public long? Rev { get; init; }
+
     /// <param name="FileBlobs">A file item's uploaded files, in order; empty when none were sent.</param>
-    public sealed record Clip(ClipItem Item, string? ImageBlob, string? ThumbBlob, IReadOnlyList<FileBlob> FileBlobs) : ItemPayload;
+    public sealed record Clip(ClipItem Item, string? ImageBlob, string? ThumbBlob, IReadOnlyList<FileBlob> FileBlobs) : ItemPayload
+    {
+        /// <summary>The session id of the one device this was sent to, if any.</summary>
+        public string? ToDevice { get; init; }
+        /// <summary>The sending device's name, for the "Sent from …" notice.</summary>
+        public string? FromDevice { get; init; }
+    }
     public sealed record SnippetPayload(Snippet Snippet) : ItemPayload;
     public sealed record Secret(string Name, string Value, DateTime? CreatedAt) : ItemPayload;
 }
@@ -102,12 +111,16 @@ public static partial class SyncPayload
     [System.Text.RegularExpressions.GeneratedRegex(@"(?<!\\)((?:\\\\)*)\\u(D[89AB][0-9A-F]{2})\\u(D[C-F][0-9A-F]{2})", System.Text.RegularExpressions.RegexOptions.IgnoreCase)]
     private static partial System.Text.RegularExpressions.Regex SurrogateEscape();
 
+    /// <summary>Fields that describe one write rather than the item: they never count as a change.</summary>
+    public static readonly string[] WriteFields = ["rev", "toDevice", "fromDevice"];
+
     /// <summary>SHA-256 of the payload with keys sorted. A secret's createdAt is left out: Credential Manager only
-    /// knows the last write time, which every apply bumps.</summary>
+    /// knows the last write time, which every apply bumps. So are <see cref="WriteFields"/>.</summary>
     public static string Fingerprint(JsonObject payload)
     {
         var canonical = Canonical(payload)!.AsObject();
         if (canonical["type"]?.GetValue<string>() == "secret") canonical.Remove("createdAt");
+        foreach (var field in WriteFields) canonical.Remove(field);
         return SyncCrypto.Sha256Hex(Encoding.UTF8.GetBytes(Json(canonical)));
     }
 
@@ -122,9 +135,17 @@ public static partial class SyncPayload
     // MARK: Reading
 
     /// <summary>Parses a decrypted payload. Unknown fields are ignored; unknown types return null.</summary>
-    public static ItemPayload? Parse(byte[] plaintext, Guid id, string? spaceId)
+    public static ItemPayload? Parse(byte[] plaintext, Guid id, string? spaceId) =>
+        JsonNode.Parse(plaintext) is JsonObject json ? Parse(json, id, spaceId) : null;
+
+    public static ItemPayload? Parse(JsonObject json, Guid id, string? spaceId)
     {
-        if (JsonNode.Parse(plaintext) is not JsonObject json) return null;
+        var payload = ParseBody(json, id, spaceId);
+        return payload is null ? null : payload with { Rev = json["rev"] is JsonValue r && r.TryGetValue<double>(out var rev) ? (long)rev : null };
+    }
+
+    private static ItemPayload? ParseBody(JsonObject json, Guid id, string? spaceId)
+    {
         switch (Str(json, "type"))
         {
             case "clip":
@@ -163,7 +184,11 @@ public static partial class SyncPayload
                     CreatedAt = created,
                     LastCopiedAt = Time(json, "lastCopiedAt") ?? created,
                 };
-                return new ItemPayload.Clip(item, Str(json, "imageBlob"), Str(json, "thumbBlob"), FileBlobs(json));
+                return new ItemPayload.Clip(item, Str(json, "imageBlob"), Str(json, "thumbBlob"), FileBlobs(json))
+                {
+                    ToDevice = Str(json, "toDevice"),
+                    FromDevice = Str(json, "fromDevice"),
+                };
             case "snippet":
                 return new ItemPayload.SnippetPayload(new Snippet
                 {

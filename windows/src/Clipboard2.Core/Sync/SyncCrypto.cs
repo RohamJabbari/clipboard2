@@ -15,6 +15,9 @@ public static class SyncCrypto
     public const byte AeadVersion = 0x01;
     public const int NonceSize = 12, TagSize = 16, KeySize = 32;
     public const int KdfIterations = 600_000;
+    /// <summary>A prelogin outside these bounds is refused before deriving (a hostile server could otherwise ask for
+    /// a cheap KDF, or one that ties the PC up).</summary>
+    public const int MinKdfIterations = 600_000, MaxKdfIterations = 10_000_000;
     public const int SaltSize = 16;
 
     // MARK: AEAD

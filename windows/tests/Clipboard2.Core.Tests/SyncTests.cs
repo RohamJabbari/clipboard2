@@ -442,10 +442,10 @@ public sealed class SyncEngineTests : IDisposable
         public Settings Settings { get; } = new() { SyncApiBaseUrl = FakeCloud.ApiBase };
         public SyncAccount Account { get; }
 
-        public Device(FakeCloud cloud, Func<DateTime>? clock = null)
+        public Device(FakeCloud cloud, Func<DateTime>? clock = null, int iterations = 1000)
         {
             Store = new ClipStore(":memory:", new BlobStore(Dir));
-            Account = new SyncAccount(Store, Vault, Settings, Keys, new HttpClient(cloud), clock, kdfIterations: 1000);
+            Account = new SyncAccount(Store, Vault, Settings, Keys, new HttpClient(cloud), clock, kdfIterations: iterations, minKdfIterations: 1000);
         }
 
         public string Personal => Account.Engine!.Identity.PersonalSpaceId;
@@ -465,9 +465,9 @@ public sealed class SyncEngineTests : IDisposable
         foreach (var d in _devices) d.Dispose();
     }
 
-    private Device NewDevice(Func<DateTime>? clock = null)
+    private Device NewDevice(Func<DateTime>? clock = null, int iterations = 1000)
     {
-        var d = new Device(_cloud, clock);
+        var d = new Device(_cloud, clock, iterations);
         _devices.Add(d);
         return d;
     }
@@ -475,7 +475,7 @@ public sealed class SyncEngineTests : IDisposable
     private async Task<Device> SignedUp(string email = Email)
     {
         var d = NewDevice();
-        Assert.True(await d.Account.CreateAccountAsync(email, email[..email.IndexOf('@')], Password, Password), d.Account.Error);
+        Assert.True(await d.Account.CreateAccountAsync(email, email[..email.IndexOf('@')], Password, Password, _cloud.IssueSignupCode()), d.Account.Error);
         Assert.Equal(SyncPhase.SignedIn, d.Account.Phase);
         await d.Sync();
         return d;
@@ -496,7 +496,7 @@ public sealed class SyncEngineTests : IDisposable
         var d = NewDevice();
         Assert.False(await d.Account.CreateAccountAsync(Email, "roham", Password, "different"));
         Assert.Equal("The passwords don't match.", d.Account.Error);
-        Assert.True(await d.Account.CreateAccountAsync("  Roham@Example.com ", " roham ", Password, Password), d.Account.Error);
+        Assert.True(await d.Account.CreateAccountAsync("  Roham@Example.com ", " roham ", Password, Password, _cloud.IssueSignupCode()), d.Account.Error);
         Assert.Equal(Email, d.Account.Email);
         Assert.True(_cloud.HasAccount(Email));
         Assert.DoesNotContain(Password, _cloud.LastAuthKey(Email)!);
@@ -504,7 +504,7 @@ public sealed class SyncEngineTests : IDisposable
 
         // Same email again is refused; a wrong password is reported.
         var dup = NewDevice();
-        Assert.False(await dup.Account.CreateAccountAsync(Email, "someone", Password, Password));
+        Assert.False(await dup.Account.CreateAccountAsync(Email, "someone", Password, Password, _cloud.IssueSignupCode()));
         Assert.Contains("already exists", dup.Account.Error);
         Assert.False(await dup.Account.SignInAsync(Email, "wrong password"));
         Assert.Equal("The email or password is wrong.", dup.Account.Error);
@@ -699,7 +699,7 @@ public sealed class SyncEngineTests : IDisposable
         for (var i = 1; i < 210; i++) d.Copy($"history {i}", 1000 - i);
         for (var i = 0; i < 3; i++) d.Store.TogglePin(d.Copy($"pinned {i}", 5000 + i));
         d.Store.CreateSnippet("S", "", "body");
-        Assert.True(await d.Account.CreateAccountAsync(Email, "roham", Password, Password));
+        Assert.True(await d.Account.CreateAccountAsync(Email, "roham", Password, Password, _cloud.IssueSignupCode()));
         await d.Sync();
 
         var live = _cloud.LiveItems(d.Personal);
@@ -749,21 +749,26 @@ public sealed class SyncEngineTests : IDisposable
     public async Task ConflictAppliesTheServerVersion()
     {
         var a = await SignedUp();
-        var b = await SignedIn();
+        var later = NewDevice(() => DateTime.UtcNow.AddMinutes(5));   // its writes carry a later updatedAt
+        Assert.True(await later.Account.SignInAsync(Email, Password), later.Account.Error);
         var item = a.Copy("v1");
         await a.Sync();
-        await b.Sync();
+        await later.Sync();
         var id = ClipStore.SyncId(item.Id);
-        _cloud.BumpUpdatedAt(a.Personal, id, 10_000_000);   // a newer write A hasn't pulled yet
+        later.Store.SetLabel("their label", later.Store.Find(item.Id)!);
+        await later.Sync();
+        _cloud.HiddenFromChanges.Add(id);                   // a newer write A hasn't pulled yet
         a.Store.SetLabel("local label", a.Store.Find(item.Id)!);
         await a.Sync();
         Assert.True(_cloud.Count("PUT api.fake") > 0);
         var local = a.Store.Find(item.Id)!;
-        Assert.Null(local.Label);                           // LWW: the server's version won
-        Assert.False(local.IsPinned);
+        Assert.Equal("their label", local.Label);           // LWW: the server's version won
+        _cloud.HiddenFromChanges.Clear();
         var puts = _cloud.Count("PUT api.fake");
         await a.Sync();
+        await a.Sync();
         Assert.Equal(puts, _cloud.Count("PUT api.fake"));  // converged, no retry loop
+        Assert.Equal("their label", a.Store.Find(item.Id)!.Label);
     }
 
     [Fact]
@@ -943,7 +948,7 @@ public sealed class SyncEngineTests : IDisposable
         var d = NewDevice(() => now);
         for (var i = 0; i < 20; i++) d.Copy($"item {i}", 100 - i);
         _cloud.RateLimitAfter = 12;
-        Assert.True(await d.Account.CreateAccountAsync(Email, "roham", Password, Password));
+        Assert.True(await d.Account.CreateAccountAsync(Email, "roham", Password, Password, _cloud.IssueSignupCode()));
         await d.Sync();
         Assert.NotNull(d.Account.RetryAfter);
         Assert.Null(d.Account.Error);
@@ -997,14 +1002,14 @@ public sealed class SyncEngineTests : IDisposable
         var d = NewDevice();
         foreach (var bad in new[] { "", "ab", "_roham", "roham!", "roham²", "Ⅻroham", new string('x', 25) })
         {
-            Assert.False(await d.Account.CreateAccountAsync(Email, bad, Password, Password));
+            Assert.False(await d.Account.CreateAccountAsync(Email, bad, Password, Password, _cloud.IssueSignupCode()));
             Assert.NotNull(d.Account.Error);
         }
         Assert.Equal(SyncAccount.UsernameRule, d.Account.Error);
         Assert.False(_cloud.HasAccount(Email));
 
         // Trimmed and NFC-normalized ("e" + combining diaeresis becomes "ë"), as the server keeps it.
-        Assert.True(await d.Account.CreateAccountAsync(Email, "  Zoëy.b-1 ", Password, Password), d.Account.Error);
+        Assert.True(await d.Account.CreateAccountAsync(Email, "  Zoëy.b-1 ", Password, Password, _cloud.IssueSignupCode()), d.Account.Error);
         Assert.Equal("Zoëy.b-1", _cloud.Username(Email));
         Assert.Equal("Zoëy.b-1", d.Account.Username);
         var restored = new SyncAccount(d.Store, d.Vault, d.Settings, d.Keys, new HttpClient(_cloud), kdfIterations: 1000);
@@ -1018,7 +1023,7 @@ public sealed class SyncEngineTests : IDisposable
     {
         await SignedUp();   // "roham"
         var d = NewDevice();
-        Assert.False(await d.Account.CreateAccountAsync("friend@example.com", "ROHAM", Password, Password));
+        Assert.False(await d.Account.CreateAccountAsync("friend@example.com", "ROHAM", Password, Password, _cloud.IssueSignupCode()));
         Assert.Equal("That username is taken. Try another one.", d.Account.Error);
         Assert.False(_cloud.HasAccount("friend@example.com"));
         Assert.Equal(SyncPhase.SignedOut, d.Account.Phase);
@@ -1109,5 +1114,489 @@ public sealed class SyncEngineTests : IDisposable
         Assert.Equal("Team", Badge(a, "from b"));
         Assert.False(await a.Account.ChangeUsernameAsync("roham"));
         Assert.Equal("The sync server doesn't support usernames yet.", a.Account.Error);
+    }
+
+    // MARK: October 2026 hardening (docs/sync/HARDENING-2026-10.md)
+
+    private int Puts(Device d, string id) => _cloud.Count($"PUT api.fake/v1/spaces/{d.Personal}/items/{id}");
+
+    [Fact]
+    public async Task AQuotaErrorDoesNotHoldBackDeletions()
+    {
+        _cloud.MaxLiveItems = 2;
+        var a = await SignedUp();
+        var x = a.Copy("x", 30);
+        var y = a.Copy("y", 20);
+        await a.Sync();
+        Assert.Equal(2, _cloud.LiveItems(a.Personal).Count);
+
+        a.Store.Delete(a.Store.Find(x.Id)!);
+        var z = a.Copy("z", 10);
+        var w = a.Copy("w", 5);
+        await a.Sync();
+        Assert.Equal("user", _cloud.ItemById(a.Personal, ClipStore.SyncId(x.Id)).Deleted);   // deletions go first
+        Assert.Equal(new[] { ClipStore.SyncId(y.Id), ClipStore.SyncId(w.Id) }.Order(), _cloud.LiveItems(a.Personal).Select(i => i.Id).Order());
+        Assert.Contains("quota_exceeded", a.Account.Warnings);
+        Assert.Null(a.Account.Error);
+
+        // Refused until a deletion frees space (or the next launch), not on every tick.
+        var puts = Puts(a, ClipStore.SyncId(z.Id));
+        await a.Sync();
+        Assert.Equal(puts, Puts(a, ClipStore.SyncId(z.Id)));
+        a.Store.Delete(a.Store.Find(y.Id)!);
+        await a.Sync();
+        Assert.Contains(_cloud.LiveItems(a.Personal), i => i.Id == ClipStore.SyncId(z.Id));
+    }
+
+    [Fact]
+    public async Task APullDoesNotUndoAnUnpushedLocalDelete()
+    {
+        var a = await SignedUp();
+        var b = await SignedIn();
+        var item = a.Copy("shared");
+        await a.Sync();
+        await b.Sync();
+        b.Store.Delete(b.Store.Find(item.Id)!);   // not pushed yet
+        a.Store.TogglePin(a.Store.Find(item.Id)!);
+        await a.Sync();                            // a remote edit B hasn't seen
+        await b.Sync();
+        Assert.Null(b.Store.Find(item.Id));
+        Assert.Equal("user", _cloud.ItemById(a.Personal, ClipStore.SyncId(item.Id)).Deleted);
+        await a.Sync();
+        Assert.Null(a.Store.Find(item.Id));
+    }
+
+    [Fact]
+    public async Task ANewerUnpushedLocalEditWinsAndAnOlderOneLoses()
+    {
+        var a = await SignedUp();
+        var b = await SignedIn();
+        a.Store.CreateSnippet("Sig", "", "v1");
+        await a.Sync();
+        await b.Sync();
+
+        static void Edit(Device d, string body)
+        {
+            var snippet = d.Store.AllSnippets().Single();
+            snippet.Body = body;
+            d.Store.SaveSnippet(snippet);
+        }
+
+        Edit(a, "from A");
+        await a.Sync();
+        await Task.Delay(20);
+        Edit(b, "from B, later");                  // newer than A's upload, not pushed yet
+        await b.Sync();
+        Assert.Equal("from B, later", b.Store.AllSnippets().Single().Body);
+        await a.Sync();
+        Assert.Equal("from B, later", a.Store.AllSnippets().Single().Body);
+
+        Edit(b, "older on B");
+        await Task.Delay(20);
+        Edit(a, "newer on A");
+        await a.Sync();
+        await b.Sync();
+        Assert.Equal("newer on A", b.Store.AllSnippets().Single().Body);
+        var puts = _cloud.Count("PUT api.fake");
+        await b.Sync();
+        await a.Sync();
+        Assert.Equal(puts, _cloud.Count("PUT api.fake"));
+    }
+
+    [Fact]
+    public async Task AnInterruptedResyncCarriesOnAndReconciles()
+    {
+        _cloud.PageLimit = 2;
+        var a = await SignedUp();
+        var now = DateTime.UtcNow;
+        var b = NewDevice(() => now);
+        Assert.True(await b.Account.CreateAccountAsync("friend@example.com", "friend", Password, Password, _cloud.IssueSignupCode()), b.Account.Error);
+        await b.Sync();
+        Assert.True(await a.Account.CreateGroupAsync("Team"));
+        var group = a.Account.Groups.Single();
+        await Invite(a, b, group.Id);
+        var gone = a.Copy("gone", 60, group.Id);
+        a.Copy("kept", 50, group.Id);
+        await a.Sync();
+        await b.Sync();
+        Assert.Equal(2, b.Store.ItemsInSpace(group.Id).Count);
+
+        // While B is away: "gone" is deleted and its tombstone purged, and four items arrive.
+        a.Store.Delete(a.Store.Find(gone.Id)!);
+        await a.Sync();
+        _cloud.Purge(group.Id, ClipStore.SyncId(gone.Id));
+        for (var i = 0; i < 4; i++) a.Copy($"new {i}", 40 - i, group.Id);
+        await a.Sync();
+
+        _cloud.RateLimitAfter = 3;                           // spaces, the reset, the first page; then 429
+        await b.Sync();
+        Assert.NotNull(b.Account.RetryAfter);
+        Assert.True(b.Store.IsResyncing(group.Id));
+        Assert.NotNull(b.Store.Find(gone.Id));
+
+        _cloud.RateLimitAfter = null;
+        now = now.AddMinutes(1);
+        await b.Sync();                                      // carries on from the cursor and reconciles
+        Assert.False(b.Store.IsResyncing(group.Id));
+        Assert.Null(b.Store.Find(gone.Id));
+        Assert.Equal(5, b.Store.ItemsInSpace(group.Id).Count);
+    }
+
+    [Fact]
+    public async Task RefusedItemsAreNotUploadedAgainAfterARestart()
+    {
+        _cloud.MaxItemBytes = 600;
+        var d = await SignedUp();
+        var big = d.Copy(new string('x', 2000));
+        d.Copy("small");
+        await d.Sync();
+        var id = ClipStore.SyncId(big.Id);
+        Assert.DoesNotContain(_cloud.LiveItems(d.Personal), i => i.Id == id);
+        Assert.Single(_cloud.LiveItems(d.Personal));
+        var puts = Puts(d, id);
+        Assert.Equal(1, puts);
+
+        var restarted = new SyncAccount(d.Store, d.Vault, d.Settings, d.Keys, new HttpClient(_cloud), kdfIterations: 1000);
+        restarted.Restore();
+        await restarted.SyncNowAsync();
+        await restarted.SyncNowAsync();
+        Assert.Equal(puts, Puts(d, id));
+
+        d.Store.ReplaceText(d.Store.Find(big.Id)!, "short now");   // changed: tried again
+        await restarted.SyncNowAsync();
+        Assert.Contains(_cloud.LiveItems(d.Personal), i => i.Id == id);
+    }
+
+    [Fact]
+    public async Task ReceivedFilesAreMarkedAsDownloaded()
+    {
+        Assert.Equal("[ZoneTransfer]\r\nZoneId=3\r\n", ZoneIdentifier.Content);
+        var a = await SignedUp();
+        var b = await SignedIn();
+        var marked = new List<string>();
+        b.Account.Engine!.MarkReceivedFile = path =>
+        {
+            marked.Add(path);
+            ZoneIdentifier.Mark(path);
+        };
+        var item = a.Store.Ingest(ProcessedCapture.ForFiles([WriteFile(a, "report.pdf", RandomNumberGenerator.GetBytes(500)), WriteFile(a, "notes.txt", [1, 2])]));
+        await a.Sync();
+        await b.Sync();
+        var copy = b.Store.Find(item.Id)!;
+        Assert.Equal(2, copy.Files.Count);
+        Assert.Equal(copy.Files, marked);
+        if (OperatingSystem.IsWindows())
+            foreach (var file in copy.Files) Assert.Contains("ZoneId=3", File.ReadAllText(file + ":Zone.Identifier"));
+        Assert.All(Directory.GetFiles(b.Store.SyncedFolder(item.Id)), f => Assert.DoesNotContain("Zone.Identifier", f));
+    }
+
+    private static JsonObject OpenPayload(Device d, FakeCloud.Item remote)
+    {
+        var space = d.Account.Engine!.Space(d.Personal)!;
+        var plaintext = SyncCrypto.Open(space.ItemKey, Convert.FromBase64String(remote.Ciphertext!), SyncCrypto.Aad.Item(space.Id, remote.Id, remote.Category));
+        return JsonNode.Parse(plaintext)!.AsObject();
+    }
+
+    [Fact]
+    public async Task PayloadsCarryRevAndReplaysAndRollbacksAreDropped()
+    {
+        var a = await SignedUp();
+        var b = await SignedIn();
+        var item = a.Copy("v1");
+        await a.Sync();
+        var id = ClipStore.SyncId(item.Id);
+        var remote = _cloud.ItemById(a.Personal, id);
+        Assert.Equal(remote.UpdatedAt, OpenPayload(a, remote)["rev"]!.GetValue<long>());
+        await b.Sync();
+        a.Store.TogglePin(a.Store.Find(item.Id)!);
+        await a.Sync();
+        await b.Sync();
+        Assert.True(b.Store.Find(item.Id)!.IsPinned);
+
+        _cloud.ServePrevious(a.Personal, id, rollback: false);   // the old ciphertext under a new updatedAt
+        await b.Sync();
+        Assert.True(b.Store.Find(item.Id)!.IsPinned);
+        _cloud.ServePrevious(a.Personal, id, rollback: true);    // the old ciphertext with its own old updatedAt
+        await b.Sync();
+        Assert.True(b.Store.Find(item.Id)!.IsPinned);
+
+        // Payloads from older apps (no rev) are accepted; rev and toDevice never count as a change.
+        var legacy = SyncPayload.ForClip(item);
+        Assert.Null(SyncPayload.Parse(SyncPayload.Encode(legacy), item.Id, null)!.Rev);
+        var written = (JsonObject)legacy.DeepClone();
+        written["rev"] = 5;
+        written["toDevice"] = "x";
+        Assert.Equal(5, SyncPayload.Parse(SyncPayload.Encode(written), item.Id, null)!.Rev);
+        Assert.Equal(SyncPayload.Fingerprint(legacy), SyncPayload.Fingerprint(written));
+    }
+
+    [Fact]
+    public async Task ReceivedTimesAreClampedToArrival()
+    {
+        var a = await SignedUp();
+        var b = await SignedIn();
+        var future = a.Store.Ingest(ProcessedCapture.ForText("from a fast clock"), DateTime.UtcNow.AddMinutes(5));
+        await a.Sync();
+        await b.Sync();
+        var copy = b.Store.Find(future.Id)!;
+        Assert.True(copy.LastCopiedAt <= DateTime.UtcNow);
+        Assert.True(copy.CreatedAt <= DateTime.UtcNow);
+        var puts = _cloud.Count("PUT api.fake");
+        await b.Sync();
+        Assert.Equal(puts, _cloud.Count("PUT api.fake"));   // the clamped copy doesn't bounce back
+    }
+
+    [Fact]
+    public async Task KdfSettingsOutOfBoundsOrLoweredAreRefusedBeforeDeriving()
+    {
+        var d = NewDevice(iterations: 2000);
+        Assert.True(await d.Account.CreateAccountAsync(Email, "roham", Password, Password, _cloud.IssueSignupCode()), d.Account.Error);
+        Assert.True(await d.Account.SignOutAsync());
+        var logins = _cloud.Count("POST api.fake/v1/auth/login");
+
+        _cloud.SetIterations(Email, 1500);   // lower than this PC saw for this email
+        Assert.False(await d.Account.SignInAsync(Email, Password));
+        Assert.Contains("weaker password settings", d.Account.Error);
+        foreach (var iterations in new[] { 999, SyncCrypto.MaxKdfIterations + 1 })
+        {
+            _cloud.SetIterations(Email, iterations);
+            var fresh = NewDevice();
+            Assert.False(await fresh.Account.SignInAsync(Email, Password));
+            Assert.Contains("unusual password settings", fresh.Account.Error);
+        }
+        Assert.Equal(logins, _cloud.Count("POST api.fake/v1/auth/login"));   // the password was never used
+        Assert.Equal(600_000, SyncCrypto.MinKdfIterations);
+    }
+
+    [Fact]
+    public async Task AChangedGroupKeyIsNotAdoptedUntilLeaveAndRejoin()
+    {
+        var a = await SignedUp();
+        var b = await SignedUp("friend@example.com");
+        Assert.True(await a.Account.CreateGroupAsync("Team"));
+        var group = a.Account.Groups.Single();
+        await Invite(a, b, group.Id);
+        a.Copy("before", 0, group.Id);
+        await a.Sync();
+        await b.Sync();
+
+        var evil = SyncCrypto.WrapSpaceKey(SyncCrypto.RandomKey(), group.Id, b.Account.Uid!, _cloud.PublicKey("friend@example.com"));
+        _cloud.ReplaceWrappedKey(group.Id, b.Account.Uid!, evil);
+        a.Copy("after", 0, group.Id);
+        await a.Sync();
+        await b.Sync();
+        Assert.Contains("This group's key changed unexpectedly", b.Account.Error);
+        Assert.Equal(SyncStatus.Error, b.Account.CurrentStatus);
+        Assert.DoesNotContain(b.Store.ItemsInSpace(group.Id), i => i.Text == "after");
+        Assert.Contains(b.Store.ItemsInSpace(group.Id), i => i.Text == "before");
+        Assert.Single(b.Store.Groups());   // still listed, so it can be left
+
+        Assert.True(await b.Account.LeaveGroupAsync(group.Id), b.Account.Error);
+        await Invite(a, b, group.Id);
+        await b.Sync();
+        Assert.Null(b.Account.Error);
+        Assert.Contains(b.Store.ItemsInSpace(group.Id), i => i.Text == "after");
+    }
+
+    [Fact]
+    public async Task SignUpNeedsAnInviteCodeAndAGroupCodeJoinsTheGroup()
+    {
+        var d = NewDevice();
+        Assert.False(await d.Account.CreateAccountAsync(Email, "roham", Password, Password));
+        Assert.Contains("invite-only", d.Account.Error);
+        Assert.False(await d.Account.CreateAccountAsync(Email, "roham", Password, Password, "ABCD-EFGH"));
+        Assert.Contains("doesn't look like an invite code", d.Account.Error);
+        Assert.False(await d.Account.CreateAccountAsync(Email, "roham", Password, Password, "AAAA-AAAA-AAAA-AAAA"));
+        Assert.Contains("unknown, already used or expired", d.Account.Error);
+        Assert.False(_cloud.HasAccount(Email));
+
+        var code = _cloud.IssueSignupCode();
+        Assert.True(await d.Account.CreateAccountAsync(Email, "roham", Password, Password, code.ToLowerInvariant().Replace("-", " ")), d.Account.Error);
+        Assert.Equal(0, _cloud.OpenSignupCodes);
+        var reuse = NewDevice();
+        Assert.False(await reuse.Account.CreateAccountAsync("other@example.com", "other", Password, Password, code));
+        Assert.Contains("already used", reuse.Account.Error);
+
+        // A group invite code signs up and joins that group.
+        Assert.True(await d.Account.CreateGroupAsync("Family"));
+        var group = d.Account.Groups.Single();
+        var groupCode = (await d.Account.CreateInviteAsync(group.Id))!;
+        var friend = NewDevice();
+        Assert.True(await friend.Account.CreateAccountAsync("friend@example.com", "friend", Password, Password, groupCode), friend.Account.Error);
+        Assert.Equal("Family", Assert.Single(friend.Account.Groups).Name);
+        Assert.Contains("You joined Family", friend.Account.Status);
+        Assert.Equal(0, _cloud.PendingInvites(group.Id));
+    }
+
+    [Fact]
+    public async Task InviteSomeoneCreatesListsAndRevokesSignupCodes()
+    {
+        var d = await SignedUp();
+        var code = await d.Account.CreateSignupCodeAsync();
+        Assert.Matches("^[A-Z2-7]{4}(-[A-Z2-7]{4}){3}$", code);
+        var open = Assert.Single(await d.Account.SignupCodesAsync());
+        Assert.True(await d.Account.RevokeSignupCodeAsync(open.Id));
+        Assert.Empty(await d.Account.SignupCodesAsync());
+
+        var codes = new List<string>();
+        for (var i = 0; i < 10; i++) codes.Add((await d.Account.CreateSignupCodeAsync())!);
+        Assert.Null(await d.Account.CreateSignupCodeAsync());
+        Assert.Contains("10 open invites", d.Account.Error);
+
+        // A code works once for signing up, and then no longer counts as open.
+        var invited = NewDevice();
+        Assert.True(await invited.Account.CreateAccountAsync("invited@example.com", "invited", Password, Password, codes[3]), invited.Account.Error);
+        Assert.Equal(9, (await d.Account.SignupCodesAsync()).Count);
+        Assert.NotNull(await d.Account.CreateSignupCodeAsync());
+    }
+
+    [Fact]
+    public async Task DevicesAreListedSignedOutAndSentTo()
+    {
+        var a = await SignedUp();
+        var b = await SignedIn();
+        await a.Account.RefreshDevicesAsync();
+        Assert.Equal(2, a.Account.Devices.Count);
+        Assert.True(a.Account.Devices[0].IsCurrent);
+        Assert.Equal(Environment.MachineName, a.Account.Devices[0].Name);
+        var bId = b.Account.CurrentDeviceId!;
+        Assert.NotEqual(a.Account.CurrentDeviceId, bId);
+
+        var received = new List<(ClipItem Item, string From)>();
+        b.Account.ReceivedFromDevice += (item, from) => received.Add((item, from));
+        var old = a.Copy("send me", 600);
+        await a.Sync();
+        await b.Sync();
+        b.Copy("something newer on B");
+        Assert.Empty(received);
+
+        Assert.False(await a.Account.SendToDeviceAsync(a.Store.Find(old.Id)!, a.Account.CurrentDeviceId!));
+        Assert.True(await a.Account.SendToDeviceAsync(a.Store.Find(old.Id)!, bId), a.Account.Error);
+        Assert.Equal(old.Id, a.Store.AllItems().First().Id);
+        await b.Sync();
+        var (sent, from) = Assert.Single(received);
+        Assert.Equal(old.Id, sent.Id);
+        Assert.Equal(Environment.MachineName, from);
+        Assert.Equal(old.Id, b.Store.AllItems().First().Id);   // at the top on B
+        var puts = _cloud.Count("PUT api.fake");
+        await a.Sync();
+        await b.Sync();
+        Assert.Equal(puts, _cloud.Count("PUT api.fake"));
+        Assert.Single(received);
+
+        // Another device just gets the item.
+        var c = await SignedIn();
+        Assert.Contains(c.Store.AllItems(), i => i.Id == old.Id);
+
+        Assert.True(await a.Account.SignOutDeviceAsync(bId), a.Account.Error);
+        await b.Sync();
+        Assert.Equal(SyncPhase.NeedsSignIn, b.Account.Phase);
+        Assert.True(await a.Account.SignOutDeviceAsync(a.Account.CurrentDeviceId!), a.Account.Error);
+        Assert.Equal(SyncPhase.SignedOut, a.Account.Phase);
+        Assert.Equal(SyncStatus.SignedOut, a.Account.CurrentStatus);
+    }
+
+    [Fact]
+    public async Task StatusAndPollingCadence()
+    {
+        var now = DateTime.UtcNow;
+        var d = NewDevice(() => now);
+        Assert.Equal(SyncStatus.SignedOut, d.Account.CurrentStatus);
+        var seen = new List<SyncStatus>();
+        d.Account.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(SyncAccount.CurrentStatus)) seen.Add(d.Account.CurrentStatus);
+        };
+        Assert.True(await d.Account.CreateAccountAsync(Email, "roham", Password, Password, _cloud.IssueSignupCode()));
+        await d.Sync();
+        Assert.Equal(SyncStatus.Idle, d.Account.CurrentStatus);
+        Assert.Contains(SyncStatus.Syncing, seen);
+
+        Assert.Equal(SyncAccount.IdlePollInterval, d.Account.PollInterval);
+        d.Account.ReportActivity();
+        Assert.Equal(TimeSpan.FromSeconds(15), d.Account.PollInterval);
+        var changes = _cloud.Count("GET api.fake/v1/spaces");
+        d.Account.SetPanelOpen(true);   // syncs once right away
+        Assert.Equal(TimeSpan.FromSeconds(3), d.Account.PollInterval);
+        await d.Sync();
+        Assert.True(_cloud.Count("GET api.fake/v1/spaces") > changes);
+        Assert.False(d.Account.PollIfDue());
+        now = now.AddSeconds(4);
+        Assert.True(d.Account.PollIfDue());
+        await d.Sync();
+        d.Account.SetPanelOpen(false);
+        Assert.Equal(TimeSpan.FromSeconds(15), d.Account.PollInterval);
+        now = now.AddSeconds(14);
+        Assert.False(d.Account.PollIfDue());
+        now = now.AddMinutes(5);
+        Assert.Equal(TimeSpan.FromSeconds(60), d.Account.PollInterval);
+        Assert.True(d.Account.PollIfDue());
+        await d.Sync();
+
+        _cloud.Offline = true;
+        now = now.AddMinutes(2);
+        await d.Sync();
+        Assert.Equal(SyncStatus.Offline, d.Account.CurrentStatus);
+        _cloud.Offline = false;
+        await d.Sync();
+        Assert.Equal(SyncStatus.Idle, d.Account.CurrentStatus);
+        Assert.Null(d.Account.Error);
+    }
+
+    [Fact]
+    public async Task AFastClockIsReportedAndItsItemsWaitForTheNextLaunch()
+    {
+        var d = NewDevice(() => DateTime.UtcNow.AddMinutes(30));
+        Assert.True(await d.Account.CreateAccountAsync(Email, "roham", Password, Password, _cloud.IssueSignupCode()), d.Account.Error);
+        var item = d.Copy("written with a fast clock");
+        await d.Sync();
+        Assert.Contains("Your clock is off", d.Account.Error);
+        Assert.Equal(SyncStatus.Error, d.Account.CurrentStatus);
+        Assert.Empty(_cloud.LiveItems(d.Personal));
+        var puts = Puts(d, ClipStore.SyncId(item.Id));
+        await d.Sync();
+        Assert.Equal(puts, Puts(d, ClipStore.SyncId(item.Id)));
+    }
+
+    [Fact]
+    public async Task OthersGroupItemsCantBeChangedButStayChangedHere()
+    {
+        var a = await SignedUp();
+        var b = await SignedUp("friend@example.com");
+        Assert.True(await a.Account.CreateGroupAsync("Team"));
+        var group = a.Account.Groups.Single();
+        await Invite(a, b, group.Id);
+        var note = a.Copy("a's note", 0, group.Id);
+        await a.Sync();
+        await b.Sync();
+
+        b.Store.SetLabel("b's label", b.Store.Find(note.Id)!);
+        await b.Sync();
+        Assert.Contains(b.Account.Warnings, w => w.Contains("Only its author or the group's owner"));
+        Assert.Equal("b's label", b.Store.Find(note.Id)!.Label);   // kept here
+        await a.Sync();
+        Assert.Null(a.Store.Find(note.Id)!.Label);
+        var writes = _cloud.Count("PUT api.fake") + _cloud.Count("DELETE api.fake");
+        await b.Sync();
+        Assert.Equal(writes, _cloud.Count("PUT api.fake") + _cloud.Count("DELETE api.fake"));
+
+        b.Store.Delete(b.Store.Find(note.Id)!);
+        await b.Sync();
+        await b.Sync();
+        Assert.Null(b.Store.Find(note.Id));
+        Assert.Contains(_cloud.LiveItems(group.Id), i => i.Id == ClipStore.SyncId(note.Id));
+        Assert.Equal(1, _cloud.Count($"DELETE api.fake/v1/spaces/{group.Id}/items/{ClipStore.SyncId(note.Id)}"));
+    }
+
+    [Fact]
+    public void SignupInvitesAreParsedLikeInviteCodes()
+    {
+        Assert.Equal("ABCDEFGHIJKLMNOP", Assert.IsType<SignupInvite.Code>(SignupInvite.Parse(" abcd-efgh-ijkl-mnop ")).Value);
+        Assert.Equal("OIBA2345OIBAQRST", Assert.IsType<SignupInvite.Code>(SignupInvite.Parse("018A-2345-018A-QRST")).Value);
+        var bytes = InviteCode.Generate();
+        Assert.Equal(bytes, Assert.IsType<SignupInvite.Group>(SignupInvite.Parse(InviteCode.Format(bytes))).CodeBytes);
+        Assert.Null(SignupInvite.Parse("ABCD-EFGH-IJKL-MNO"));
+        Assert.Null(SignupInvite.Parse("ABCD-EFGH-IJKL-MNO9"));
+        Assert.Null(SignupInvite.Parse(""));
     }
 }
