@@ -31,6 +31,7 @@ public sealed class QuickPanelWindow : Window
     private readonly Border _detail = new();
     private readonly TextBlock _hints = Fluent.Label("", 12, Fluent.Secondary);
     private readonly TextBlock _notice = Fluent.Label("", 12);
+    private readonly SyncStatusBadge _syncStatus;
     private readonly Dictionary<string, Border> _rowViews = [];
     private List<string> _renderedIds = [];
     private bool _renderQueued;
@@ -93,8 +94,11 @@ public sealed class QuickPanelWindow : Window
         content.Children.Add(_detail);
 
         var footer = new DockPanel { Margin = new Thickness(16, 7, 16, 8) };
+        _syncStatus = new SyncStatusBadge(services.Sync);
         DockPanel.SetDock(_notice, Dock.Right);
+        DockPanel.SetDock(_syncStatus, Dock.Right);
         footer.Children.Add(_notice);
+        footer.Children.Add(_syncStatus);
         footer.Children.Add(_hints);
 
         var root = new Grid();
@@ -112,9 +116,12 @@ public sealed class QuickPanelWindow : Window
         Content = new Border { Background = Fluent.PanelBackground, Child = root };
 
         PreviewKeyDown += OnPreviewKeyDown;
-        Deactivated += (_, _) => { if (IsVisible) _services.ClosePanel(); };
+        Deactivated += (_, _) => { if (IsVisible) CloseAfterDeactivation(); };
         Model.Changed += QueueRender;
         _services.StoreChanged += () => Dispatcher.BeginInvoke(() => { if (IsVisible) Model.Refresh(); });
+        _services.Sync.Changed += () => Dispatcher.BeginInvoke(_syncStatus.Update);
+        _services.ImageText.Indexed += OnImageTextRead;
+        SetUpDropTargets();
     }
 
     private static void AutomationName(DependencyObject element, string name) =>
@@ -157,6 +164,128 @@ public sealed class QuickPanelWindow : Window
     public void HidePanel()
     {
         if (IsVisible) Hide();
+    }
+
+    /// <summary>Closes when another window is activated, except while the mouse button is held: the user may be
+    /// dragging files in from File Explorer. Then it waits for the release, and stays if something was dropped.</summary>
+    private void CloseAfterDeactivation()
+    {
+        const int VK_LBUTTON = 0x01;
+        if (!Native.IsDown(VK_LBUTTON))
+        {
+            _services.ClosePanel();
+            return;
+        }
+        var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+        timer.Tick += (_, _) =>
+        {
+            if (Native.IsDown(VK_LBUTTON)) return;
+            timer.Stop();
+            if (IsVisible && !IsActive) _services.ClosePanel();
+        };
+        timer.Start();
+    }
+
+    /// <summary>Brings the panel back to the front after something was dropped on it from another app.</summary>
+    private void ReactivateAfterDrop()
+    {
+        Activate();
+        Native.ForceForeground(new WindowInteropHelper(this).Handle);
+        FocusForMode();
+    }
+
+    private void OnImageTextRead(ClipItem item)
+    {
+        if (!IsVisible) return;
+        var selected = Model.SelectedEntry?.ClipItem?.Id == item.Id;
+        if (Model.Query.Length == 0 && !selected) return;
+        Model.Refresh();
+        if (selected) _detailState = default;   // show "Text in image"
+        QueueRender();
+    }
+
+    // MARK: Drag and drop
+
+    private const string EntryFormat = "Clipboard2.PanelEntry";
+    private Point _dragStart;
+    private PanelEntry? _dragEntry;
+
+    private void BeginRowDrag(Border row, PanelEntry entry, MouseEventArgs e)
+    {
+        if (e.LeftButton != MouseButtonState.Pressed || _dragEntry != entry || entry.ClipItem is not { } item || item == Model.SelectionItem) return;
+        var delta = e.GetPosition(this) - _dragStart;
+        if (Math.Abs(delta.X) < SystemParameters.MinimumHorizontalDragDistance && Math.Abs(delta.Y) < SystemParameters.MinimumVerticalDragDistance) return;
+        _dragEntry = null;
+        var data = new DataObject();
+        data.SetData(EntryFormat, entry.Id);
+        if (item.Kind.IsTextual()) data.SetText(item.Text);
+        DragDrop.DoDragDrop(row, data, DragDropEffects.Copy);
+    }
+
+    private static List<string> DroppedFiles(IDataObject data) =>
+        data.GetDataPresent(DataFormats.FileDrop) && data.GetData(DataFormats.FileDrop) is string[] files ? [.. files] : [];
+
+    private static string? DroppedText(IDataObject data) =>
+        !data.GetDataPresent(EntryFormat) && data.GetDataPresent(DataFormats.UnicodeText) ? data.GetData(DataFormats.UnicodeText) as string : null;
+
+    /// <summary>Files or text from other apps can be dropped on the list; they go into history.</summary>
+    private void SetUpDropTargets()
+    {
+        _rowScroll.AllowDrop = true;
+        _rowScroll.DragOver += (_, e) =>
+        {
+            e.Effects = DroppedFiles(e.Data).Count > 0 || DroppedText(e.Data) is not null ? DragDropEffects.Copy : DragDropEffects.None;
+            e.Handled = true;
+        };
+        _rowScroll.Drop += (_, e) =>
+        {
+            e.Handled = true;
+            var files = DroppedFiles(e.Data);
+            var added = files.Count > 0 ? _services.AddDroppedFiles(files)
+                : DroppedText(e.Data) is { } text ? _services.AddDroppedText(text) : null;
+            if (added is null) return;
+            ReactivateAfterDrop();
+            Model.Refresh(resetSelection: true);
+            Model.ShowNotice(files.Count > 1 ? $"Added {files.Count} files to history" : "Added to history");
+        };
+    }
+
+    /// <summary>Dropping a panel item, files or text on a group chip shares it to that group.</summary>
+    private void MakeGroupDropTarget(Border chip, string groupId, string groupName)
+    {
+        chip.AllowDrop = true;
+        bool Accepts(IDataObject data) => data.GetDataPresent(EntryFormat) || DroppedFiles(data).Count > 0 || DroppedText(data) is not null;
+        chip.DragEnter += (_, e) =>
+        {
+            if (!Accepts(e.Data)) return;
+            chip.BorderBrush = Fluent.Accent;
+            chip.BorderThickness = new Thickness(2);
+        };
+        chip.DragLeave += (_, _) => chip.BorderThickness = new Thickness(0);
+        chip.DragOver += (_, e) =>
+        {
+            e.Effects = Accepts(e.Data) ? DragDropEffects.Copy : DragDropEffects.None;
+            e.Handled = true;
+        };
+        chip.Drop += (_, e) =>
+        {
+            e.Handled = true;
+            chip.BorderThickness = new Thickness(0);
+            if (e.Data.GetData(EntryFormat) is string id)
+            {
+                // Dragging one of several selected items shares the whole selection.
+                if (!(Model.IsMultiSelecting && Model.SelectedIds.Contains(id))) Model.Select(id);
+                Model.Perform(new PanelAction.ShareTo(groupId, groupName));
+                return;
+            }
+            var files = DroppedFiles(e.Data);
+            var added = files.Count > 0 ? _services.AddDroppedFiles(files, groupId)
+                : DroppedText(e.Data) is { } text ? _services.AddDroppedText(text, groupId) : null;
+            if (added is null) return;
+            ReactivateAfterDrop();
+            Model.Refresh();
+            Model.ShowNotice($"Shared to “{groupName}”");
+        };
     }
 
     private void FocusForMode()
@@ -244,7 +373,11 @@ public sealed class QuickPanelWindow : Window
         }
         // Sync groups come after the built-in filters (Tab cycles through them too).
         foreach (var (id, name) in Model.GroupNames.OrderBy(g => g.Value, StringComparer.CurrentCultureIgnoreCase))
-            AddChip(name, Glyphs.Group, Model.GroupFilter == id, () => Model.SetGroupFilter(id));
+        {
+            var chip = AddChip(name, Glyphs.Group, Model.GroupFilter == id, () => Model.SetGroupFilter(id));
+            chip.ToolTip = $"Drop items or files here to share them to “{name}”";
+            MakeGroupDropTarget(chip, id, name);
+        }
     }
 
     private PanelFilter? ActiveContentType => Model.GroupFilter is null && Model.Filter.IsContentType() ? Model.Filter : null;
@@ -279,7 +412,7 @@ public sealed class QuickPanelWindow : Window
         menu.IsOpen = true;
     }
 
-    private void AddChip(string title, string glyph, bool selected, Action choose)
+    private Border AddChip(string title, string glyph, bool selected, Action choose)
     {
         var content = new StackPanel { Orientation = Orientation.Horizontal };
         var icon = Glyphs.Icon(glyph, 13, selected ? Fluent.AccentText : Fluent.Secondary);
@@ -298,6 +431,7 @@ public sealed class QuickPanelWindow : Window
         AutomationName(chip, $"{title} filter");
         chip.MouseLeftButtonUp += (_, _) => choose();
         _chips.Children.Add(chip);
+        return chip;
     }
 
     private void RenderRows()
@@ -344,8 +478,11 @@ public sealed class QuickPanelWindow : Window
     private Border BuildRow(PanelEntry entry, int index, bool multi)
     {
         var border = new Border { CornerRadius = new CornerRadius(6), Padding = new Thickness(8, 6, 8, 6), Margin = new Thickness(0, 1, 0, 1), Cursor = Cursors.Arrow };
+        border.MouseMove += (_, e) => BeginRowDrag(border, entry, e);
         border.MouseLeftButtonDown += (_, e) =>
         {
+            _dragStart = e.GetPosition(this);
+            _dragEntry = e.ClickCount >= 2 ? null : entry;
             if (e.ClickCount >= 2)
             {
                 if (Model.IsMultiSelecting && Model.IsSelected(entry)) Model.PasteSelection(); else Model.Activate(entry);
@@ -485,6 +622,13 @@ public sealed class QuickPanelWindow : Window
         }
         menu.Items.Add(slots);
         if (ShareMenu(entry) is { } share) menu.Items.Add(share);
+        if (entry.ClipItem is { } sendable && sendable != Model.SelectionItem && _services.OtherDevices is { Count: > 0 } devices)
+        {
+            var send = new MenuItem { Header = "Send to Device" };
+            foreach (var device in devices)
+                send.Items.Add(Item($"Send to {device.Name}", () => _ = _services.SendToDeviceAsync(sendable, device, fromPanel: true)));
+            menu.Items.Add(send);
+        }
         if (entry.ClipItem is { } item)
         {
             menu.Items.Add(Item("Paste as Plain Text", () => Model.Activate(entry, Transform.PlainText)));
@@ -564,11 +708,7 @@ public sealed class QuickPanelWindow : Window
 
         UIElement body = entry switch
         {
-            PanelEntry.Clip { Item.Kind: ClipKind.Image } c => new Image
-            {
-                Source = c.Item.ImageFile is { } f ? ImageTools.Load(_services.Store.Blobs.PathFor(f), 900) : null,
-                Stretch = Stretch.Uniform, Margin = new Thickness(14),
-            },
+            PanelEntry.Clip { Item.Kind: ClipKind.Image } c => ImagePreview(c.Item),
             PanelEntry.Clip { Item.Kind: ClipKind.File } c => Padded(FileList(c.Item.Files)),
             PanelEntry.Clip c => TextView(c.Item.Text),
             PanelEntry.SnippetEntry s => TextView(s.Snippet.Body),
@@ -582,6 +722,38 @@ public sealed class QuickPanelWindow : Window
         var meta = Padded(Metadata(entry), 12);
         Grid.SetRow(meta, 2);
         grid.Children.Add(meta);
+        return grid;
+    }
+
+    /// <summary>The picture, and below it the text read from it (when there is any).</summary>
+    private UIElement ImagePreview(ClipItem item)
+    {
+        var image = new Image
+        {
+            Source = item.ImageFile is { } f ? ImageTools.Load(_services.Store.Blobs.PathFor(f), 900) : null,
+            Stretch = Stretch.Uniform, Margin = new Thickness(14),
+        };
+        if (string.IsNullOrEmpty(item.OcrText)) return image;
+        var grid = new Grid();
+        grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.Children.Add(image);
+        var section = new StackPanel { Margin = new Thickness(14, 0, 14, 10) };
+        var header = new DockPanel { Margin = new Thickness(0, 0, 0, 4) };
+        var copy = new Button { Content = "Copy Text", FontSize = 12, Padding = new Thickness(8, 2, 8, 2) };
+        var text = item.OcrText;
+        copy.Click += (_, _) => { _services.CopyText(text); Model.ShowNotice("Copied the text in the image"); };
+        DockPanel.SetDock(copy, Dock.Right);
+        header.Children.Add(copy);
+        header.Children.Add(Fluent.Label("Text in image", 12, Fluent.Secondary, FontWeights.SemiBold));
+        section.Children.Add(header);
+        section.Children.Add(new TextBox
+        {
+            Text = text, IsReadOnly = true, TextWrapping = TextWrapping.Wrap, BorderThickness = new Thickness(0), Background = Fluent.Subtle,
+            MaxHeight = 120, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(8), FontSize = 13,
+        });
+        Grid.SetRow(section, 1);
+        grid.Children.Add(section);
         return grid;
     }
 
@@ -987,6 +1159,7 @@ public sealed class QuickPanelWindow : Window
     private void RenderHints()
     {
         _notice.Text = Model.Notice ?? "";
+        _syncStatus.Update();
         _hints.Text = Model.Mode switch
         {
             PanelMode.Browse when Model.IsMultiSelecting => $"Enter Paste {Model.SelectedClips.Count} items    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+P Pin    Del Delete    Esc Close",

@@ -59,6 +59,7 @@ public abstract record PanelAction
     public sealed record TogglePin : PanelAction;
     public sealed record ShareToGroup : PanelAction;
     public sealed record ShareTo(string GroupId, string GroupName) : PanelAction;
+    public sealed record SendTo(string DeviceId, string DeviceName) : PanelAction;
     public sealed record Delete : PanelAction;
 
     public string Section(string aiName) => this switch
@@ -67,6 +68,7 @@ public abstract record PanelAction
         ApplyTransform => "Transform & Paste",
         Ask or SetUpAI => $"Ask {aiName}",
         ShareTo => "Share to Group",
+        SendTo => "Send to Device",
         _ => "Item",
     };
 
@@ -85,9 +87,13 @@ public abstract record PanelAction
         TogglePin => isPinned ? "Unpin" : "Pin",
         ShareToGroup => "Share to Group…",
         ShareTo s => s.GroupName,
+        SendTo d => $"Send to {d.DeviceName}",
         _ => "Delete",
     };
 }
+
+/// <summary>Another signed-in device of the same account, for "Send to ‹device›".</summary>
+public sealed record DeviceTarget(string Id, string Name);
 
 /// <summary>Things the panel asks the app to do (paste into the previous app, open Settings…).</summary>
 public interface IPanelHost
@@ -191,6 +197,10 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     public IReadOnlyDictionary<string, string> GroupNames { get; private set; } = new Dictionary<string, string>();
     /// <summary>The signed-in sync user (null when signed out), so own group items show the own username.</summary>
     public Func<SyncSelf?>? Self { get; set; }
+    /// <summary>The account's other devices (empty or null when signed out).</summary>
+    public Func<IReadOnlyList<DeviceTarget>>? Devices { get; set; }
+    /// <summary>Sends a history item to one device; the host reports failures with <see cref="ShowNotice"/>.</summary>
+    public Action<ClipItem, DeviceTarget>? SendToDevice { get; set; }
     private Dictionary<string, SpaceRecord> _groups = [];
     private Dictionary<(string Space, string LocalId), string?> _authors = [];
     /// <summary>In the action menu: picking the group to share with.</summary>
@@ -668,6 +678,11 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     private bool CanShare => store.Groups().Count > 0;
 
+    private IReadOnlyList<DeviceTarget> OtherDevices => SendToDevice is null ? [] : Devices?.Invoke() ?? [];
+
+    private IEnumerable<PanelAction> SendActions =>
+        OtherDevices.OrderBy(d => d.Name, StringComparer.CurrentCultureIgnoreCase).Select(d => new PanelAction.SendTo(d.Id, d.Name));
+
     public void SetActionQuery(string query)
     {
         if (query == ActionQuery) return;
@@ -725,6 +740,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                     break;
             }
             if (CanShare) actions.Add(new PanelAction.ShareToGroup());
+            if (entry is PanelEntry.Clip) actions.AddRange(SendActions);
             if (slots.SlotFor(entry.SlotTarget) is { } slot) actions.Add(new PanelAction.ClearSlot(slot));
             if (entry is PanelEntry.Clip or PanelEntry.SecretEntry) actions.Add(new PanelAction.Delete());
             return actions;
@@ -812,6 +828,11 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 break;
             case PanelAction.ShareTo share:
                 Share(entry, share);
+                break;
+            case PanelAction.SendTo send when item is not null:
+                SendToDevice?.Invoke(item, new DeviceTarget(send.DeviceId, send.DeviceName));
+                ResetMode();
+                ShowNotice($"Sending to {send.DeviceName}…");
                 break;
             case PanelAction.Delete:
                 Mode = PanelMode.Browse;

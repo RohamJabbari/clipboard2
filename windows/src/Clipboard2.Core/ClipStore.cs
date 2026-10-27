@@ -112,7 +112,11 @@ public sealed class ClipStore : IDisposable
                     UPDATE sync_cursor SET since = 0 WHERE space_id IN (SELECT id FROM sync_spaces WHERE kind = 'group');
                     """);
             }
-            // v3 (OCR text) comes from the features branch and goes here, before v4.
+            if (version < 3)
+            {
+                // v3: text recognised in images (local only), for search. Null = not read yet.
+                Exec("ALTER TABLE clips ADD COLUMN ocr_text TEXT;");
+            }
             if (version < 4)
             {
                 // v4: a full re-sync survives an interruption (the flag and the ids seen so far), and items the server
@@ -357,6 +361,21 @@ public sealed class ClipStore : IDisposable
     private static void DeleteFolder(string folder)
     {
         try { System.IO.Directory.Delete(folder, recursive: true); } catch { /* already gone or in use */ }
+    }
+
+    // MARK: Text in images
+
+    /// <summary>Newest images whose text hasn't been read yet.</summary>
+    public List<ClipItem> ImagesNeedingOcr(int limit) =>
+        Query("SELECT * FROM clips WHERE kind = $k AND ocr_text IS NULL AND image_file IS NOT NULL ORDER BY last_copied DESC LIMIT $n",
+            ("$k", (int)ClipKind.Image), ("$n", limit));
+
+    /// <summary>Stores recognised text ("" = none). Local only: it isn't part of the sync payload, so no
+    /// <see cref="Changed"/> (which would schedule a sync).</summary>
+    public void SetOcrText(Guid id, string text)
+    {
+        Exec("UPDATE clips SET ocr_text = $t WHERE id = $id", ("$t", text), ("$id", id.ToString()));
+        Revision++;
     }
 
     // MARK: Snippets
@@ -765,6 +784,7 @@ public sealed class ClipStore : IDisposable
                 Label = Str("label"),
                 CopyCount = (int)Num("copy_count"),
                 SpaceId = Str("space_id"),
+                OcrText = Str("ocr_text"),
             });
         }
         return list;

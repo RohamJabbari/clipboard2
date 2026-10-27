@@ -37,6 +37,8 @@ public sealed class AppServices : IPanelHost
     public SubscriptionAccount ChatGptAccount { get; } = new(SubscriptionCli.Codex);
     public ModelLister Models { get; }
     public SyncAccount Sync { get; }
+    /// <summary>Reads the text in history images in the background, for search.</summary>
+    public ImageTextIndexer ImageText { get; }
     public Dispatcher Dispatcher { get; }
 
     private readonly ClipboardListener _listener = new();
@@ -66,6 +68,10 @@ public sealed class AppServices : IPanelHost
         Settings = Settings.Load(SettingsPath);
         Store = new ClipStore(Path.Combine(DataDirectory, "history.db"), new BlobStore(Path.Combine(DataDirectory, "Blobs")),
             Path.Combine(DataDirectory, "Synced Files"));
+        ImageText = new ImageTextIndexer(Store, (path, ct) => Task.Run(() => TextRecognizer.RecognizeFileAsync(path), ct))
+        {
+            Logger = message => Log.Info("Image text: " + message),
+        };
         Secrets = new SecretVault(Settings);
         Slots = new QuickSlots(Settings);
         Models = new ModelLister(Keys);
@@ -73,6 +79,11 @@ public sealed class AppServices : IPanelHost
         Panel.GroupFilterSelected += () => _ = Sync.SyncNowAsync();
         Sync = new SyncAccount(Store, Secrets, Settings, Keys) { Logger = message => Log.Info("Sync: " + message) };
         Panel.Self = () => Sync.Self;
+        Panel.Devices = () => Sync.IsSignedIn
+            ? [.. Sync.Devices.Where(d => !d.IsCurrent).Select(d => new DeviceTarget(d.Id, d.Name))]
+            : [];
+        Panel.SendToDevice = (item, device) => _ = SendToDeviceAsync(item, device, fromPanel: true);
+        Store.Changed += () => _ = ImageText.Kick();
         Store.Changed += () => StoreChanged?.Invoke();
         Store.Changed += ScheduleSync;
         Secrets.Changed += () =>
@@ -134,6 +145,12 @@ public sealed class AppServices : IPanelHost
             await Task.Delay(TimeSpan.FromSeconds(20));
             if (Settings.CheckForUpdates) await Updates.CheckAsync(Settings.InstallUpdatesAutomatically);
         });
+        // Older images are read a little after launch, so starting up stays quick.
+        Dispatcher.BeginInvoke(async () =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(15));
+            _ = ImageText.Kick();
+        });
         _ = ClaudeAccount.RefreshAsync();
         _ = ChatGptAccount.RefreshAsync();
 
@@ -152,6 +169,7 @@ public sealed class AppServices : IPanelHost
 
     public void Shutdown()
     {
+        ImageText.Stop();
         _tray?.Dispose();
         _contextMenu?.Dispose();
         Hotkeys.Dispose();
@@ -277,6 +295,7 @@ public sealed class AppServices : IPanelHost
 
     public void ShowFlyout(Point nearScreenPoint)
     {
+        Sync.ReportActivity();
         _flyout ??= new FlyoutWindow(this);
         _flyout.ShowNear(nearScreenPoint);
     }
@@ -324,6 +343,7 @@ public sealed class AppServices : IPanelHost
         var appTransform = transform ?? Settings.DefaultTransform(Tracker.AppFor(target)?.Id is { } path ? Path.GetFileName(path) : null);
         ClipboardIO.Write(item, appTransform, Store.Blobs);
         Store.Touch(item);
+        Sync.ReportActivity();
         _ = SendPasteAsync(target);
     }
 
@@ -331,6 +351,7 @@ public sealed class AppServices : IPanelHost
     {
         var target = TargetForPaste;
         ClipboardIO.Write(items, transform, Store.Blobs);
+        Sync.ReportActivity();
         _ = SendPasteAsync(target);
     }
 
@@ -338,6 +359,7 @@ public sealed class AppServices : IPanelHost
     {
         var target = TargetForPaste;
         ClipboardIO.WriteText(text);
+        Sync.ReportActivity();
         _ = SendPasteAsync(target, cursorOffsetFromEnd);
     }
 
@@ -482,6 +504,7 @@ public sealed class AppServices : IPanelHost
         _panelTarget = target;
         Panel.PrepareForSelection(text, Tracker.AppFor(target));
         PanelWindow.ShowNear(target);
+        Sync.SetPanelOpen(true);
     }
 
     /// <summary>Ctrl+Alt+C: the selected text goes straight into the default sync group's history.</summary>
@@ -557,6 +580,80 @@ public sealed class AppServices : IPanelHost
         if (text.Length == 0) { System.Media.SystemSounds.Beep.Play(); return; }
         Store.Ingest(ProcessedCapture.ForText(text, source: new AppRef("clipboard2", "Text from Screen")));
         await PasteKeepingClipboardAsync(text, target);
+    }
+
+    // MARK: Send to device, drops
+
+    /// <summary>Sends a history item to another of the account's devices; it shows up there as "Sent from ‹this PC›".</summary>
+    public async Task SendToDeviceAsync(ClipItem item, DeviceTarget device, bool fromPanel)
+    {
+        Sync.ReportActivity();
+        try
+        {
+            await Sync.SendToDeviceAsync(item, device.Id);
+            if (fromPanel) Panel.ShowNotice($"Sent to {device.Name}");
+            else _tray?.ShowBalloon($"Sent to {device.Name}", item.DisplayTitle);
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Sending to {device.Name} failed", ex);
+            var message = SyncAccount.Friendly(ex);
+            if (fromPanel) Panel.ShowNotice($"Couldn't send to {device.Name}: {message}");
+            else _tray?.ShowBalloon($"Couldn't send to {device.Name}", message);
+        }
+    }
+
+    /// <summary>The account's other devices, by name (none when signed out).</summary>
+    public List<DeviceTarget> OtherDevices => Panel.Devices?.Invoke().OrderBy(d => d.Name, StringComparer.CurrentCultureIgnoreCase).ToList() ?? [];
+
+    /// <summary>Right-click menu: sends the selection (copied with Ctrl+C) to a device, or the newest copy when
+    /// nothing is selected. A saved secret is never sent this way.</summary>
+    public async Task SendSelectionToDeviceAsync(DeviceTarget device)
+    {
+        if (!Sync.IsSignedIn)
+        {
+            OpenSettings("Sync");
+            return;
+        }
+        var source = Tracker.AppFor(Tracker.TargetWindow);
+        var raw = await CopySelectionCaptureAsync(source);
+        var capture = raw is null ? null : await CaptureProcessor.ProcessAsync(raw, Store.Blobs);
+        ClipItem? item = null;
+        if (capture is not null)
+        {
+            if (capture.Kind.IsTextual() && (string.IsNullOrWhiteSpace(capture.Text) || Secrets.ValueHashes.Contains(capture.Hash)))
+            {
+                System.Media.SystemSounds.Beep.Play();
+                return;
+            }
+            item = Store.Ingest(capture);
+        }
+        item ??= Store.ItemsInSpace(null).FirstOrDefault();
+        if (item is null)
+        {
+            System.Media.SystemSounds.Beep.Play();
+            return;
+        }
+        await SendToDeviceAsync(item, device, fromPanel: false);
+    }
+
+    /// <summary>Files dropped on the panel's list (into history) or on a group chip (shared to that group).</summary>
+    public ClipItem? AddDroppedFiles(IReadOnlyList<string> paths, string? spaceId = null)
+    {
+        if (paths.Count == 0) return null;
+        var item = Store.Ingest(ProcessedCapture.ForFiles(paths), spaceId: spaceId);
+        Sync.ReportActivity();
+        return item;
+    }
+
+    /// <summary>Text dragged in from another app. Blank text and saved secrets are refused.</summary>
+    public ClipItem? AddDroppedText(string text, string? spaceId = null)
+    {
+        var capture = ProcessedCapture.ForText(text);
+        if (string.IsNullOrWhiteSpace(text) || Secrets.ValueHashes.Contains(capture.Hash)) return null;
+        var item = Store.Ingest(capture, spaceId: spaceId);
+        Sync.ReportActivity();
+        return item;
     }
 
     // MARK: AI

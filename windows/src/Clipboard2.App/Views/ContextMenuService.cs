@@ -97,6 +97,7 @@ public sealed class ContextMenuService : IDisposable
                 InputSender.Click(_location);
                 await Task.Delay(80);
             }
+            _services.Sync.ReportActivity();
             var menu = Build(explorer);
             _host ??= CreateHost();
             Native.SetWindowPos(new WindowInteropHelper(_host).EnsureHandle(), IntPtr.Zero, _location.X, _location.Y, 1, 1, Native.SWP_NOZORDER);
@@ -156,6 +157,9 @@ public sealed class ContextMenuService : IDisposable
         {
             menu.Items.Add(Item("Send Selection to Group", Glyphs.Group, () => Do(_services.SendSelectionToGroupAsync), ShortcutFor(Hotkey.SendToGroup)));
             menu.Items.Add(Item("Paste from Group", Glyphs.Group, () => Do(_services.PasteFromGroupAsync), ShortcutFor(Hotkey.PasteFromGroup)));
+            // One entry per other device: sends the selection, or the newest copy when nothing is selected.
+            foreach (var device in _services.OtherDevices)
+                menu.Items.Add(Item($"Send to {device.Name}", Glyphs.Cloud, () => Do(() => _services.SendSelectionToDeviceAsync(device))));
         }
         menu.Items.Add(Submenu("Recent", Glyphs.Clock, _services.Store.AllItems().Take(12).Select(item =>
             Item(item.DisplayTitle.Length > 60 ? item.DisplayTitle[..60] + "…" : item.DisplayTitle, item.IsPinned ? Glyphs.Pin : Glyphs.Text,

@@ -9,6 +9,7 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using Clipboard2.App.Platform;
 using Clipboard2.Core;
+using Clipboard2.Core.Sync;
 
 namespace Clipboard2.App.Views;
 
@@ -239,19 +240,33 @@ public sealed class TrayIcon : IDisposable
     private readonly AppServices _services;
     private readonly System.Windows.Forms.ToolStripMenuItem _updateItem;
     private readonly System.Windows.Forms.ToolStripMenuItem _pauseItem;
+    private readonly System.Windows.Forms.ToolStripMenuItem _syncStatusItem;
+    private readonly System.Windows.Forms.ToolStripMenuItem _syncNowItem;
+    private readonly System.Windows.Forms.ToolStripSeparator _syncSeparator;
+    private readonly TrayStatusIcons _statusIcons;
+    private readonly System.Windows.Threading.DispatcherTimer _statusTimer = new() { Interval = TimeSpan.FromSeconds(30) };
 
     public TrayIcon(AppServices services)
     {
         _services = services;
         var stream = Application.GetResourceStream(new Uri("pack://application:,,,/Assets/app.ico")).Stream;
+        var baseIcon = new System.Drawing.Icon(stream, System.Windows.Forms.SystemInformation.SmallIconSize);
+        _statusIcons = new TrayStatusIcons(baseIcon);
         _icon = new System.Windows.Forms.NotifyIcon
         {
-            Icon = new System.Drawing.Icon(stream, System.Windows.Forms.SystemInformation.SmallIconSize),
+            Icon = baseIcon,
             Text = "Clipboard2",
             Visible = true,
         };
         var menu = new System.Windows.Forms.ContextMenuStrip();
         menu.Items.Add($"Open Clipboard2 ({services.Settings.Hotkeys[Hotkey.QuickPanel]})", null, (_, _) => services.ShowPanel());
+        // Sync: a status line (an error opens Settings → Sync) and Sync Now. Hidden when signed out.
+        _syncStatusItem = new System.Windows.Forms.ToolStripMenuItem("", null, (_, _) => services.OpenSettings("Sync"));
+        _syncNowItem = new System.Windows.Forms.ToolStripMenuItem("Sync Now", null, (_, _) => _ = services.Sync.SyncNowAsync());
+        _syncSeparator = new System.Windows.Forms.ToolStripSeparator();
+        menu.Items.Add(_syncStatusItem);
+        menu.Items.Add(_syncNowItem);
+        menu.Items.Add(_syncSeparator);
         _pauseItem = new System.Windows.Forms.ToolStripMenuItem("Pause Capture", null, (_, _) => TogglePause());
         menu.Items.Add(_pauseItem);
         menu.Items.Add("Settings…", null, (_, _) => services.OpenSettings());
@@ -263,7 +278,12 @@ public sealed class TrayIcon : IDisposable
         menu.Items.Add(_updateItem);
         menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
         menu.Items.Add("Quit Clipboard2", null, (_, _) => Application.Current.Shutdown());
-        menu.Opening += (_, _) => _pauseItem.Text = services.Settings.IsPaused ? "Resume Capture" : "Pause Capture";
+        menu.Opening += (_, _) =>
+        {
+            _pauseItem.Text = services.Settings.IsPaused ? "Resume Capture" : "Pause Capture";
+            services.Sync.ReportActivity();
+            UpdateSyncStatus();
+        };
         _icon.ContextMenuStrip = menu;
         _icon.MouseClick += (_, e) =>
         {
@@ -271,6 +291,10 @@ public sealed class TrayIcon : IDisposable
             Native.GetCursorPos(out var point);
             services.ShowFlyout(new Point(point.X, point.Y));
         };
+        services.Sync.Changed += () => services.Dispatcher.BeginInvoke(UpdateSyncStatus);
+        _statusTimer.Tick += (_, _) => UpdateSyncStatus();   // keeps "2 min ago" current
+        _statusTimer.Start();
+        UpdateSyncStatus();
         _icon.BalloonTipClicked += async (_, _) =>
         {
             if (services.Updates.AvailableVersion is not null) await services.Updates.InstallAsync();
@@ -281,7 +305,22 @@ public sealed class TrayIcon : IDisposable
     {
         _services.Settings.IsPaused = !_services.Settings.IsPaused;
         _services.Settings.Save();
-        _icon.Text = _services.Settings.IsPaused ? "Clipboard2 (paused)" : "Clipboard2";
+        UpdateSyncStatus();
+    }
+
+    /// <summary>Tray icon variant (a dot while syncing, offline or failing), tooltip and the menu's status line.</summary>
+    private void UpdateSyncStatus()
+    {
+        var status = SyncStatusText.From(_services.Sync);
+        _syncStatusItem.Visible = _syncNowItem.Visible = _syncSeparator.Visible = status.IsVisible;
+        _syncStatusItem.Text = status.Text;
+        _syncStatusItem.Enabled = status.Status is SyncStatus.Error or SyncStatus.Offline;
+        _syncStatusItem.ToolTipText = status.Status is SyncStatus.Error or SyncStatus.Offline ? "Open Settings → Sync" : "";
+        _syncNowItem.Enabled = status.CanSyncNow;
+        _icon.Icon = _statusIcons.For(status.Status);
+        var text = _services.Settings.IsPaused ? "Clipboard2 (paused)" : "Clipboard2";
+        if (status.IsVisible) text += "\n" + status.Text;
+        _icon.Text = text.Length > 127 ? text[..127] : text;
     }
 
     public void ShowBalloon(string title, string text) => _icon.ShowBalloonTip(5000, title, text, System.Windows.Forms.ToolTipIcon.None);
@@ -298,7 +337,9 @@ public sealed class TrayIcon : IDisposable
 
     public void Dispose()
     {
+        _statusTimer.Stop();
         _icon.Visible = false;
         _icon.Dispose();
+        _statusIcons.Dispose();
     }
 }
