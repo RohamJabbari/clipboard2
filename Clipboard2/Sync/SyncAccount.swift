@@ -727,6 +727,7 @@ final class SyncAccount {
     /// A local store changed: sync after the debounce. Commits sync makes itself don't count.
     func localChange() {
         guard let engine, !engine.isApplyingRemote else { return }
+        engine.noteLocalChange()
         reportActivity()
         requestTick(after: SyncConfig.debounce)
     }
@@ -738,7 +739,8 @@ final class SyncAccount {
     }
 
     func syncNow() {
-        guard engine != nil else { return }
+        guard let engine else { return }
+        engine.noteLocalChange()   // a manual sync (or a send) always does a full pass
         requestTick(after: .zero)
     }
 

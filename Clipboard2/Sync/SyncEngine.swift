@@ -46,6 +46,25 @@ final class SyncEngine {
     /// The space list was refreshed (start of every tick), so groups show before items arrive.
     var onSpacesUpdated: (() -> Void)?
 
+    /// Whether this Mac changed anything since the last upload pass. Idle ticks (polling while
+    /// the panel is open) then only pull, instead of re-reading and re-hashing every item. A full
+    /// pass still runs every `fullPushInterval` as a safety net.
+    private var localChangesPending = true
+    private var lastFullPush: Date?
+    static let fullPushInterval: TimeInterval = 5 * 60
+
+    /// Something changed here (history, snippets, secrets, a send): the next tick uploads.
+    func noteLocalChange() { localChangesPending = true }
+
+    /// Sync records by local id, loaded once per tick instead of one fetch per lookup.
+    private var metaIndex: [String: SyncMeta]?
+    private var indexesMetas = false
+    /// While a page is being applied, store and snippet commits are collected into one (each
+    /// commit refreshes every open list).
+    private var commitsDeferred = 0
+    private var pendingStoreCommit = false
+    private var pendingSnippetCommit = false
+
     /// Images downloaded ahead of `apply` (see `prefetchImages`), by image blob id: the decrypted
     /// image and a thumbnail made from it.
     private var prefetched: [String: (image: Data, thumbnail: Data?)] = [:]
@@ -168,28 +187,47 @@ final class SyncEngine {
         // while sending it) must never keep new group items from arriving.
         let spaces = updateSpaces(remote).sorted { !$0.isPersonal && $1.isPersonal }
         onSpacesUpdated?()
+        indexesMetas = true
         defer {
             prefetched = [:]
+            indexesMetas = false
+            metaIndex = nil
             save()
         }
         for space in spaces {
+            // Duplicates can only appear where something arrived.
             try await inSpace(space, merging: .quietly) { try await self.pull(space, itemKey: $0) }
         }
-        for space in spaces {
-            // Duplicates found after the push need one more tick to send their tombstones.
-            try await inSpace(space, merging: .asLocalChange) { try await self.push(space, itemKey: $0) }
+        let fullPassDue = lastFullPush.map { now().timeIntervalSince($0) > Self.fullPushInterval } ?? true
+        guard localChangesPending || fullPassDue || !pendingToDevice.isEmpty else { return }
+        // Cleared first, so a change made while uploading is picked up by the next tick.
+        localChangesPending = false
+        do {
+            for space in spaces {
+                // Duplicates found after the push need one more tick to send their tombstones.
+                try await inSpace(space, merging: .asLocalChange) { try await self.push(space, itemKey: $0); return true }
+            }
+            lastFullPush = now()
+        } catch {
+            localChangesPending = true
+            throw error
         }
     }
 
     private enum MergeMode { case quietly, asLocalChange }
 
-    private func inSpace(_ space: SyncSpace, merging: MergeMode, _ work: (Data) async throws -> Void) async throws {
+    /// `work` returns whether duplicates may have appeared (something was received or sent).
+    private func inSpace(_ space: SyncSpace, merging: MergeMode, _ work: (Data) async throws -> Bool) async throws {
         try checkActive()
         let spaceId = space.id
         guard let key = spaceKeys[spaceId], !keyMismatches.contains(spaceId) else { return }
         do {
-            try await work(SyncCrypto.itemKey(spaceKey: key))
+            let changed = try await work(SyncCrypto.itemKey(spaceKey: key))
             try checkActive()
+            guard changed else {
+                quietly { flushSecrets() }
+                return
+            }
             let local = localSpaceID(spaceId)
             let merged = merging == .quietly ? quietly { store.convergeDuplicates(inSpace: local) }
                                              : store.convergeDuplicates(inSpace: local)
@@ -313,8 +351,15 @@ final class SyncEngine {
 
     // MARK: Pull
 
-    private func pull(_ space: SyncSpace, itemKey: Data) async throws {
+    /// Returns whether any item came in.
+    private func pull(_ space: SyncSpace, itemKey: Data) async throws -> Bool {
         let spaceId = space.id
+        var received = false
+        commitsDeferred += 1
+        defer {
+            commitsDeferred -= 1
+            flushCommits()
+        }
         while true {
             let since = space.since
             let page = try await api.changes(spaceId: spaceId, since: since, limit: SyncConfig.changesPageSize, full: space.resyncing)
@@ -339,11 +384,14 @@ final class SyncEngine {
                 try checkActive()
             }
             prefetched = [:]
+            received = received || !page.items.isEmpty
+            flushCommits()
             space.since = max(since, page.nextSince)
             save()
             if !page.hasMore || page.items.isEmpty { break }
         }
         if space.resyncing { finishResync(space) }
+        return received
     }
 
     /// After a full resync: the tombstones older than the purge horizon are gone, so whatever we
@@ -536,7 +584,7 @@ final class SyncEngine {
         if item.kind != .file { store.removeSyncedFiles(of: uuid) }
         quietly {
             if existing == nil { store.insertSynced(item) }
-            store.commitSynced()
+            commitStore()
         }
 
         let fileBlobs = hasFiles
@@ -640,7 +688,7 @@ final class SyncEngine {
         snippet.spaceID = localSpaceID(spaceId)
         quietly {
             if existing == nil { snippets.insertSynced(snippet) }
-            snippets.commitSynced()
+            commitSnippets()
         }
         recordMeta(id: remote.id, spaceId: spaceId, category: .snippet, fingerprint: snippetFingerprint(snippet),
                    seq: remote.seq, updatedAt: remote.updatedAt, authorUid: remote.authorUid)
@@ -1155,8 +1203,26 @@ final class SyncEngine {
     }
 
     private func commitLocal() {
-        store.commitSynced()
-        snippets.commitSynced()
+        commitStore()
+        commitSnippets()
+    }
+
+    private func commitStore() {
+        if commitsDeferred > 0 { pendingStoreCommit = true } else { store.commitSynced() }
+    }
+
+    private func commitSnippets() {
+        if commitsDeferred > 0 { pendingSnippetCommit = true } else { snippets.commitSynced() }
+    }
+
+    /// Commits what a page applied, once.
+    private func flushCommits() {
+        quietly {
+            if pendingStoreCommit { store.commitSynced() }
+            if pendingSnippetCommit { snippets.commitSynced() }
+        }
+        pendingStoreCommit = false
+        pendingSnippetCommit = false
     }
 
     private func flushSecrets() {
@@ -1171,6 +1237,7 @@ final class SyncEngine {
         let meta = self.meta(for: id) ?? {
             let meta = SyncMeta(localId: id, spaceId: spaceId, category: category.rawValue)
             context.insert(meta)
+            metaIndex?[id] = meta
             return meta
         }()
         meta.spaceId = spaceId
@@ -1186,9 +1253,18 @@ final class SyncEngine {
     }
 
     func meta(for id: String) -> SyncMeta? {
-        var descriptor = FetchDescriptor<SyncMeta>(predicate: #Predicate { $0.localId == id })
-        descriptor.fetchLimit = 1
-        return (try? context.fetch(descriptor))?.first
+        guard indexesMetas else {
+            var descriptor = FetchDescriptor<SyncMeta>(predicate: #Predicate { $0.localId == id })
+            descriptor.fetchLimit = 1
+            return (try? context.fetch(descriptor))?.first
+        }
+        if metaIndex == nil {
+            let all = (try? context.fetch(FetchDescriptor<SyncMeta>())) ?? []
+            metaIndex = Dictionary(all.map { ($0.localId, $0) }, uniquingKeysWith: { first, _ in first })
+        }
+        // Deleted since the index was built (sign-out, tombstones, resync): gone.
+        guard let meta = metaIndex?[id], !meta.isDeleted, meta.modelContext != nil else { return nil }
+        return meta
     }
 
     func metas(inSpace spaceId: String) -> [SyncMeta] {

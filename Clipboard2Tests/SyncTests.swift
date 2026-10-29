@@ -890,8 +890,10 @@ nonisolated enum SHA256Fake {
 }
 
 final class FakeSecrets: SyncSecretSource {
-    var refs: [String: SecretRef] = [:]
-    var values: [String: String] = [:]
+    /// Local edits (like SecretStore.onChange in the app); set by FakeDevice.
+    var onChange: (() -> Void)?
+    var refs: [String: SecretRef] = [:] { didSet { onChange?() } }
+    var values: [String: String] = [:] { didSet { onChange?() } }
 
     var syncSecrets: [SecretRef] { Array(refs.values) }
     func syncValue(id: String) -> String? { values[id] }
@@ -952,6 +954,15 @@ final class FakeDevice {
         let token = user.token
         engine = SyncEngine(api: FakeClient(server: user.server, token: { token }), identity: user.identity,
                             context: container.mainContext, store: store, snippets: snippets, secrets: secrets)
+        // Like the app (SyncAccount.localChange): local commits ask the next tick to upload.
+        let engine = self.engine
+        let noteChange = { [weak engine] in
+            guard let engine, !engine.isApplyingRemote else { return }
+            engine.noteLocalChange()
+        }
+        store.onCommit = noteChange
+        snippets.onCommit = noteChange
+        secrets.onChange = noteChange
     }
 
     func texts(inSpace space: String? = nil) -> Set<String> { Set(store.items(inSpace: space).map(\.text)) }
@@ -1023,6 +1034,53 @@ struct SyncEngineTests {
         #expect(await server.item(space: user.personal, id: item.id.uuidString.lowercased())?.category == "pinned")
         try await mac2.engine.tick()
         #expect(mac2.store.item(withID: item.id)?.isPinned == true)
+    }
+
+    @Test func idleTicksOnlyPullAndChangesStillGoOut() async throws {
+        let server = FakeSyncServer()
+        let user = try await FakeUser.make("alice", on: server)
+        let mac = try FakeDevice(user)
+        var clock = Date(timeIntervalSince1970: 1_800_000_000)
+        mac.engine.now = { clock }
+        mac.store.ingest(.text("first"))
+        try await mac.engine.tick()
+        let afterFirst = await server.seq
+
+        // Nothing changed: no upload, no commit.
+        var commits = 0
+        let signal = mac.store.onCommit
+        mac.store.onCommit = { commits += 1; signal?() }
+        try await mac.engine.tick()
+        #expect(await server.seq == afterFirst)
+        #expect(commits == 0)
+
+        // A local change (signalled by the store's commit) goes out on the next tick.
+        mac.store.ingest(.text("second"))
+        try await mac.engine.tick()
+        #expect(await server.live(space: user.personal).count == 2)
+
+        // Safety net: even a change nothing signalled is sent by the periodic full pass.
+        let item = try #require(mac.store.allItems().first { $0.text == "first" })
+        item.isPinned = true
+        try await mac.engine.tick()
+        #expect(await server.live(space: user.personal).first { $0.id == lower(item.id) }?.category == "history")
+        clock = clock.addingTimeInterval(SyncEngine.fullPushInterval + 1)
+        try await mac.engine.tick()
+        #expect(await server.live(space: user.personal).first { $0.id == lower(item.id) }?.category == "pinned")
+    }
+
+    @Test func aPulledPageIsCommittedOnce() async throws {
+        let server = FakeSyncServer()
+        let user = try await FakeUser.make("alice", on: server)
+        let mac1 = try FakeDevice(user), mac2 = try FakeDevice(user)
+        for i in 0..<300 { mac1.snippets.create(name: "s\(i)", body: "body \(i)") }
+        try await mac1.engine.tick()
+        var commits = 0
+        let signal = mac2.snippets.onCommit
+        mac2.snippets.onCommit = { commits += 1; signal?() }
+        try await mac2.engine.tick()
+        #expect(mac2.snippets.all().count == 300)
+        #expect(commits == 1)
     }
 
     @Test func imagesFromAnotherMacDownloadInParallelWithLocalThumbnails() async throws {
@@ -1234,11 +1292,13 @@ struct SyncEngineTests {
         let remoteCopy = try #require(mac2.snippets.snippet(withID: snippet.id))
         remoteCopy.body = "v2 from mac2"
         remoteCopy.updatedAt = Date(timeIntervalSince1970: 3_000)
+        mac2.engine.noteLocalChange()   // what SnippetStore.didEdit signals, without its timestamp
         try await mac2.engine.tick()
 
         // mac1 edited earlier and never saw mac2's version before pushing (its cursor skips it).
         snippet.body = "older edit on mac1"
         snippet.updatedAt = Date(timeIntervalSince1970: 2_000)
+        mac1.engine.noteLocalChange()
         let latest = await server.seq
         for space in mac1.engine.allSpaces() { space.since = latest }
         try await mac1.engine.tick()
@@ -1938,6 +1998,7 @@ struct SyncHardeningTests {
 
         snippet.body = "v2"
         snippet.updatedAt = Date(timeIntervalSince1970: 2_000)
+        mac1.engine.noteLocalChange()   // what SnippetStore.didEdit signals, without its timestamp
         try await mac1.engine.tick()
         try await mac2.engine.tick()
         #expect(mac2.snippets.snippet(withID: snippet.id)?.body == "v2")
