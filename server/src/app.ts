@@ -185,6 +185,8 @@ async function requireGroupOwner(db: Queryable, spaceId: string, uid: string) {
   if (membership.role !== "owner") throw forbidden("Only the group owner can do that");
 }
 
+const SERVER_TOTAL_TTL_MS = 30_000;
+
 /** Bytes this user currently occupies: live items they wrote plus blobs they registered. */
 async function bytesUsed(db: Queryable, uid: string): Promise<number> {
   const { rows } = await db.query<{ total: number }>(
@@ -248,6 +250,21 @@ export function buildApp(deps: Deps): FastifyInstance {
   const app = Fastify({ logger, bodyLimit: Math.ceil(limits.itemBytes * 1.4) + 64 * 1024, trustProxy: (_address: string, hop: number) => hop < 1 });
   const requests = new RateLimiter(limits.requestsPerMinute);
   const inviteLookups = new RateLimiter(limits.invitesPerMinute);
+
+  // The server-wide cap only guards the shared database and bucket, but summing every row on the
+  // server costs a full scan per upload. Each instance re-counts at most every 30 s and adds its own
+  // writes in between; it may miss up to 30 s of other instances' writes, which is fine for a cap.
+  // (Deletions are only seen at the next re-count, so the estimate errs on the full side.)
+  let serverTotal: { bytes: number; at: number } | undefined;
+  const serverBytes = async (db: Queryable) => {
+    if (!serverTotal || Date.now() - serverTotal.at > SERVER_TOTAL_TTL_MS) {
+      serverTotal = { bytes: await bytesStored(db, null), at: Date.now() };
+    }
+    return serverTotal.bytes;
+  };
+  const addServerBytes = (delta: number) => {
+    if (serverTotal) serverTotal.bytes += delta;
+  };
   const scryptSlots = new Semaphore(limits.scryptConcurrency, limits.scryptQueue);
   const serverKey = preloginKey(pool);
   serverKey.catch(() => {}); // surfaced on first prelogin instead of as an unhandled rejection
@@ -915,7 +932,7 @@ export function buildApp(deps: Deps): FastifyInstance {
         }
         if ((await bytesStored(db, spaceId)) - replaced + body.ciphertext.length > limits.groupBytes) throw groupFull("This group's sync storage is full");
       }
-      if ((await bytesStored(db, null)) - replaced + body.ciphertext.length > limits.totalBytes) throw serverFull();
+      if ((await serverBytes(db)) - replaced + body.ciphertext.length > limits.totalBytes) throw serverFull();
 
       const { rows: saved } = await db.query<{ seq: number }>(
         `INSERT INTO items (space_id, id, category, sort_at, updated_at, ciphertext, blob_ids, size, author_uid)
@@ -927,6 +944,7 @@ export function buildApp(deps: Deps): FastifyInstance {
          RETURNING seq`,
         [spaceId, itemId, body.category, body.sortAt, body.updatedAt, body.ciphertext, blobIds, body.ciphertext.length, uid],
       );
+      addServerBytes(body.ciphertext.length - replaced);
 
       const dropped = (existing?.blob_ids ?? []).filter((b) => !blobIds.includes(b));
       const paths = await dropBlobs(db, spaceId, dropped);
@@ -1035,8 +1053,9 @@ export function buildApp(deps: Deps): FastifyInstance {
       }
       if ((await bytesUsed(db, uid)) + body.size > limits.userBytes) throw new ApiError(403, "quota_exceeded", "Your sync storage is full");
       if (membership.kind === "group" && (await bytesStored(db, spaceId)) + body.size > limits.groupBytes) throw groupFull("This group's sync storage is full");
-      if ((await bytesStored(db, null)) + body.size > limits.totalBytes) throw serverFull();
+      if ((await serverBytes(db)) + body.size > limits.totalBytes) throw serverFull();
       await db.query("INSERT INTO blobs (space_id, id, size, owner_uid) VALUES ($1, $2, $3, $4)", [spaceId, body.id, body.size, uid]);
+      addServerBytes(body.size);
     });
     const signed = await storage.signedPutUrl(blobPath(spaceId, body.id), body.size, { ifGenerationMatch: body.ifGenerationMatch === true });
     return { url: signed.url, method: "PUT", headers: signed.headers, expiresAt: signed.expiresAt };
