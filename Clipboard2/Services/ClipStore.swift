@@ -141,6 +141,25 @@ final class ClipStore {
         commit()
     }
 
+    /// Saves text edited in the quick panel. `rtf`/`html` are nil for plain text. The item keeps
+    /// its place, pin and label; another item that now has the same content is merged into it.
+    func editText(of item: ClipItem, text: String, rtf: Data?, html: Data?) {
+        guard item.kind.isTextual, text != item.text || rtf != item.rtfData else { return }
+        let hash = ContentHasher.hash(text: text)
+        if let duplicate = self.item(withHash: hash, inSpace: item.spaceID), duplicate.id != item.id {
+            item.copyCount += duplicate.copyCount
+            remove(duplicate)
+        }
+        item.kind = rtf == nil ? .text : .richText
+        item.text = text
+        item.preview = TextPreview.make(text)
+        item.rtfData = rtf
+        item.htmlData = html
+        item.contentHash = hash
+        item.byteCount = text.utf8.count + (rtf?.count ?? 0) + (html?.count ?? 0)
+        commit()
+    }
+
     // MARK: Duplicates
 
     /// Recomputes text hashes (after a hashing change) and applies precomputed image hashes.

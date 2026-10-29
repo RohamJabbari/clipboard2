@@ -660,6 +660,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
             nonisolated(unsafe) let event = event
             let handled = MainActor.assumeIsolated { () -> Bool in
                 guard let self, let window = self.panel, event.window === window else { return false }
+                if window.firstResponder is ClipEditorTextView { return self.model.handleEditorKey(event) }
                 return self.model.handleKeyDown(event)
             }
             return handled ? nil : event

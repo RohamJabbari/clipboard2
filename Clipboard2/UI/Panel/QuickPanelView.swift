@@ -59,6 +59,8 @@ struct QuickPanelView: View {
             }
             Hairline()
             HintBar(entry: model.selectedEntry, mode: model.mode, notice: model.notice,
+                    isEditingText: model.isEditingText,
+                    canEditText: model.selectedEntry?.clip.map(model.isEditable) ?? false,
                     selectionCount: model.isMultiSelecting ? model.selectedClips.count : nil,
                     updateVersion: env.updates.readyVersion,
                     syncIndicator: env.sync.indicator,
@@ -311,7 +313,7 @@ struct QuickPanelView: View {
             if model.isMultiSelecting {
                 MultiSelectionPreview(clips: model.selectedClips, totalSelected: model.selectedIDs.count)
             } else if let entry = model.selectedEntry {
-                PreviewPane(entry: entry, onEditSecret: model.beginEditSecret)
+                PreviewPane(entry: entry, onEditSecret: model.beginEditSecret, model: model)
             } else {
                 Color.clear
             }
@@ -580,6 +582,8 @@ struct HintBar: View {
     let entry: PanelEntry?
     let mode: PanelMode
     let notice: String?
+    var isEditingText = false
+    var canEditText = false
     var selectionCount: Int?
     /// A downloaded update waiting for a relaunch: shown quietly at the trailing end.
     var updateVersion: String?
@@ -590,6 +594,11 @@ struct HintBar: View {
     var body: some View {
         HStack(spacing: 14) {
             switch mode {
+            case .browse where isEditingText:
+                hint("esc", "Done")
+                hint("⌘⏎", "Paste")
+                hint("⌘B ⌘I ⌘U", "Style")
+                hint("⌘Z", "Undo")
             case .browse where selectionCount != nil:
                 hint("⏎", "Paste \(selectionCount ?? 0) Items")
                 hint("⌥⏎", "Plain Text")
@@ -603,6 +612,7 @@ struct HintBar: View {
                 }
                 if entry != nil {
                     hint("⌘K", "Actions")
+                    if canEditText { hint("⌘E", "Edit") }
                     hint("⌘⇧1–9", "Assign Slot")
                 }
             case .actions:
@@ -643,7 +653,7 @@ struct HintBar: View {
                     .layoutPriority(-1)
                     .help(syncIndicator.offersSyncNow ? "\(syncIndicator.title()) — use Sync Now in the menu bar menu" : syncIndicator.title())
             }
-            hint("esc", mode == .browse ? "Close" : "Back")
+            if !isEditingText { hint("esc", mode == .browse ? "Close" : "Back") }
         }
         .font(.caption)
         .foregroundStyle(.secondary)

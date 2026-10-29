@@ -3,6 +3,8 @@ import SwiftUI
 struct PreviewPane: View {
     let entry: PanelEntry
     var onEditSecret: ((SecretRef) -> Void)?
+    /// When set, the account's own text items are editable in place.
+    var model: PanelViewModel?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -20,7 +22,11 @@ struct PreviewPane: View {
         case .clip(let item):
             switch item.kind {
             case .text, .richText:
-                TextPreviewView(text: item.text)
+                if let model, model.isEditable(item) {
+                    ClipEditor(item: item, model: model)
+                } else {
+                    TextPreviewView(text: item.text)
+                }
             case .image:
                 VStack(spacing: 0) {
                     ImagePreviewView(item: item)

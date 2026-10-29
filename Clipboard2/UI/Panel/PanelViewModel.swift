@@ -344,8 +344,60 @@ final class PanelViewModel {
     @ObservationIgnored private var userMovedSelection = false
 
     func didClose() {
+        flushEditor?()
+        isEditingText = false
         selectionItem = nil
         resetMode()
+    }
+
+    // MARK: Editing the previewed text
+
+    /// The preview's text editor has keyboard focus (keys go to it, not the list).
+    var isEditingText = false
+    /// Bumped by ⌘E to move keyboard focus into the editor.
+    private(set) var editorFocusToken = 0
+    /// Set by the editor: saves pending edits now (before pasting or closing).
+    @ObservationIgnored var flushEditor: (() -> Void)?
+    /// Set by the editor: styles the selection (style bar and ⌘B/⌘I/⌘U).
+    @ObservationIgnored var applyStyle: (TextStyle) -> Void = { _ in }
+
+    /// Only this account's own text items: transient selections aren't saved, and group items
+    /// belong to everyone in the group.
+    func isEditable(_ item: ClipItem) -> Bool {
+        item.kind.isTextual && !item.isTransient && item.spaceID == nil
+    }
+
+    func beginEditing() {
+        guard let item = selectedEntry?.clip, isEditable(item), !isMultiSelecting else { return }
+        editorFocusToken &+= 1
+    }
+
+    /// Saves and hands the keyboard back to the search field and list.
+    func endEditing() {
+        flushEditor?()
+        isEditingText = false
+        focusToken &+= 1
+    }
+
+    func saveEdit(_ item: ClipItem, text: String, rtf: Data?, html: Data?) {
+        env.store.editText(of: item, text: text, rtf: rtf, html: html)
+    }
+
+    /// Keys while the editor has focus: everything is typing except leaving and pasting.
+    func handleEditorKey(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        switch event.keyCode {
+        case KeyCode.escape:
+            endEditing()
+            return true
+        case KeyCode.returnKey where flags.contains(.command), KeyCode.keypadEnter where flags.contains(.command):
+            flushEditor?()
+            isEditingText = false
+            activate(selectedEntry, transform: flags.contains(.option) ? .plainText : nil)
+            return true
+        default:
+            return false
+        }
     }
 
     func resetMode() {
@@ -595,6 +647,7 @@ final class PanelViewModel {
 
     func activate(_ entry: PanelEntry?, transform: Transform? = nil) {
         guard let entry else { return }
+        flushEditor?()
         switch entry {
         case .clip(let item):
             let target = targetApp
@@ -1164,6 +1217,9 @@ final class PanelViewModel {
                 return true
             case "k":
                 openActions()
+                return true
+            case "e":
+                beginEditing()
                 return true
             case ",":
                 onClose()

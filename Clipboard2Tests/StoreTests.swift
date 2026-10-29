@@ -18,6 +18,42 @@ struct StoreTests {
         store = ClipStore(context: container.mainContext, blobs: blobs)
     }
 
+    // MARK: Editing in the panel
+
+    @Test func editingTextKeepsTheItemsPlaceAndPin() {
+        let t0 = Date(timeIntervalSince1970: 1_000)
+        let item = store.ingest(.text("teh draft"), now: t0)
+        store.togglePin(item)
+        store.editText(of: item, text: "the draft", rtf: nil, html: nil)
+        #expect(item.text == "the draft")
+        #expect(item.preview == "the draft")
+        #expect(item.kind == .text)
+        #expect(item.isPinned)
+        #expect(item.lastCopiedAt == t0)
+        #expect(item.contentHash == ContentHasher.hash(text: "the draft"))
+        #expect(store.item(withHash: ContentHasher.hash(text: "teh draft")) == nil)
+    }
+
+    @Test func stylingMakesRichTextAndClearingMakesItPlainAgain() {
+        let item = store.ingest(.text("hello"))
+        let rtf = Data("{\\rtf1 {\\b hello}}".utf8)
+        store.editText(of: item, text: "hello", rtf: rtf, html: Data("<b>hello</b>".utf8))
+        #expect(item.kind == .richText)
+        #expect(item.rtfData == rtf)
+        store.editText(of: item, text: "hello", rtf: nil, html: nil)
+        #expect(item.kind == .text)
+        #expect(item.htmlData == nil)
+    }
+
+    @Test func editingIntoAnotherItemsTextMergesThem() {
+        let edited = store.ingest(.text("first"))
+        store.ingest(.text("second"))
+        store.editText(of: edited, text: "second", rtf: nil, html: nil)
+        #expect(store.count() == 1)
+        #expect(store.allItems().first?.id == edited.id)
+        #expect(edited.copyCount == 2)
+    }
+
     // MARK: Dedupe
 
     @Test func copyingSameTextTwiceKeepsOneItemAndMovesItToTop() {
