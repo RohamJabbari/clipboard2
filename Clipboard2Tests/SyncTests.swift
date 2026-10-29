@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import CoreGraphics
 import SwiftData
 @testable import Clipboard2
 
@@ -763,6 +764,23 @@ actor FakeSyncServer {
         blobs[(ticket.url.host() ?? "") + ticket.url.path()] = data
     }
 
+    // Download instrumentation: a delay per download, and how many ran at once.
+    private(set) var downloads: [String] = []
+    private(set) var maxConcurrentDownloads = 0
+    private var concurrentDownloads = 0
+    private var downloadDelay: Duration = .zero
+
+    func setDownloadDelay(_ delay: Duration) { downloadDelay = delay }
+
+    func beginDownload(_ blob: String) -> Duration {
+        downloads.append(blob)
+        concurrentDownloads += 1
+        maxConcurrentDownloads = max(maxConcurrentDownloads, concurrentDownloads)
+        return downloadDelay
+    }
+
+    func endDownload() { concurrentDownloads -= 1 }
+
     func download(space: String, blob: String) throws -> Data {
         guard let data = blobs["\(space)/\(blob)"] else {
             throw SyncAPIError.server(status: 404, code: "not_found", message: "", retryAfter: nil)
@@ -859,6 +877,9 @@ nonisolated struct FakeClient: SyncService {
     }
     func downloadBlob(spaceId: String, blobId: String) async throws -> Data {
         _ = try await caller()
+        let delay = await server.beginDownload(blobId)
+        if delay > .zero { try? await Task.sleep(for: delay) }
+        await server.endDownload()
         return try await server.download(space: spaceId, blob: blobId)
     }
 }
@@ -1002,6 +1023,35 @@ struct SyncEngineTests {
         #expect(await server.item(space: user.personal, id: item.id.uuidString.lowercased())?.category == "pinned")
         try await mac2.engine.tick()
         #expect(mac2.store.item(withID: item.id)?.isPinned == true)
+    }
+
+    @Test func imagesFromAnotherMacDownloadInParallelWithLocalThumbnails() async throws {
+        let server = FakeSyncServer()
+        let user = try await FakeUser.make("alice", on: server)
+        let mac1 = try FakeDevice(user), mac2 = try FakeDevice(user)
+        let context = CGContext(data: nil, width: 64, height: 48, bitsPerComponent: 8, bytesPerRow: 0,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        context.setFillColor(CGColor(red: 0.2, green: 0.5, blue: 0.9, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 64, height: 48))
+        let image = try #require(context.makeImage())
+        let png = try #require(ImageProcessor.encodePNG(image))
+        for i in 0..<12 {
+            try mac1.store.blobs.write(png, name: "pic\(i).png")
+            try mac1.store.blobs.write(png, name: "pic\(i)-thumb.png")
+            mac1.store.ingest(ProcessedCapture(kind: .image, text: "", preview: "Image", fileURLs: [], hash: "image:px:64x48:\(i)",
+                                               imageFile: "pic\(i).png", thumbnailFile: "pic\(i)-thumb.png", imageWidth: 64, imageHeight: 48))
+        }
+        try await mac1.engine.tick()
+
+        await server.setDownloadDelay(.milliseconds(40))
+        try await mac2.engine.tick()
+        let images = mac2.store.allItems().filter { $0.kind == .image }
+        #expect(images.count == 12)
+        #expect(images.allSatisfy { $0.imageFile != nil && $0.thumbnailFile != nil })
+        // One download per image (thumbnails are made locally), several at a time.
+        #expect(await server.downloads.count == 12)
+        #expect(await server.maxConcurrentDownloads > 1)
+        #expect(await server.maxConcurrentDownloads <= SyncEngine.parallelDownloads)
     }
 
     @Test func imagesTravelAsEncryptedBlobs() async throws {

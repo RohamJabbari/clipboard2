@@ -341,6 +341,7 @@ final class SyncAccount {
         engine.deviceId = session?.deviceId
         engine.deviceName = deviceName
         engine.onPinsChanged = { [weak self] pins in self?.rememberPins(pins) }
+        engine.onSpacesUpdated = { [weak self] in self?.loadGroups() }
         engine.onSentToThisDevice = { [weak self] _, from in self?.onItemSentHere?(from ?? "another device") }
         for (space, key) in keys { engine.adoptSpaceKey(key, for: space) }
         self.engine = engine

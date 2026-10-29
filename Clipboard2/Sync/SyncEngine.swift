@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import SwiftData
 
 
@@ -42,6 +43,16 @@ final class SyncEngine {
     var onSentToThisDevice: ((UUID, String?) -> Void)?
     /// The space-key pins changed; they're kept with the session keys.
     var onPinsChanged: (([String: String]) -> Void)?
+    /// The space list was refreshed (start of every tick), so groups show before items arrive.
+    var onSpacesUpdated: (() -> Void)?
+
+    /// Images downloaded ahead of `apply` (see `prefetchImages`), by image blob id: the decrypted
+    /// image and a thumbnail made from it.
+    private var prefetched: [String: (image: Data, thumbnail: Data?)] = [:]
+    /// How many images download at once while pulling, and how many items one prefetch covers
+    /// (bounds the memory held to that many images).
+    static let parallelDownloads = 6
+    static let prefetchWindow = 8
 
     private var spaceKeys: [String: Data] = [:]
     /// SHA-256 (hex) of each space's key as first unwrapped or adopted, by space id.
@@ -156,7 +167,11 @@ final class SyncEngine {
         // Groups first, and every download before any upload: a long first upload (or a rate limit
         // while sending it) must never keep new group items from arriving.
         let spaces = updateSpaces(remote).sorted { !$0.isPersonal && $1.isPersonal }
-        defer { save() }
+        onSpacesUpdated?()
+        defer {
+            prefetched = [:]
+            save()
+        }
         for space in spaces {
             try await inSpace(space, merging: .quietly) { try await self.pull(space, itemKey: $0) }
         }
@@ -314,10 +329,16 @@ final class SyncEngine {
                 continue
             }
             if space.resyncing { space.resyncSeen.append(contentsOf: page.items.map(\.id)) }
-            for item in page.items {
+            for (index, item) in page.items.enumerated() {
+                if index % Self.prefetchWindow == 0 {
+                    await prefetchImages(page.items[index..<min(index + Self.prefetchWindow, page.items.count)],
+                                         spaceId: spaceId, itemKey: itemKey)
+                    try checkActive()
+                }
                 try await apply(item, spaceId: spaceId, itemKey: itemKey, force: false)
                 try checkActive()
             }
+            prefetched = [:]
             space.since = max(since, page.nextSince)
             save()
             if !page.hasMore || page.items.isEmpty { break }
@@ -445,8 +466,15 @@ final class SyncEngine {
         var thumbData: Data?
         if !blobIds.isEmpty && !hasImages, let imageBlob = payload.imageBlob {
             do {
-                imageData = try await downloadBlob(spaceId: spaceId, blobId: imageBlob, itemKey: itemKey)
-                if let thumb = payload.thumbBlob {
+                if let ready = prefetched.removeValue(forKey: imageBlob) {
+                    (imageData, thumbData) = (ready.image, ready.thumbnail)
+                } else {
+                    let image = try await downloadBlob(spaceId: spaceId, blobId: imageBlob, itemKey: itemKey)
+                    // The thumbnail is made here rather than downloaded: half the requests.
+                    (imageData, thumbData) = (image, await Self.thumbnail(of: image))
+                }
+                // An image this Mac can't decode: use the sender's thumbnail.
+                if thumbData == nil, let thumb = payload.thumbBlob {
                     thumbData = try? await downloadBlob(spaceId: spaceId, blobId: thumb, itemKey: itemKey)
                 }
             } catch let error as SyncAPIError where error.status == 404 {
@@ -640,6 +668,72 @@ final class SyncEngine {
         recordMeta(id: remote.id, spaceId: spaceId, category: .secret, fingerprint: ref.flatMap(secretFingerprint) ?? "",
                    seq: remote.seq, updatedAt: remote.updatedAt, localStamp: ref.flatMap(Self.secretStamp) ?? "",
                    authorUid: remote.authorUid)
+    }
+
+    // MARK: Parallel image downloads
+
+    /// Downloads, decrypts and thumbnails the images `apply` is about to need for `items`, a few at
+    /// once. Best effort: anything that fails here is fetched again by `applyClip`, one at a time,
+    /// with the usual error and rate-limit handling.
+    private func prefetchImages(_ items: ArraySlice<RemoteItem>, spaceId: String, itemKey: Data) async {
+        var wanted: [String] = []
+        for remote in items {
+            guard remote.deleted == nil, let ciphertext = remote.ciphertext, SyncCategory(rawValue: remote.category)?.isClip == true,
+                  !isApplied(remote, spaceId: spaceId),
+                  let plaintext = try? await Self.open(ciphertext, key: itemKey,
+                                                       aad: SyncCrypto.AAD.item(spaceId: spaceId, itemId: remote.id, category: remote.category)),
+                  case .clip(let clip) = try? SyncPayload.decode(plaintext),
+                  let blob = clip.imageBlob, prefetched[blob] == nil,
+                  needsImage(clip, itemId: remote.id)
+            else { continue }
+            wanted.append(blob)
+        }
+        guard !wanted.isEmpty, !isStopped else { return }
+        let api = self.api
+        await withTaskGroup(of: (String, Data, Data?)?.self) { group in
+            var next = wanted.makeIterator()
+            func add() -> Bool {
+                guard let blob = next.next() else { return false }
+                group.addTask {
+                    guard let sealed = try? await api.downloadBlob(spaceId: spaceId, blobId: blob),
+                          let image = try? await Self.open(sealed, key: itemKey, aad: SyncCrypto.AAD.blob(spaceId: spaceId, blobId: blob))
+                    else { return nil }
+                    return (blob, image, await Self.thumbnail(of: image))
+                }
+                return true
+            }
+            for _ in 0..<Self.parallelDownloads where add() {}
+            for await result in group {
+                if let (blob, image, thumbnail) = result { prefetched[blob] = (image, thumbnail) }
+                _ = add()
+            }
+        }
+    }
+
+    /// `apply` would skip this item: this device already has the server's version.
+    private func isApplied(_ remote: RemoteItem, spaceId: String) -> Bool {
+        guard let meta = meta(for: remote.id) else { return false }
+        return meta.spaceId == spaceId && remote.seq > 0 && meta.remoteSeq >= remote.seq
+    }
+
+    /// Mirrors `applyClip`: the image is downloaded unless this exact version is already here.
+    private func needsImage(_ payload: ClipPayload, itemId: String) -> Bool {
+        guard payload.kind == ClipKind.image.rawValue, let uuid = UUID(uuidString: itemId) else { return false }
+        let hasImages = store.item(withID: uuid)?.imageFile != nil && meta(for: itemId)?.blobIds == payload.blobIds
+        return !hasImages
+    }
+
+    @concurrent
+    nonisolated static func thumbnail(of image: Data, maxPixels: Int = 480) async -> Data? {
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixels,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+        ]
+        guard let source = CGImageSourceCreateWithData(image as CFData, nil),
+              let thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        else { return nil }
+        return ImageProcessor.encodePNG(thumb)
     }
 
     private func downloadBlob(spaceId: String, blobId: String, itemKey: Data) async throws -> Data {
