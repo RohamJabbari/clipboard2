@@ -39,9 +39,14 @@ enum Permission: String, CaseIterable, Identifiable {
     var isGranted: Bool {
         switch self {
         case .accessibility: AXPermission.isTrusted
-        case .screenRecording: CGPreflightScreenCaptureAccess()
+        case .screenRecording: ScreenRecordingPermission.isKnownGranted
         case .loginItem: LoginItem.isEnabled
         }
+    }
+
+    /// Like `isGranted`, but asks macOS afresh for Screen Recording (see ScreenRecordingPermission).
+    func currentStatus() async -> Bool {
+        self == .screenRecording ? await ScreenRecordingPermission.check() : isGranted
     }
 
     /// From the permissions list: just open the right Settings page (no system dialogs —
@@ -62,6 +67,48 @@ enum Permission: String, CaseIterable, Identifiable {
 
     private func open(_ string: String) {
         if let url = URL(string: string) { NSWorkspace.shared.open(url) }
+    }
+}
+
+/// macOS answers CGPreflightScreenCaptureAccess() once per process and keeps that answer until
+/// the app restarts, so a grant made while Clipboard2 runs looked missing. A fresh process gets
+/// the current answer: Clipboard2 runs its own executable with `probeArgument` (handled in
+/// `Clipboard2Main` before any UI starts) and reads the exit status. The capture itself goes
+/// through `/usr/sbin/screencapture`, also a new process, so it works without a restart.
+enum ScreenRecordingPermission {
+    nonisolated static let probeArgument = "--probe-screen-recording"
+
+    /// Set once any check said yes; the grant can only be revoked by quitting the app anyway.
+    private static var granted = false
+    private static var lastProbe: (date: Date, result: Bool)?
+
+    static var isKnownGranted: Bool { granted || CGPreflightScreenCaptureAccess() }
+
+    /// The current answer. Probes at most every 2 seconds while the answer is still no.
+    static func check() async -> Bool {
+        if isKnownGranted { return true }
+        if let lastProbe, Date.now.timeIntervalSince(lastProbe.date) < 2 { return lastProbe.result }
+        let result = await probe()
+        lastProbe = (.now, result)
+        if result { granted = true }
+        return result
+    }
+
+    @concurrent
+    nonisolated private static func probe() async -> Bool {
+        guard let executable = Bundle.main.executableURL else { return false }
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = [probeArgument]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
     }
 }
 
@@ -96,7 +143,6 @@ final class PermissionsWindowController: NSObject, NSWindowDelegate {
 struct PermissionsView: View {
     let dismiss: () -> Void
     @State private var granted: [Permission: Bool] = [:]
-    @State private var screenRecordingRequested = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -132,12 +178,6 @@ struct PermissionsView: View {
                 }
             }
 
-            if screenRecordingRequested && granted[.screenRecording] != true {
-                Text("After allowing Screen Recording, quit and reopen Clipboard2 — macOS only applies it on the next launch.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
             HStack {
                 if granted[.accessibility] != true {
                     Text("Without Accessibility, Clipboard2 only copies — you press ⌘V yourself.")
@@ -154,7 +194,7 @@ struct PermissionsView: View {
         .task {
             while !Task.isCancelled {
                 var now: [Permission: Bool] = [:]
-                for permission in Permission.allCases { now[permission] = permission.isGranted }
+                for permission in Permission.allCases { now[permission] = await permission.currentStatus() }
                 if now != granted { withAnimation { granted = now } }
                 try? await Task.sleep(for: .seconds(1))
             }
@@ -196,7 +236,6 @@ struct PermissionsView: View {
                     .contentTransition(.symbolEffect(.replace))
             } else {
                 Button(permission == .loginItem ? "Turn On" : "Open Settings") {
-                    if permission == .screenRecording { screenRecordingRequested = true }
                     permission.openSettings()
                 }
             }
@@ -270,7 +309,7 @@ struct PermissionsSection: View {
         .task {
             while !Task.isCancelled {
                 var now: [Permission: Bool] = [:]
-                for permission in Permission.allCases { now[permission] = permission.isGranted }
+                for permission in Permission.allCases { now[permission] = await permission.currentStatus() }
                 if now != granted { withAnimation { granted = now } }
                 try? await Task.sleep(for: .seconds(1))
             }

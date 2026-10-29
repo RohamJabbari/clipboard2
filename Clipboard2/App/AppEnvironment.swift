@@ -413,15 +413,15 @@ final class AppEnvironment {
     /// Screenshot a region, recognise its text on-device, paste it at the cursor and keep it
     /// in history.
     func captureScreenText() {
-        guard CGPreflightScreenCaptureAccess() else {
-            // Shows the system prompt (first time) and adds Clipboard2 to Screen Recording settings.
-            if !CGRequestScreenCaptureAccess() {
-                showScreenRecordingHelp()
-            }
-            return
-        }
         let target = appTracker.targetApp
         Task {
+            guard await ScreenRecordingPermission.check() else {
+                // Shows the system prompt (first time) and adds Clipboard2 to Screen Recording settings.
+                if !CGRequestScreenCaptureAccess() {
+                    showScreenRecordingHelp()
+                }
+                return
+            }
             // Capture to the clipboard (a file capture shows the floating thumbnail and the
             // image ends up being used instead of its text), then put the old clipboard back.
             monitor.isSuspended = true
