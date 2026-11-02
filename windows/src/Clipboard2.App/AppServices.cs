@@ -341,8 +341,7 @@ public sealed class AppServices : IPanelHost
     {
         var target = TargetForPaste;
         var appTransform = transform ?? Settings.DefaultTransform(Tracker.AppFor(target)?.Id is { } path ? Path.GetFileName(path) : null);
-        ClipboardIO.Write(item, appTransform, Store.Blobs);
-        Store.Touch(item);
+        ClipboardIO.Write(item, appTransform, Store.Blobs);   // keeps its place in the list
         Sync.ReportActivity();
         _ = SendPasteAsync(target);
     }
@@ -366,7 +365,6 @@ public sealed class AppServices : IPanelHost
     public void Copy(ClipItem item)
     {
         ClipboardIO.Write(item, null, Store.Blobs);
-        Store.Touch(item);
     }
 
     public void Copy(IReadOnlyList<ClipItem> items) => ClipboardIO.Write(items, null, Store.Blobs);

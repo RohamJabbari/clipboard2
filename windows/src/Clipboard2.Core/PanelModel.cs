@@ -795,7 +795,6 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                     ShowNotice($"Can't apply “{t.Transform.Title()}” to this item");
                     return;
                 }
-                if (item != SelectionItem) store.Touch(item);
                 host.ClosePanel();
                 host.PasteText(result);
                 break;

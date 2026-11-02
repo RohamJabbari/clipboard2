@@ -150,16 +150,15 @@ final class PasteService {
 
     // MARK: Copy / paste
 
+    /// Copying or pasting from the list leaves the item where it is; only a new copy moves it up.
     func copy(_ item: ClipItem) {
         write(item)
-        store.touch(item)
     }
 
     /// Copies the item and pastes it into `target` (defaults to the last non-Clipboard2 app).
     func paste(_ item: ClipItem, transform: Transform? = nil, into target: NSRunningApplication? = nil) {
         let target = target ?? tracker.targetApp
         write(item, transform: transform, targetBundleID: target?.bundleIdentifier)
-        store.touch(item)
         sendPasteKeystroke(to: target)
     }
 

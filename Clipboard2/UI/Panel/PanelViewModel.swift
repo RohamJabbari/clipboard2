@@ -999,7 +999,6 @@ final class PanelViewModel {
                 return
             }
             let target = targetApp
-            if !item.isTransient { env.store.touch(item) }
             onClose()
             env.paste.paste(text: result, into: target)
         case .ai(let aiAction):
