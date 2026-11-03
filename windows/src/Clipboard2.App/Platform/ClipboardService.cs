@@ -84,6 +84,9 @@ public static class ClipboardIO
             if (text.Length > MaxTextLength) return null;
             var rtf = formats.Contains(DataFormats.Rtf) ? Retry(() => data.GetData(DataFormats.Rtf) as string, null) : null;
             var html = formats.Contains(DataFormats.Html) ? Retry(() => data.GetData(DataFormats.Html) as string, null) : null;
+            // Like the Mac: huge formatting (a whole document with embedded images) is dropped, the text stays.
+            if (rtf?.Length > MaxRichDataChars) rtf = null;
+            if (html?.Length > MaxRichDataChars) html = null;
             return new RawCapture(rtf is null && html is null ? ClipKind.Text : ClipKind.RichText, text, rtf, html, [], null, source);
         }
 
@@ -94,18 +97,23 @@ public static class ClipboardIO
     }
 
     /// <summary>Prefers the "PNG" format (keeps alpha) over the DIB WPF decodes by default.</summary>
+    private const int MaxRichDataChars = 10 * 1024 * 1024;
+    private const long MaxImageBytes = 64 * 1024 * 1024;
+
     public static BitmapSource? ReadImage(System.Windows.IDataObject data, string[] formats)
     {
         try
         {
             if (formats.Contains("PNG") && data.GetData("PNG") is MemoryStream png)
             {
+                if (png.Length > MaxImageBytes) return null;
                 var frame = BitmapFrame.Create(png, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
                 frame.Freeze();
                 return frame;
             }
             if (formats.Contains(DataFormats.Bitmap) && System.Windows.Clipboard.GetImage() is { } bitmap)
             {
+                if ((long)bitmap.PixelWidth * bitmap.PixelHeight * 4 > MaxImageBytes) return null;
                 bitmap.Freeze();
                 return bitmap;
             }
