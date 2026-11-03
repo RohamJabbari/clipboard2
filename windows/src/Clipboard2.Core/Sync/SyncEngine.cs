@@ -110,7 +110,12 @@ public sealed partial class SyncEngine
     public const int HistoryLimit = 200;
     public const int PageSize = 500;
     public const int MaxItemBytes = 2 * 1024 * 1024;
-    public const int MaxBlobBytes = 25 * 1024 * 1024;
+    /// <summary>The largest blob the server takes, ciphertext included.</summary>
+    public const int MaxBlobBytes = 100 * 1024 * 1024;
+    /// <summary>What sealing adds to a blob: version byte, nonce and tag.</summary>
+    public const int SealOverhead = 29;
+    /// <summary>The largest file that fits in a blob.</summary>
+    public const int MaxFileBytes = MaxBlobBytes - SealOverhead;
     public const int MaxFilesPerItem = 10;
     /// <summary>A "send to device" older than this (a re-download, a late device) is just an item, without a notice.</summary>
     public static readonly TimeSpan SentNoticeWindow = TimeSpan.FromHours(1);
@@ -126,6 +131,9 @@ public sealed partial class SyncEngine
     /// <summary>Refusals that last until the next launch: (space, id) → refused fingerprint and why. Over quota is
     /// also forgotten after any deletion (it frees space); refusals for good go to the store instead.</summary>
     private readonly Dictionary<(string Space, string Id), (string Fingerprint, string Reason)> _refusedForNow = [];
+    /// <summary>Synced items whose last push left out files too large for a blob: (space, id) → the warning.
+    /// Reported every tick while the item is around.</summary>
+    private readonly Dictionary<(string Space, string Id), string> _leftOut = [];
 
     public SyncEngine(ClipStore store, ISecretVault vault, SyncApi api, SyncIdentity identity, Func<DateTime>? clock = null,
                       SpaceKeyPins? pins = null)
@@ -172,7 +180,22 @@ public sealed partial class SyncEngine
             ct.ThrowIfCancellationRequested();
             await PushAsync(space, report, ct);
         }
+        report.Warnings.AddRange(_leftOut.Where(l => _spaces.ContainsKey(l.Key.Space)).Select(l => l.Value).Distinct());
         return report;
+    }
+
+    /// <summary>Why a clip can't be shared to a group, or null when it can: a file item with a file larger than a blob
+    /// takes, or with more files than sync sends. Other kinds are always fine.</summary>
+    public static string? GroupShareProblem(ClipItem item) => item.Kind == ClipKind.File ? GroupShareProblem(item.Files) : null;
+
+    /// <summary><see cref="GroupShareProblem(ClipItem)"/> for files about to become an item. Folders and missing files
+    /// don't count: they're never sent.</summary>
+    public static string? GroupShareProblem(IEnumerable<string> files)
+    {
+        var sized = files.Distinct().Select(f => (Path: f, Size: FileSize(f))).Where(f => f.Size is not null).ToList();
+        if (sized.FirstOrDefault(f => f.Size > MaxFileBytes) is { Path: not null } big)
+            return $"“{Path.GetFileName(big.Path)}” is {IncomingDownload.FormatSize(big.Size!.Value)}. Groups take files up to {IncomingDownload.FormatSize(MaxFileBytes)}.";
+        return sized.Count > MaxFilesPerItem ? $"Groups take at most {MaxFilesPerItem} files at a time." : null;
     }
 
     /// <summary>GET /v1/spaces, unwrapping new keys. Spaces the user left or lost lose their local data. A key that
@@ -772,6 +795,7 @@ public sealed partial class SyncEngine
             }
         }
 
+        foreach (var gone in _leftOut.Keys.Where(k => k.Space == space.Id && !live.Contains(k.Id)).ToList()) _leftOut.Remove(gone);
         var refused = store.SyncRejections(space.Id);
         foreach (var stale in refused.Keys.Where(id => !live.Contains(id))) store.ClearSyncRejected(space.Id, stale);
         foreach (var local in push)
@@ -825,7 +849,7 @@ public sealed partial class SyncEngine
                 var path = store.Blobs.PathFor(file);
                 if (!File.Exists(path)) continue;
                 var bytes = await File.ReadAllBytesAsync(path, ct);
-                if (bytes.Length + 29 > MaxBlobBytes)
+                if (bytes.Length > MaxFileBytes)
                 {
                     Logger?.Invoke($"Image of {local.Id} is too large to sync");
                     store.SetSyncRejected(space.Id, local.Id, refusedFingerprint, "too_large");
@@ -836,7 +860,14 @@ public sealed partial class SyncEngine
                 await api.RegisterAndUploadBlobAsync(space.Id, blobId, ciphertext, ct);
                 blobs[file] = blobId;
             }
-            if (clip.Kind == ClipKind.File) await UploadFilesAsync(space, clip, meta, blobs, ct);
+            if (clip.Kind == ClipKind.File)
+            {
+                var tooLarge = await UploadFilesAsync(space, clip, meta, blobs, ct);
+                if (tooLarge.Count == 0) _leftOut.Remove((space.Id, local.Id));
+                else _leftOut[(space.Id, local.Id)] = tooLarge.Count == 1
+                    ? $"“{tooLarge[0]}” is larger than {IncomingDownload.FormatSize(MaxFileBytes)}, so it doesn't sync."
+                    : $"{tooLarge.Count} files are larger than {IncomingDownload.FormatSize(MaxFileBytes)}, so they don't sync.";
+            }
         }
         var full = Render(local, blobs);
         var category = full.Category;
@@ -876,14 +907,20 @@ public sealed partial class SyncEngine
     }
 
     /// <summary>Uploads a file item's regular files that fit in a blob, at most <see cref="MaxFilesPerItem"/>, reusing
-    /// blobs already on the server. The others stay listed by path only.</summary>
-    private async Task UploadFilesAsync(SyncSpace space, ClipItem clip, SyncMeta? meta, Dictionary<string, string> blobs, CancellationToken ct)
+    /// blobs already on the server. The others stay listed by path only. Returns the names of those too large.</summary>
+    private async Task<List<string>> UploadFilesAsync(SyncSpace space, ClipItem clip, SyncMeta? meta, Dictionary<string, string> blobs, CancellationToken ct)
     {
         var uploaded = 0;
+        var tooLarge = new List<string>();
         foreach (var path in clip.Files.Distinct())
         {
             if (uploaded == MaxFilesPerItem) break;
-            if (FileSize(path) is not { } size || size + 29 > MaxBlobBytes) continue;   // gone, a folder, or too large
+            if (FileSize(path) is not { } size) continue;   // gone or a folder
+            if (size > MaxFileBytes)
+            {
+                tooLarge.Add(Path.GetFileName(path));
+                continue;
+            }
             if (meta is { Trimmed: false } && meta.BlobMap.TryGetValue(FileKey(path, size), out var known))
             {
                 blobs[FileKey(path, size)] = known;
@@ -897,13 +934,18 @@ public sealed partial class SyncEngine
                 Logger?.Invoke($"Couldn't read a file of {ClipStore.SyncId(clip.Id)}: {ex.Message}");
                 continue;
             }
-            if (bytes.Length + 29 > MaxBlobBytes) continue;   // grew since
+            if (bytes.Length > MaxFileBytes)   // grew since
+            {
+                tooLarge.Add(Path.GetFileName(path));
+                continue;
+            }
             var blobId = Guid.NewGuid().ToString("D");
             var ciphertext = SyncCrypto.Seal(space.ItemKey, bytes, SyncCrypto.Aad.Blob(space.Id, blobId));
             await api.RegisterAndUploadBlobAsync(space.Id, blobId, ciphertext, ct);
             blobs[FileKey(path, bytes.Length)] = blobId;
             uploaded++;
         }
+        return tooLarge;
     }
 
     /// <summary>The item's <c>blobIds</c>: image, thumbnail, then the files in payload order.</summary>
@@ -993,12 +1035,12 @@ public sealed partial class SyncEngine
     /// <summary>Starts showing a clip as incoming when its image or files aren't on this device yet.</summary>
     private void TrackDownload(SyncSpace space, string itemId, ItemPayload.Clip clip, Dictionary<string, string> known)
     {
-        // Sizes are compared with ciphertext Content-Lengths: + 29 bytes of seal overhead.
+        // Sizes are compared with ciphertext Content-Lengths: + the seal overhead.
         var blobs = new Dictionary<string, (long Received, long Size)>();
         foreach (var (blob, size) in new[] { (clip.ImageBlob, clip.Item.ByteCount), (clip.ThumbBlob, 0L) })
-            if (blob is not null && Guid.TryParse(blob, out _) && KeptImage(known, blob) is null) blobs[blob] = (0, size > 0 ? size + 29 : 0);
+            if (blob is not null && Guid.TryParse(blob, out _) && KeptImage(known, blob) is null) blobs[blob] = (0, size > 0 ? size + SealOverhead : 0);
         var files = ReceivableFiles(clip);
-        foreach (var file in files.Where(f => KeptFile(known, f.Blob) is null)) blobs[file.Blob] = (0, file.Size + 29);
+        foreach (var file in files.Where(f => KeptFile(known, f.Blob) is null)) blobs[file.Blob] = (0, file.Size + SealOverhead);
         if (blobs.Count == 0) return;
         var name = files.Count == 0 ? "Image" : SafeFileName(files[0].Name) + (files.Count > 1 ? $" +{files.Count - 1} more" : "");
         lock (_incomingLock)

@@ -1,4 +1,5 @@
 using Clipboard2.Core.AI;
+using Clipboard2.Core.Sync;
 
 namespace Clipboard2.Core;
 
@@ -869,6 +870,13 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 BeginShareToGroup();
                 break;
             case PanelAction.ShareTo share:
+                // All or nothing: one item that can't sync keeps the whole selection out of the group.
+                if (clips.Where(c => c.SpaceId != share.GroupId).Select(SyncEngine.GroupShareProblem).FirstOrDefault(p => p is not null) is { } problem)
+                {
+                    ResetMode();
+                    ShowNotice(problem);
+                    break;
+                }
                 foreach (var c in clips.Where(c => c.SpaceId != share.GroupId)) store.CopyToSpace(c, share.GroupId);
                 ResetMode();
                 Refresh();
@@ -897,6 +905,10 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             case PanelEntry.Clip c when c.Item == SelectionItem:
                 store.Ingest(ProcessedCapture.ForText(c.Item.Text, source: c.Item.Source), spaceId: share.GroupId);
                 host.ClosePanel();
+                return;
+            case PanelEntry.Clip c when SyncEngine.GroupShareProblem(c.Item) is { } problem:
+                ResetMode();
+                ShowNotice(problem);
                 return;
             case PanelEntry.Clip c:
                 store.CopyToSpace(c.Item, share.GroupId);

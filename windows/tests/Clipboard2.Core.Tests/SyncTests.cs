@@ -607,6 +607,50 @@ public sealed class SyncEngineTests : IDisposable
     }
 
     [Fact]
+    public async Task FileLargerThanTheOldCapSyncs()
+    {
+        var a = await SignedUp();
+        var video = WriteFile(a, "video.mov", RandomNumberGenerator.GetBytes(30 * 1024 * 1024));
+        var item = a.Store.Ingest(ProcessedCapture.ForFiles([video]));
+        await a.Sync();
+        Assert.Single(_cloud.ItemById(a.Personal, ClipStore.SyncId(item.Id)).BlobIds);
+        Assert.Empty(a.Account.Warnings);
+
+        var b = await SignedIn();
+        var copy = Assert.Single(b.Store.AllItems());
+        Assert.Equal(File.ReadAllBytes(video), File.ReadAllBytes(copy.Files[0]));
+    }
+
+    [Fact]
+    public void GroupShareProblemRefusesFilesSyncCantSend()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "c2-share-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string Make(string name, long length)
+            {
+                var path = Path.Combine(dir, name);
+                using var f = File.Create(path);
+                f.SetLength(length);
+                return path;
+            }
+            var small = Make("notes.txt", 1000);
+            var exact = Make("exact.bin", SyncEngine.MaxFileBytes);
+            var big = Make("video.mov", 132L << 20);
+            ClipItem Files(params string[] paths) => new() { Kind = ClipKind.File, Files = [.. paths] };
+
+            Assert.Null(SyncEngine.GroupShareProblem(Files(small, exact, dir)));   // a folder isn't sent, so it's fine
+            Assert.Null(SyncEngine.GroupShareProblem(new ClipItem { Kind = ClipKind.Text, Text = new string('x', 1000) }));
+            Assert.Equal("“video.mov” is 132 MB. Groups take files up to 100 MB.", SyncEngine.GroupShareProblem(Files(small, big)));
+            var many = Enumerable.Range(0, SyncEngine.MaxFilesPerItem + 1).Select(i => Make($"f{i}.txt", 10)).ToArray();
+            Assert.Equal($"Groups take at most {SyncEngine.MaxFilesPerItem} files at a time.", SyncEngine.GroupShareProblem(Files(many)));
+            Assert.Null(SyncEngine.GroupShareProblem(Files(many[..SyncEngine.MaxFilesPerItem])));
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
+    [Fact]
     public async Task FilesSyncAsBlobsAndArriveAsFiles()
     {
         var a = await SignedUp();
@@ -621,6 +665,7 @@ public sealed class SyncEngineTests : IDisposable
         var remote = _cloud.ItemById(a.Personal, ClipStore.SyncId(item.Id));
         Assert.Equal(2, remote.BlobIds.Count);
         Assert.Equal(2, _cloud.BlobCount(a.Personal));
+        Assert.Contains("“huge.iso” is larger than 100 MB, so it doesn't sync.", a.Account.Warnings);
 
         var b = await SignedIn();
         var copy = Assert.Single(b.Store.AllItems());

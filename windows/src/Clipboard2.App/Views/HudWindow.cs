@@ -17,7 +17,7 @@ public sealed class HudWindow : Window
     private readonly TextBlock _icon = Glyphs.Icon(Glyphs.Download, 20);
     private readonly TextBlock _title = Fluent.Label("", 13, null, FontWeights.SemiBold);
     private readonly ProgressBar _bar = new() { Height = 4, Minimum = 0, Maximum = 1, Margin = new Thickness(0, 6, 0, 4) };
-    private readonly TextBlock _detail = Fluent.Label("", 12, Fluent.Secondary);
+    private readonly TextBlock _detail = Fluent.Label("", 12, Fluent.Secondary, wrap: true);
     private readonly DispatcherTimer _hideTimer = new() { Interval = TimeSpan.FromSeconds(2.5) };
 
     public HudWindow()
@@ -57,7 +57,7 @@ public sealed class HudWindow : Window
     public void ShowProgress(IntPtr near, IncomingDownload download)
     {
         _hideTimer.Stop();
-        Set(Glyphs.Download, $"Downloading {download.Name}", download.ProgressText);
+        Set(Glyphs.Download, $"Downloading {download.Name}", download.ProgressText, bar: true);
         _bar.IsIndeterminate = download.Fraction is null;
         _bar.Value = download.Fraction ?? 0;
         ShowNear(near);
@@ -66,8 +66,19 @@ public sealed class HudWindow : Window
     /// <summary>A one-line message ("Paste cancelled") that hides itself after a moment.</summary>
     public void ShowMessage(IntPtr near, string glyph, string message)
     {
-        Set(glyph, message, null);
+        Set(glyph, message, null, bar: false);
         ShowNear(near);
+        _hideTimer.Interval = TimeSpan.FromSeconds(2.5);
+        _hideTimer.Stop();
+        _hideTimer.Start();
+    }
+
+    /// <summary>A warning with a line or two of explanation, shown long enough to read.</summary>
+    public void ShowWarning(IntPtr near, string title, string detail)
+    {
+        Set(Glyphs.Warning, title, detail, bar: false);
+        ShowNear(near);
+        _hideTimer.Interval = TimeSpan.FromSeconds(5);
         _hideTimer.Stop();
         _hideTimer.Start();
     }
@@ -78,12 +89,13 @@ public sealed class HudWindow : Window
         if (IsVisible) Hide();
     }
 
-    private void Set(string glyph, string title, string? detail)
+    private void Set(string glyph, string title, string? detail, bool bar)
     {
         _icon.Text = glyph;
         _title.Text = title;
         _detail.Text = detail ?? "";
-        _bar.Visibility = _detail.Visibility = detail is null ? Visibility.Collapsed : Visibility.Visible;
+        _detail.Visibility = detail is null ? Visibility.Collapsed : Visibility.Visible;
+        _bar.Visibility = bar ? Visibility.Visible : Visibility.Collapsed;
         System.Windows.Automation.AutomationProperties.SetName(this, detail is null ? title : $"{title}, {detail}");
     }
 

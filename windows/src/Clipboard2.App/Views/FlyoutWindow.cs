@@ -215,7 +215,7 @@ public sealed class FlyoutWindow : Window
         {
             var share = new MenuItem { Header = "Share to Group" };
             foreach (var group in groups)
-                share.Items.Add(Item(group.DisplayName, () => _services.Store.CopyToSpace(item, group.Id)));
+                share.Items.Add(Item(group.DisplayName, () => _services.ShareToGroup(item, group)));
             menu.Items.Add(share);
         }
         menu.Items.Add(new Separator());
