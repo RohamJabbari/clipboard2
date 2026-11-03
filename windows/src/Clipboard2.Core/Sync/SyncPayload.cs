@@ -29,8 +29,9 @@ public abstract record ItemPayload
     public sealed record Secret(string Name, string Value, DateTime? CreatedAt) : ItemPayload;
 }
 
-/// <summary>One file of a file item, uploaded as an encrypted blob. <see cref="Size"/> is the plaintext byte count.</summary>
-public sealed record FileBlob(string Name, string Blob, long Size);
+/// <summary>One file of a file item, uploaded as an encrypted blob. <see cref="Size"/> is the plaintext byte count.
+/// <see cref="Folder"/>: the blob is a zip of a folder ("name.zip"), unpacked on receipt.</summary>
+public sealed record FileBlob(string Name, string Blob, long Size, bool Folder = false);
 
 /// <summary>Builds and parses the plaintext JSON inside an item, and its fingerprint.</summary>
 public static partial class SyncPayload
@@ -66,7 +67,7 @@ public static partial class SyncPayload
         if (rich && item.Html is { } html) json["html"] = Convert.ToBase64String(Encoding.UTF8.GetBytes(CfHtml.Extract(html)));
         if (item.Files.Count > 0) json["files"] = new JsonArray([.. item.Files.Select(f => (JsonNode?)FileUrl(f))]);
         if (fileBlobs is { Count: > 0 })
-            json["fileBlobs"] = new JsonArray([.. fileBlobs.Select(f => (JsonNode?)new JsonObject { ["name"] = f.Name, ["blob"] = f.Blob, ["size"] = f.Size })]);
+            json["fileBlobs"] = new JsonArray([.. fileBlobs.Select(f => (JsonNode?)FileBlobJson(f))]);
         if (imageBlob is not null) json["imageBlob"] = imageBlob;
         if (thumbBlob is not null) json["thumbBlob"] = thumbBlob;
         if (item.ImageWidth > 0) json["imageWidth"] = item.ImageWidth;
@@ -81,6 +82,14 @@ public static partial class SyncPayload
         json["createdAt"] = Millis(item.CreatedAt);
         json["lastCopiedAt"] = Millis(item.LastCopiedAt);
         json["contentHash"] = item.ContentHash;
+        return json;
+    }
+
+    /// <summary>"folder" only when true, so payloads (and fingerprints) of plain files stay as they were.</summary>
+    private static JsonObject FileBlobJson(FileBlob f)
+    {
+        var json = new JsonObject { ["name"] = f.Name, ["blob"] = f.Blob, ["size"] = f.Size };
+        if (f.Folder) json["folder"] = true;
         return json;
     }
 
@@ -234,7 +243,8 @@ public static partial class SyncPayload
         foreach (var entry in array.OfType<JsonObject>())
         {
             if (Str(entry, "name") is not { } name || Str(entry, "blob") is not { } blob) continue;
-            list.Add(new FileBlob(name, blob, entry["size"] is JsonValue v && v.TryGetValue<double>(out var d) ? (long)d : 0));
+            list.Add(new FileBlob(name, blob, entry["size"] is JsonValue v && v.TryGetValue<double>(out var d) ? (long)d : 0,
+                entry["folder"] is JsonValue fv && fv.TryGetValue<bool>(out var folder) && folder));
         }
         return list;
     }

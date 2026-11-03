@@ -355,6 +355,8 @@ public sealed class ClipStore : IDisposable
         var kept = item.Kind == ClipKind.File ? item.Files.ToHashSet(StringComparer.OrdinalIgnoreCase) : [];
         foreach (var file in System.IO.Directory.EnumerateFiles(folder).Where(f => !kept.Contains(f)).ToList())
             try { File.Delete(file); } catch { /* in use: removed with the folder later */ }
+        foreach (var dir in System.IO.Directory.EnumerateDirectories(folder).Where(d => !kept.Contains(d)).ToList())
+            DeleteFolder(dir);   // a received folder the item no longer lists
         if (!System.IO.Directory.EnumerateFileSystemEntries(folder).Any()) DeleteFolder(folder);
     }
 

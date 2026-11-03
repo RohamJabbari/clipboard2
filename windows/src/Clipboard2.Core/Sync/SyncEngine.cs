@@ -134,6 +134,9 @@ public sealed partial class SyncEngine
     /// <summary>Synced items whose last push left out files too large for a blob: (space, id) → the warning.
     /// Reported every tick while the item is around.</summary>
     private readonly Dictionary<(string Space, string Id), string> _leftOut = [];
+    /// <summary>The zips of the folders of file items, by folder path: made off the UI thread at the start of each
+    /// tick (<see cref="PrepareFolderArchivesAsync"/>), so rendering a payload never has to walk or zip a folder.</summary>
+    private readonly Dictionary<string, FolderArchive> _archives = [];
 
     public SyncEngine(ClipStore store, ISecretVault vault, SyncApi api, SyncIdentity identity, Func<DateTime>? clock = null,
                       SpaceKeyPins? pins = null)
@@ -144,7 +147,11 @@ public sealed partial class SyncEngine
         this.pins = pins;
         Identity = identity;
         _now = clock ?? (() => DateTime.UtcNow);
+        FolderArchives = new FolderArchiveCache(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(store.SyncedFilesDirectory))!, "Folder Archives"));
     }
+
+    /// <summary>Where folder zips are kept between ticks (next to "Synced Files" by default).</summary>
+    public FolderArchiveCache FolderArchives { get; set; }
 
     public SyncIdentity Identity { get; }
     public Action<string>? Logger { get; set; }
@@ -167,6 +174,7 @@ public sealed partial class SyncEngine
     {
         var report = new SyncReport();
         await RefreshSpacesAsync(ct);
+        await PrepareFolderArchivesAsync([.. _spaces.Values.SelectMany(PushedFolderCandidates)], sweep: true, ct);
         // Groups first, and every download before any upload: a long first upload (or a rate limit
         // while sending it) must never keep new group items from arriving.
         var spaces = _spaces.Values.OrderBy(s => s.IsPersonal).ToList();
@@ -184,19 +192,71 @@ public sealed partial class SyncEngine
         return report;
     }
 
-    /// <summary>Why a clip can't be shared to a group, or null when it can: a file item with a file larger than a blob
-    /// takes, or with more files than sync sends. Other kinds are always fine.</summary>
+    /// <summary>Why a clip can't be shared to a group, or null when it can: a file item with a file or folder larger
+    /// than a blob takes, or with more files than sync sends. Other kinds are always fine.</summary>
     public static string? GroupShareProblem(ClipItem item) => item.Kind == ClipKind.File ? GroupShareProblem(item.Files) : null;
 
-    /// <summary><see cref="GroupShareProblem(ClipItem)"/> for files about to become an item. Folders and missing files
-    /// don't count: they're never sent.</summary>
+    /// <summary><see cref="GroupShareProblem(ClipItem)"/> for files about to become an item. A folder counts as one
+    /// file, sized by its zip estimate (its files' bytes + 1 KB per entry) and shown with its files' total. Missing
+    /// files don't count: they're never sent. Walks folders on the calling thread.</summary>
     public static string? GroupShareProblem(IEnumerable<string> files)
     {
-        var sized = files.Distinct().Select(f => (Path: f, Size: FileSize(f))).Where(f => f.Size is not null).ToList();
-        if (sized.FirstOrDefault(f => f.Size > MaxFileBytes) is { Path: not null } big)
-            return $"“{Path.GetFileName(big.Path)}” is {IncomingDownload.FormatSize(big.Size!.Value)}. Groups take files up to {IncomingDownload.FormatSize(MaxFileBytes)}.";
+        var sized = new List<(string Name, long Shown, bool TooLarge)>();
+        foreach (var path in files.Distinct())
+        {
+            if (FileSize(path) is { } size) sized.Add((Path.GetFileName(path), size, size > MaxFileBytes));
+            else if (FolderZip.Measure(path) is { } folder) sized.Add((FolderZip.Name(path), folder.TotalBytes, folder.Estimate > MaxFileBytes));
+        }
+        if (sized.FirstOrDefault(f => f.TooLarge) is { Name: not null } big)
+            return $"“{big.Name}” is {IncomingDownload.FormatSize(big.Shown)}. Groups take files up to {IncomingDownload.FormatSize(MaxFileBytes)}.";
         return sized.Count > MaxFilesPerItem ? $"Groups take at most {MaxFilesPerItem} files at a time." : null;
     }
+
+    // MARK: Folder archives
+
+    /// <summary>The paths of the file items a push renders in a space (the folders among them are found later).</summary>
+    private IEnumerable<string> PushedFolderCandidates(SyncSpace space)
+    {
+        var history = 0;
+        foreach (var clip in store.ItemsInSpace(space.LocalId))   // newest first, like LocalItems
+        {
+            if (!clip.IsPinned && history++ >= HistoryLimit) continue;
+            if (clip.Kind == ClipKind.File) foreach (var path in clip.Files) yield return path;
+        }
+    }
+
+    /// <summary>Zips the folders among <paramref name="paths"/> (or finds their zips in the cache) on a worker thread,
+    /// so pushes and fingerprints know each folder's zip. <paramref name="sweep"/>: also deletes the zips of folders
+    /// no item lists any more.</summary>
+    private async Task PrepareFolderArchivesAsync(IReadOnlyCollection<string> paths, bool sweep, CancellationToken ct)
+    {
+        var candidates = paths.Distinct().ToList();
+        var cache = FolderArchives;
+        var prepared = await Task.Run(() =>
+        {
+            var found = new List<(string Path, FolderArchive? Archive)>();
+            foreach (var path in candidates)
+            {
+                ct.ThrowIfCancellationRequested();
+                bool isFolder;
+                try { isFolder = Directory.Exists(path); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { isFolder = false; }
+                found.Add((path, isFolder ? cache.Prepare(path, MaxFileBytes) : null));
+            }
+            if (sweep) cache.Sweep(found.Where(f => f.Archive is not null).Select(f => f.Path), TimeSpan.FromMinutes(10));
+            return found;
+        }, ct);
+        foreach (var (path, archive) in prepared)
+        {
+            if (archive is null) _archives.Remove(path);
+            else _archives[path] = archive;
+        }
+        if (sweep) foreach (var stale in _archives.Keys.Except(candidates).ToList()) _archives.Remove(stale);
+    }
+
+    /// <summary>The prepared zip of a folder that still exists.</summary>
+    private FolderArchive? ArchiveOf(string path) =>
+        _archives.TryGetValue(path, out var archive) && archive.ZipPath is not null && Directory.Exists(path) ? archive : null;
 
     /// <summary>GET /v1/spaces, unwrapping new keys. Spaces the user left or lost lose their local data. A key that
     /// differs from the pinned one is refused and its space stops syncing.</summary>
@@ -492,7 +552,13 @@ public sealed partial class SyncEngine
                 var url = await api.BlobUrlAsync(space.Id, entry.Blob, ct);
                 var bytes = SyncCrypto.Open(space.ItemKey, await api.DownloadAsync(url, ct, DownloadProgress(itemId, entry.Blob)),
                     SyncCrypto.Aad.Blob(space.Id, entry.Blob));
-                var name = UniqueName(SafeFileName(entry.Name), names);
+                if (entry.Folder && await ReceiveFolderAsync(folder, entry, bytes, names, ct) is { } unpacked)
+                {
+                    files[i] = unpacked;
+                    blobs[FileKey(unpacked, bytes.Length)] = entry.Blob;
+                    continue;
+                }
+                var name = UniqueName(SafeFileName(entry.Name), names);   // a file, or a folder zip that can't be unpacked
                 var path = Path.Combine(folder, name);
                 Directory.CreateDirectory(folder);
                 await File.WriteAllBytesAsync(path + ".tmp", bytes, ct);
@@ -514,6 +580,25 @@ public sealed partial class SyncEngine
         item.Files = received;
         item.Text = shown.Text;
         item.Preview = shown.Preview;
+    }
+
+    /// <summary>Unpacks a received folder zip into the item's synced folder and keeps the zip as that folder's
+    /// archive (so it isn't pushed back). Null when the zip is refused: it's then saved as a plain file.</summary>
+    private async Task<string?> ReceiveFolderAsync(string itemFolder, FileBlob entry, byte[] zip, HashSet<string> names, CancellationToken ct)
+    {
+        var name = UniqueName(SafeFileName(FolderZip.StripZip(entry.Name)), names);
+        var target = Path.Combine(itemFolder, name);
+        Directory.CreateDirectory(itemFolder);
+        if (await Task.Run(() => FolderZip.Extract(zip, target), ct) is not { } extracted)
+        {
+            Logger?.Invoke($"Refused to unpack the folder “{name}”; keeping it as a zip");
+            return null;
+        }
+        foreach (var file in extracted) MarkDownloaded(file);   // before the archive's signature: marking may touch them
+        var cache = FolderArchives;
+        if (await Task.Run(() => cache.Store(target, zip), ct) is { } archive) _archives[target] = archive;
+        names.Add(name);
+        return target;
     }
 
     private void MarkDownloaded(string path)
@@ -554,9 +639,13 @@ public sealed partial class SyncEngine
     private static List<FileBlob> ReceivableFiles(ItemPayload.Clip clip) =>
         [.. clip.FileBlobs.Where(f => Guid.TryParse(f.Blob, out _)).Take(MaxFilesPerItem)];
 
-    /// <summary>The local copy of a received file that's still intact (same size as when it was written).</summary>
-    private static (string Path, long Size)? KeptFile(Dictionary<string, string> known, string blobId) =>
-        known.TryGetValue(blobId, out var key) && ParseFileKey(key) is { } kept && FileSize(kept.Path) == kept.Size ? kept : null;
+    /// <summary>The local copy of a received file that's still intact (same size as when it was written), or of a
+    /// received folder whose zip is unchanged.</summary>
+    private (string Path, long Size)? KeptFile(Dictionary<string, string> known, string blobId) =>
+        known.TryGetValue(blobId, out var key) && ParseFileKey(key) is { } kept && SizeOf(kept.Path) == kept.Size ? kept : null;
+
+    /// <summary>A file's length, or a folder's zip size (as last prepared).</summary>
+    private long? SizeOf(string path) => FileSize(path) ?? ArchiveOf(path)?.ZipSize;
 
     /// <summary>The local image file of a blob, if this device still has it.</summary>
     private string? KeptImage(Dictionary<string, string> known, string blobId) =>
@@ -691,8 +780,8 @@ public sealed partial class SyncEngine
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { return null; }
     }
 
-    /// <summary>The files of a file item that are on the server (in <paramref name="blobs"/>), in the item's order.</summary>
-    private static List<FileBlob> FileBlobs(ClipItem item, IReadOnlyDictionary<string, string> blobs)
+    /// <summary>The files and folders of a file item that are on the server (in <paramref name="blobs"/>), in the item's order.</summary>
+    private List<FileBlob> FileBlobs(ClipItem item, IReadOnlyDictionary<string, string> blobs)
     {
         if (item.Kind != ClipKind.File || blobs.Count == 0) return [];
         var uploaded = new Dictionary<string, (long Size, string Blob)>();
@@ -700,7 +789,11 @@ public sealed partial class SyncEngine
             if (ParseFileKey(key) is { } k) uploaded[k.Path] = (k.Size, blob);
         var list = new List<FileBlob>();
         foreach (var path in item.Files.Distinct())
-            if (uploaded.TryGetValue(path, out var u) && FileSize(path) == u.Size) list.Add(new FileBlob(Path.GetFileName(path), u.Blob, u.Size));
+        {
+            if (!uploaded.TryGetValue(path, out var u)) continue;
+            if (FileSize(path) == u.Size) list.Add(new FileBlob(Path.GetFileName(path), u.Blob, u.Size));
+            else if (ArchiveOf(path)?.ZipSize == u.Size) list.Add(new FileBlob(FolderZip.Name(path) + ".zip", u.Blob, u.Size, Folder: true));
+        }
         return list;
     }
 
@@ -906,8 +999,9 @@ public sealed partial class SyncEngine
         return written;
     }
 
-    /// <summary>Uploads a file item's regular files that fit in a blob, at most <see cref="MaxFilesPerItem"/>, reusing
-    /// blobs already on the server. The others stay listed by path only. Returns the names of those too large.</summary>
+    /// <summary>Uploads a file item's regular files and folder zips that fit in a blob, at most
+    /// <see cref="MaxFilesPerItem"/>, reusing blobs already on the server. The others stay listed by path only.
+    /// Returns the names of those too large.</summary>
     private async Task<List<string>> UploadFilesAsync(SyncSpace space, ClipItem clip, SyncMeta? meta, Dictionary<string, string> blobs, CancellationToken ct)
     {
         var uploaded = 0;
@@ -915,7 +1009,16 @@ public sealed partial class SyncEngine
         foreach (var path in clip.Files.Distinct())
         {
             if (uploaded == MaxFilesPerItem) break;
-            if (FileSize(path) is not { } size) continue;   // gone or a folder
+            if (FileSize(path) is null && Directory.Exists(path))
+            {
+                switch (await UploadFolderAsync(space, clip, path, meta, blobs, ct))
+                {
+                    case true: uploaded++; break;
+                    case false: tooLarge.Add(FolderZip.Name(path)); break;
+                }
+                continue;
+            }
+            if (FileSize(path) is not { } size) continue;   // gone
             if (size > MaxFileBytes)
             {
                 tooLarge.Add(Path.GetFileName(path));
@@ -946,6 +1049,34 @@ public sealed partial class SyncEngine
             uploaded++;
         }
         return tooLarge;
+    }
+
+    /// <summary>Uploads a folder's prepared zip (or reuses its blob). True when it's on the server, false when it's too
+    /// large, null when it couldn't be zipped or read.</summary>
+    private async Task<bool?> UploadFolderAsync(SyncSpace space, ClipItem clip, string path, SyncMeta? meta, Dictionary<string, string> blobs,
+                                                CancellationToken ct)
+    {
+        if (!_archives.TryGetValue(path, out var archive)) return null;
+        if (archive.ZipPath is null || archive.ZipSize > MaxFileBytes) return false;
+        var key = FileKey(path, archive.ZipSize);
+        if (meta is { Trimmed: false } && meta.BlobMap.TryGetValue(key, out var known))
+        {
+            blobs[key] = known;
+            return true;
+        }
+        byte[] bytes;
+        try { bytes = await File.ReadAllBytesAsync(archive.ZipPath, ct); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Logger?.Invoke($"Couldn't read the zip of a folder of {ClipStore.SyncId(clip.Id)}: {ex.Message}");
+            return null;
+        }
+        if (bytes.Length != archive.ZipSize) return null;   // replaced since it was prepared
+        var blobId = Guid.NewGuid().ToString("D");
+        var ciphertext = SyncCrypto.Seal(space.ItemKey, bytes, SyncCrypto.Aad.Blob(space.Id, blobId));
+        await api.RegisterAndUploadBlobAsync(space.Id, blobId, ciphertext, ct);
+        blobs[key] = blobId;
+        return true;
     }
 
     /// <summary>The item's <c>blobIds</c>: image, thumbnail, then the files in payload order.</summary>
@@ -996,6 +1127,7 @@ public sealed partial class SyncEngine
         var target = item.SpaceId is null && store.Find(item.Id) is { } existing ? existing : store.CopyToSpace(item, null);
         store.Touch(target, _now());
         var id = ClipStore.SyncId(target.Id);
+        if (target.Kind == ClipKind.File) await PrepareFolderArchivesAsync(target.Files, sweep: false, ct);
         return await PushItemAsync(personal, new LocalItem.Clip(id, store.Find(target.Id)!), store.SyncMetaFor(personal.Id, id), ct,
             new JsonObject { ["toDevice"] = deviceId, ["fromDevice"] = fromDevice });
     }
@@ -1042,7 +1174,8 @@ public sealed partial class SyncEngine
         var files = ReceivableFiles(clip);
         foreach (var file in files.Where(f => KeptFile(known, f.Blob) is null)) blobs[file.Blob] = (0, file.Size + SealOverhead);
         if (blobs.Count == 0) return;
-        var name = files.Count == 0 ? "Image" : SafeFileName(files[0].Name) + (files.Count > 1 ? $" +{files.Count - 1} more" : "");
+        var first = files.Count == 0 ? null : files[0].Folder ? FolderZip.StripZip(files[0].Name) : files[0].Name;
+        var name = first is null ? "Image" : SafeFileName(first) + (files.Count > 1 ? $" +{files.Count - 1} more" : "");
         lock (_incomingLock)
         {
             _incoming.RemoveAll(i => i.Key == itemId);
