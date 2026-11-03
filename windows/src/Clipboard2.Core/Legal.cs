@@ -2,20 +2,18 @@ namespace Clipboard2.Core;
 
 public sealed record LegalSection(string Title, string Body);
 
-/// <summary>The privacy notice (Art. 13 GDPR) and the Impressum, shown in Settings → About and linked at sign-up.
-/// <c>[ADDRESS]</c> and <c>[CONTACT EMAIL]</c> are placeholders until the operator fills them in.</summary>
+/// <summary>The privacy notice (Art. 13 GDPR), shown in Settings → About and linked at sign-up. The operator is a
+/// private person sharing a free app with friends, so there's no Impressum, and questions go to them directly.</summary>
 public static class Legal
 {
     public const string Operator = "Roham Jabbari";
-    public const string Address = "[ADDRESS]";
-    public const string ContactEmail = "[CONTACT EMAIL]";
-    public const string PrivacyUpdated = "October 2026";
+    public const string PrivacyUpdated = "November 2026";
 
     public static readonly IReadOnlyList<LegalSection> PrivacyNotice =
     [
         new("Who is responsible",
-            $"Clipboard2 is run by {Operator}, a private person in Austria ({Address}). He is the controller for the sync service under the GDPR. " +
-            $"For anything about your data, write to {ContactEmail}."),
+            $"Clipboard2 is run free of charge by {Operator}, a private person in Austria, the controller for the sync service under the GDPR. " +
+            $"For anything about your data, ask {Operator} directly."),
         new("Without an account, nothing leaves your PC",
             "Your history, images, files, snippets and settings are stored only on this PC. Secrets are stored in Windows Credential Manager. " +
             "Text recognition in images runs on this PC. Clipboard2 has no analytics, no tracking and no advertising.\n" +
@@ -64,17 +62,9 @@ public static class Legal
         new("Your rights",
             "You can ask for access to your data (Art. 15 GDPR), correction (Art. 16), deletion (Art. 17), restriction (Art. 18), a portable copy " +
             "(Art. 20; Settings → General → Export Backup also gives you one) and you can object to processing based on legitimate interest (Art. 21). " +
-            $"Write to {ContactEmail}. Because your content is end-to-end encrypted, the operator can only hand out or delete it as encrypted data.\n" +
+            $"Ask {Operator}. Because your content is end-to-end encrypted, the operator can only hand out or delete it as encrypted data.\n" +
             "You can also complain to a data protection authority, in Austria the Datenschutzbehörde (Barichgasse 40–42, 1030 Vienna, www.dsb.gv.at)."),
         new("Changes", $"If this notice changes, the new version ships with the app. Last updated: {PrivacyUpdated}."),
-    ];
-
-    public static readonly IReadOnlyList<LegalSection> Impressum =
-    [
-        new("Impressum",
-            $"Medieninhaber und Betreiber / Owner and operator:\n{Operator}\n{Address}\nAustria\n\nKontakt / Contact: {ContactEmail}"),
-        new("Offenlegung (§ 25 MedienG)",
-            "Clipboard2 is a private, non-commercial project. Grundlegende Richtung: information about the Clipboard2 app and its sync service."),
     ];
 
     /// <summary>The whole notice as plain text (for copying).</summary>

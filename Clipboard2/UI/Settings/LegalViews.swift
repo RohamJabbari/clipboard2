@@ -1,14 +1,11 @@
 import SwiftUI
 
-/// The privacy notice (Art. 13 GDPR) and the legal notice (Impressum, § 5 ECG / § 25 MedienG).
-/// The operator is a private person. `[ADDRESS]` and `[CONTACT EMAIL]` are placeholders that must
-/// be filled in before release.
+/// The privacy notice (Art. 13 GDPR). The operator is a private person sharing a free app with
+/// friends, so there's no Impressum, and questions go to them directly.
 nonisolated enum LegalText {
     static let operatorName = "Roham Jabbari"
-    static let address = "[ADDRESS]"
     static let country = "Austria"
-    static let email = "[CONTACT EMAIL]"
-    static let lastUpdated = "October 2026"
+    static let lastUpdated = "November 2026"
 
     struct Section: Identifiable, Sendable {
         let title: String
@@ -18,8 +15,8 @@ nonisolated enum LegalText {
 
     static let privacy: [Section] = [
         Section(title: "Who is responsible", body: """
-        \(operatorName), \(address), \(country) — a private person who develops and runs Clipboard2 and its sync service. \
-        Contact for anything about your data: \(email).
+        \(operatorName), \(country) — a private person who develops and runs Clipboard2 and its sync service, \
+        free of charge. For anything about your data, ask \(operatorName) directly.
         """),
         Section(title: "Without an account", body: """
         Your history, snippets, secrets and settings stay on this Mac. Secrets are kept in your Keychain. Text in \
@@ -73,7 +70,7 @@ nonisolated enum LegalText {
         Section(title: "Your rights", body: """
         You can ask for access to your data (Art. 15 GDPR), correction (Art. 16), deletion (Art. 17), restriction \
         (Art. 18) and a copy to take elsewhere (Art. 20), and object to processing based on our legitimate \
-        interest (Art. 21). Write to \(email). Because your content is encrypted, only your own devices can show \
+        interest (Art. 21). Ask \(operatorName). Because your content is encrypted, only your own devices can show \
         it; Settings → General → Back up exports it in readable form for you.
 
         You may also complain to the Austrian Data Protection Authority (Datenschutzbehörde, Barichgasse 40–42, \
@@ -85,22 +82,9 @@ nonisolated enum LegalText {
         """),
     ]
 
-    static let impressum: [Section] = [
-        Section(title: "Media owner and service provider", body: """
-        Medieninhaber und Diensteanbieter (§ 5 ECG, § 25 MedienG):
-        \(operatorName)
-        \(address)
-        \(country)
-        Email: \(email)
-        """),
-        Section(title: "About this app", body: """
-        Clipboard2 is a clipboard manager for Mac and Windows, with optional end-to-end-encrypted sync, run by a \
-        private person. Grundlegende Richtung: information about Clipboard2 and the operation of its sync service.
-        """),
-    ]
 }
 
-/// A scrolling document of titled sections, used for both notices.
+/// A scrolling document of titled sections.
 struct LegalDocumentView: View {
     let title: String
     let sections: [LegalText.Section]
@@ -142,30 +126,18 @@ struct LegalDocumentView: View {
     }
 }
 
-/// "Privacy Notice · Legal Notice" for the bottom of Settings → General.
+/// "Privacy Notice" for the bottom of Settings → General.
 struct LegalLinks: View {
-    @State private var showing: Document?
-
-    enum Document: String, Identifiable {
-        case privacy, impressum
-        var id: String { rawValue }
-    }
+    @State private var showing = false
 
     var body: some View {
-        HStack(spacing: 6) {
-            Button("Privacy Notice") { showing = .privacy }
-            Text("·").accessibilityHidden(true)
-            Button("Legal Notice (Impressum)") { showing = .impressum }
-        }
-        .buttonStyle(.link)
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .sheet(item: $showing) { document in
-            switch document {
-            case .privacy: LegalDocumentView(title: "Privacy Notice", sections: LegalText.privacy)
-            case .impressum: LegalDocumentView(title: "Legal Notice", sections: LegalText.impressum)
+        Button("Privacy Notice") { showing = true }
+            .buttonStyle(.link)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .sheet(isPresented: $showing) {
+                LegalDocumentView(title: "Privacy Notice", sections: LegalText.privacy)
             }
-        }
     }
 }
 

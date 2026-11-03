@@ -14,7 +14,7 @@ using Clipboard2.Core;
 namespace Clipboard2.App.Views;
 
 /// <summary>Settings → General → Backup (encrypted export and import, docs/BACKUP-FORMAT.md), and the privacy
-/// notice and Impressum (About, and a link at sign-up).</summary>
+/// notice (About, and a link at sign-up).</summary>
 public sealed partial class SettingsWindow
 {
     private const int MinBackupPassphraseLength = 8;
@@ -174,14 +174,13 @@ public sealed partial class SettingsWindow
         }
     }
 
-    // MARK: Privacy notice and Impressum
+    // MARK: Privacy notice
 
     private void AddLegalSection(StackPanel page)
     {
         page.Children.Add(Header("Privacy and legal"));
         page.Children.Add(Card(
-            Row("What sync stores, where, and your rights", Action("Privacy Notice", () => LegalWindow.Open(this, "Privacy Notice", Legal.PrivacyNotice))),
-            Row($"Operated by {Legal.Operator}, Austria", Action("Impressum", () => LegalWindow.Open(this, "Impressum", Legal.Impressum)))));
+            Row("What sync stores, where, and your rights", Action("Privacy Notice", () => LegalWindow.Open(this, "Privacy Notice", Legal.PrivacyNotice)))));
     }
 
     /// <summary>Shown above "Create Account".</summary>

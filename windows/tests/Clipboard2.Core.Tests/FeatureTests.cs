@@ -420,12 +420,9 @@ public sealed class LegalTests
     public void NoticeNamesTheOperatorRegionAndRights()
     {
         var privacy = Legal.PlainText(Legal.PrivacyNotice);
-        foreach (var expected in new[] { "Roham Jabbari", "[ADDRESS]", "[CONTACT EMAIL]", "europe-west1", "Art. 6(1)(b)", "Art. 15",
+        foreach (var expected in new[] { "Roham Jabbari", "europe-west1", "Art. 6(1)(b)", "Art. 15",
                      "Datenschutzbehörde", "Delete Account", "can't read", "Anthropic", "90 days" })
             Assert.Contains(expected, privacy);
-        var impressum = Legal.PlainText(Legal.Impressum);
-        Assert.Contains("Roham Jabbari", impressum);
-        Assert.Contains("[ADDRESS]", impressum);
-        Assert.Contains("[CONTACT EMAIL]", impressum);
+        Assert.DoesNotContain("[", privacy);
     }
 }
