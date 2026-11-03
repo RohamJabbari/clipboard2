@@ -1299,12 +1299,12 @@ public sealed partial class SettingsWindow : Window
         actions.Children.Add(Fluent.Label(status, 13, updates.AvailableVersion is null ? Fluent.Secondary : Fluent.Accent));
         actions.Children.Add(updates.AvailableVersion is null
             ? Action("Check for Updates", async () => { await updates.CheckAsync(); RefreshTab("About"); })
-            : Action("Update and Restart", async () => await updates.InstallAsync(), accent: true));
+            : Action("Restart to Update", async () => await updates.InstallAsync(), accent: true));
         page.Children.Add(Card(
             Row("Check for updates every hour", Toggle(S.CheckForUpdates, on => { S.CheckForUpdates = on; Save(); })),
             Row("Install updates automatically", Toggle(S.InstallUpdatesAutomatically, on => { S.InstallUpdatesAutomatically = on; Save(); })),
             actions));
-        page.Children.Add(Hint("Updates come from GitHub and install in place — Clipboard2 restarts with your data intact."));
+        page.Children.Add(Hint("Updates come from GitHub and download quietly. Installed automatically, they apply when Clipboard2 quits or while the PC is idle — your data stays."));
 
         page.Children.Add(Header("Data"));
         page.Children.Add(Card(
