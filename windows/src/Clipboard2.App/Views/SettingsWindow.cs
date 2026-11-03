@@ -53,6 +53,11 @@ public sealed partial class SettingsWindow : Window
         _services.Updates.Changed += about;
         _services.Sync.Changed += sync;
         // The services outlive this window: a closed one mustn't keep rebuilding.
+        // Text fields save when they lose focus, which closing the window doesn't do.
+        Closing += (_, _) =>
+        {
+            if (Keyboard.FocusedElement is UIElement field) field.RaiseEvent(new RoutedEventArgs(UIElement.LostFocusEvent, field));
+        };
         Closed += (_, _) =>
         {
             _services.Secrets.Changed -= secrets;

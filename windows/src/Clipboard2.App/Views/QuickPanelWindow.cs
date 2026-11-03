@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
@@ -239,11 +240,33 @@ public sealed class QuickPanelWindow : Window
         var data = new DataObject();
         data.SetData(EntryFormat, entry.Id);
         if (item.Kind.IsTextual()) data.SetText(item.Text);
+        else if (DraggedFiles(item) is { Count: > 0 } files) data.SetFileDropList(files);
+        if (item.Kind == ClipKind.Image && item.ImageFile is { } image && File.Exists(_services.Store.Blobs.PathFor(image)))
+            data.SetData("PNG", new MemoryStream(File.ReadAllBytes(_services.Store.Blobs.PathFor(image))));
         DragDrop.DoDragDrop(row, data, DragDropEffects.Copy);
     }
 
+    /// <summary>What Explorer and other apps receive: a file clip's files that still exist; an image as a PNG
+    /// file (apps that take images directly also get the "PNG" format).</summary>
+    private System.Collections.Specialized.StringCollection DraggedFiles(ClipItem item)
+    {
+        var files = new System.Collections.Specialized.StringCollection();
+        if (item.Kind == ClipKind.File)
+            files.AddRange([.. item.Files.Where(f => File.Exists(f) || Directory.Exists(f))]);
+        else if (item.Kind == ClipKind.Image && item.ImageFile is { } image && File.Exists(_services.Store.Blobs.PathFor(image)))
+        {
+            var folder = Path.Combine(Path.GetTempPath(), "Clipboard2 Drags", item.Id.ToString("N"));
+            Directory.CreateDirectory(folder);
+            var png = Path.Combine(folder, "Image.png");
+            File.Copy(_services.Store.Blobs.PathFor(image), png, overwrite: true);
+            files.Add(png);
+        }
+        return files;
+    }
+
+    /// <summary>Files dropped in from other apps; not a row of this panel dragged around (it carries its own files).</summary>
     private static List<string> DroppedFiles(IDataObject data) =>
-        data.GetDataPresent(DataFormats.FileDrop) && data.GetData(DataFormats.FileDrop) is string[] files ? [.. files] : [];
+        !data.GetDataPresent(EntryFormat) && data.GetDataPresent(DataFormats.FileDrop) && data.GetData(DataFormats.FileDrop) is string[] files ? [.. files] : [];
 
     private static string? DroppedText(IDataObject data) =>
         !data.GetDataPresent(EntryFormat) && data.GetDataPresent(DataFormats.UnicodeText) ? data.GetData(DataFormats.UnicodeText) as string : null;

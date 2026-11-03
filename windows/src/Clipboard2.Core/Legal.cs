@@ -64,6 +64,9 @@ public static class Legal
             "(Art. 20; Settings → General → Export Backup also gives you one) and you can object to processing based on legitimate interest (Art. 21). " +
             $"Ask {Operator}. Because your content is end-to-end encrypted, the operator can only hand out or delete it as encrypted data.\n" +
             "You can also complain to a data protection authority, in Austria the Datenschutzbehörde (Barichgasse 40–42, 1030 Vienna, www.dsb.gv.at)."),
+        new("Do you have to provide data?",
+            "Only to use sync: without an email address and password we can't create an account. Everything else in " +
+            "Clipboard2 works without one. No automated decisions are made about you."),
         new("Changes", $"If this notice changes, the new version ships with the app. Last updated: {PrivacyUpdated}."),
     ];
 
