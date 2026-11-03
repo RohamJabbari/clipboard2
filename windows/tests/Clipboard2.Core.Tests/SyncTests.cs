@@ -1290,6 +1290,103 @@ public sealed class SyncEngineTests : IDisposable
         Assert.All(Directory.GetFiles(b.Store.SyncedFolder(item.Id)), f => Assert.DoesNotContain("Zone.Identifier", f));
     }
 
+    [Fact]
+    public async Task IncomingFilesAreListedAsDownloadsUntilApplied()
+    {
+        var a = await SignedUp();
+        var b = await SignedUp("friend@example.com");
+        Assert.True(await a.Account.CreateGroupAsync("Family"));
+        var group = a.Account.Groups.Single().Id;
+        await Invite(a, b, group);
+        await b.Sync();
+        var item = a.Store.Ingest(ProcessedCapture.ForFiles([WriteFile(a, "report.pdf", RandomNumberGenerator.GetBytes(300_000)), WriteFile(a, "notes.txt", [1, 2])]),
+            spaceId: group);
+        await a.Sync();
+
+        var seen = new List<IncomingDownload>();
+        _cloud.ServingBlob = _ => seen.AddRange(b.Account.Downloads);
+        var changes = 0;
+        b.Account.DownloadsChanged += () => Interlocked.Increment(ref changes);
+        await b.Sync();
+
+        Assert.Equal(2, seen.Count);
+        Assert.All(seen, d => Assert.Equal((item.Id, group, "report.pdf +1 more", 300_002L + 2 * 29), (d.ItemId, d.SpaceId, d.Name, d.BytesTotal)));
+        Assert.Equal(new long[] { 0, 300_029 }, seen.Select(d => d.BytesReceived));   // the second file starts once the first is in
+        Assert.True(changes > 0);
+        Assert.Empty(b.Account.Downloads);
+        Assert.Equal(ClipKind.File, b.Store.Find(item.Id)!.Kind);
+
+        // Files this device already has aren't downloaded again, so an edit isn't listed.
+        seen.Clear();
+        a.Store.TogglePin(a.Store.Find(item.Id)!);
+        await a.Sync();
+        await b.Sync();
+        Assert.True(b.Store.Find(item.Id)!.IsPinned);
+        Assert.Empty(seen);
+    }
+
+    private static ClipItem Image(Device d, string name, int size)
+    {
+        d.Store.Blobs.Write(RandomNumberGenerator.GetBytes(size), name);
+        d.Store.Blobs.Write([1, 2, 3], "thumb-" + name);
+        return d.Store.Ingest(new ProcessedCapture { Kind = ClipKind.Image, Preview = "Image 4×4", Hash = "image:" + name, ImageFile = name,
+            ThumbnailFile = "thumb-" + name, ImageWidth = 4, ImageHeight = 4, ByteCount = size });
+    }
+
+    [Fact]
+    public async Task AMissingOrFailedDownloadIsNoLongerListed()
+    {
+        var a = await SignedUp();
+        var b = await SignedIn();
+        var seen = new List<IncomingDownload>();
+        _cloud.ServingBlob = _ => seen.AddRange(b.Account.Downloads);
+
+        // The thumbnail is gone (404): the image is listed while it downloads, then dropped with the item.
+        var lost = Image(a, "lost.png", 4096);
+        await a.Sync();
+        _cloud.DropBlob(a.Personal, _cloud.ItemById(a.Personal, ClipStore.SyncId(lost.Id)).BlobIds[1]);
+        await b.Sync();
+        Assert.Equal(("Image", 4096L + 29), (Assert.Single(seen).Name, seen[0].BytesTotal));
+        Assert.Empty(b.Account.Downloads);
+        Assert.Null(b.Store.Find(lost.Id));
+
+        // The network drops mid-download: the tick fails and nothing stays listed; the next tick gets it.
+        seen.Clear();
+        var flaky = Image(a, "flaky.png", 4096);
+        await a.Sync();
+        _cloud.ServingBlob = _ =>
+        {
+            seen.AddRange(b.Account.Downloads);
+            _cloud.Offline = true;
+        };
+        await b.Sync();
+        Assert.Equal(flaky.Id, Assert.Single(seen).ItemId);
+        Assert.Equal(SyncStatus.Offline, b.Account.CurrentStatus);
+        Assert.Empty(b.Account.Downloads);
+        Assert.Null(b.Store.Find(flaky.Id));
+        _cloud.ServingBlob = null;
+        _cloud.Offline = false;
+        await b.Sync();
+        Assert.Equal(ClipKind.Image, b.Store.Find(flaky.Id)!.Kind);
+        Assert.Empty(b.Account.Downloads);
+    }
+
+    [Fact]
+    public void DownloadSizesAreFormatted()
+    {
+        var culture = System.Globalization.CultureInfo.CurrentCulture;
+        System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+        try
+        {
+            Assert.Equal("12.4 of 80 MB", new IncomingDownload(Guid.Empty, "", "x", 13_000_000, 80L << 20).ProgressText);
+            Assert.Equal("0 of 1.5 KB", new IncomingDownload(Guid.Empty, "", "x", 0, 1536).ProgressText);
+            Assert.Equal("Starting…", new IncomingDownload(Guid.Empty, "", "x", 0, 0).ProgressText);
+            Assert.Equal(new[] { "512 KB", "150 MB", "99.5 MB", "1.2 GB" },
+                new[] { 512L << 10, 150L << 20, 99L * (1 << 20) + (1 << 19), 1_288_490_189L }.Select(IncomingDownload.FormatSize));
+        }
+        finally { System.Globalization.CultureInfo.CurrentCulture = culture; }
+    }
+
     private static JsonObject OpenPayload(Device d, FakeCloud.Item remote)
     {
         var space = d.Account.Engine!.Space(d.Personal)!;

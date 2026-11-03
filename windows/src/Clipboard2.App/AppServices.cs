@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Threading;
@@ -528,10 +529,21 @@ public sealed class AppServices : IPanelHost
         _ = Sync.SyncNowAsync();
     }
 
+    private HudWindow? _hud;
+    private HudWindow Hud => _hud ??= new HudWindow();
+    /// <summary>Set while "Paste from group" waits for an item to download; the shortcut pressed again cancels it.</summary>
+    private CancellationTokenSource? _groupPasteWait;
+
     /// <summary>Pastes the newest item of the default group. Fetches first (briefly), so something a group
-    /// member just sent is pasted; if the server is slow or unreachable, the newest known one is.</summary>
+    /// member just sent is pasted; if the server is slow or unreachable, the newest known one is. An item that's
+    /// still downloading is waited for, with its progress on screen.</summary>
     public async Task PasteFromGroupAsync()
     {
+        if (_groupPasteWait is { } waiting)
+        {
+            waiting.Cancel();
+            return;
+        }
         if (!Sync.IsSignedIn || Sync.DefaultGroup is not { } group)
         {
             OpenSettings("Sync");
@@ -539,11 +551,63 @@ public sealed class AppServices : IPanelHost
         }
         var target = Tracker.TargetWindow;
         await Task.WhenAny(Sync.SyncNowAsync(), Task.Delay(TimeSpan.FromMilliseconds(1500)));
+        if (Sync.Downloads.LastOrDefault(d => d.SpaceId == group.Id) is { } incoming)
+        {
+            await PasteWhenDownloadedAsync(incoming, target);
+            return;
+        }
         if (Store.ItemsInSpace(group.Id).FirstOrDefault() is not { } item)
         {
             _tray?.ShowBalloon(group.DisplayName, "Nothing in this group yet.");
             return;
         }
+        _panelTarget = target;
+        Paste(item, null);
+    }
+
+    /// <summary>Shows the download's progress and pastes the item once it's in. If another window came to the front
+    /// meanwhile, the item only goes on the clipboard.</summary>
+    private async Task PasteWhenDownloadedAsync(IncomingDownload incoming, IntPtr target)
+    {
+        using var wait = _groupPasteWait = new CancellationTokenSource();
+        var arrived = new TaskCompletionSource<ClipItem?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        // Gone from the list: applied (it's in the store now) or failed.
+        void Update()
+        {
+            if (Sync.Downloads.FirstOrDefault(d => d.ItemId == incoming.ItemId) is { } current) Hud.ShowProgress(target, current);
+            else arrived.TrySetResult(Store.Find(incoming.ItemId));
+        }
+        void OnDownloadsChanged() => Dispatcher.BeginInvoke(Update);
+        Sync.DownloadsChanged += OnDownloadsChanged;
+        ClipItem? item;
+        try
+        {
+            Update();
+            using var _ = wait.Token.Register(() => arrived.TrySetCanceled());
+            item = await arrived.Task;
+        }
+        catch (OperationCanceledException)
+        {
+            Hud.ShowMessage(target, Glyphs.Cancel, "Paste cancelled");
+            return;
+        }
+        finally
+        {
+            Sync.DownloadsChanged -= OnDownloadsChanged;
+            _groupPasteWait = null;
+        }
+        if (item is null)
+        {
+            Hud.ShowMessage(target, Glyphs.Warning, $"Couldn't download {incoming.Name}");
+            return;
+        }
+        if (Tracker.TargetWindow != target)
+        {
+            Copy(item);
+            Hud.ShowMessage(target, Glyphs.Check, "Ready — press Ctrl+V to paste");
+            return;
+        }
+        Hud.HideHud();
         _panelTarget = target;
         Paste(item, null);
     }

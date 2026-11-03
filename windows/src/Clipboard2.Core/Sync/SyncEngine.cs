@@ -34,6 +34,39 @@ public sealed class SyncReport
     public bool ClockSkew { get; set; }
 }
 
+/// <summary>A received clip whose image or files are still downloading; it's added to the history once they're in.</summary>
+/// <param name="Name">The first file's name ("report.pdf +2 more" for several), or "Image".</param>
+/// <param name="BytesTotal">The sizes the payload gives, replaced by each blob's Content-Length once it's seen; 0 while
+/// unknown. <paramref name="BytesReceived"/> never exceeds it.</param>
+public sealed record IncomingDownload(Guid ItemId, string SpaceId, string Name, long BytesReceived, long BytesTotal)
+{
+    /// <summary>0–1, or null while the total is unknown.</summary>
+    public double? Fraction => BytesTotal > 0 ? (double)BytesReceived / BytesTotal : null;
+
+    /// <summary>"12.4 of 80 MB", both in the total's unit; "Starting…" while the total is unknown.</summary>
+    public string ProgressText
+    {
+        get
+        {
+            if (BytesTotal <= 0) return "Starting…";
+            var (scale, unit) = Unit(BytesTotal);
+            return $"{Number(BytesReceived / scale)} of {Number(BytesTotal / scale)} {unit}";
+        }
+    }
+
+    /// <summary>"512 KB", "12.4 MB", "1.2 GB": one decimal under 100.</summary>
+    public static string FormatSize(long bytes)
+    {
+        var (scale, unit) = Unit(bytes);
+        return $"{Number(bytes / scale)} {unit}";
+    }
+
+    private static (double Scale, string Unit) Unit(long bytes) =>
+        bytes >= 1L << 30 ? (1 << 30, "GB") : bytes >= 1L << 20 ? (1 << 20, "MB") : (1 << 10, "KB");
+
+    private static string Number(double value) => value.ToString(value < 100 ? "0.#" : "0", System.Globalization.CultureInfo.CurrentCulture);
+}
+
 /// <summary>The personal space is gone from the server: the account was deleted elsewhere.</summary>
 public sealed class SyncAccountGoneException() : Exception("Your sync account no longer exists.");
 
@@ -241,19 +274,30 @@ public sealed partial class SyncEngine
                 continue;
             }
             var prepared = new List<Prepared>();
-            foreach (var item in page.Items)
-                if (await PrepareAsync(space, item, force: false, ct) is { } p) prepared.Add(p);
             var notices = new List<(ClipItem Item, string From)>();
-            using (store.Batch())
+            try
             {
-                foreach (var p in prepared)
+                foreach (var item in page.Items)
                 {
-                    if (Apply(space, p) is { } notice) notices.Add(notice);
-                    report.Pulled++;
+                    if (await PrepareAsync(space, item, force: false, ct) is { } p) prepared.Add(p);
+                    else EndDownloads([item.Id]);   // skipped, or its blobs couldn't be fetched
                 }
-                if (resync) store.MarkResyncSeen(space.Id, page.Items.Select(i => i.Id));
-                since = Math.Max(since, page.NextSince);
-                store.SetSyncCursor(space.Id, since);
+                using (store.Batch())
+                {
+                    foreach (var p in prepared)
+                    {
+                        if (Apply(space, p) is { } notice) notices.Add(notice);
+                        report.Pulled++;
+                    }
+                    if (resync) store.MarkResyncSeen(space.Id, page.Items.Select(i => i.Id));
+                    since = Math.Max(since, page.NextSince);
+                    store.SetSyncCursor(space.Id, since);
+                }
+            }
+            finally
+            {
+                // After the commit: an item that's no longer incoming is in the store, unless it failed.
+                EndDownloads(page.Items.Select(i => i.Id));
             }
             foreach (var (item, from) in notices) ReceivedFromDevice?.Invoke(item, from);
             if (!page.HasMore || page.Items.Count == 0)
@@ -342,10 +386,11 @@ public sealed partial class SyncEngine
         if (payload is ItemPayload.Clip clip)
         {
             var known = (meta?.BlobMap ?? new Dictionary<string, string>()).ToDictionary(p => p.Value, p => p.Key);   // blob id → file
+            TrackDownload(space, item.Id, clip, known);
             try
             {
-                clip.Item.ImageFile = await LocalBlobAsync(space, clip.ImageBlob, known, blobs, ct);
-                clip.Item.ThumbnailFile = await LocalBlobAsync(space, clip.ThumbBlob, known, blobs, ct);
+                clip.Item.ImageFile = await LocalBlobAsync(space, item.Id, clip.ImageBlob, known, blobs, ct);
+                clip.Item.ThumbnailFile = await LocalBlobAsync(space, item.Id, clip.ThumbBlob, known, blobs, ct);
             }
             catch (Exception ex) when (ex is SyncApiException { Code: not "network" } or CryptographicException or IOException)
             {
@@ -354,7 +399,7 @@ public sealed partial class SyncEngine
                 return null;
             }
             if (clip.Item.Kind == ClipKind.Image && clip.Item.ImageFile is null) return null;
-            if (clip.FileBlobs.Count > 0) await ReceiveFilesAsync(space, clip, known, blobs, ct);
+            if (clip.FileBlobs.Count > 0) await ReceiveFilesAsync(space, item.Id, clip, known, blobs, ct);
         }
         return new Prepared(item, payload, blobs, json, Dirty: dirty);
     }
@@ -399,19 +444,19 @@ public sealed partial class SyncEngine
     /// <summary>Writes a file item's blobs to its synced folder, keeping local copies that are still intact, and makes
     /// it a file item. A file that can't be fetched is left out; with none at all it stays text listing the paths.
     /// Each new file is marked as downloaded.</summary>
-    private async Task ReceiveFilesAsync(SyncSpace space, ItemPayload.Clip clip, Dictionary<string, string> known,
+    private async Task ReceiveFilesAsync(SyncSpace space, string itemId, ItemPayload.Clip clip, Dictionary<string, string> known,
                                          Dictionary<string, string> blobs, CancellationToken ct)
     {
         var item = clip.Item;
-        var entries = clip.FileBlobs.Where(f => Guid.TryParse(f.Blob, out _)).Take(MaxFilesPerItem).ToList();
+        var entries = ReceivableFiles(clip);
         var files = new string?[entries.Count];
         var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         // Kept files first, so a new file with the same name can't overwrite one of them.
         for (var i = 0; i < entries.Count; i++)
         {
-            if (!known.TryGetValue(entries[i].Blob, out var key) || ParseFileKey(key) is not { } kept || FileSize(kept.Path) != kept.Size) continue;
+            if (KeptFile(known, entries[i].Blob) is not { } kept) continue;
             files[i] = kept.Path;
-            blobs[key] = entries[i].Blob;
+            blobs[FileKey(kept.Path, kept.Size)] = entries[i].Blob;
             names.Add(Path.GetFileName(kept.Path));
         }
         var folder = store.SyncedFolder(item.Id);
@@ -422,7 +467,8 @@ public sealed partial class SyncEngine
             try
             {
                 var url = await api.BlobUrlAsync(space.Id, entry.Blob, ct);
-                var bytes = SyncCrypto.Open(space.ItemKey, await api.DownloadAsync(url, ct), SyncCrypto.Aad.Blob(space.Id, entry.Blob));
+                var bytes = SyncCrypto.Open(space.ItemKey, await api.DownloadAsync(url, ct, DownloadProgress(itemId, entry.Blob)),
+                    SyncCrypto.Aad.Blob(space.Id, entry.Blob));
                 var name = UniqueName(SafeFileName(entry.Name), names);
                 var path = Path.Combine(folder, name);
                 Directory.CreateDirectory(folder);
@@ -481,17 +527,29 @@ public sealed partial class SyncEngine
         return candidate;
     }
 
-    private async Task<string?> LocalBlobAsync(SyncSpace space, string? blobId, Dictionary<string, string> known,
+    /// <summary>The files of a file item that are fetched: those with a valid blob id, at most <see cref="MaxFilesPerItem"/>.</summary>
+    private static List<FileBlob> ReceivableFiles(ItemPayload.Clip clip) =>
+        [.. clip.FileBlobs.Where(f => Guid.TryParse(f.Blob, out _)).Take(MaxFilesPerItem)];
+
+    /// <summary>The local copy of a received file that's still intact (same size as when it was written).</summary>
+    private static (string Path, long Size)? KeptFile(Dictionary<string, string> known, string blobId) =>
+        known.TryGetValue(blobId, out var key) && ParseFileKey(key) is { } kept && FileSize(kept.Path) == kept.Size ? kept : null;
+
+    /// <summary>The local image file of a blob, if this device still has it.</summary>
+    private string? KeptImage(Dictionary<string, string> known, string blobId) =>
+        known.TryGetValue(blobId, out var existing) && File.Exists(store.Blobs.PathFor(existing)) ? existing : null;
+
+    private async Task<string?> LocalBlobAsync(SyncSpace space, string itemId, string? blobId, Dictionary<string, string> known,
                                                Dictionary<string, string> blobs, CancellationToken ct)
     {
         if (blobId is null || !Guid.TryParse(blobId, out _)) return null;
-        if (known.TryGetValue(blobId, out var existing) && File.Exists(store.Blobs.PathFor(existing)))
+        if (KeptImage(known, blobId) is { } existing)
         {
             blobs[existing] = blobId;
             return existing;
         }
         var url = await api.BlobUrlAsync(space.Id, blobId, ct);
-        var ciphertext = await api.DownloadAsync(url, ct);
+        var ciphertext = await api.DownloadAsync(url, ct, DownloadProgress(itemId, blobId));
         var bytes = SyncCrypto.Open(space.ItemKey, ciphertext, SyncCrypto.Aad.Blob(space.Id, blobId));
         var file = blobId + ".png";
         store.Blobs.Write(bytes, file);
@@ -862,11 +920,15 @@ public sealed partial class SyncEngine
     /// <summary>A 409's <c>current</c> is applied like a pulled change, even over unpushed local changes.</summary>
     private async Task ApplyCurrentAsync(SyncSpace space, RemoteItem current, CancellationToken ct)
     {
-        if (await PrepareAsync(space, current, force: true, ct) is { } prepared)
+        try
         {
-            using var _ = store.Batch();
-            Apply(space, prepared);
+            if (await PrepareAsync(space, current, force: true, ct) is { } prepared)
+            {
+                using var _ = store.Batch();
+                Apply(space, prepared);
+            }
         }
+        finally { EndDownloads([current.Id]); }
     }
 
     /// <summary>Personal: stop tracking but keep the local copy. Group: the server is the source, so delete it.</summary>
@@ -894,5 +956,113 @@ public sealed partial class SyncEngine
         var id = ClipStore.SyncId(target.Id);
         return await PushItemAsync(personal, new LocalItem.Clip(id, store.Find(target.Id)!), store.SyncMetaFor(personal.Id, id), ct,
             new JsonObject { ["toDevice"] = deviceId, ["fromDevice"] = fromDevice });
+    }
+
+    // MARK: Incoming downloads
+
+    public static readonly TimeSpan DownloadsNoticeInterval = TimeSpan.FromMilliseconds(100);
+
+    /// <summary>A clip being downloaded (<paramref name="Key"/>: its remote id): per blob, the bytes received and the
+    /// expected size.</summary>
+    private sealed record Incoming(string Key, Guid Id, string SpaceId, string Name, Dictionary<string, (long Received, long Size)> Blobs);
+
+    private readonly Lock _incomingLock = new();
+    private readonly List<Incoming> _incoming = [];   // in arrival order
+    private IReadOnlyList<IncomingDownload>? _downloads;
+    private long _downloadsNoticeAt;
+    private bool _downloadsNoticeQueued;
+
+    /// <summary>Received clips whose image or files are downloading right now, oldest first. Safe to read from any thread.</summary>
+    public IReadOnlyList<IncomingDownload> Downloads
+    {
+        get
+        {
+            lock (_incomingLock)
+                return _downloads ??= [.. _incoming.Select(i =>
+                {
+                    var total = i.Blobs.Values.Sum(b => b.Size);
+                    return new IncomingDownload(i.Id, i.SpaceId, i.Name, Math.Min(i.Blobs.Values.Sum(b => b.Received), total), total);
+                })];
+        }
+    }
+
+    /// <summary><see cref="Downloads"/> changed. At most every <see cref="DownloadsNoticeInterval"/> (the last change
+    /// always follows), and possibly on a thread-pool thread.</summary>
+    public event Action? DownloadsChanged;
+
+    /// <summary>Starts showing a clip as incoming when its image or files aren't on this device yet.</summary>
+    private void TrackDownload(SyncSpace space, string itemId, ItemPayload.Clip clip, Dictionary<string, string> known)
+    {
+        // Sizes are compared with ciphertext Content-Lengths: + 29 bytes of seal overhead.
+        var blobs = new Dictionary<string, (long Received, long Size)>();
+        foreach (var (blob, size) in new[] { (clip.ImageBlob, clip.Item.ByteCount), (clip.ThumbBlob, 0L) })
+            if (blob is not null && Guid.TryParse(blob, out _) && KeptImage(known, blob) is null) blobs[blob] = (0, size > 0 ? size + 29 : 0);
+        var files = ReceivableFiles(clip);
+        foreach (var file in files.Where(f => KeptFile(known, f.Blob) is null)) blobs[file.Blob] = (0, file.Size + 29);
+        if (blobs.Count == 0) return;
+        var name = files.Count == 0 ? "Image" : SafeFileName(files[0].Name) + (files.Count > 1 ? $" +{files.Count - 1} more" : "");
+        lock (_incomingLock)
+        {
+            _incoming.RemoveAll(i => i.Key == itemId);
+            _incoming.Add(new Incoming(itemId, clip.Item.Id, space.Id, name, blobs));
+        }
+        NotifyDownloads();
+    }
+
+    private Action<long, long?> DownloadProgress(string itemId, string blobId) => (received, length) =>
+    {
+        lock (_incomingLock)
+        {
+            if (_incoming.Find(i => i.Key == itemId) is not { } incoming || !incoming.Blobs.TryGetValue(blobId, out var blob)) return;
+            incoming.Blobs[blobId] = (received, length ?? blob.Size);
+        }
+        NotifyDownloads();
+    };
+
+    private void EndDownloads(IEnumerable<string> itemIds)
+    {
+        var ended = itemIds.ToHashSet();
+        int removed;
+        lock (_incomingLock) removed = _incoming.RemoveAll(i => ended.Contains(i.Key));
+        if (removed > 0) NotifyDownloads();
+    }
+
+    /// <summary>Forgets every download in progress: the engine is being dropped.</summary>
+    public void ClearDownloads()
+    {
+        int removed;
+        lock (_incomingLock)
+        {
+            removed = _incoming.Count;
+            _incoming.Clear();
+        }
+        if (removed > 0) NotifyDownloads();
+    }
+
+    /// <summary>Raises <see cref="DownloadsChanged"/> now, or once the interval since the last one has passed.</summary>
+    private void NotifyDownloads()
+    {
+        lock (_incomingLock)
+        {
+            _downloads = null;
+            if (_downloadsNoticeQueued) return;
+            var wait = _downloadsNoticeAt + (long)DownloadsNoticeInterval.TotalMilliseconds - Environment.TickCount64;
+            if (wait > 0)
+            {
+                _downloadsNoticeQueued = true;
+                _ = Task.Delay(TimeSpan.FromMilliseconds(wait)).ContinueWith(_ =>
+                {
+                    lock (_incomingLock)
+                    {
+                        _downloadsNoticeQueued = false;
+                        _downloadsNoticeAt = Environment.TickCount64;
+                    }
+                    DownloadsChanged?.Invoke();
+                }, TaskScheduler.Default);
+                return;
+            }
+            _downloadsNoticeAt = Environment.TickCount64;
+        }
+        DownloadsChanged?.Invoke();
     }
 }

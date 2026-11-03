@@ -35,6 +35,8 @@ internal sealed class FakeCloud : HttpMessageHandler
     public bool Offline { get; set; }
     /// <summary>Item ids the change feed leaves out for now (replication lag): writes still see them.</summary>
     public HashSet<string> HiddenFromChanges { get; } = [];
+    /// <summary>Called with the blob id before storage serves a blob's content.</summary>
+    public Action<string>? ServingBlob { get; set; }
     public List<string> Log { get; } = [];
     public int Count(string prefix) => Log.Count(l => l.StartsWith(prefix));
 
@@ -337,7 +339,9 @@ internal sealed class FakeCloud : HttpMessageHandler
             blob.Bytes = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
             return new HttpResponseMessage(HttpStatusCode.OK);
         }
-        return blob.Bytes is { } bytes ? new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(bytes) } : new HttpResponseMessage(HttpStatusCode.NotFound);
+        if (blob.Bytes is null) return new HttpResponseMessage(HttpStatusCode.NotFound);
+        ServingBlob?.Invoke(parts[1]);
+        return new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(blob.Bytes) };
     }
 
     // MARK: API

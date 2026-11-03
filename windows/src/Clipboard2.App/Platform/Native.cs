@@ -43,6 +43,10 @@ public static partial class Native
     public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
     public const uint MONITOR_DEFAULTTONEAREST = 2;
     public const uint SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
+    [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hwnd, int index);
+    [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hwnd, int index, int value);
+    public const int GWL_EXSTYLE = -20;
+    public const int WS_EX_TRANSPARENT = 0x20, WS_EX_TOOLWINDOW = 0x80, WS_EX_NOACTIVATE = 0x08000000;
 
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }

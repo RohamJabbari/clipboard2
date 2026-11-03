@@ -321,23 +321,49 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
             throw new SyncApiException(response.StatusCode, "upload_failed", $"Uploading an image failed ({(int)response.StatusCode}).");
     }
 
-    public async Task<byte[]> DownloadAsync(string url, CancellationToken ct = default)
+    /// <summary>Downloads from a signed URL, streaming. <paramref name="progress"/> gets the bytes received so far and
+    /// the Content-Length (null when the server sends none) as they arrive.</summary>
+    public async Task<byte[]> DownloadAsync(string url, CancellationToken ct = default, Action<long, long?>? progress = null)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        using var response = await Send(request, ct);
+        using var response = await Send(request, ct, HttpCompletionOption.ResponseHeadersRead);
         if (!response.IsSuccessStatusCode)
             throw new SyncApiException(response.StatusCode, "download_failed", $"Downloading an image failed ({(int)response.StatusCode}).");
-        return await response.Content.ReadAsByteArrayAsync(ct);
+        var length = response.Content.Headers.ContentLength;
+        // The client's timeout ends with the headers: a body that stalls as long fails like an unanswered request.
+        using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(stall.Token);
+            var body = new MemoryStream(length is > 0 and <= SyncEngine.MaxBlobBytes ? (int)length : 0);
+            var buffer = new byte[81920];
+            progress?.Invoke(0, length);
+            while (true)
+            {
+                stall.CancelAfter(_http.Timeout);
+                var read = await stream.ReadAsync(buffer, stall.Token);
+                if (read == 0) break;
+                body.Write(buffer, 0, read);
+                progress?.Invoke(body.Length, length);
+            }
+            return body.Length == body.Capacity ? body.GetBuffer() : body.ToArray();
+        }
+        catch (Exception ex) when (ex is HttpRequestException or IOException) { throw Unreachable(ex); }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { throw Unanswered(); }
     }
 
     // MARK: Plumbing
 
-    private async Task<HttpResponseMessage> Send(HttpRequestMessage request, CancellationToken ct)
+    private async Task<HttpResponseMessage> Send(HttpRequestMessage request, CancellationToken ct,
+                                                 HttpCompletionOption completion = HttpCompletionOption.ResponseContentRead)
     {
-        try { return await _http.SendAsync(request, ct); }
-        catch (HttpRequestException ex) { throw new SyncApiException(0, "network", "Couldn't reach the sync server. (" + ex.Message + ")"); }
-        catch (TaskCanceledException) when (!ct.IsCancellationRequested) { throw new SyncApiException(0, "network", "The sync server didn't answer in time."); }
+        try { return await _http.SendAsync(request, completion, ct); }
+        catch (HttpRequestException ex) { throw Unreachable(ex); }
+        catch (TaskCanceledException) when (!ct.IsCancellationRequested) { throw Unanswered(); }
     }
+
+    private static SyncApiException Unreachable(Exception ex) => new(0, "network", "Couldn't reach the sync server. (" + ex.Message + ")");
+    private static SyncApiException Unanswered() => new(0, "network", "The sync server didn't answer in time.");
 
     private async Task<(HttpStatusCode Status, JsonObject? Json)> SendAsync(HttpMethod method, string path, JsonNode? body,
                                                                          CancellationToken ct, HttpStatusCode[]? allow = null, bool anonymous = false)

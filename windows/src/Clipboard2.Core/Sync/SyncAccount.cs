@@ -129,6 +129,10 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
     public event PropertyChangedEventHandler? PropertyChanged;
     /// <summary>Another device sent a clip here: the item (now at the top) and the sender's device name.</summary>
     public event Action<ClipItem, string>? ReceivedFromDevice;
+    /// <summary>Received clips whose image or files are still downloading (<see cref="SyncEngine.Downloads"/>).</summary>
+    public IReadOnlyList<IncomingDownload> Downloads => _engine?.Downloads ?? [];
+    /// <summary><see cref="Downloads"/> changed: throttled, and possibly raised off the UI thread.</summary>
+    public event Action? DownloadsChanged;
 
     public SyncAccount(ClipStore store, ISecretVault vault, Settings settings, IKeyStore keys, HttpClient? http = null,
                        Func<DateTime>? clock = null, int kdfIterations = SyncCrypto.KdfIterations,
@@ -839,8 +843,10 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
         _devicesFresh = false;
         CurrentDeviceId = null;
         Devices = [];
+        _engine?.ClearDownloads();
         _engine = new SyncEngine(_store, _vault, _api, identity, _now, _pins) { Logger = m => Logger?.Invoke(m) };
         _engine.ReceivedFromDevice += (item, from) => ReceivedFromDevice?.Invoke(item, from);
+        _engine.DownloadsChanged += () => DownloadsChanged?.Invoke();
     }
 
     private void SignOutLocally()
@@ -849,6 +855,7 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
         {
             foreach (var id in engine.Spaces.Select(s => s.Id).Concat(engine.KeyChangedSpaces).Append(engine.Identity.PersonalSpaceId).ToList())
                 _pins.Remove(id);
+            engine.ClearDownloads();
         }
         foreach (var record in _store.SyncSpaces()) _pins.Remove(record.Id);
         _engine = null;

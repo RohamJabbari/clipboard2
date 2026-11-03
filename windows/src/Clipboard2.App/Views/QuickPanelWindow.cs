@@ -32,6 +32,7 @@ public sealed class QuickPanelWindow : Window
     private readonly TextBlock _hints = Fluent.Label("", 12, Fluent.Secondary);
     private readonly TextBlock _notice = Fluent.Label("", 12);
     private readonly SyncStatusBadge _syncStatus;
+    private readonly IncomingDownloadBanner _incoming = new();
     private readonly Dictionary<string, Border> _rowViews = [];
     private List<string> _renderedIds = [];
     private bool _renderQueued;
@@ -86,7 +87,11 @@ public sealed class QuickPanelWindow : Window
         content.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(44, GridUnitType.Star) });
         content.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1) });
         content.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(56, GridUnitType.Star) });
-        content.Children.Add(_rowScroll);
+        var list = new DockPanel();
+        DockPanel.SetDock(_incoming, Dock.Top);
+        list.Children.Add(_incoming);
+        list.Children.Add(_rowScroll);
+        content.Children.Add(list);
         var divider = new Border { Background = Fluent.Separator };
         Grid.SetColumn(divider, 1);
         content.Children.Add(divider);
@@ -120,6 +125,7 @@ public sealed class QuickPanelWindow : Window
         Model.Changed += QueueRender;
         _services.StoreChanged += () => Dispatcher.BeginInvoke(() => { if (IsVisible) Model.Refresh(); });
         _services.Sync.Changed += () => Dispatcher.BeginInvoke(_syncStatus.Update);
+        _services.Sync.DownloadsChanged += () => Dispatcher.BeginInvoke(() => { if (IsVisible) UpdateIncoming(); });
         _services.ImageText.Indexed += OnImageTextRead;
         SetUpDropTargets();
     }
@@ -354,6 +360,7 @@ public sealed class QuickPanelWindow : Window
         }
         _targetLabel.Text = Model.TargetApp is { } app ? $"Pastes into {app.Name}" : "";
         RenderChips();
+        UpdateIncoming();
         RenderRows();
         var previousMode = _detailState.Mode;
         RenderDetail();
@@ -379,6 +386,11 @@ public sealed class QuickPanelWindow : Window
             MakeGroupDropTarget(chip, id, name);
         }
     }
+
+    /// <summary>Group items still downloading, while that group (or All) is shown. Updated in place: no list render.</summary>
+    private void UpdateIncoming() => _incoming.Update([.. _services.Sync.Downloads.Where(d => Model.GroupFilter is { } group
+        ? d.SpaceId == group
+        : Model.Filter == PanelFilter.All && Model.GroupNames.ContainsKey(d.SpaceId))]);
 
     private PanelFilter? ActiveContentType => Model.GroupFilter is null && Model.Filter.IsContentType() ? Model.Filter : null;
 
