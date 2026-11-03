@@ -23,7 +23,7 @@ nonisolated enum SyncConfig {
     /// Newest history items kept per space, on the server and locally for groups.
     static let historyLimit = 200
     static let maxItemCiphertext = 2 * 1024 * 1024
-    static let maxBlobCiphertext = 25 * 1024 * 1024
+    static let maxBlobCiphertext = 100 * 1024 * 1024
     /// Files whose contents a single file clip carries.
     static let maxFilesPerItem = 10
     static let changesPageSize = 500

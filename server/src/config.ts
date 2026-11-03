@@ -29,7 +29,7 @@ export interface Limits {
 
 export const limits = (): Limits => ({
   itemBytes: int("LIMIT_ITEM_BYTES", 2 * 1024 * 1024),
-  blobBytes: int("LIMIT_BLOB_BYTES", 25 * 1024 * 1024),
+  blobBytes: int("LIMIT_BLOB_BYTES", 100 * 1024 * 1024),
   userBytes: int("LIMIT_USER_BYTES", 1024 * 1024 * 1024),
   nonHistoryPerSpace: int("LIMIT_NON_HISTORY_PER_SPACE", 5000),
   groupsOwned: int("LIMIT_GROUPS_OWNED", 20),

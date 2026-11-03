@@ -799,6 +799,10 @@ final class PanelViewModel {
 
     /// Copies items into a group's space with new ids (selected text from another app is stored there).
     func share(_ items: [ClipItem], to group: SyncGroup) {
+        if let problem = items.lazy.compactMap(SyncEngine.groupShareProblem).first {
+            refuseGroupShare(problem)
+            return
+        }
         for item in items {
             if item.isTransient {
                 env.store.ingest(.text(item.text, source: item.source), spaceID: group.id)
@@ -816,9 +820,21 @@ final class PanelViewModel {
         }
     }
 
+    /// Nothing is shared; the reason shows big enough not to be missed.
+    private func refuseGroupShare(_ problem: String) {
+        NSSound.beep()
+        if mode == .actions || mode == .shareToGroup { mode = .browse }
+        HUD.show(problem, symbol: "exclamationmark.triangle.fill", duration: .seconds(3.5))
+        showNotice("Not shared")
+    }
+
     // MARK: Send to device
 
     func send(_ item: ClipItem, to device: DeviceTarget) {
+        if let problem = SyncEngine.groupShareProblem(item) {
+            refuseGroupShare(problem.replacingOccurrences(of: "Groups take", with: "Sync takes"))
+            return
+        }
         env.sync.sendToDevice(item, deviceId: device.id)
         if mode == .actions { mode = .browse }
         showNotice("Sent to \(device.name)")
@@ -858,6 +874,10 @@ final class PanelViewModel {
         let group = target.flatMap { id in env.sync.groups.first { $0.id == id } }
         if target != nil && group == nil { return }
         onDropFinished()
+        if group != nil, let problem = SyncEngine.groupShareProblem(fileURLs: files) {
+            refuseGroupShare(problem)
+            return
+        }
         let raw = RawCapture(kind: .file, fileURLs: files)
         Task {
             guard let capture = await CaptureProcessor.process(raw, blobs: env.blobs) else { return }

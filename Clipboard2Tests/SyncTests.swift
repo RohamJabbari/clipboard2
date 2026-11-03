@@ -1232,6 +1232,32 @@ struct SyncEngineTests {
         for item in mac2.store.allItems() { mac2.store.delete(item) }
     }
 
+    @Test func filesTooBigOrTooManyAreRefusedForGroups() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "GroupShare-\(UUID())", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        func file(_ name: String, size: Int) throws -> URL {
+            let url = dir.appending(path: name)
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+            let handle = try FileHandle(forWritingTo: url)
+            try handle.truncate(atOffset: UInt64(size))      // sparse: instant, no real 100 MB
+            try handle.close()
+            return url
+        }
+        let limit = SyncConfig.maxBlobCiphertext - SyncCrypto.sealOverhead
+        let fits = try file("fits.mov", size: 30 * 1024 * 1024)
+        let edge = try file("edge.mov", size: limit)
+        let big = try file("big.mov", size: limit + 1)
+        #expect(SyncEngine.groupShareProblem(fileURLs: [fits, edge]) == nil)
+        let problem = try #require(SyncEngine.groupShareProblem(fileURLs: [fits, big]))
+        #expect(problem.contains("big.mov"))
+        #expect(problem.contains("100 MB"))
+        let many = try (0...SyncConfig.maxFilesPerItem).map { try file("f\($0).txt", size: 1) }
+        #expect(SyncEngine.groupShareProblem(fileURLs: many)?.contains("at most") == true)
+        #expect(SyncEngine.groupShareProblem(fileURLs: Array(many.prefix(SyncConfig.maxFilesPerItem))) == nil)
+        #expect(SyncEngine.groupShareProblem(fileURLs: [dir]) == nil)      // a folder travels as its name
+    }
+
     @Test func downloadProgressAddsUpBlobsAndWaitsForUnknownSizes() {
         let meter = DownloadMeter(expected: ["a": 100, "b": 0])
         meter.update("a", received: 40, expected: -1)

@@ -429,6 +429,11 @@ final class AppEnvironment {
                 NSSound.beep()
                 return
             }
+            if capture.kind == .file, let problem = SyncEngine.groupShareProblem(fileURLs: capture.fileURLs) {
+                NSSound.beep()
+                HUD.show(problem, symbol: "exclamationmark.triangle.fill", duration: .seconds(3.5))
+                return
+            }
             store.ingest(capture, spaceID: group.id)
             HUD.show("Sent to \(group.name)", symbol: "person.2.fill")
             sync.syncNow()

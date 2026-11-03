@@ -298,7 +298,7 @@ Item = {"id","category":"history|pinned|snippet|secret","seq","sortAt","updatedA
 | Limit | Value | Error |
 |---|---|---|
 | Item ciphertext | 2 MB | `too_large` |
-| Blob | 25 MB | `too_large` |
+| Blob | 100 MB | `too_large` |
 | Blob ids per item | 12 | `invalid` |
 | Bytes per user (items + blobs they wrote) | 1 GB | 403 `quota_exceeded` |
 | Non-history items per space | 5 000 | 403 `quota_exceeded` |

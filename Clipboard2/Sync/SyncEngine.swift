@@ -1142,6 +1142,32 @@ final class SyncEngine {
         warnings.append(message)
     }
 
+    /// Why these files can't be shared to a group (nil: they can). Sync would leave a file that's
+    /// too big out, and the others would get the item without it, so sharing is refused instead.
+    nonisolated static func groupShareProblem(fileURLs: [URL]) -> String? {
+        let limit = SyncConfig.maxBlobCiphertext - SyncCrypto.sealOverhead
+        var files = 0
+        for url in fileURLs where url.isFileURL {
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true, let size = values.fileSize
+            else { continue }
+            if size > limit {
+                // Binary megabytes, so the limit reads as the round "100 MB" it is.
+                let maximum = "\(SyncConfig.maxBlobCiphertext / 1_048_576) MB"
+                return "“\(url.lastPathComponent)” is \(Int64(size).formatted(.byteCount(style: .memory))). Groups take files up to \(maximum)."
+            }
+            files += 1
+        }
+        if files > SyncConfig.maxFilesPerItem {
+            return "Groups take at most \(SyncConfig.maxFilesPerItem) files at a time."
+        }
+        return nil
+    }
+
+    static func groupShareProblem(_ item: ClipItem) -> String? {
+        item.kind == .file ? groupShareProblem(fileURLs: item.fileURLs) : nil
+    }
+
     /// Files of a file clip whose contents sync: regular files that fit in one blob, at most 10.
     static func uploadableFiles(_ item: ClipItem) -> [(url: URL, size: Int)] {
         let limit = SyncConfig.maxBlobCiphertext - SyncCrypto.sealOverhead
