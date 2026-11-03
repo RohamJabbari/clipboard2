@@ -160,6 +160,8 @@ internal sealed class FakeCloud : HttpMessageHandler
     }
     /// <summary>Loses a blob, as garbage collection would.</summary>
     public void DropBlob(string spaceId, string blobId) => _blobs.Remove((spaceId, blobId));
+    /// <summary>A hostile writer's blob: replaces its stored ciphertext.</summary>
+    public void ReplaceBlob(string spaceId, string blobId, byte[] ciphertext) => _blobs[(spaceId, blobId)].Bytes = ciphertext;
 
     /// <summary>Simulates a newer write from elsewhere without the client seeing it yet.</summary>
     public void BumpUpdatedAt(string spaceId, string id, long by) => _spaces[spaceId].Items[id].UpdatedAt += by;

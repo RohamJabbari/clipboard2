@@ -639,13 +639,18 @@ public sealed class SyncEngineTests : IDisposable
             var exact = Make("exact.bin", SyncEngine.MaxFileBytes);
             var big = Make("video.mov", 132L << 20);
             ClipItem Files(params string[] paths) => new() { Kind = ClipKind.File, Files = [.. paths] };
+            var folder = Path.Combine(dir, "Small");
+            Directory.CreateDirectory(Path.Combine(folder, "sub"));
+            Make(Path.Combine("Small", "sub", "a.txt"), 5000);
 
-            Assert.Null(SyncEngine.GroupShareProblem(Files(small, exact, dir)));   // a folder isn't sent, so it's fine
+            Assert.Null(SyncEngine.GroupShareProblem(Files(small, exact, folder)));
             Assert.Null(SyncEngine.GroupShareProblem(new ClipItem { Kind = ClipKind.Text, Text = new string('x', 1000) }));
             Assert.Equal("“video.mov” is 132 MB. Groups take files up to 100 MB.", SyncEngine.GroupShareProblem(Files(small, big)));
             var many = Enumerable.Range(0, SyncEngine.MaxFilesPerItem + 1).Select(i => Make($"f{i}.txt", 10)).ToArray();
             Assert.Equal($"Groups take at most {SyncEngine.MaxFilesPerItem} files at a time.", SyncEngine.GroupShareProblem(Files(many)));
             Assert.Null(SyncEngine.GroupShareProblem(Files(many[..SyncEngine.MaxFilesPerItem])));
+            Assert.Equal($"Groups take at most {SyncEngine.MaxFilesPerItem} files at a time.",
+                SyncEngine.GroupShareProblem(Files([.. many[..SyncEngine.MaxFilesPerItem], folder])));   // a folder counts as one
         }
         finally { Directory.Delete(dir, recursive: true); }
     }
@@ -656,11 +661,9 @@ public sealed class SyncEngineTests : IDisposable
         var a = await SignedUp();
         var pdf = WriteFile(a, "report.pdf", RandomNumberGenerator.GetBytes(5000));
         var png = WriteFile(a, "photo.png", RandomNumberGenerator.GetBytes(300));
-        var folder = Path.Combine(a.Dir, "Documents", "Folder");
-        Directory.CreateDirectory(folder);
         var big = Path.Combine(a.Dir, "Documents", "huge.iso");
         using (var f = File.Create(big)) f.SetLength(SyncEngine.MaxBlobBytes);   // + seal overhead: one byte too many
-        var item = a.Store.Ingest(ProcessedCapture.ForFiles([pdf, folder, png, big]));
+        var item = a.Store.Ingest(ProcessedCapture.ForFiles([pdf, png, big]));
         await a.Sync();
         var remote = _cloud.ItemById(a.Personal, ClipStore.SyncId(item.Id));
         Assert.Equal(2, remote.BlobIds.Count);
@@ -707,10 +710,8 @@ public sealed class SyncEngineTests : IDisposable
     {
         var a = await SignedUp();
         var b = await SignedIn();
-        var folder = Path.Combine(a.Dir, "Documents", "Folder");
-        Directory.CreateDirectory(folder);
         var missing = Path.Combine(a.Dir, "Documents", "gone.txt");
-        var nothing = a.Store.Ingest(ProcessedCapture.ForFiles([folder, missing]));   // like an item from an older sender
+        var nothing = a.Store.Ingest(ProcessedCapture.ForFiles([missing, Path.Combine(a.Dir, "Documents", "gone too.txt")]));
         var lost = a.Store.Ingest(ProcessedCapture.ForFiles([WriteFile(a, "a.txt", [1]), WriteFile(a, "b.txt", [2])]));
         var half = a.Store.Ingest(ProcessedCapture.ForFiles([WriteFile(a, "c.txt", [3]), WriteFile(a, "d.txt", [4])]));
         await a.Sync();
@@ -734,6 +735,215 @@ public sealed class SyncEngineTests : IDisposable
         // A local delete removes the folder too.
         b.Store.Delete(partial);
         Assert.False(Directory.Exists(b.Store.SyncedFolder(half.Id)));
+    }
+
+    private const string Unicode = "Ünïcödé – 日本 😀.txt";
+
+    /// <summary>Documents/Project: a.txt, the non-ASCII file, sub/b.bin, sub/deeper/ (empty).</summary>
+    private static string WriteProject(Device d)
+    {
+        var folder = Path.Combine(d.Dir, "Documents", "Project");
+        Directory.CreateDirectory(Path.Combine(folder, "sub", "deeper"));
+        File.WriteAllText(Path.Combine(folder, "a.txt"), "hello");
+        File.WriteAllText(Path.Combine(folder, Unicode), "grüß dich");
+        File.WriteAllBytes(Path.Combine(folder, "sub", "b.bin"), RandomNumberGenerator.GetBytes(20_000));
+        return folder;
+    }
+
+    /// <summary>Every entry under a folder ("sub/" for folders) with its bytes.</summary>
+    private static List<(string Path, string Content)> Tree(string folder) =>
+    [
+        .. Directory.EnumerateFileSystemEntries(folder, "*", SearchOption.AllDirectories)
+            .Select(p => (Path.GetRelativePath(folder, p).Replace('\\', '/') + (Directory.Exists(p) ? "/" : ""),
+                Directory.Exists(p) ? "" : Convert.ToBase64String(File.ReadAllBytes(p))))
+            .OrderBy(e => e.Item1, StringComparer.Ordinal),
+    ];
+
+    private int BlobUploads => _cloud.Count("PUT storage.fake");
+
+    [Fact]
+    public async Task FoldersSyncAsZipsAndArriveAsFolders()
+    {
+        var a = await SignedUp();
+        var b = await SignedIn();
+        var project = WriteProject(a);
+        var notes = WriteFile(a, "notes.txt", [1, 2, 3]);
+        var item = a.Store.Ingest(ProcessedCapture.ForFiles([project, notes]));
+        await a.Sync();
+
+        var remote = _cloud.ItemById(a.Personal, ClipStore.SyncId(item.Id));
+        Assert.Equal(2, remote.BlobIds.Count);
+        var blobs = OpenPayload(a, remote)["fileBlobs"]!.AsArray();
+        Assert.Equal("Project.zip", blobs[0]!["name"]!.GetValue<string>());
+        Assert.True(blobs[0]!["folder"]!.GetValue<bool>());
+        Assert.Null(blobs[1]!["folder"]);   // only written when true
+
+        var seen = new List<IncomingDownload>();
+        _cloud.ServingBlob = _ => seen.AddRange(b.Account.Downloads);
+        await b.Sync();
+        Assert.All(seen, d => Assert.Equal("Project +1 more", d.Name));
+        var copy = b.Store.Find(item.Id)!;
+        Assert.Equal(ClipKind.File, copy.Kind);
+        var folderOnB = Path.Combine(b.Store.SyncedFolder(item.Id), "Project");
+        Assert.Equal([folderOnB, Path.Combine(b.Store.SyncedFolder(item.Id), "notes.txt")], copy.Files);
+        Assert.True(Directory.Exists(folderOnB));
+        Assert.Equal(Tree(project), Tree(folderOnB));
+        Assert.Contains(("sub/deeper/", ""), Tree(folderOnB));
+        Assert.True(File.Exists(Path.Combine(folderOnB, Unicode)));
+    }
+
+    [Fact]
+    public async Task UnchangedFoldersAreNotUploadedAgain()
+    {
+        var a = await SignedUp();
+        var project = WriteProject(a);
+        var item = a.Store.Ingest(ProcessedCapture.ForFiles([project]));
+        await a.Sync();
+        var uploads = BlobUploads;
+        var puts = Puts(a, ClipStore.SyncId(item.Id));
+        var blob = Assert.Single(_cloud.ItemById(a.Personal, ClipStore.SyncId(item.Id)).BlobIds);
+
+        await a.Sync();
+        await a.Sync();
+        Assert.Equal(uploads, BlobUploads);
+        Assert.Equal(puts, Puts(a, ClipStore.SyncId(item.Id)));
+        var archives = a.Account.Engine!.FolderArchives.Directory;
+        Assert.Single(Directory.GetFiles(archives));
+
+        // A change inside it sends a new zip, and the old archive goes.
+        File.WriteAllText(Path.Combine(project, "sub", "new.txt"), "new");
+        await a.Sync();
+        Assert.Equal(uploads + 1, BlobUploads);
+        Assert.NotEqual(blob, Assert.Single(_cloud.ItemById(a.Personal, ClipStore.SyncId(item.Id)).BlobIds));
+        Assert.Single(Directory.GetFiles(archives));
+    }
+
+    [Fact]
+    public async Task ReceivedFoldersAreNotPushedBack()
+    {
+        var a = await SignedUp();
+        var b = await SignedIn();
+        var item = a.Store.Ingest(ProcessedCapture.ForFiles([WriteProject(a)]));
+        await a.Sync();
+        await b.Sync();
+        var copy = b.Store.Find(item.Id)!;
+        Assert.True(Directory.Exists(copy.Files[0]));
+        var uploads = BlobUploads;
+        var puts = _cloud.Count("PUT api.fake");
+        var blobs = _cloud.ItemById(a.Personal, ClipStore.SyncId(item.Id)).BlobIds;
+
+        // B's next sync renders the folder from the zip it received: nothing changed, nothing sent.
+        await b.Sync();
+        await a.Sync();
+        await b.Sync();
+        Assert.Equal(puts, _cloud.Count("PUT api.fake"));
+        Assert.Equal(uploads, BlobUploads);
+
+        // A pin on B reuses the blob, and the folder isn't downloaded again on either side.
+        var served = 0;
+        _cloud.ServingBlob = _ => served++;
+        b.Store.TogglePin(b.Store.Find(item.Id)!);
+        await b.Sync();
+        await a.Sync();
+        await b.Sync();
+        Assert.True(a.Store.Find(item.Id)!.IsPinned);
+        Assert.Equal(blobs, _cloud.ItemById(a.Personal, ClipStore.SyncId(item.Id)).BlobIds);
+        Assert.Equal(uploads, BlobUploads);
+        Assert.Equal(0, served);
+        Assert.True(Directory.Exists(b.Store.Find(item.Id)!.Files[0]));
+    }
+
+    [Fact]
+    public async Task AFolderZipThatClimbsOutIsKeptAsAZip()
+    {
+        var a = await SignedUp();
+        var b = await SignedIn();
+        var item = a.Store.Ingest(ProcessedCapture.ForFiles([WriteProject(a)]));
+        await a.Sync();
+        var blob = Assert.Single(_cloud.ItemById(a.Personal, ClipStore.SyncId(item.Id)).BlobIds);
+        var evil = new MemoryStream();
+        using (var zip = new System.IO.Compression.ZipArchive(evil, System.IO.Compression.ZipArchiveMode.Create, leaveOpen: true))
+        {
+            using (var w = new StreamWriter(zip.CreateEntry("ok.txt").Open())) w.Write("fine");
+            using (var w = new StreamWriter(zip.CreateEntry("../evil.txt").Open())) w.Write("gotcha");
+        }
+        var space = a.Account.Engine!.Space(a.Personal)!;
+        _cloud.ReplaceBlob(a.Personal, blob, SyncCrypto.Seal(space.ItemKey, evil.ToArray(), SyncCrypto.Aad.Blob(space.Id, blob)));
+        await b.Sync();
+
+        var copy = b.Store.Find(item.Id)!;
+        var folder = b.Store.SyncedFolder(item.Id);
+        Assert.Equal([Path.Combine(folder, "Project.zip")], copy.Files);
+        Assert.Equal(evil.ToArray(), File.ReadAllBytes(copy.Files[0]));
+        Assert.Equal(["Project.zip"], Directory.EnumerateFileSystemEntries(folder).Select(Path.GetFileName));
+        Assert.Empty(Directory.EnumerateFiles(b.Dir, "evil.txt", SearchOption.AllDirectories));
+        Assert.Empty(Directory.EnumerateFiles(b.Store.SyncedFilesDirectory, "ok.txt", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public void FolderZipsRefuseUnsafeEntries()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "c2-zip-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            byte[] Zip(params string[] names)
+            {
+                var ms = new MemoryStream();
+                using (var zip = new System.IO.Compression.ZipArchive(ms, System.IO.Compression.ZipArchiveMode.Create, leaveOpen: true))
+                    foreach (var name in names)
+                        using (var w = new StreamWriter(zip.CreateEntry(name).Open())) w.Write(name);
+                return ms.ToArray();
+            }
+            var target = Path.Combine(dir, "out");
+            Assert.Null(FolderZip.Extract(Zip("a.txt", "sub/../../x.txt"), target));
+            Assert.Null(FolderZip.Extract(Zip("/etc/x.txt"), target));
+            Assert.Null(FolderZip.Extract(Zip("..\\x.txt"), target));
+            Assert.Null(FolderZip.Extract([1, 2, 3], target));
+            Assert.False(Directory.Exists(target));
+            Assert.Empty(Directory.EnumerateFileSystemEntries(dir));   // no staging folder left behind
+            var files = FolderZip.Extract(Zip("a.txt", "./sub/b.txt", "sub/c/"), target)!;
+            Assert.Equal([Path.Combine(target, "a.txt"), Path.Combine(target, "sub", "b.txt")], files);
+            Assert.True(Directory.Exists(Path.Combine(target, "sub", "c")));
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
+    [Fact]
+    public void GroupShareProblemRefusesFoldersTooLargeForABlob()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "c2-share-" + Guid.NewGuid().ToString("N"));
+        var folder = Path.Combine(dir, "Footage");
+        Directory.CreateDirectory(Path.Combine(folder, "day 2"));
+        try
+        {
+            foreach (var name in new[] { "a.mov", Path.Combine("day 2", "b.mov") })
+                using (var f = File.Create(Path.Combine(folder, name))) f.SetLength(60L << 20);
+            ClipItem Files(params string[] paths) => new() { Kind = ClipKind.File, Files = [.. paths] };
+            Assert.Equal("“Footage” is 120 MB. Groups take files up to 100 MB.", SyncEngine.GroupShareProblem(Files(folder)));
+
+            // Just under the limit in bytes, but over it with 1 KB per entry.
+            File.Delete(Path.Combine(folder, "a.mov"));
+            using (var f = File.Create(Path.Combine(folder, "day 2", "b.mov"))) f.SetLength(SyncEngine.MaxFileBytes - 1024);
+            Assert.NotNull(SyncEngine.GroupShareProblem(Files(folder)));
+            using (var f = File.Create(Path.Combine(folder, "day 2", "b.mov"))) f.SetLength(SyncEngine.MaxFileBytes - 2048);
+            Assert.Null(SyncEngine.GroupShareProblem(Files(folder)));
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
+    [Fact]
+    public void FileBlobsWriteFolderOnlyWhenTrue()
+    {
+        var plain = new FileBlob("a.txt", "33333333-3333-4333-8333-333333333333", 5);
+        var folder = new FileBlob("Project.zip", "44444444-4444-4444-8444-444444444444", 900, Folder: true);
+        var item = ClipItem.From(ProcessedCapture.ForFiles(["/x/a.txt", "/x/Project"]), DateTime.UtcNow);
+        var json = SyncPayload.ForClip(item, fileBlobs: [plain, folder]);
+        Assert.Equal("""[{"name":"a.txt","blob":"33333333-3333-4333-8333-333333333333","size":5},""" +
+                     """{"name":"Project.zip","blob":"44444444-4444-4444-8444-444444444444","size":900,"folder":true}]""",
+            json["fileBlobs"]!.ToJsonString());
+        var parsed = Assert.IsType<ItemPayload.Clip>(SyncPayload.Parse(SyncPayload.Encode(json), item.Id, null));
+        Assert.Equal([plain, folder], parsed.FileBlobs);
     }
 
     [Fact]
