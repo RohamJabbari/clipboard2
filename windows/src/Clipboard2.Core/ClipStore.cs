@@ -488,11 +488,23 @@ public sealed class ClipStore : IDisposable
     /// <summary>A synced file belongs to its item's folder, which goes when the item does: the copy gets its own.</summary>
     private string CopySyncedFile(string path, Guid from, Guid to)
     {
-        if (!string.Equals(Path.GetDirectoryName(path), SyncedFolder(from), StringComparison.OrdinalIgnoreCase) || !File.Exists(path)) return path;
-        var target = Path.Combine(SyncedFolder(to), Path.GetFileName(path));
+        var trimmed = Path.TrimEndingDirectorySeparator(path);
+        if (!string.Equals(Path.GetDirectoryName(trimmed), SyncedFolder(from), StringComparison.OrdinalIgnoreCase)) return path;
+        var target = Path.Combine(SyncedFolder(to), Path.GetFileName(trimmed));
         System.IO.Directory.CreateDirectory(SyncedFolder(to));
-        File.Copy(path, target, overwrite: true);
+        if (File.Exists(trimmed)) File.Copy(trimmed, target, overwrite: true);
+        else if (System.IO.Directory.Exists(trimmed)) CopyFolder(trimmed, target);
+        else return path;
         return target;
+    }
+
+    private static void CopyFolder(string source, string target)
+    {
+        System.IO.Directory.CreateDirectory(target);
+        foreach (var dir in System.IO.Directory.EnumerateDirectories(source, "*", SearchOption.AllDirectories))
+            System.IO.Directory.CreateDirectory(Path.Combine(target, Path.GetRelativePath(source, dir)));
+        foreach (var file in System.IO.Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
+            File.Copy(file, Path.Combine(target, Path.GetRelativePath(source, file)), overwrite: true);
     }
 
     /// <summary>Removes every item and snippet of a space (group left, deleted or signed out). Secrets live in the vault.</summary>

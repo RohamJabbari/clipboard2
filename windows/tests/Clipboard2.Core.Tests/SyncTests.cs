@@ -790,6 +790,12 @@ public sealed class SyncEngineTests : IDisposable
         Assert.Equal(Tree(project), Tree(folderOnB));
         Assert.Contains(("sub/deeper/", ""), Tree(folderOnB));
         Assert.True(File.Exists(Path.Combine(folderOnB, Unicode)));
+
+        // Copied elsewhere, the folder comes along: the copy outlives the original.
+        var moved = b.Store.CopyToSpace(copy, null);
+        var movedFolder = Path.Combine(b.Store.SyncedFolder(moved.Id), "Project");
+        Assert.Equal(movedFolder, moved.Files[0]);
+        Assert.Equal(Tree(project), Tree(movedFolder));
     }
 
     [Fact]
