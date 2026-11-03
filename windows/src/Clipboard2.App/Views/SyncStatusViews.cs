@@ -69,6 +69,54 @@ public sealed class TrayStatusIcons(System.Drawing.Icon baseIcon) : IDisposable
     }
 }
 
+/// <summary>The strip above the quick panel's list while an item for the shown group is downloading:
+/// "Receiving report.pdf", a thin bar and "12.4 of 80 MB".</summary>
+public sealed class IncomingDownloadBanner : Border
+{
+    private readonly TextBlock _name = Fluent.Label("", 12);
+    private readonly TextBlock _size = Fluent.Label("", 12, Fluent.Secondary);
+    private readonly ProgressBar _bar = new() { Height = 2, MinHeight = 2, Minimum = 0, Maximum = 1, Margin = new Thickness(0, 5, 0, 0) };
+
+    public IncomingDownloadBanner()
+    {
+        var icon = Glyphs.Icon(Glyphs.Download, 13, Fluent.Accent);
+        icon.Margin = new Thickness(0, 0, 8, 0);
+        _size.Margin = new Thickness(8, 0, 0, 0);
+        var line = new DockPanel();
+        DockPanel.SetDock(icon, Dock.Left);
+        DockPanel.SetDock(_size, Dock.Right);
+        line.Children.Add(icon);
+        line.Children.Add(_size);
+        line.Children.Add(_name);
+        var stack = new StackPanel();
+        stack.Children.Add(line);
+        stack.Children.Add(_bar);
+        Child = stack;
+        CornerRadius = new CornerRadius(6);
+        Padding = new Thickness(10, 6, 10, 7);
+        Margin = new Thickness(8, 6, 8, 0);
+        Background = Fluent.Subtle;
+        Visibility = Visibility.Collapsed;
+    }
+
+    /// <summary>Shows the oldest of <paramref name="downloads"/>, or hides when there are none.</summary>
+    public void Update(IReadOnlyList<IncomingDownload> downloads)
+    {
+        if (downloads.Count == 0)
+        {
+            Visibility = Visibility.Collapsed;
+            return;
+        }
+        var download = downloads[0];
+        _name.Text = $"Receiving {download.Name}";
+        _size.Text = download.ProgressText;
+        _bar.IsIndeterminate = download.Fraction is null;
+        _bar.Value = download.Fraction ?? 0;
+        Visibility = Visibility.Visible;
+        System.Windows.Automation.AutomationProperties.SetName(this, $"{_name.Text}, {_size.Text}");
+    }
+}
+
 /// <summary>The quick panel footer's "● Synced · 2 min ago". Clicking it syncs now.</summary>
 public sealed class SyncStatusBadge : Border
 {
