@@ -61,7 +61,7 @@ fi
 [[ "$ARG" == "--check" ]] && { echo "✓ The app embeds the feed key."; exit 0; }
 
 if [[ $WAIT == 1 ]]; then
-  echo "▸ Waiting for the GitHub build of $TAG…"
+  echo "▸ Waiting for the GitHub build of ${TAG}…"
   RUN=""
   for _ in $(seq 1 30); do
     RUN=$(gh run list -R "$REPO" --workflow windows.yml --branch "$TAG" --limit 1 --json databaseId -q '.[0].databaseId' 2>/dev/null || true)
