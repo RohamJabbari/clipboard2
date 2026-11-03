@@ -47,11 +47,17 @@ struct QuickPanelView: View {
                 .padding(.bottom, 10)
             Hairline()
             HStack(spacing: 0) {
-                resultsList
-                    .frame(width: listWidth)
-                    .overlay { listDropHighlight }
-                    .onDrop(of: [.fileURL, .clipboard2Clip],
-                            delegate: PanelDropDelegate(target: .list, model: model, isTargeted: $listDropTargeted))
+                VStack(spacing: 0) {
+                    IncomingDownloadsBanner(downloads: env.sync.downloads.filter { download in
+                        model.groupFilter.map { $0 == download.spaceId } ?? true
+                    })
+                    resultsList
+                }
+                .animation(.smooth(duration: 0.3), value: env.sync.downloads.isEmpty)
+                .frame(width: listWidth)
+                .overlay { listDropHighlight }
+                .onDrop(of: [.fileURL, .clipboard2Clip],
+                        delegate: PanelDropDelegate(target: .list, model: model, isTargeted: $listDropTargeted))
                 Hairline(vertical: true)
                 detailPane
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -670,6 +676,53 @@ struct HintBar: View {
                 .padding(.vertical, 1)
                 .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
             Text(label)
+        }
+    }
+}
+
+/// Synced items still downloading (a big file someone just sent): they appear in the list once
+/// they're complete, so this says something is coming and how far along it is.
+struct IncomingDownloadsBanner: View {
+    let downloads: [IncomingDownload]
+
+    var body: some View {
+        if let first = downloads.first {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(.tint)
+                    .symbolEffect(.pulse, options: .repeating)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text("Receiving \(first.name)")
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if downloads.count > 1 {
+                            Text("+\(downloads.count - 1)")
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 4)
+                        Text(first.progressText)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.callout.weight(.medium))
+                    if let fraction = first.fraction {
+                        ProgressView(value: fraction)
+                            .animation(.smooth(duration: 0.2), value: fraction)
+                    } else {
+                        ProgressView().progressViewStyle(.linear)
+                    }
+                }
+                .controlSize(.mini)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .padding(.horizontal, 8)
+            .padding(.top, 6)
+            .transition(.move(edge: .top).combined(with: .opacity))
+            .accessibilityElement(children: .combine)
         }
     }
 }

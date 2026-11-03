@@ -200,6 +200,8 @@ final class SyncAccount {
     @ObservationIgnored private let makeService: (@escaping @Sendable () async throws -> String) -> any SyncService
 
     @ObservationIgnored private(set) var engine: SyncEngine?
+    /// Group and personal clips still downloading their image or files, newest first.
+    private(set) var downloads: [IncomingDownload] = []
     @ObservationIgnored private var session: StoredSyncSession?
     /// The 3 s debounce after local changes (and the wait out of a rate limit). Cancelling it
     /// never touches a running tick.
@@ -342,6 +344,7 @@ final class SyncAccount {
         engine.deviceName = deviceName
         engine.onPinsChanged = { [weak self] pins in self?.rememberPins(pins) }
         engine.onSpacesUpdated = { [weak self] in self?.loadGroups() }
+        engine.onDownloadsChanged = { [weak self] in self?.downloads = $0 }
         engine.onSentToThisDevice = { [weak self] _, from in self?.onItemSentHere?(from ?? "another device") }
         for (space, key) in keys { engine.adoptSpaceKey(key, for: space) }
         self.engine = engine

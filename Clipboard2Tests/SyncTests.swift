@@ -771,6 +771,8 @@ actor FakeSyncServer {
     private var downloadDelay: Duration = .zero
 
     func setDownloadDelay(_ delay: Duration) { downloadDelay = delay }
+    /// Every stored blob goes missing (404 on download).
+    func loseBlobs() { blobs = [:] }
 
     func beginDownload(_ blob: String) -> Duration {
         downloads.append(blob)
@@ -1172,6 +1174,76 @@ struct SyncEngineTests {
         let folder = AppPaths.syncedFilesFolder(for: item.id)
         mac2.store.delete(item)
         #expect(!FileManager.default.fileExists(atPath: folder.path))
+    }
+
+    @Test func aFileShowsAsDownloadingUntilItArrives() async throws {
+        let server = FakeSyncServer()
+        let user = try await FakeUser.make("alice", on: server)
+        let mac1 = try FakeDevice(user), mac2 = try FakeDevice(user)
+        let dir = FileManager.default.temporaryDirectory.appending(path: "SyncFiles-\(UUID())", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let urls = [dir.appending(path: "Big.mov"), dir.appending(path: "notes.txt")]
+        try Data(count: 5000).write(to: urls[0])
+        try Data("hello".utf8).write(to: urls[1])
+        mac1.store.ingest(ProcessedCapture(kind: .file, text: urls.map(\.path).joined(separator: "\n"), preview: "2 files",
+                                           fileURLs: urls, hash: ContentHasher.hash(fileURLs: urls)))
+        try await mac1.engine.tick()
+
+        await server.setDownloadDelay(.milliseconds(200))
+        var seen: [[IncomingDownload]] = []
+        mac2.engine.onDownloadsChanged = { seen.append($0) }
+        let tick = Task { try await mac2.engine.tick() }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while mac2.engine.downloads.isEmpty, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        let download = try #require(mac2.engine.downloads.first)
+        #expect(download.name == "Big.mov and 1 more")
+        #expect(download.spaceId == user.personal)
+        #expect(download.total == Int64(5000 + 5 + 2 * SyncCrypto.sealOverhead))
+        #expect(mac2.store.item(withID: download.id) == nil)
+
+        try await tick.value
+        #expect(mac2.engine.downloads.isEmpty)
+        #expect(seen.last == [])
+        let item = try #require(mac2.store.item(withID: download.id))
+        defer { mac2.store.delete(item) }
+        #expect(item.fileURLs.count == 2)
+    }
+
+    @Test func aDownloadThatFailsStopsShowing() async throws {
+        let server = FakeSyncServer()
+        let user = try await FakeUser.make("alice", on: server)
+        let mac1 = try FakeDevice(user), mac2 = try FakeDevice(user)
+        let dir = FileManager.default.temporaryDirectory.appending(path: "SyncFiles-\(UUID())", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appending(path: "Gone.zip")
+        try Data(count: 100).write(to: url)
+        mac1.store.ingest(ProcessedCapture(kind: .file, text: url.path, preview: "Gone.zip",
+                                           fileURLs: [url], hash: ContentHasher.hash(fileURLs: [url])))
+        try await mac1.engine.tick()
+        await server.loseBlobs()
+
+        var seen: [[IncomingDownload]] = []
+        mac2.engine.onDownloadsChanged = { seen.append($0) }
+        try await mac2.engine.tick()
+        #expect(seen.contains { $0.first?.name == "Gone.zip" })
+        #expect(mac2.engine.downloads.isEmpty)
+        for item in mac2.store.allItems() { mac2.store.delete(item) }
+    }
+
+    @Test func downloadProgressAddsUpBlobsAndWaitsForUnknownSizes() {
+        let meter = DownloadMeter(expected: ["a": 100, "b": 0])
+        meter.update("a", received: 40, expected: -1)
+        #expect(meter.bytes.received == 40)
+        #expect(meter.bytes.total == 0)        // b's size isn't known yet
+        meter.update("b", received: 10, expected: 300)
+        #expect(meter.bytes.received == 50)
+        #expect(meter.bytes.total == 400)
+        let download = IncomingDownload(id: UUID(), spaceId: "s", name: "x", startedAt: .now,
+                                        received: 200, total: 400)
+        #expect(download.fraction == 0.5)
+        #expect(IncomingDownload(id: UUID(), spaceId: "s", name: "x", startedAt: .now, received: 5, total: 0).fraction == nil)
     }
 
     @Test func fileNamesFromOtherDevicesCantEscapeTheirFolder() {

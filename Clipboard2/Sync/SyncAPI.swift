@@ -1,8 +1,22 @@
 import Foundation
+import os
+
+/// Bytes received so far and bytes expected (-1 while unknown), as a download comes in.
+typealias DownloadProgress = @Sendable (_ received: Int64, _ expected: Int64) -> Void
 
 /// The one seam between sync and the network, so requests can be checked in tests.
 nonisolated protocol HTTPTransport: Sendable {
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse)
+    func send(_ request: URLRequest, progress: @escaping DownloadProgress) async throws -> (Data, HTTPURLResponse)
+}
+
+extension HTTPTransport {
+    /// Transports without byte-level progress report once, at the end.
+    func send(_ request: URLRequest, progress: @escaping DownloadProgress) async throws -> (Data, HTTPURLResponse) {
+        let result = try await send(request)
+        progress(Int64(result.0.count), Int64(result.0.count))
+        return result
+    }
 }
 
 nonisolated struct URLSessionTransport: HTTPTransport {
@@ -12,6 +26,37 @@ nonisolated struct URLSessionTransport: HTTPTransport {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         return (data, http)
+    }
+
+    func send(_ request: URLRequest, progress: @escaping DownloadProgress) async throws -> (Data, HTTPURLResponse) {
+        let delegate = ProgressDelegate(progress: progress)
+        defer { delegate.finish() }
+        let (data, response) = try await session.data(for: request, delegate: delegate)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        return (data, http)
+    }
+
+    /// Watches the task's byte counts; async `data(for:)` doesn't forward data callbacks.
+    nonisolated private final class ProgressDelegate: NSObject, URLSessionTaskDelegate, Sendable {
+        let progress: DownloadProgress
+        private let observation = OSAllocatedUnfairLock<NSKeyValueObservation?>(initialState: nil)
+
+        init(progress: @escaping DownloadProgress) { self.progress = progress }
+
+        func urlSession(_ session: URLSession, didCreateTask task: URLSessionTask) {
+            let progress = self.progress
+            let watch = task.observe(\.countOfBytesReceived) { task, _ in
+                progress(task.countOfBytesReceived, task.countOfBytesExpectedToReceive)
+            }
+            observation.withLock { $0 = watch }
+        }
+
+        func finish() {
+            observation.withLock {
+                $0?.invalidate()
+                $0 = nil
+            }
+        }
     }
 }
 
@@ -301,6 +346,15 @@ nonisolated protocol SyncService: Sendable {
     func registerBlob(spaceId: String, blobId: String, size: Int) async throws -> BlobUploadTicket
     func uploadBlob(_ ticket: BlobUploadTicket, data: Data) async throws
     func downloadBlob(spaceId: String, blobId: String) async throws -> Data
+    func downloadBlob(spaceId: String, blobId: String, progress: @escaping DownloadProgress) async throws -> Data
+}
+
+extension SyncService {
+    func downloadBlob(spaceId: String, blobId: String, progress: @escaping DownloadProgress) async throws -> Data {
+        let data = try await downloadBlob(spaceId: spaceId, blobId: blobId)
+        progress(Int64(data.count), Int64(data.count))
+        return data
+    }
 }
 
 /// HTTP client for clipboard2-api. `token` returns the session token (auth routes don't use it).
@@ -501,10 +555,14 @@ nonisolated struct SyncAPI: SyncService {
     }
 
     func downloadBlob(spaceId: String, blobId: String) async throws -> Data {
+        try await downloadBlob(spaceId: spaceId, blobId: blobId) { _, _ in }
+    }
+
+    func downloadBlob(spaceId: String, blobId: String, progress: @escaping DownloadProgress) async throws -> Data {
         let ticket = try await send("GET", "v1/spaces/\(spaceId)/blobs/\(blobId)", as: BlobDownloadTicket.self)
         var request = URLRequest(url: ticket.url)
         request.timeoutInterval = 120
-        let (data, response) = try await perform(request)
+        let (data, response) = try await perform(request, progress: progress)
         guard (200..<300).contains(response.statusCode) else {
             throw SyncAPIError.server(status: response.statusCode, code: "download_failed", message: "Blob download failed", retryAfter: nil)
         }
@@ -571,8 +629,9 @@ nonisolated struct SyncAPI: SyncService {
         }
     }
 
-    private func perform(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+    private func perform(_ request: URLRequest, progress: DownloadProgress? = nil) async throws -> (Data, HTTPURLResponse) {
         do {
+            if let progress { return try await transport.send(request, progress: progress) }
             return try await transport.send(request)
         } catch {
             throw SyncAPIError.network(error.localizedDescription)

@@ -6,3 +6,4 @@ dist/
 build-dev/
 windows/**/bin/
 windows/**/obj/
+.claude/worktrees/

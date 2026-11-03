@@ -1,5 +1,6 @@
 import Foundation
 import ImageIO
+import os
 import SwiftData
 
 
@@ -45,6 +46,12 @@ final class SyncEngine {
     var onPinsChanged: (([String: String]) -> Void)?
     /// The space list was refreshed (start of every tick), so groups show before items arrive.
     var onSpacesUpdated: (() -> Void)?
+    /// Clips whose image or files are downloading, newest first. Called when one starts or ends,
+    /// and every 150 ms while any is running.
+    var onDownloadsChanged: (([IncomingDownload]) -> Void)?
+    private(set) var downloads: [IncomingDownload] = []
+    private var activeDownloads: [UUID: ActiveDownload] = [:]
+    private var downloadsTicker: Task<Void, Never>?
 
     /// Whether this Mac changed anything since the last upload pass. Idle ticks (polling while
     /// the panel is open) then only pull, instead of re-reading and re-hashing every item. A full
@@ -105,7 +112,11 @@ final class SyncEngine {
     /// models that were just deleted.
     private(set) var isStopped = false
 
-    func stop() { isStopped = true }
+    func stop() {
+        isStopped = true
+        activeDownloads = [:]
+        publishDownloads()
+    }
 
     private func checkActive() throws {
         if isStopped { throw CancellationError() }
@@ -359,6 +370,7 @@ final class SyncEngine {
         defer {
             commitsDeferred -= 1
             flushCommits()
+            endDownloads(inSpace: spaceId)
         }
         while true {
             let since = space.since
@@ -487,6 +499,7 @@ final class SyncEngine {
 
     private func applyClip(_ payload: ClipPayload, remote: RemoteItem, spaceId: String, itemKey: Data, force: Bool) async throws {
         guard let uuid = UUID(uuidString: remote.id) else { return }
+        defer { endDownload(uuid) }
         let isFile = payload.kind == ClipKind.file.rawValue
         let blobIds = payload.kind == ClipKind.image.rawValue || isFile ? payload.blobIds : []
         let known = meta(for: remote.id)
@@ -496,13 +509,16 @@ final class SyncEngine {
         let keptFiles = before.map(\.fileURLs) ?? []
         let hasFiles = isFile && known?.blobIds == blobIds && !keptFiles.isEmpty
             && keptFiles.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }
+        let needsImage = !blobIds.isEmpty && !hasImages && payload.imageBlob.map { prefetched[$0] == nil } == true
+        let meter = (isFile && !hasFiles) || needsImage
+            ? beginDownload(uuid, spaceId: spaceId, payload: payload) : nil
 
         var received: [ReceivedFile] = []
         if isFile && !hasFiles {
             for file in payload.fileBlobs ?? [] {
                 do {
                     received.append(ReceivedFile(name: file.name, blob: file.blob,
-                                                 data: try await downloadBlob(spaceId: spaceId, blobId: file.blob, itemKey: itemKey)))
+                                                 data: try await downloadBlob(spaceId: spaceId, blobId: file.blob, itemKey: itemKey, meter: meter)))
                 } catch let error as SyncAPIError where error.status == 404 {
                     Log.sync.notice("A file of \(remote.id, privacy: .public) is gone; skipping it")
                 }
@@ -517,7 +533,7 @@ final class SyncEngine {
                 if let ready = prefetched.removeValue(forKey: imageBlob) {
                     (imageData, thumbData) = (ready.image, ready.thumbnail)
                 } else {
-                    let image = try await downloadBlob(spaceId: spaceId, blobId: imageBlob, itemKey: itemKey)
+                    let image = try await downloadBlob(spaceId: spaceId, blobId: imageBlob, itemKey: itemKey, meter: meter)
                     // The thumbnail is made here rather than downloaded: half the requests.
                     (imageData, thumbData) = (image, await Self.thumbnail(of: image))
                 }
@@ -724,7 +740,7 @@ final class SyncEngine {
     /// once. Best effort: anything that fails here is fetched again by `applyClip`, one at a time,
     /// with the usual error and rate-limit handling.
     private func prefetchImages(_ items: ArraySlice<RemoteItem>, spaceId: String, itemKey: Data) async {
-        var wanted: [String] = []
+        var wanted: [(blob: String, meter: DownloadMeter)] = []
         for remote in items {
             guard remote.deleted == nil, let ciphertext = remote.ciphertext, SyncCategory(rawValue: remote.category)?.isClip == true,
                   !isApplied(remote, spaceId: spaceId),
@@ -732,18 +748,20 @@ final class SyncEngine {
                                                        aad: SyncCrypto.AAD.item(spaceId: spaceId, itemId: remote.id, category: remote.category)),
                   case .clip(let clip) = try? SyncPayload.decode(plaintext),
                   let blob = clip.imageBlob, prefetched[blob] == nil,
-                  needsImage(clip, itemId: remote.id)
+                  needsImage(clip, itemId: remote.id), let uuid = UUID(uuidString: remote.id)
             else { continue }
-            wanted.append(blob)
+            wanted.append((blob, beginDownload(uuid, spaceId: spaceId, payload: clip)))
         }
         guard !wanted.isEmpty, !isStopped else { return }
         let api = self.api
         await withTaskGroup(of: (String, Data, Data?)?.self) { group in
             var next = wanted.makeIterator()
             func add() -> Bool {
-                guard let blob = next.next() else { return false }
+                guard let (blob, meter) = next.next() else { return false }
                 group.addTask {
-                    guard let sealed = try? await api.downloadBlob(spaceId: spaceId, blobId: blob),
+                    guard let sealed = try? await api.downloadBlob(spaceId: spaceId, blobId: blob, progress: { received, expected in
+                              meter.update(blob, received: received, expected: expected)
+                          }),
                           let image = try? await Self.open(sealed, key: itemKey, aad: SyncCrypto.AAD.blob(spaceId: spaceId, blobId: blob))
                     else { return nil }
                     return (blob, image, await Self.thumbnail(of: image))
@@ -784,9 +802,73 @@ final class SyncEngine {
         return ImageProcessor.encodePNG(thumb)
     }
 
-    private func downloadBlob(spaceId: String, blobId: String, itemKey: Data) async throws -> Data {
-        let sealed = try await api.downloadBlob(spaceId: spaceId, blobId: blobId)
+    private func downloadBlob(spaceId: String, blobId: String, itemKey: Data, meter: DownloadMeter? = nil) async throws -> Data {
+        let sealed = try await api.downloadBlob(spaceId: spaceId, blobId: blobId) { received, expected in
+            meter?.update(blobId, received: received, expected: expected)
+        }
         return try await Self.open(sealed, key: itemKey, aad: SyncCrypto.AAD.blob(spaceId: spaceId, blobId: blobId))
+    }
+
+    // MARK: Download progress
+
+    nonisolated struct ActiveDownload: Sendable {
+        var spaceId: String
+        var name: String
+        var startedAt: Date
+        var meter: DownloadMeter
+    }
+
+    /// Starts showing a clip as downloading (or returns the meter it already has, from a prefetch).
+    private func beginDownload(_ id: UUID, spaceId: String, payload: ClipPayload) -> DownloadMeter {
+        if let active = activeDownloads[id] { return active.meter }
+        var expected: [String: Int64] = [:]
+        var name = "Image"
+        if payload.kind == ClipKind.file.rawValue, let files = payload.fileBlobs, let first = files.first {
+            for file in files { expected[file.blob] = Int64(file.size + SyncCrypto.sealOverhead) }
+            name = files.count > 1 ? "\(first.name) and \(files.count - 1) more" : first.name
+        } else if let image = payload.imageBlob {
+            expected[image] = Int64(max(payload.byteCount ?? 0, 0))
+        }
+        let meter = DownloadMeter(expected: expected)
+        activeDownloads[id] = ActiveDownload(spaceId: spaceId, name: name, startedAt: now(), meter: meter)
+        downloadsChanged()
+        return meter
+    }
+
+    private func endDownload(_ id: UUID) {
+        guard activeDownloads.removeValue(forKey: id) != nil else { return }
+        publishDownloads()
+    }
+
+    private func endDownloads(inSpace spaceId: String) {
+        let before = activeDownloads.count
+        activeDownloads = activeDownloads.filter { $0.value.spaceId != spaceId }
+        if activeDownloads.count != before { publishDownloads() }
+    }
+
+    /// Publishes now, and keeps publishing progress while anything downloads.
+    private func downloadsChanged() {
+        publishDownloads()
+        guard downloadsTicker == nil else { return }
+        downloadsTicker = Task { [weak self] in
+            while true {
+                try? await Task.sleep(for: .milliseconds(150))
+                guard let self, !self.activeDownloads.isEmpty else { break }
+                self.publishDownloads()
+            }
+            self?.downloadsTicker = nil
+        }
+    }
+
+    private func publishDownloads() {
+        let current = activeDownloads.map { id, active in
+            let bytes = active.meter.bytes
+            return IncomingDownload(id: id, spaceId: active.spaceId, name: active.name, startedAt: active.startedAt,
+                                    received: bytes.received, total: bytes.total)
+        }.sorted { $0.startedAt > $1.startedAt }
+        guard current != downloads else { return }
+        downloads = current
+        onDownloadsChanged?(current)
     }
 
     // MARK: Crypto and file reads, off the main actor
@@ -1306,5 +1388,56 @@ final class SyncEngine {
         for meta in (try? context.fetch(FetchDescriptor<SyncMeta>())) ?? [] { context.delete(meta) }
         for space in spaces { context.delete(space) }
         try? context.save()
+    }
+}
+
+/// A synced clip whose image or files are still downloading ("Receiving report.pdf, 12 of 80 MB").
+nonisolated struct IncomingDownload: Identifiable, Equatable, Sendable {
+    /// The clip's id; it's in the store once the download ends, unless it failed.
+    var id: UUID
+    var spaceId: String
+    var name: String
+    var startedAt: Date
+    var received: Int64
+    /// 0 while unknown.
+    var total: Int64
+
+    var fraction: Double? { total > 0 ? min(1, Double(received) / Double(total)) : nil }
+
+    /// "12.4 MB of 80 MB", or "12.4 MB" while the total is unknown.
+    var progressText: String {
+        let received = self.received.formatted(.byteCount(style: .file))
+        guard total > 0 else { return received }
+        return "\(received) of \(total.formatted(.byteCount(style: .file)))"
+    }
+}
+
+/// Bytes per blob of one downloading clip, written from URLSession's threads and read by the engine.
+nonisolated final class DownloadMeter: Sendable {
+    private let blobs: OSAllocatedUnfairLock<[String: Bytes]>
+
+    struct Bytes: Sendable {
+        var received: Int64 = 0
+        var expected: Int64
+    }
+
+    init(expected: [String: Int64]) {
+        blobs = OSAllocatedUnfairLock(initialState: expected.mapValues { Bytes(expected: $0) })
+    }
+
+    func update(_ blob: String, received: Int64, expected: Int64) {
+        blobs.withLock { state in
+            let known = state[blob]?.expected ?? 0
+            state[blob] = Bytes(received: received, expected: expected > 0 ? expected : known)
+        }
+    }
+
+    /// `total` is 0 while any blob's size is still unknown.
+    var bytes: (received: Int64, total: Int64) {
+        blobs.withLock { state in
+            let received = state.values.reduce(Int64(0)) { $0 + $1.received }
+            guard state.values.allSatisfy({ $0.expected > 0 }) else { return (received, 0) }
+            return (received, state.values.reduce(Int64(0)) { $0 + max($1.expected, $1.received) })
+        }
     }
 }

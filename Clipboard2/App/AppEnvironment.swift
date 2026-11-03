@@ -49,6 +49,8 @@ final class AppEnvironment {
     #if DEBUG
     @ObservationIgnored private var stressMonitor: ClipboardMonitor?
     #endif
+    /// Paste from group waiting for an item to finish downloading; the shortcut again cancels it.
+    @ObservationIgnored private var groupPasteWait: Task<Void, Never>?
 
     /// Why the history database couldn't be opened. While set, the app runs on an empty
     /// in-memory store and never captures, sweeps files or syncs, so nothing on disk is touched.
@@ -337,20 +339,63 @@ final class AppEnvironment {
 
     /// Pastes the newest item of the default group. Fetches first (briefly), so something a group
     /// member just sent is pasted; if the server is slow or unreachable, the newest known one is.
+    /// An item still downloading (a big file) is waited for, with its progress in a HUD.
     func pasteFromDefaultGroup() {
         guard sync.isSignedIn, let group = sync.defaultGroup else {
             SettingsOpener.open(tab: .sync)
             return
         }
+        if let waiting = groupPasteWait {
+            waiting.cancel()
+            groupPasteWait = nil
+            HUD.show("Paste cancelled", symbol: "xmark.circle.fill")
+            return
+        }
         let target = appTracker.targetApp
-        Task {
+        groupPasteWait = Task {
+            defer { groupPasteWait = nil }
             await sync.syncAndWait(timeout: .milliseconds(1500))
+            guard !Task.isCancelled else { return }
+            if let download = sync.downloads.first(where: { $0.spaceId == group.id }) {
+                guard let item = await waitForDownload(download), !Task.isCancelled else { return }
+                if let target, NSWorkspace.shared.frontmostApplication != target {
+                    // The user moved on while it downloaded: don't paste into whatever is in front now.
+                    paste.copy(item)
+                    HUD.show("Ready — press ⌘V to paste", symbol: "doc.on.clipboard.fill", duration: .seconds(2.5))
+                } else {
+                    HUD.hide()
+                    paste.paste(item, into: target)
+                }
+                return
+            }
             guard let item = store.items(inSpace: group.id).first else {
                 HUD.show("Nothing in \(group.name) yet", symbol: "person.2")
                 return
             }
             paste.paste(item, into: target)
         }
+    }
+
+    /// Shows the download's progress until it ends; the item, or nil when it failed or was cancelled.
+    private func waitForDownload(_ download: IncomingDownload) async -> ClipItem? {
+        let progress = HUDProgress(title: "Downloading \(download.name)")
+        var shown = false
+        while !Task.isCancelled, let current = sync.downloads.first(where: { $0.id == download.id }) {
+            progress.fraction = current.fraction
+            progress.detail = current.progressText
+            if !shown {
+                HUD.show(progress: progress)
+                shown = true
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard !Task.isCancelled else { return nil }
+        // Applied in the same main-actor turn the download ended, so it's in the store by now.
+        guard let item = store.item(withID: download.id) else {
+            HUD.show("Couldn't download \(download.name)", symbol: "exclamationmark.triangle.fill", duration: .seconds(2.5))
+            return nil
+        }
+        return item
     }
 
     /// Copies the selection in the frontmost app (text, rich text, images or files) and stores it
