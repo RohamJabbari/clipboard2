@@ -98,10 +98,18 @@ nonisolated struct ClipPayload: Codable, Equatable, Sendable {
 }
 
 /// One file of a file clip: its name, the blob holding its contents, and its plaintext size.
+/// A folder is a zip of its contents, named `<folder>.zip`, with `folder` set (omitted otherwise,
+/// so older payloads keep their fingerprints and older apps receive the zip as a file).
 nonisolated struct FileBlob: Codable, Equatable, Sendable {
     var name: String
     var blob: String
     var size: Int
+    var folder: Bool?
+
+    /// The name to save it under: a folder without its `.zip`.
+    var localName: String {
+        folder == true && name.lowercased().hasSuffix(".zip") ? String(name.dropLast(4)) : name
+    }
 }
 
 /// `type: "snippet"`.

@@ -517,7 +517,7 @@ final class SyncEngine {
         if isFile && !hasFiles {
             for file in payload.fileBlobs ?? [] {
                 do {
-                    received.append(ReceivedFile(name: file.name, blob: file.blob,
+                    received.append(ReceivedFile(name: file.name, blob: file.blob, folder: file.folder == true,
                                                  data: try await downloadBlob(spaceId: spaceId, blobId: file.blob, itemKey: itemKey, meter: meter)))
                 } catch let error as SyncAPIError where error.status == 404 {
                     Log.sync.notice("A file of \(remote.id, privacy: .public) is gone; skipping it")
@@ -618,6 +618,7 @@ final class SyncEngine {
     nonisolated struct ReceivedFile: Sendable {
         var name: String
         var blob: String
+        var folder = false
         var data: Data
     }
 
@@ -642,6 +643,10 @@ final class SyncEngine {
         var taken = Set<String>()
         var written: [WrittenFile] = []
         for file in files {
+            if file.folder, let unpacked = writeReceivedFolder(file, in: folder, taken: &taken) {
+                written.append(unpacked)
+                continue
+            }
             let url = folder.appending(path: safeFileName(file.name, taken: &taken))
             do {
                 try file.data.write(to: url)
@@ -652,6 +657,24 @@ final class SyncEngine {
             }
         }
         return written
+    }
+
+    /// Unpacks a received folder next to the item's files. Nil when the archive is refused,
+    /// and it's then saved as the zip it is.
+    nonisolated static func writeReceivedFolder(_ file: ReceivedFile, in folder: URL, taken: inout Set<String>) -> WrittenFile? {
+        let archive = folder.appending(path: ".\(UUID().uuidString).zip")
+        defer { try? FileManager.default.removeItem(at: archive) }
+        var claimed = taken
+        let target = folder.appending(path: safeFileName(FileBlob(name: file.name, blob: file.blob, size: 0, folder: true).localName,
+                                                         taken: &claimed), directoryHint: .isDirectory)
+        guard (try? file.data.write(to: archive)) != nil, FolderArchive.unpack(archive, into: target) else { return nil }
+        taken = claimed
+        markDownloaded(target)
+        if let walker = FileManager.default.enumerator(at: target, includingPropertiesForKeys: nil) {
+            for case let url as URL in walker { markDownloaded(url) }
+        }
+        FolderArchive.adopt(file.data, for: target)
+        return WrittenFile(url: target, blob: file.blob, size: file.data.count)
     }
 
     /// Quarantines a received file like a browser download, naming Clipboard2 as the agent, so
@@ -825,7 +848,7 @@ final class SyncEngine {
         var name = "Image"
         if payload.kind == ClipKind.file.rawValue, let files = payload.fileBlobs, let first = files.first {
             for file in files { expected[file.blob] = Int64(file.size + SyncCrypto.sealOverhead) }
-            name = files.count > 1 ? "\(first.name) and \(files.count - 1) more" : first.name
+            name = files.count > 1 ? "\(first.localName) and \(files.count - 1) more" : first.localName
         } else if let image = payload.imageBlob {
             expected[image] = Int64(max(payload.byteCount ?? 0, 0))
         }
@@ -930,7 +953,9 @@ final class SyncEngine {
                 history += 1
                 if history > SyncConfig.historyLimit { continue }
             }
-            if let job = clipJob(item, meta: metaByID[item.id.uuidString.lowercased()], nowMs: nowMs) { jobs.append(job) }
+            let meta = metaByID[item.id.uuidString.lowercased()]
+            await prepareFolders(item, meta: meta)
+            if let job = clipJob(item, meta: meta, nowMs: nowMs) { jobs.append(job) }
         }
         for snippet in snippets.snippets(inSpace: localSpace) {
             let id = snippet.id.uuidString.lowercased()
@@ -1038,7 +1063,7 @@ final class SyncEngine {
                     current[key] = blob
                 } else if current[key] == nil {
                     let blob = SyncCrypto.newID()
-                    uploads.append((blob, file.url))
+                    uploads.append((blob, file.upload))
                     current[key] = blob
                 }
             }
@@ -1148,13 +1173,20 @@ final class SyncEngine {
         let limit = SyncConfig.maxBlobCiphertext - SyncCrypto.sealOverhead
         var files = 0
         for url in fileURLs where url.isFileURL {
-            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
-                  values.isRegularFile == true, let size = values.fileSize
-            else { continue }
+            let size: Int
+            if FolderArchive.isFolder(url) {
+                size = Int(FolderArchive.estimatedArchiveSize(of: url, stoppingAbove: Int64(limit)))
+            } else {
+                guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                      values.isRegularFile == true, let fileSize = values.fileSize
+                else { continue }
+                size = fileSize
+            }
             if size > limit {
                 // Binary megabytes, so the limit reads as the round "100 MB" it is.
                 let maximum = "\(SyncConfig.maxBlobCiphertext / 1_048_576) MB"
-                return "“\(url.lastPathComponent)” is \(Int64(size).formatted(.byteCount(style: .memory))). Groups take files up to \(maximum)."
+                let shown = FolderArchive.isFolder(url) ? "over \(maximum)" : Int64(size).formatted(.byteCount(style: .memory))
+                return "“\(url.lastPathComponent)” is \(shown). Groups take files up to \(maximum)."
             }
             files += 1
         }
@@ -1168,18 +1200,47 @@ final class SyncEngine {
         item.kind == .file ? groupShareProblem(fileURLs: item.fileURLs) : nil
     }
 
-    /// Files of a file clip whose contents sync: regular files that fit in one blob, at most 10.
-    static func uploadableFiles(_ item: ClipItem) -> [(url: URL, size: Int)] {
+    /// A file of a file clip whose contents sync. A folder is uploaded as its archive.
+    struct UploadableFile {
+        var url: URL
+        /// The bytes uploaded: the file, or the folder's archive.
+        var size: Int
+        var upload: URL
+        var isFolder: Bool
+    }
+
+    /// Files of a file clip whose contents sync: regular files, and folders already archived
+    /// (`prepareFolders`), that fit in one blob, at most 10.
+    static func uploadableFiles(_ item: ClipItem) -> [UploadableFile] {
         let limit = SyncConfig.maxBlobCiphertext - SyncCrypto.sealOverhead
-        var files: [(url: URL, size: Int)] = []
+        var files: [UploadableFile] = []
         for url in item.fileURLs where url.isFileURL {
-            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
-                  values.isRegularFile == true, let size = values.fileSize, size <= limit
-            else { continue }
-            files.append((url, size))
+            if FolderArchive.isFolder(url) {
+                guard let archive = FolderArchive.cached(for: url),
+                      let size = try? archive.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= limit
+                else { continue }
+                files.append(UploadableFile(url: url, size: size, upload: archive, isFolder: true))
+            } else {
+                guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                      values.isRegularFile == true, let size = values.fileSize, size <= limit
+                else { continue }
+                files.append(UploadableFile(url: url, size: size, upload: url, isFolder: false))
+            }
             if files.count == SyncConfig.maxFilesPerItem { break }
         }
         return files
+    }
+
+    /// Archives the folders of a file clip about to be pushed, off the main actor, so building
+    /// its job (which only reads the cache) finds them.
+    private func prepareFolders(_ item: ClipItem, meta: SyncMeta?) async {
+        guard item.kind == .file else { return }
+        let id = item.id.uuidString.lowercased()
+        if pendingToDevice[id] == nil, let meta, !meta.localStamp.isEmpty, meta.localStamp == Self.stamp(item) { return }
+        let limit = SyncConfig.maxBlobCiphertext - SyncCrypto.sealOverhead
+        for url in item.fileURLs where url.isFileURL && FolderArchive.isFolder(url) {
+            _ = await FolderArchive.prepare(url, limit: limit)
+        }
     }
 
     /// The key of a file in `SyncMeta.fileBlobs`.
@@ -1212,7 +1273,9 @@ final class SyncEngine {
         if item.kind == .file {
             let files = Self.uploadableFiles(item).compactMap { file -> FileBlob? in
                 guard let blob = fileBlobs[Self.fileKey(file.url.path, file.size)] else { return nil }
-                return FileBlob(name: file.url.lastPathComponent, blob: blob, size: file.size)
+                let name = file.url.lastPathComponent
+                return file.isFolder ? FileBlob(name: name + ".zip", blob: blob, size: file.size, folder: true)
+                                     : FileBlob(name: name, blob: blob, size: file.size)
             }
             payload = ClipPayload(item: item, fileBlobs: files)
         } else {

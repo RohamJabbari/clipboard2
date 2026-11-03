@@ -1155,13 +1155,13 @@ struct SyncEngineTests {
                                            fileURLs: urls, hash: ContentHasher.hash(fileURLs: urls)))
         try await mac1.engine.tick()
         let remote = try #require(await server.live(space: user.personal).first)
-        #expect(remote.blobIds.count == 2)   // the folder travels as its name only
+        #expect(remote.blobIds.count == 3)   // the empty folder travels as a zip too
 
         try await mac2.engine.tick()
         let item = try #require(mac2.store.allItems().first)
         defer { mac2.store.delete(item) }
         #expect(item.kind == .file)
-        #expect(item.fileURLs.map(\.lastPathComponent) == ["Report.pdf", "notes.txt"])
+        #expect(item.fileURLs.map(\.lastPathComponent) == ["Report.pdf", "notes.txt", "Folder"])
         #expect(item.fileURLs.allSatisfy { $0.path.hasPrefix(AppPaths.syncedFilesDirectory.path) })
         #expect(try Data(contentsOf: item.fileURLs[0]) == report)
 
@@ -1255,7 +1255,72 @@ struct SyncEngineTests {
         let many = try (0...SyncConfig.maxFilesPerItem).map { try file("f\($0).txt", size: 1) }
         #expect(SyncEngine.groupShareProblem(fileURLs: many)?.contains("at most") == true)
         #expect(SyncEngine.groupShareProblem(fileURLs: Array(many.prefix(SyncConfig.maxFilesPerItem))) == nil)
-        #expect(SyncEngine.groupShareProblem(fileURLs: [dir]) == nil)      // a folder travels as its name
+        #expect(SyncEngine.groupShareProblem(fileURLs: [dir])?.contains("“\(dir.lastPathComponent)” is over 100 MB") == true)
+        let small = dir.appending(path: "Small", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: small, withIntermediateDirectories: true)
+        try Data("hi".utf8).write(to: small.appending(path: "a.txt"))
+        #expect(SyncEngine.groupShareProblem(fileURLs: [small, fits]) == nil)
+    }
+
+    @Test func foldersTravelAsZipsAndArriveAsFolders() async throws {
+        let server = FakeSyncServer()
+        let user = try await FakeUser.make("alice", on: server)
+        let mac1 = try FakeDevice(user), mac2 = try FakeDevice(user)
+        let dir = FileManager.default.temporaryDirectory.appending(path: "SyncFolders-\(UUID())", directoryHint: .isDirectory)
+        let project = dir.appending(path: "Project", directoryHint: .isDirectory)
+        let nested = project.appending(path: "Sub/Deeper", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let big = Data((0..<200_000).map { UInt8($0 % 251) })
+        try big.write(to: project.appending(path: "data.bin"))
+        try Data("grüß dich".utf8).write(to: nested.appending(path: "Ünï ☃.txt"))
+        try FileManager.default.createSymbolicLink(at: project.appending(path: "link"), withDestinationURL: URL(filePath: "/etc"))
+        let urls = [project]
+        mac1.store.ingest(ProcessedCapture(kind: .file, text: project.path, preview: "Project",
+                                           fileURLs: urls, hash: ContentHasher.hash(fileURLs: urls)))
+        try await mac1.engine.tick()
+        let remote = try #require(await server.live(space: user.personal).first)
+        #expect(remote.blobIds.count == 1)
+
+        try await mac2.engine.tick()
+        let item = try #require(mac2.store.allItems().first)
+        defer { mac2.store.delete(item) }
+        let received = try #require(item.fileURLs.first)
+        #expect(item.fileURLs.count == 1)
+        #expect(received.lastPathComponent == "Project")
+        #expect(try Data(contentsOf: received.appending(path: "data.bin")) == big)
+        let text = received.appending(path: "Sub/Deeper/Ünï ☃.txt")
+        #expect(try String(contentsOf: text, encoding: .utf8) == "grüß dich")
+        #expect(!FileManager.default.fileExists(atPath: received.appending(path: "link").path))   // symlinks stay home
+
+        // Neither side sends it again.
+        try await mac2.engine.tick()
+        try await mac1.engine.tick()
+        try await mac2.engine.tick()
+        #expect(await server.live(space: user.personal).first?.blobIds == remote.blobIds)
+        #expect(await server.live(space: user.personal).first?.seq == remote.seq)
+    }
+
+    @Test func receivedZipsCantEscapeTheirFolder() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "Unpack-\(UUID())", directoryHint: .isDirectory)
+        let source = dir.appending(path: "src/aa", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try Data("x".utf8).write(to: source.appending(path: "evil.txt"))
+        let zip = dir.appending(path: "a.zip")
+        try FolderArchive.write(dir.appending(path: "src"), to: zip)
+        // Rename "aa/…" to "../…" in both headers: same length, so the zip stays valid.
+        var bytes = [UInt8](try Data(contentsOf: zip))
+        let from = Array("aa/".utf8), to = Array("../".utf8)
+        for i in 0...(bytes.count - from.count) where Array(bytes[i..<i + from.count]) == from {
+            bytes.replaceSubrange(i..<i + from.count, with: to)
+        }
+        try Data(bytes).write(to: zip)
+        let target = dir.appending(path: "out/target", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+        #expect(!FolderArchive.unpack(zip, into: target))
+        #expect(!FileManager.default.fileExists(atPath: dir.appending(path: "out/evil.txt").path))
+        #expect(!FileManager.default.fileExists(atPath: target.path))
     }
 
     @Test func downloadProgressAddsUpBlobsAndWaitsForUnknownSizes() {
