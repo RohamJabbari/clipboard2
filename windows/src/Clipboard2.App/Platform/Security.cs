@@ -16,7 +16,24 @@ public static class CredentialManager
 {
     public sealed record Entry(string Target, string? UserName, string? Comment, DateTime Written);
 
+    /// <summary>Credential Manager holds at most 2560 bytes per credential (1280 UTF-16 characters). A longer value
+    /// (an SSH key, a certificate) is split: the credential itself says how many parts, which live under
+    /// <c>Clipboard2/part/…</c> so they never show up as secrets of their own.</summary>
+    private const int MaxChars = 1280;
+    private const string PartsHeader = "\0C2PARTS:";
+    private static string PartTarget(string target, int index) => $"Clipboard2/part/{target}/{index}";
+
     public static bool Write(string target, string secret, string? userName = null, string? comment = null)
+    {
+        var parts = secret.Length <= MaxChars ? [] : secret.Chunk(MaxChars).Select(c => new string(c)).ToList();
+        for (var i = 0; i < parts.Count; i++)
+            if (!WriteOne(PartTarget(target, i), parts[i], userName, comment)) return false;
+        if (!WriteOne(target, parts.Count > 0 ? PartsHeader + parts.Count : secret, userName, comment)) return false;
+        DeleteParts(target, from: parts.Count);
+        return true;
+    }
+
+    private static bool WriteOne(string target, string secret, string? userName, string? comment)
     {
         var bytes = Encoding.Unicode.GetBytes(secret);
         var blob = Marshal.AllocHGlobal(bytes.Length);
@@ -43,6 +60,25 @@ public static class CredentialManager
 
     public static string? Read(string target)
     {
+        var value = ReadOne(target);
+        if (value is null || !value.StartsWith(PartsHeader, StringComparison.Ordinal)
+            || !int.TryParse(value.AsSpan(PartsHeader.Length), out var count)) return value;
+        var whole = new StringBuilder();
+        for (var i = 0; i < count; i++)
+        {
+            if (ReadOne(PartTarget(target, i)) is not { } part) return null;
+            whole.Append(part);
+        }
+        return whole.ToString();
+    }
+
+    private static void DeleteParts(string target, int from)
+    {
+        for (var i = from; Native.CredDelete(PartTarget(target, i), Native.CRED_TYPE_GENERIC, 0); i++) { }
+    }
+
+    private static string? ReadOne(string target)
+    {
         if (!Native.CredRead(target, Native.CRED_TYPE_GENERIC, 0, out var pointer)) return null;
         try
         {
@@ -56,7 +92,11 @@ public static class CredentialManager
         }
     }
 
-    public static void Delete(string target) => Native.CredDelete(target, Native.CRED_TYPE_GENERIC, 0);
+    public static void Delete(string target)
+    {
+        Native.CredDelete(target, Native.CRED_TYPE_GENERIC, 0);
+        DeleteParts(target, from: 0);
+    }
 
     public static List<Entry> Enumerate(string filter)
     {
@@ -192,6 +232,9 @@ public sealed class SecretVault : ISecretVault
     /// <summary>Why the last check refused, for callers that want to say so; null after a success.</summary>
     public string? LastDenial { get; private set; }
 
+    /// <summary>True while the Windows Hello prompt is up: it takes focus, and the panel mustn't close for it.</summary>
+    public bool IsAuthenticating { get; private set; }
+
     /// <summary>Windows Hello (face, fingerprint or PIN). Fails closed: without Hello, or when it can't be asked,
     /// secrets stay locked.</summary>
     private async Task<bool> VerifyAsync(string reason)
@@ -204,9 +247,15 @@ public sealed class SecretVault : ISecretVault
             TellUser(HelloRequiredMessage);
             return false;
         }
+        IsAuthenticating = true;
         try
         {
-            var result = await UserConsentVerifier.RequestVerificationAsync($"Clipboard2 wants to {reason}.");
+            // Tied to the window in front (ours, usually the panel); unparented, the prompt can open behind it.
+            var owner = Native.GetForegroundWindow();
+            var message = $"Clipboard2 wants to {reason}.";
+            var result = owner != IntPtr.Zero
+                ? await UserConsentVerifierInterop.RequestVerificationForWindowAsync(owner, message)
+                : await UserConsentVerifier.RequestVerificationAsync(message);
             if (result == UserConsentVerificationResult.Verified) return true;
             LastDenial = result == UserConsentVerificationResult.Canceled ? null : $"Windows Hello didn't confirm it's you ({result}).";
             return false;
@@ -216,6 +265,10 @@ public sealed class SecretVault : ISecretVault
             Log.Error("Windows Hello failed", ex);
             LastDenial = "Windows Hello couldn't be asked, so the secret stays locked.";
             return false;
+        }
+        finally
+        {
+            IsAuthenticating = false;
         }
     }
 

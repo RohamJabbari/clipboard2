@@ -488,7 +488,8 @@ public sealed partial class SettingsWindow : Window
         page.Children.Add(Card(Row("Name", name), Row("Value", secretValue), Row("", Action("Add Secret", () =>
         {
             if (name.Text.Trim().Length == 0 || secretValue.Password.Length == 0) return;
-            _services.Secrets.Add(name.Text.Trim(), secretValue.Password);
+            if (_services.Secrets.Add(name.Text.Trim(), secretValue.Password) is null)
+                MessageBox.Show(this, "Windows Credential Manager refused to save it.", "Clipboard2", MessageBoxButton.OK, MessageBoxImage.Warning);
         }))));
 
         page.Children.Add(Header("Security"));
@@ -514,7 +515,7 @@ public sealed partial class SettingsWindow : Window
         _ = Task.Run(async () =>
         {
             if (!await SecretVault.HelloAvailableAsync())
-                Dispatcher.Invoke(() => helloHint.Text = "Windows Hello isn't set up on this PC, so secrets paste without confirmation. Set up a PIN, face or fingerprint in Windows Settings → Accounts → Sign-in options.");
+                Dispatcher.Invoke(() => helloHint.Text = "Windows Hello isn't set up on this PC, so secrets stay locked: they can't be pasted or shown. Set up a PIN, face or fingerprint in Windows Settings → Accounts → Sign-in options.");
         });
         return page;
     }

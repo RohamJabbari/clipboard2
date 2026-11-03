@@ -323,11 +323,25 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         _ => "",
     };
 
+    private int _noticeId;
+
+    /// <summary>Shows a notice in the footer for a few seconds (from the UI thread: the delay resumes there).</summary>
     public void ShowNotice(string text)
     {
         Notice = text;
+        _ = ClearNoticeAsync(text, ++_noticeId);
         Notify();
     }
+
+    private async Task ClearNoticeAsync(string text, int id)
+    {
+        await Task.Delay(NoticeDuration);
+        if (id != _noticeId || Notice != text) return;
+        Notice = null;
+        Notify();
+    }
+
+    public static TimeSpan NoticeDuration { get; set; } = TimeSpan.FromSeconds(3);
 
     public void Refresh(bool resetSelection = false)
     {

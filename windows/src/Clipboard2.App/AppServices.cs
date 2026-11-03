@@ -292,6 +292,9 @@ public sealed class AppServices : IPanelHost
         _panelWindow?.HidePanel();
         Panel.DidClose();
         Sync.SetPanelOpen(false);
+        // A paste right after closing reads the target synchronously; any later one (tray, right-click menu)
+        // must not be sent back to the window the panel was opened over.
+        Dispatcher.BeginInvoke(() => _panelTarget = IntPtr.Zero, System.Windows.Threading.DispatcherPriority.Background);
     }
 
     public void ShowFlyout(Point nearScreenPoint)
@@ -342,34 +345,54 @@ public sealed class AppServices : IPanelHost
     {
         var target = TargetForPaste;
         var appTransform = transform ?? Settings.DefaultTransform(Tracker.AppFor(target)?.Id is { } path ? Path.GetFileName(path) : null);
-        ClipboardIO.Write(item, appTransform, Store.Blobs);   // keeps its place in the list
         Sync.ReportActivity();
-        _ = SendPasteAsync(target);
+        // Keeps its place in the list. Ctrl+V only when the clipboard really holds it, never the old contents.
+        if (ClipboardIO.Write(item, appTransform, Store.Blobs)) _ = SendPasteAsync(target);
+        else ClipboardFailed(target, [item]);
     }
 
     public void Paste(IReadOnlyList<ClipItem> items, Transform? transform)
     {
         var target = TargetForPaste;
-        ClipboardIO.Write(items, transform, Store.Blobs);
         Sync.ReportActivity();
-        _ = SendPasteAsync(target);
+        if (ClipboardIO.Write(items, transform, Store.Blobs)) _ = SendPasteAsync(target);
+        else ClipboardFailed(target, items);
     }
 
     public void PasteText(string text, int cursorOffsetFromEnd = 0)
     {
         var target = TargetForPaste;
-        ClipboardIO.WriteText(text);
         Sync.ReportActivity();
-        _ = SendPasteAsync(target, cursorOffsetFromEnd);
+        if (ClipboardIO.WriteText(text)) _ = SendPasteAsync(target, cursorOffsetFromEnd);
+        else ClipboardFailed(target, []);
     }
 
     public void Copy(ClipItem item)
     {
-        ClipboardIO.Write(item, null, Store.Blobs);
+        if (!ClipboardIO.Write(item, null, Store.Blobs)) ClipboardFailed(Tracker.TargetWindow, [item]);
     }
 
-    public void Copy(IReadOnlyList<ClipItem> items) => ClipboardIO.Write(items, null, Store.Blobs);
-    public void CopyText(string text) => ClipboardIO.WriteText(text);
+    public void Copy(IReadOnlyList<ClipItem> items)
+    {
+        if (!ClipboardIO.Write(items, null, Store.Blobs)) ClipboardFailed(Tracker.TargetWindow, items);
+    }
+
+    public void CopyText(string text)
+    {
+        if (!ClipboardIO.WriteText(text)) ClipboardFailed(Tracker.TargetWindow, []);
+    }
+
+    /// <summary>Says why nothing was pasted or copied, instead of pasting whatever was on the clipboard before.</summary>
+    private void ClipboardFailed(IntPtr near, IReadOnlyList<ClipItem> items)
+    {
+        _panelTarget = IntPtr.Zero;
+        System.Media.SystemSounds.Beep.Play();
+        if (items.Count > 0 && items.All(i => i.Kind == ClipKind.File))
+            Hud.ShowWarning(near, items.Count == 1 ? "The file is gone" : "The files are gone",
+                "It was moved or deleted since it was copied.");
+        else
+            Hud.ShowWarning(near, "Couldn't use the clipboard", "Another app is holding it. Try again in a moment.");
+    }
     public string? CurrentClipboardText() => ClipboardIO.CurrentText();
 
     /// <summary>Pastes text, then puts the previous clipboard back.</summary>

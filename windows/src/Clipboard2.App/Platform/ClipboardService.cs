@@ -143,10 +143,12 @@ public static class ClipboardIO
 
     private static void Mark(DataObject data) => data.SetData(ClipboardFilter.InternalMarker, "1");
 
-    private static void Commit(DataObject data) => Retry(() => System.Windows.Clipboard.SetDataObject(data, copy: true));
+    /// <summary>False when another app kept the clipboard locked through every retry.</summary>
+    private static bool Commit(DataObject data) => Retry(() => { System.Windows.Clipboard.SetDataObject(data, copy: true); return true; }, false);
 
-    /// <summary>Writes an item; a transform (or the target app's default) applies to text.</summary>
-    public static void Write(ClipItem item, Transform? transform, BlobStore blobs)
+    /// <summary>Writes an item; a transform (or the target app's default) applies to text. False when nothing was
+    /// written: the clipboard stayed locked, or a file clip's files are all gone. The clipboard is then untouched.</summary>
+    public static bool Write(ClipItem item, Transform? transform, BlobStore blobs)
     {
         var data = new DataObject();
         switch (item.Kind)
@@ -177,43 +179,40 @@ public static class ClipboardIO
                 files.AddRange([.. item.Files.Where(File.Exists).Concat(item.Files.Where(Directory.Exists))]);
                 if (files.Count > 0) data.SetFileDropList(files);
                 if (transform is not null) data.SetData(DataFormats.UnicodeText, item.Text);
+                else if (files.Count == 0) return false;
                 break;
         }
         Mark(data);
-        Commit(data);
+        return Commit(data);
     }
 
     /// <summary>Several items: text joined by line breaks, files as one drop, otherwise the first item.</summary>
-    public static void Write(IReadOnlyList<ClipItem> items, Transform? transform, BlobStore blobs)
+    public static bool Write(IReadOnlyList<ClipItem> items, Transform? transform, BlobStore blobs)
     {
-        if (items.Count == 1) { Write(items[0], transform, blobs); return; }
+        if (items.Count == 1) return Write(items[0], transform, blobs);
         if (items.All(i => i.Kind.IsTextual()))
+            return WriteText(string.Join("\n", items.Select(i => transform?.Apply(i.Text) ?? i.Text)));
+        if (items.All(i => i.Kind == ClipKind.File))
         {
-            WriteText(string.Join("\n", items.Select(i => transform?.Apply(i.Text) ?? i.Text)));
-        }
-        else if (items.All(i => i.Kind == ClipKind.File))
-        {
-            var data = new DataObject();
             var files = new StringCollection();
-            files.AddRange([.. items.SelectMany(i => i.Files)]);
+            files.AddRange([.. items.SelectMany(i => i.Files).Where(f => File.Exists(f) || Directory.Exists(f))]);
+            if (files.Count == 0) return false;
+            var data = new DataObject();
             data.SetFileDropList(files);
             Mark(data);
-            Commit(data);
+            return Commit(data);
         }
-        else
-        {
-            // Windows has no multi-item clipboard; text where possible, then the first image.
-            var text = string.Join("\n", items.Where(i => i.Kind != ClipKind.Image).Select(i => i.Text));
-            if (text.Length > 0) WriteText(text); else Write(items[0], transform, blobs);
-        }
+        // Windows has no multi-item clipboard; text where possible, then the first image.
+        var text = string.Join("\n", items.Where(i => i.Kind != ClipKind.Image).Select(i => i.Text));
+        return text.Length > 0 ? WriteText(text) : Write(items[0], transform, blobs);
     }
 
-    public static void WriteText(string text)
+    public static bool WriteText(string text)
     {
         var data = new DataObject();
         data.SetData(DataFormats.UnicodeText, text);
         Mark(data);
-        Commit(data);
+        return Commit(data);
     }
 
     /// <summary>Kept out of Windows clipboard history (Win+V), cloud sync and other managers.</summary>

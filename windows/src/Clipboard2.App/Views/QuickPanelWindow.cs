@@ -178,6 +178,19 @@ public sealed class QuickPanelWindow : Window
     private void CloseAfterDeactivation()
     {
         const int VK_LBUTTON = 0x01;
+        if (_services.Secrets.IsAuthenticating)
+        {
+            // Windows Hello took focus for something asked from the panel: stay, and come back once it's answered.
+            var hello = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(150) };
+            hello.Tick += (_, _) =>
+            {
+                if (_services.Secrets.IsAuthenticating) return;
+                hello.Stop();
+                if (IsVisible) ReactivateAfterDrop();
+            };
+            hello.Start();
+            return;
+        }
         if (!Native.IsDown(VK_LBUTTON))
         {
             _services.ClosePanel();
