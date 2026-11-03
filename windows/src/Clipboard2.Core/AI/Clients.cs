@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 
 namespace Clipboard2.Core.AI;
 
@@ -219,7 +220,110 @@ public static class Cli
         return null;
     }
 
-    /// <summary>.cmd shims (npm) must run through cmd.exe.</summary>
+    private static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: false);
+
+    /// <summary>How a CLI is really launched: the program, the arguments that go before the caller's, and
+    /// whether it goes through cmd.exe (then arguments can't contain line breaks).</summary>
+    public sealed record Launch(string FileName, IReadOnlyList<string> Prefix, bool ViaCmd);
+
+    /// <summary>
+    /// npm installs <c>claude.cmd</c>/<c>codex.cmd</c> shims. Running those through <c>cmd.exe /c</c> breaks on
+    /// quoted paths with spaces and on arguments with line breaks (cmd ends the command at the first one), so the
+    /// shim is resolved to what it runs: <c>node &lt;package&gt;\cli.js</c>, or a native .exe. Only an
+    /// unrecognised shim, or no Node, falls back to cmd.exe.
+    /// </summary>
+    public static Launch Resolve(string executable, Func<string, bool>? fileExists = null, Func<string?>? findNode = null,
+                                 string? shimContent = null)
+    {
+        fileExists ??= File.Exists;
+        if (!executable.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase) && !executable.EndsWith(".bat", StringComparison.OrdinalIgnoreCase))
+            return new(executable, [], false);
+        var shimDir = Path.GetDirectoryName(executable) ?? "";
+        if (shimContent is null)
+        {
+            try { shimContent = File.ReadAllText(executable); } catch { }
+        }
+        if (shimContent is not null && ParseShim(shimContent) is { } shim)
+        {
+            var target = Path.Combine(shimDir, shim.Target);
+            if (fileExists(target))
+            {
+                if (!shim.UsesNode) return new(target, [], false);
+                var localNode = Path.Combine(shimDir, "node.exe");
+                var node = fileExists(localNode) ? localNode : (findNode ?? FindNode)();
+                if (node is not null) return new(node, [target], false);
+            }
+        }
+        return new(Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe", [executable], true);
+    }
+
+    /// <summary>The target of an npm cmd-shim (relative to the shim's folder) and whether Node runs it.
+    /// Handles the current <c>"%dp0%\…"</c> and the older <c>"%~dp0\…"</c> forms.</summary>
+    public static (string Target, bool UsesNode)? ParseShim(string content)
+    {
+        foreach (var line in content.Split('\n').Reverse())
+        {
+            if (!line.Contains("%*")) continue;
+            var matches = Regex.Matches(line, @"""%(?:~dp0|dp0%)\\?([^""%]+)""");
+            if (matches.Count == 0) continue;
+            var target = matches[^1].Groups[1].Value.Trim();
+            if (target.EndsWith("node.exe", StringComparison.OrdinalIgnoreCase)) continue;
+            var usesNode = line.Contains("%_prog%", StringComparison.OrdinalIgnoreCase) || matches.Count > 1
+                || Regex.IsMatch(target, @"\.[cm]?js$", RegexOptions.IgnoreCase);
+            return (target, usesNode);
+        }
+        return null;
+    }
+
+    private static string? FindNode()
+    {
+        foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            try
+            {
+                var path = Path.Combine(dir.Trim('"'), "node.exe");
+                if (File.Exists(path)) return path;
+            }
+            catch { /* malformed PATH entry */ }
+        }
+        var programFiles = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "nodejs", "node.exe");
+        return File.Exists(programFiles) ? programFiles : null;
+    }
+
+    /// <summary>The cmd.exe fallback: <c>/d /s /c ""shim" "arg" …"</c>. With /s, cmd strips exactly the outer pair
+    /// of quotes, so quoted paths with spaces survive. cmd can't carry line breaks; callers move multi-line text
+    /// to stdin or a file first.</summary>
+    public static string CmdArguments(string shim, IEnumerable<string> arguments)
+    {
+        var parts = new List<string> { Quote(shim) };
+        foreach (var a in arguments)
+        {
+            if (a.Contains('\n') || a.Contains('\r')) throw new ArgumentException("cmd.exe can't pass line breaks in arguments.", nameof(arguments));
+            parts.Add(Quote(a));
+        }
+        return "/d /s /c \"" + string.Join(" ", parts) + "\"";
+    }
+
+    /// <summary>CommandLineToArgvW quoting (what Node and native CLIs parse). Always quotes, so cmd.exe also
+    /// leaves <c>&amp; | &lt; &gt; ^</c> inside alone.</summary>
+    public static string Quote(string arg)
+    {
+        var sb = new StringBuilder("\"");
+        var slashes = 0;
+        foreach (var c in arg)
+        {
+            if (c == '\\') { slashes++; continue; }
+            sb.Append('\\', c == '"' ? slashes * 2 + 1 : slashes);
+            slashes = 0;
+            sb.Append(c);
+        }
+        sb.Append('\\', slashes * 2);
+        return sb.Append('"').ToString();
+    }
+
+    /// <summary>True when <paramref name="executable"/> only runs through cmd.exe, so arguments must be single-line.</summary>
+    public static bool NeedsShell(string executable) => Resolve(executable).ViaCmd;
+
     public static ProcessStartInfo StartInfo(string executable, IEnumerable<string> arguments)
     {
         var info = new ProcessStartInfo
@@ -229,20 +333,23 @@ public static class Cli
             RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true,
-            StandardOutputEncoding = Encoding.UTF8,
+            // No BOM: a BOM on stdin would become the first character of the prompt.
+            StandardInputEncoding = Utf8,
+            StandardOutputEncoding = Utf8,
+            StandardErrorEncoding = Utf8,
             WorkingDirectory = Path.GetTempPath(),   // keeps project instruction files out of the prompt
         };
-        if (executable.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase))
+        var launch = Resolve(executable);
+        info.FileName = launch.FileName;
+        if (launch.ViaCmd)
         {
-            info.FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe";
-            info.ArgumentList.Add("/c");
-            info.ArgumentList.Add(executable);
+            info.Arguments = CmdArguments(launch.Prefix[0], arguments);
         }
         else
         {
-            info.FileName = executable;
+            foreach (var a in launch.Prefix) info.ArgumentList.Add(a);
+            foreach (var a in arguments) info.ArgumentList.Add(a);
         }
-        foreach (var a in arguments) info.ArgumentList.Add(a);
         return info;
     }
 
@@ -278,11 +385,16 @@ public sealed class ClaudeCodeCliClient(string model) : IAIStreamingClient
 {
     public static string? Executable => Cli.Find("claude");
 
-    public List<string> Arguments(string system)
+    /// <param name="systemPromptFile">When set, the system prompt is read from this file (<c>--system-prompt-file</c>)
+    /// instead of being passed inline: needed when the CLI runs through cmd.exe, which cuts arguments at line breaks.</param>
+    public List<string> Arguments(string system, string? systemPromptFile = null)
     {
         var args = new List<string>
         {
-            "-p", "--system-prompt", system, "--tools", "", "--strict-mcp-config", "--disable-slash-commands",
+            "-p",
+            systemPromptFile is null ? "--system-prompt" : "--system-prompt-file",
+            systemPromptFile ?? system,
+            "--tools", "", "--strict-mcp-config", "--disable-slash-commands",
             "--no-session-persistence", "--output-format", "stream-json", "--include-partial-messages", "--verbose",
         };
         if (model.Length > 0) args.AddRange(["--model", model]);
@@ -324,24 +436,38 @@ public sealed class ClaudeCodeCliClient(string model) : IAIStreamingClient
         var exe = Executable ?? throw AIException.CliMissing("Claude");
         var streamed = false;
         var buffered = new StringBuilder();
-        await foreach (var line in Cli.StreamLinesAsync(exe, Arguments(system), user, ct))
+        // Through cmd.exe (an npm shim we couldn't resolve to node) a multi-line prompt can't go in argv.
+        string? promptFile = null;
+        if (Cli.NeedsShell(exe))
         {
-            switch (Parse(line))
+            promptFile = Path.Combine(Path.GetTempPath(), $"clipboard2-prompt-{Guid.NewGuid():N}.txt");
+            await File.WriteAllTextAsync(promptFile, system, new UTF8Encoding(false), ct);
+        }
+        try
+        {
+            await foreach (var line in Cli.StreamLinesAsync(exe, Arguments(system, promptFile), user, ct))
             {
-                case LineEvent.Delta d:
-                    streamed = true;
-                    yield return d.Text;
-                    break;
-                case LineEvent.Message m:
-                    buffered.Append(m.Text);
-                    break;
-                case LineEvent.Result r when r.IsError:
-                    if (r.Text.Contains("not logged in", StringComparison.OrdinalIgnoreCase) || r.Text.Contains("/login")) throw AIException.NotSignedIn();
-                    throw new AIException(AIErrorKind.Api, r.Text.Length == 0 ? "Claude reported an error." : r.Text);
-                case LineEvent.Result r:
-                    if (!streamed) yield return buffered.Length > 0 ? buffered.ToString() : r.Text;
-                    break;
+                switch (Parse(line))
+                {
+                    case LineEvent.Delta d:
+                        streamed = true;
+                        yield return d.Text;
+                        break;
+                    case LineEvent.Message m:
+                        buffered.Append(m.Text);
+                        break;
+                    case LineEvent.Result r when r.IsError:
+                        if (r.Text.Contains("not logged in", StringComparison.OrdinalIgnoreCase) || r.Text.Contains("/login")) throw AIException.NotSignedIn();
+                        throw new AIException(AIErrorKind.Api, r.Text.Length == 0 ? "Claude reported an error." : r.Text);
+                    case LineEvent.Result r:
+                        if (!streamed) yield return buffered.Length > 0 ? buffered.ToString() : r.Text;
+                        break;
+                }
             }
+        }
+        finally
+        {
+            if (promptFile is not null) try { File.Delete(promptFile); } catch { /* temp folder */ }
         }
     }
 }

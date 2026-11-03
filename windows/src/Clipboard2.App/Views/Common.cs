@@ -295,9 +295,10 @@ public sealed class TrayIcon : IDisposable
         _statusTimer.Tick += (_, _) => UpdateSyncStatus();   // keeps "2 min ago" current
         _statusTimer.Start();
         UpdateSyncStatus();
+        // Only the update balloon acts on a click; InstallAsync never throws (failures go to Updates.LastError).
         _icon.BalloonTipClicked += async (_, _) =>
         {
-            if (services.Updates.AvailableVersion is not null) await services.Updates.InstallAsync();
+            if (_lastBalloonIsUpdate && services.Updates.AvailableVersion is not null) await services.Updates.InstallAsync();
         };
     }
 
@@ -323,16 +324,25 @@ public sealed class TrayIcon : IDisposable
         _icon.Text = text.Length > 127 ? text[..127] : text;
     }
 
-    public void ShowBalloon(string title, string text) => _icon.ShowBalloonTip(5000, title, text, System.Windows.Forms.ToolTipIcon.None);
+    public void ShowBalloon(string title, string text) => ShowBalloon(title, text, isUpdate: false);
 
+    private void ShowBalloon(string title, string text, bool isUpdate)
+    {
+        _lastBalloonIsUpdate = isUpdate;
+        _icon.ShowBalloonTip(5000, title, text, System.Windows.Forms.ToolTipIcon.None);
+    }
+
+    private bool _lastBalloonIsUpdate;
     private string? _notifiedVersion;
 
+    /// <summary>Automatic updates stay silent (Sparkle-style): only the menu item changes, the update installs on
+    /// quit. With automatic updates off there's one balloon per new version.</summary>
     public void ShowUpdate(string? version)
     {
-        _updateItem.Text = version is null ? "Check for Updates…" : $"Update to {version} and Restart";
-        if (version is null || version == _notifiedVersion) return;
+        _updateItem.Text = version is null ? "Check for Updates…" : $"Restart to Update ({version})";
+        if (version is null || version == _notifiedVersion || _services.Settings.InstallUpdatesAutomatically) return;
         _notifiedVersion = version;   // one balloon per new version, not one per hourly check
-        ShowBalloon("Update available", $"Clipboard2 {version} is ready. Click here to update and restart.");
+        ShowBalloon("Update available", $"Clipboard2 {version} is available. Click here to restart to update.", isUpdate: true);
     }
 
     public void Dispose()

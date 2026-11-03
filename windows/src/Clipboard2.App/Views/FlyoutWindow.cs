@@ -111,9 +111,10 @@ public sealed class FlyoutWindow : Window
 
     private void RenderBanner()
     {
-        if (_services.Updates.AvailableVersion is { } version)
+        // Automatic updates are silent (installed on quit; the tray menu has "Restart to Update"), so no banner.
+        if (_services.Updates.AvailableVersion is { } version && !_services.Settings.InstallUpdatesAutomatically)
         {
-            var button = new Button { Content = $"Clipboard2 {version} is available — Update", HorizontalAlignment = HorizontalAlignment.Stretch, Margin = new Thickness(10, 0, 10, 6) };
+            var button = new Button { Content = $"Clipboard2 {version} is available — Restart to Update", HorizontalAlignment = HorizontalAlignment.Stretch, Margin = new Thickness(10, 0, 10, 6) };
             button.Click += async (_, _) => await _services.Updates.InstallAsync();
             _banner.Child = button;
         }
