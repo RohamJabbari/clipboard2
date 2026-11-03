@@ -32,6 +32,8 @@ public sealed record SlotTarget(SlotKind Kind, string Id)
 /// Secrets and API keys are never stored here — see the Credential Manager store.</summary>
 public sealed class Settings
 {
+    /// <summary>Bumped when <see cref="Migrate"/> needs to change persisted values once.</summary>
+    public const int CurrentVersion = 1;
     public const int DefaultMaxItems = 500;
     public const int DefaultMaxAgeMinutes = 43_200;   // 30 days
     public static readonly int[] MaxItemChoices = [100, 250, 500, 1000, 2500, 5000, 0];
@@ -39,6 +41,9 @@ public sealed class Settings
     public static readonly int[] SecretGraceChoices = [0, 1, 5, 15, 60];
     public static readonly int[] SecretClearChoices = [15, 30, 60, 120, 0];
 
+    /// <summary>0 = a file written before settings were versioned. Every property is written to disk,
+    /// defaults included, so a changed default only reaches existing installs through <see cref="Migrate"/>.</summary>
+    public int Version { get; set; }
     public int MaxItems { get; set; } = DefaultMaxItems;
     public int MaxAgeMinutes { get; set; } = DefaultMaxAgeMinutes;
     public bool IsPaused { get; set; }
@@ -58,7 +63,8 @@ public sealed class Settings
     public Dictionary<string, string> Hotkeys { get; set; } = new(Hotkey.Defaults);
     public bool LaunchAtLogin { get; set; } = true;
     public bool CheckForUpdates { get; set; } = true;
-    public bool InstallUpdatesAutomatically { get; set; }
+    /// <summary>Like Sparkle on the Mac: download quietly, install when the app quits (or is idle a while).</summary>
+    public bool InstallUpdatesAutomatically { get; set; } = true;
     public bool HasLaunchedBefore { get; set; }
     /// <summary>Debug override for the sync API base URL; null uses the built-in one.</summary>
     public string? SyncApiBaseUrl { get; set; }
@@ -102,9 +108,10 @@ public sealed class Settings
     public static Settings Load(string path)
     {
         Settings settings;
+        var exists = File.Exists(path);
         try
         {
-            settings = File.Exists(path) ? JsonSerializer.Deserialize<Settings>(File.ReadAllText(path), Json) ?? new() : new();
+            settings = exists ? JsonSerializer.Deserialize<Settings>(File.ReadAllText(path), Json) ?? new() : new();
         }
         catch
         {
@@ -112,7 +119,22 @@ public sealed class Settings
         }
         foreach (var (name, combo) in Hotkey.Defaults) settings.Hotkeys.TryAdd(name, combo);
         settings.FilePath = path;
+        if (settings.Migrate() && exists)
+        {
+            try { settings.Save(); } catch { /* migrates again next launch */ }
+        }
         return settings;
+    }
+
+    /// <summary>One-time changes to settings written by older versions. True when anything changed.</summary>
+    internal bool Migrate()
+    {
+        if (Version >= CurrentVersion) return false;
+        // v1: automatic updates became the default. Older versions wrote `false` to every settings file
+        // because it was the default, not because anyone chose it, so turn it on once.
+        if (Version < 1) InstallUpdatesAutomatically = true;
+        Version = CurrentVersion;
+        return true;
     }
 
     public void Save()
