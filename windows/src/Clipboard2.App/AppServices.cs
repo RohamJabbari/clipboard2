@@ -569,11 +569,25 @@ public sealed class AppServices : IPanelHost
             return;
         }
         var target = Tracker.TargetWindow;
-        await Task.WhenAny(Sync.SyncNowAsync(), Task.Delay(TimeSpan.FromMilliseconds(1500)));
-        if (Sync.Downloads.LastOrDefault(d => d.SpaceId == group.Id) is { } incoming)
+        // Set before the fetch, so pressing the shortcut again during it cancels too.
+        using var wait = _groupPasteWait = new CancellationTokenSource();
+        try
         {
-            await PasteWhenDownloadedAsync(incoming, target);
-            return;
+            await Task.WhenAny(Sync.SyncNowAsync(), Task.Delay(TimeSpan.FromMilliseconds(1500), wait.Token));
+            if (wait.IsCancellationRequested)
+            {
+                Hud.ShowMessage(target, Glyphs.Cancel, "Paste cancelled");
+                return;
+            }
+            if (Sync.Downloads.FirstOrDefault(d => d.SpaceId == group.Id) is { } incoming)
+            {
+                await PasteWhenDownloadedAsync(incoming, target, wait);
+                return;
+            }
+        }
+        finally
+        {
+            _groupPasteWait = null;
         }
         if (Store.ItemsInSpace(group.Id).FirstOrDefault() is not { } item)
         {
@@ -586,9 +600,8 @@ public sealed class AppServices : IPanelHost
 
     /// <summary>Shows the download's progress and pastes the item once it's in. If another window came to the front
     /// meanwhile, the item only goes on the clipboard.</summary>
-    private async Task PasteWhenDownloadedAsync(IncomingDownload incoming, IntPtr target)
+    private async Task PasteWhenDownloadedAsync(IncomingDownload incoming, IntPtr target, CancellationTokenSource wait)
     {
-        using var wait = _groupPasteWait = new CancellationTokenSource();
         var arrived = new TaskCompletionSource<ClipItem?>(TaskCreationOptions.RunContinuationsAsynchronously);
         // Gone from the list: applied (it's in the store now) or failed.
         void Update()
@@ -613,7 +626,6 @@ public sealed class AppServices : IPanelHost
         finally
         {
             Sync.DownloadsChanged -= OnDownloadsChanged;
-            _groupPasteWait = null;
         }
         if (item is null)
         {
@@ -669,19 +681,17 @@ public sealed class AppServices : IPanelHost
     public async Task SendToDeviceAsync(ClipItem item, DeviceTarget device, bool fromPanel)
     {
         Sync.ReportActivity();
-        try
+        // Failures don't throw: the account keeps the reason in Error.
+        if (await Sync.SendToDeviceAsync(item, device.Id))
         {
-            await Sync.SendToDeviceAsync(item, device.Id);
             if (fromPanel) Panel.ShowNotice($"Sent to {device.Name}");
             else _tray?.ShowBalloon($"Sent to {device.Name}", item.DisplayTitle);
+            return;
         }
-        catch (Exception ex)
-        {
-            Log.Error($"Sending to {device.Name} failed", ex);
-            var message = SyncAccount.Friendly(ex);
-            if (fromPanel) Panel.ShowNotice($"Couldn't send to {device.Name}: {message}");
-            else _tray?.ShowBalloon($"Couldn't send to {device.Name}", message);
-        }
+        var message = Sync.Error ?? "Not sent yet. Try again in a moment.";
+        Log.Info($"Sending to {device.Name} failed: {message}");
+        if (fromPanel) Panel.ShowNotice($"Couldn't send to {device.Name}: {message}");
+        else _tray?.ShowBalloon($"Couldn't send to {device.Name}", message);
     }
 
     /// <summary>The account's other devices, by name (none when signed out).</summary>

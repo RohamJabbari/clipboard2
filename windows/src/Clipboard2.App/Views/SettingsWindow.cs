@@ -6,6 +6,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using Clipboard2.App.Platform;
 using Clipboard2.Core;
@@ -42,11 +43,24 @@ public sealed partial class SettingsWindow : Window
         AddTab("AI", Glyphs.Sparkle, BuildAI);
         AddTab("Sync", "", BuildSync);
         AddTab("About", Glyphs.Info, BuildAbout);
-        _services.Secrets.Changed += () => Dispatcher.BeginInvoke(() => RefreshTab("Secrets"));
-        _services.ClaudeAccount.Changed += () => Dispatcher.BeginInvoke(() => RefreshTab("AI"));
-        _services.ChatGptAccount.Changed += () => Dispatcher.BeginInvoke(() => RefreshTab("AI"));
-        _services.Updates.Changed += () => Dispatcher.BeginInvoke(() => RefreshTab("About"));
-        _services.Sync.Changed += () => Dispatcher.BeginInvoke(() => RefreshTab("Sync"));
+        Action secrets = () => Dispatcher.BeginInvoke(() => RefreshTab("Secrets"));
+        Action ai = () => Dispatcher.BeginInvoke(() => RefreshTab("AI"));
+        Action about = () => Dispatcher.BeginInvoke(() => RefreshTab("About"));
+        Action sync = () => Dispatcher.BeginInvoke(() => RefreshTab("Sync"));
+        _services.Secrets.Changed += secrets;
+        _services.ClaudeAccount.Changed += ai;
+        _services.ChatGptAccount.Changed += ai;
+        _services.Updates.Changed += about;
+        _services.Sync.Changed += sync;
+        // The services outlive this window: a closed one mustn't keep rebuilding.
+        Closed += (_, _) =>
+        {
+            _services.Secrets.Changed -= secrets;
+            _services.ClaudeAccount.Changed -= ai;
+            _services.ChatGptAccount.Changed -= ai;
+            _services.Updates.Changed -= about;
+            _services.Sync.Changed -= sync;
+        };
     }
 
     private readonly Dictionary<string, (TabItem Tab, Func<UIElement> Build)> _pages = [];
@@ -74,10 +88,24 @@ public sealed partial class SettingsWindow : Window
         }
     }
 
+    /// <summary>Rebuilds a page in place, keeping where it was scrolled to. Not while something on it is being
+    /// typed into (sync changes every few seconds): it catches up once that field loses focus.</summary>
     private void RefreshTab(string title)
     {
-        if (_pages.TryGetValue(title, out var page) && page.Tab.Content is not null) page.Tab.Content = Scroll(page.Build());
+        if (!_pages.TryGetValue(title, out var page) || page.Tab.Content is not ScrollViewer old) return;
+        if (Keyboard.FocusedElement is TextBox or PasswordBox && Keyboard.FocusedElement is DependencyObject focused && old.IsAncestorOf(focused))
+        {
+            if (focused is UIElement field && _pendingRefresh.Add(title))
+                field.LostKeyboardFocus += (_, _) => { _pendingRefresh.Remove(title); RefreshTab(title); };
+            return;
+        }
+        var offset = old.VerticalOffset;
+        var fresh = Scroll(page.Build());
+        page.Tab.Content = fresh;
+        fresh.Loaded += (_, _) => fresh.ScrollToVerticalOffset(offset);
     }
+
+    private readonly HashSet<string> _pendingRefresh = [];
 
     private static ScrollViewer Scroll(UIElement content) => new()
     {

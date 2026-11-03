@@ -96,6 +96,8 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
     private bool _accountFresh;
     private bool _devicesFresh;
     private Task? _running;
+    /// <summary>Cancelled when signing out, so a running tick stops instead of writing into the reset store.</summary>
+    private CancellationTokenSource _ticks = new();
     private bool _panelOpen;
     private DateTime _lastActivity = DateTime.MinValue;
     private DateTime? _lastTickStarted;
@@ -414,6 +416,7 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
     /// <summary>Ends the session on the server, then removes group data, sync state and keys. Personal history stays.</summary>
     public Task<bool> SignOutAsync() => Run(null, async ct =>
     {
+        await StopTicksAsync();
         if (_token is not null)
         {
             try { await _api.LogoutAsync(ct); }
@@ -434,6 +437,7 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
         {
             throw new SyncUserException("The password is wrong.");
         }
+        await StopTicksAsync();
         SignOutLocally();
         Status = "Your sync account was deleted.";
     }, keepStatus: true);
@@ -494,6 +498,7 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
         await _api.RevokeSessionAsync(deviceId, ct);
         if (deviceId == CurrentDeviceId)
         {
+            await StopTicksAsync();
             SignOutLocally();
             return;
         }
@@ -506,13 +511,11 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
     {
         var engine = RequireEngine();
         if (deviceId == CurrentDeviceId) throw new SyncUserException("That's this PC.");
-        var name = Devices.FirstOrDefault(d => d.Id == deviceId)?.Name;
         if (_running is { IsCompleted: false } running) await running;   // one writer at a time
         if (engine.Space(engine.Identity.PersonalSpaceId) is null) await engine.RefreshSpacesAsync(ct);
         if (!await engine.SendToDeviceAsync(item, deviceId, DeviceName, ct))
             throw new SyncUserException("It changed on another device meanwhile. Try again.");
-        Status = name is null ? "Sent." : $"Sent to {name}.";
-    }, keepStatus: true);
+    });
 
     // MARK: Groups
 
@@ -723,7 +726,19 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
         }
         if (Phase != SyncPhase.SignedIn || _engine is null) return Task.CompletedTask;
         if (RetryAfter is { } until && until > _now()) return Task.CompletedTask;
-        return _running = RunTicksAsync(ct);
+        return _running = RunTicksAsync(ct.CanBeCanceled ? CancellationTokenSource.CreateLinkedTokenSource(ct, _ticks.Token).Token : _ticks.Token);
+    }
+
+    /// <summary>Stops a running tick and waits for it: nothing it does may land after the local data is reset,
+    /// and its failures (a 401 once the session is gone) mustn't reach the user.</summary>
+    private async Task StopTicksAsync()
+    {
+        _ticks.Cancel();
+        if (_running is { } running)
+        {
+            try { await running; } catch { /* it's being thrown away */ }
+        }
+        _ticks = new CancellationTokenSource();
     }
 
     private async Task RunTicksAsync(CancellationToken ct)
@@ -750,10 +765,11 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
             } while (_again && Phase == SyncPhase.SignedIn);
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             HandleSyncFailure(ex);
         }
+        catch { /* cancelled: signing out */ }
         finally
         {
             _syncing = false;
