@@ -3,6 +3,15 @@
   <channel>
     <title>Clipboard2</title>
     <item>
+      <title>Version 1.4.1</title>
+      <pubDate>Tue, 03 Nov 2026 12:26:49 GMT</pubDate>
+      <sparkle:version>9</sparkle:version>
+      <sparkle:shortVersionString>1.4.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <sparkle:releaseNotesLink>https://github.com/RohamJabbari/clipboard2-macOS/releases/tag/v1.4.1</sparkle:releaseNotesLink>
+      <enclosure url="https://github.com/RohamJabbari/clipboard2-macOS/releases/download/v1.4.1/Clipboard2-1.4.1.zip" sparkle:edSignature="P9DdbSmTIoB0z93Zbge712sx2Cz3oPqrZpshXzvKnFGW2FAtheUklSwFh5gRy8cUXNgbuy6pD5ZEr5gtD/4iBA==" length="7848948" type="application/octet-stream"/>
+    </item>
+    <item>
       <title>Version 1.4.0</title>
       <pubDate>Tue, 03 Nov 2026 09:17:11 GMT</pubDate>
       <sparkle:version>8</sparkle:version>
