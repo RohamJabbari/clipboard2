@@ -12,6 +12,7 @@ using System.Windows.Shell;
 using Clipboard2.App.Platform;
 using Clipboard2.Core;
 using Clipboard2.Core.AI;
+using Clipboard2.Core.Sync;
 using Transform = Clipboard2.Core.Transform;
 
 namespace Clipboard2.App.Views;
@@ -285,6 +286,12 @@ public sealed class QuickPanelWindow : Window
                 return;
             }
             var files = DroppedFiles(e.Data);
+            if (files.Count > 0 && SyncEngine.GroupShareProblem(files) is { } problem)
+            {
+                ReactivateAfterDrop();
+                Model.ShowNotice(problem);
+                return;
+            }
             var added = files.Count > 0 ? _services.AddDroppedFiles(files, groupId)
                 : DroppedText(e.Data) is { } text ? _services.AddDroppedText(text, groupId) : null;
             if (added is null) return;

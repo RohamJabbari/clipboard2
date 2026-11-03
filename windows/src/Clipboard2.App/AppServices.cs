@@ -523,11 +523,30 @@ public sealed class AppServices : IPanelHost
             System.Media.SystemSounds.Beep.Play();
             return;
         }
+        if (capture.Kind == ClipKind.File && SyncEngine.GroupShareProblem(capture.Files) is { } problem)
+        {
+            ShowGroupShareProblem(group.DisplayName, problem);
+            return;
+        }
         Store.Ingest(capture, spaceId: group.Id);
         _tray?.ShowBalloon($"Sent to {group.DisplayName}", capture.Preview);
         _syncDebounce.Stop();
         _ = Sync.SyncNowAsync();
     }
+
+    /// <summary>Shares a history item to a group from outside the panel, or says why it can't be.</summary>
+    public void ShareToGroup(ClipItem item, SpaceRecord group)
+    {
+        if (SyncEngine.GroupShareProblem(item) is { } problem)
+        {
+            ShowGroupShareProblem(group.DisplayName, problem);
+            return;
+        }
+        Store.CopyToSpace(item, group.Id);
+    }
+
+    private void ShowGroupShareProblem(string groupName, string problem) =>
+        Hud.ShowWarning(Tracker.TargetWindow, $"Can't share to {groupName}", problem);
 
     private HudWindow? _hud;
     private HudWindow Hud => _hud ??= new HudWindow();
