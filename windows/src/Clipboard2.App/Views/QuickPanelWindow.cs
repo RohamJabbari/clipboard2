@@ -253,14 +253,8 @@ public sealed class QuickPanelWindow : Window
         var files = new System.Collections.Specialized.StringCollection();
         if (item.Kind == ClipKind.File)
             files.AddRange([.. item.Files.Where(f => File.Exists(f) || Directory.Exists(f))]);
-        else if (item.Kind == ClipKind.Image && item.ImageFile is { } image && File.Exists(_services.Store.Blobs.PathFor(image)))
-        {
-            var folder = Path.Combine(Path.GetTempPath(), "Clipboard2 Drags", item.Id.ToString("N"));
-            Directory.CreateDirectory(folder);
-            var png = Path.Combine(folder, "Image.png");
-            File.Copy(_services.Store.Blobs.PathFor(image), png, overwrite: true);
+        else if (item.Kind == ClipKind.Image && ClipboardIO.ImageAsFile(item, _services.Store.Blobs) is { } png)
             files.Add(png);
-        }
         return files;
     }
 

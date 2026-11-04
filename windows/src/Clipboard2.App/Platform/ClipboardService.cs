@@ -194,25 +194,44 @@ public static class ClipboardIO
         return Commit(data);
     }
 
-    /// <summary>Several items: text joined by line breaks, files as one drop, otherwise the first item.</summary>
+    /// <summary>Several items: text joined by line breaks. Anything else goes out as files, the way Explorer copies
+    /// several: documents and folders as they are, images as PNG files, and any text items alongside as text.</summary>
     public static bool Write(IReadOnlyList<ClipItem> items, Transform? transform, BlobStore blobs)
     {
         if (items.Count == 1) return Write(items[0], transform, blobs);
-        if (items.All(i => i.Kind.IsTextual()))
-            return WriteText(string.Join("\n", items.Select(i => transform?.Apply(i.Text) ?? i.Text)));
-        if (items.All(i => i.Kind == ClipKind.File))
+        var text = string.Join("\n", items.Where(i => i.Kind.IsTextual()).Select(i => transform?.Apply(i.Text) ?? i.Text));
+        if (items.All(i => i.Kind.IsTextual())) return WriteText(text);
+        var files = new StringCollection();
+        var imageNumber = 0;
+        foreach (var item in items)
         {
-            var files = new StringCollection();
-            files.AddRange([.. items.SelectMany(i => i.Files).Where(f => File.Exists(f) || Directory.Exists(f))]);
-            if (files.Count == 0) return false;
-            var data = new DataObject();
-            data.SetFileDropList(files);
-            Mark(data);
-            return Commit(data);
+            if (item.Kind == ClipKind.File) files.AddRange([.. item.Files.Where(f => File.Exists(f) || Directory.Exists(f))]);
+            else if (item.Kind == ClipKind.Image && ImageAsFile(item, blobs, ++imageNumber == 1 ? "Image.png" : $"Image {imageNumber}.png") is { } png)
+                files.Add(png);
         }
-        // Windows has no multi-item clipboard; text where possible, then the first image.
-        var text = string.Join("\n", items.Where(i => i.Kind != ClipKind.Image).Select(i => i.Text));
-        return text.Length > 0 ? WriteText(text) : Write(items[0], transform, blobs);
+        if (files.Count == 0) return text.Length > 0 && WriteText(text);
+        var data = new DataObject();
+        data.SetFileDropList(files);
+        if (text.Length > 0) data.SetData(DataFormats.UnicodeText, text);
+        Mark(data);
+        return Commit(data);
+    }
+
+    /// <summary>An image clip as a real PNG file, so it can travel as a file (paste or drag into Explorer, mail,
+    /// chat). Kept per item so a later Ctrl+V still finds it; null when the image is gone.</summary>
+    public static string? ImageAsFile(ClipItem item, BlobStore blobs, string name = "Image.png")
+    {
+        if (item.ImageFile is not { } image || !File.Exists(blobs.PathFor(image))) return null;
+        try
+        {
+            var folder = Path.Combine(Path.GetTempPath(), "Clipboard2 Files", item.Id.ToString("N"));
+            Directory.CreateDirectory(folder);
+            var png = Path.Combine(folder, name);
+            if (!File.Exists(png)) File.Copy(blobs.PathFor(image), png);
+            return png;
+        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
     }
 
     public static bool WriteText(string text)

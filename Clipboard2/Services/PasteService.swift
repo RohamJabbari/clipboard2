@@ -59,38 +59,54 @@ final class PasteService {
         markAsOwnWrite()
     }
 
-    /// Several items at once: text is joined with line breaks (what nearly every app expects),
-    /// files become one multi-file drag, and mixed selections become separate pasteboard items.
+    /// Several items at once: text is joined with line breaks (what nearly every app expects).
+    /// Anything else goes out as files, the way Finder copies several: documents and folders as
+    /// they are, images as PNG files, and any text items alongside as plain text.
     func write(_ items: [ClipItem], transform: Transform?) {
         if items.count == 1, let item = items.first {
             write(item, transform: transform)
             return
         }
         pasteboard.clearContents()
+        let text = items.filter(\.kind.isTextual).map { transform?.apply($0.text) ?? $0.text }.joined(separator: "\n")
         if items.allSatisfy(\.kind.isTextual) {
-            let text = items.map { transform?.apply($0.text) ?? $0.text }.joined(separator: "\n")
             pasteboard.setString(text, forType: .string)
-        } else if items.allSatisfy({ $0.kind == .file }) {
-            pasteboard.writeObjects(items.flatMap(\.fileURLs) as [NSURL])
         } else {
-            let pbItems: [NSPasteboardItem] = items.compactMap { item in
-                let pbItem = NSPasteboardItem()
+            var imageNumber = 0
+            let urls: [URL] = items.flatMap { item -> [URL] in
                 switch item.kind {
-                case .text, .richText:
-                    pbItem.setString(item.text, forType: .string)
+                case .file: return item.fileURLs
                 case .image:
-                    guard let name = item.imageFile,
-                          let data = try? Data(contentsOf: store.blobs.url(for: name)) else { return nil }
-                    pbItem.setData(data, forType: .png)
-                case .file:
-                    guard let url = item.fileURLs.first else { return nil }
-                    pbItem.setString(url.absoluteString, forType: .fileURL)
+                    imageNumber += 1
+                    return exportedImage(item, number: imageNumber).map { [$0] } ?? []
+                case .text, .richText: return []
                 }
-                return pbItem
             }
-            pasteboard.writeObjects(pbItems)
+            pasteboard.writeObjects(urls as [NSURL])
+            // Older and Chromium-based apps (Slack, Teams, WhatsApp…) still read the legacy list of paths.
+            pasteboard.setPropertyList(urls.map(\.path), forType: NSPasteboard.PasteboardType("NSFilenamesPboardType"))
+            if !text.isEmpty { pasteboard.setString(text, forType: .string) }
         }
         markAsOwnWrite()
+    }
+
+    /// An image clip as a real PNG file, so it can travel with other files. Numbered so several
+    /// pasted into one folder don't collide; kept per item so a later ⌘V still finds it.
+    private func exportedImage(_ item: ClipItem, number: Int) -> URL? {
+        guard let name = item.imageFile else { return nil }
+        let source = store.blobs.url(for: name)
+        let folder = FileManager.default.temporaryDirectory
+            .appending(path: "Clipboard2 Paste").appending(path: item.id.uuidString)
+        let url = folder.appending(path: number == 1 ? "Image.png" : "Image \(number).png")
+        if FileManager.default.fileExists(atPath: url.path) { return url }
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: source, to: url)
+            return url
+        } catch {
+            Log.paste.error("Couldn't export image for paste: \(error.localizedDescription)")
+            return nil
+        }
     }
 
     func paste(_ items: [ClipItem], transform: Transform? = nil, into target: NSRunningApplication? = nil) {
