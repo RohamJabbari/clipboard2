@@ -285,17 +285,23 @@ final class AppEnvironment {
 
     /// Selected text gets the action icon; a focused field with nothing selected gets the paste icon.
     private func textFieldChanged(_ selection: TextFieldWatcher.Selection?, _ field: TextFieldWatcher.Field?) {
-        let app = selection?.app ?? field?.app
-        let allowed = !panel.isVisible && !(app.map(isTextIconHidden) ?? false)
-        let shownSelection = allowed && prefs.selectionIcon ? selection : nil
+        let shownSelection = selection.flatMap { selection in
+            prefs.selectionIcon && !isTextIconHidden(in: selection.app, hiddenApps: prefs.selectionIconHiddenApps)
+                ? selection : nil
+        }
         selectionIcon.update(shownSelection)
-        pasteIcon.update(allowed && prefs.pasteIcon && shownSelection == nil ? field : nil)
+        let shownField = field.flatMap { field in
+            prefs.pasteIcon && shownSelection == nil && !isTextIconHidden(in: field.app, hiddenApps: prefs.pasteIconHiddenApps)
+                ? field : nil
+        }
+        pasteIcon.update(shownField)
     }
 
-    /// Never in apps the user hid it in, nor in apps whose copies aren't recorded (password managers).
-    func isTextIconHidden(in app: NSRunningApplication) -> Bool {
-        guard let bundleID = app.bundleIdentifier else { return true }
-        return prefs.textIconHiddenApps.contains { $0.bundleID == bundleID }
+    /// Never while the quick panel is open, in apps the user hid that icon in, or in apps whose
+    /// copies aren't recorded (password managers).
+    private func isTextIconHidden(in app: NSRunningApplication, hiddenApps: [AppRef]) -> Bool {
+        guard !panel.isVisible, let bundleID = app.bundleIdentifier else { return true }
+        return hiddenApps.contains { $0.bundleID == bundleID }
             || prefs.ignoredApps.contains { $0.bundleID == bundleID }
     }
 

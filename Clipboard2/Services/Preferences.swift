@@ -108,7 +108,8 @@ final class Preferences {
         static let explainSendToGroupChange = "explainSendToGroupChange"
         static let selectionIcon = "selectionIcon"
         static let pasteIcon = "pasteIcon"
-        static let textIconHiddenApps = "textIconHiddenApps"
+        static let selectionIconHiddenApps = "selectionIconHiddenApps"
+        static let pasteIconHiddenApps = "pasteIconHiddenApps"
     }
 
     /// 0 means "ask every time".
@@ -144,8 +145,9 @@ final class Preferences {
     var selectionIcon: Bool { didSet { defaults.set(selectionIcon, forKey: Key.selectionIcon) } }
     /// The paste icon in the corner of the focused text field in other apps.
     var pasteIcon: Bool { didSet { defaults.set(pasteIcon, forKey: Key.pasteIcon) } }
-    /// Apps where the text field icons stay away ("Don't Show in …").
-    var textIconHiddenApps: [AppRef] { didSet { store(textIconHiddenApps, Key.textIconHiddenApps) } }
+    /// Apps where each icon stays away ("Don't Show in …"); hiding one leaves the other.
+    var selectionIconHiddenApps: [AppRef] { didSet { store(selectionIconHiddenApps, Key.selectionIconHiddenApps) } }
+    var pasteIconHiddenApps: [AppRef] { didSet { store(pasteIconHiddenApps, Key.pasteIconHiddenApps) } }
     var ignoredApps: [AppRef] { didSet { store(ignoredApps, Key.ignoredApps) } }
     var appTransforms: [AppTransformRule] { didSet { store(appTransforms, Key.appTransforms) } }
     var aiProvider: AIProviderKind { didSet { defaults.set(aiProvider.rawValue, forKey: Key.aiProvider) } }
@@ -227,7 +229,8 @@ final class Preferences {
         panelOrigin = PanelOrigin(rawValue: defaults.string(forKey: Key.panelOrigin) ?? "") ?? .top
         selectionIcon = defaults.bool(forKey: Key.selectionIcon)
         pasteIcon = defaults.bool(forKey: Key.pasteIcon)
-        textIconHiddenApps = Self.load([AppRef].self, defaults, Key.textIconHiddenApps) ?? []
+        selectionIconHiddenApps = Self.load([AppRef].self, defaults, Key.selectionIconHiddenApps) ?? []
+        pasteIconHiddenApps = Self.load([AppRef].self, defaults, Key.pasteIconHiddenApps) ?? []
         ignoredApps = Self.load([AppRef].self, defaults, Key.ignoredApps) ?? AppRef.defaultIgnored
         appTransforms = Self.load([AppTransformRule].self, defaults, Key.appTransforms) ?? []
         aiProvider = AIProviderKind(rawValue: defaults.string(forKey: Key.aiProvider) ?? "") ?? .claudeCode

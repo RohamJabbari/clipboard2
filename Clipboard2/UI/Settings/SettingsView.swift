@@ -159,17 +159,14 @@ private struct TextFieldIconsSection: View {
                 Text("Paste icon in text fields")
                 Text("Hover it to see your newest copies and paste one where you're typing.")
             }
-            ForEach(prefs.textIconHiddenApps, id: \.bundleID) { app in
-                LabeledContent {
-                    Button("Show Again") { prefs.textIconHiddenApps.removeAll { $0.bundleID == app.bundleID } }
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(nsImage: AppIconCache.icon(for: app.bundleID))
-                            .resizable()
-                            .frame(width: 18, height: 18)
-                            .accessibilityHidden(true)
-                        Text("Hidden in \(app.name)")
-                    }
+            ForEach(prefs.selectionIconHiddenApps, id: \.bundleID) { app in
+                hiddenRow(app, "Selection icon hidden in \(app.name)") {
+                    prefs.selectionIconHiddenApps.removeAll { $0.bundleID == app.bundleID }
+                }
+            }
+            ForEach(prefs.pasteIconHiddenApps, id: \.bundleID) { app in
+                hiddenRow(app, "Paste icon hidden in \(app.name)") {
+                    prefs.pasteIconHiddenApps.removeAll { $0.bundleID == app.bundleID }
                 }
             }
         } header: {
@@ -179,6 +176,21 @@ private struct TextFieldIconsSection: View {
         }
         .onChange(of: prefs.selectionIcon) { env.updateTextFieldIcons() }
         .onChange(of: prefs.pasteIcon) { env.updateTextFieldIcons() }
+    }
+
+    /// An app one of the icons was hidden in ("Don't Show in …"), with a way back.
+    private func hiddenRow(_ app: AppRef, _ title: String, showAgain: @escaping () -> Void) -> some View {
+        LabeledContent {
+            Button("Show Again", action: showAgain)
+        } label: {
+            HStack(spacing: 8) {
+                Image(nsImage: AppIconCache.icon(for: app.bundleID))
+                    .resizable()
+                    .frame(width: 18, height: 18)
+                    .accessibilityHidden(true)
+                Text(title)
+            }
+        }
     }
 }
 

@@ -162,7 +162,7 @@ final class SelectionIconController {
 
     private func hide(in app: NSRunningApplication) {
         guard let ref = FrontmostAppTracker.ref(for: app) else { return }
-        if !env.prefs.textIconHiddenApps.contains(ref) { env.prefs.textIconHiddenApps.append(ref) }
+        if !env.prefs.selectionIconHiddenApps.contains(ref) { env.prefs.selectionIconHiddenApps.append(ref) }
         hideAll()
         HUD.show("Hidden in \(ref.name). Settings → General brings it back.", symbol: "eye.slash", duration: .seconds(2.6))
     }
@@ -455,7 +455,9 @@ final class PasteIconController {
             onShowAll: { [weak self] in
                 self?.closePopover()
                 self?.env.showQuickPanel()
-            })
+            },
+            appName: field.app.localizedName,
+            onHideInApp: { [weak self] in self?.hide(in: field.app) })
         let host = FirstClickHostingView(rootView: view)
         let size = host.fittingSize
         let panel = FloatingPanel(size: size)
@@ -488,6 +490,15 @@ final class PasteIconController {
         popover?.orderOut(nil)
         popover = nil
         updateIconAlpha()
+    }
+
+    /// "Don't Show in ‹App›": only the paste icon; the icon beside selected text stays.
+    private func hide(in app: NSRunningApplication) {
+        guard let ref = FrontmostAppTracker.ref(for: app) else { return }
+        if !env.prefs.pasteIconHiddenApps.contains(ref) { env.prefs.pasteIconHiddenApps.append(ref) }
+        hide()
+        HUD.show("Paste icon hidden in \(ref.name). Settings → General brings it back.", symbol: "eye.slash",
+                 duration: .seconds(2.6))
     }
 }
 
@@ -581,6 +592,9 @@ private struct PastePopoverView: View {
     let shortcut: String?
     let onPaste: (ClipItem) -> Void
     let onShowAll: () -> Void
+    /// The app being typed in, for "Don't Show in ‹App›".
+    let appName: String?
+    let onHideInApp: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -623,6 +637,19 @@ private struct PastePopoverView: View {
                 .padding(8)
                 .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .padding(.top, 4)
+            if let appName {
+                Button(action: onHideInApp) {
+                    Label("Don't Show in \(appName)", systemImage: "eye.slash")
+                        .labelStyle(.titleAndIcon)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help("Hide the paste icon in \(appName). Settings → General brings it back.")
+                .padding(.horizontal, 6)
+                .padding(.top, 6)
+            }
         }
         .padding(8)
         .frame(width: 340)
