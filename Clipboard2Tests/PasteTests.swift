@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 import SwiftData
 import Testing
 @testable import Clipboard2
@@ -76,6 +77,29 @@ struct PasteTests {
         let types = pasteboard.types?.map(\.rawValue) ?? []
         #expect(ClipboardFilter.decide(types: types, sourceBundleID: nil, ignoredBundleIDs: []) == .ownWrite)
         #expect(item.fileURLs.count == 3)
+    }
+
+    /// A multi-file item (or its picked files) drags as one pasteboard item per file; the first
+    /// also carries the clip id for drops on a group chip.
+    @Test func multiFileDragsCarryEveryFile() throws {
+        let a = try file("a.txt"), b = try file("b.txt"), c = try file("c.txt")
+        var capture = ProcessedCapture.text("a.txt b.txt c.txt")
+        capture.kind = .file
+        capture.fileURLs = a.fileURLs + b.fileURLs + c.fileURLs
+        capture.hash = UUID().uuidString
+        let item = store.ingest(capture)
+        #expect(PanelDrag.needsMultiFileDrag(item))
+        #expect(!PanelDrag.needsMultiFileDrag(a))
+
+        let all = PanelDrag.files(for: item, picked: nil)
+        let entries = PanelDrag.pasteboardItems(for: item, files: all)
+        #expect(entries.compactMap { $0.string(forType: .fileURL).flatMap(URL.init(string:)) } == item.fileURLs)
+        let clipType = NSPasteboard.PasteboardType(UTType.clipboard2Clip.identifier)
+        #expect(entries.first?.data(forType: clipType) == Data(item.id.uuidString.utf8))
+        #expect(entries.dropFirst().allSatisfy { $0.data(forType: clipType) == nil })
+
+        let picked = [item.fileURLs[0], item.fileURLs[2]]
+        #expect(PanelDrag.files(for: item, picked: picked) == picked)
     }
 
     /// "Text in image" → Copy: plain text, marked so the monitor doesn't capture it as a new item.

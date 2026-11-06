@@ -9,7 +9,7 @@ extension UTType {
 enum PanelDrag {
     /// What a row carries when dragged: its id for drops inside the panel, plus the content
     /// (text, the file, or the image file) for drops into other apps. A SwiftUI drag carries one
-    /// file, so a file item offers its first file — or the first of `files`, the ones picked in the preview.
+    /// item, so a file item with several files is dragged by `MultiFileDragSource` instead.
     static func provider(for item: ClipItem, blobs: BlobStore, files: [URL]? = nil) -> NSItemProvider {
         let provider = NSItemProvider()
         let id = Data(item.id.uuidString.utf8)
@@ -27,6 +27,29 @@ enum PanelDrag {
         }
         provider.suggestedName = item.label ?? (item.kind == .image ? "Image" : nil)
         return provider
+    }
+
+    /// The files a drag of a file item carries: the ones picked in the preview, or all of them.
+    static func files(for item: ClipItem, picked: [URL]?) -> [URL] {
+        (picked ?? item.fileURLs).filter(\.isFileURL)
+    }
+
+    /// Whether dragging `item` needs one drag item per file (an AppKit drag).
+    static func needsMultiFileDrag(_ item: ClipItem) -> Bool {
+        item.kind == .file && item.fileURLs.filter(\.isFileURL).count > 1
+    }
+
+    /// One pasteboard item per file, so Finder and other apps get every file. The first also
+    /// carries the clip id, so the drag still works on a group chip.
+    static func pasteboardItems(for item: ClipItem, files: [URL]) -> [NSPasteboardItem] {
+        files.enumerated().map { index, url in
+            let entry = NSPasteboardItem()
+            entry.setString(url.absoluteString, forType: .fileURL)
+            if index == 0 {
+                entry.setData(Data(item.id.uuidString.utf8), forType: NSPasteboard.PasteboardType(UTType.clipboard2Clip.identifier))
+            }
+            return entry
+        }
     }
 
     static func loadClipID(from providers: [NSItemProvider]) async -> UUID? {
@@ -127,12 +150,54 @@ struct ClipDragSource: ViewModifier {
     let blobs: BlobStore
     /// The files picked in the preview, read when the drag starts.
     var pickedFiles: (ClipItem) -> [URL]? = { _ in nil }
+    @State private var fileDrag = MultiFileDragSource()
 
     func body(content: Content) -> some View {
-        if let item {
+        if let item, PanelDrag.needsMultiFileDrag(item) {
+            content.gesture(DragGesture(minimumDistance: 4).onChanged { _ in startFileDrag(item) })
+        } else if let item {
             content.onDrag { PanelDrag.provider(for: item, blobs: blobs, files: pickedFiles(item)) }
         } else {
             content
         }
+    }
+
+    private func startFileDrag(_ item: ClipItem) {
+        guard let event = NSApp.currentEvent, event.type == .leftMouseDragged else { return }
+        let files = PanelDrag.files(for: item, picked: pickedFiles(item))
+        guard !files.isEmpty else { return }
+        fileDrag.begin(PanelDrag.pasteboardItems(for: item, files: files), files: files, event: event)
+    }
+}
+
+/// Drags several files at once: an AppKit dragging session with one item per file, which a
+/// SwiftUI drag (a single item provider) can't do.
+final class MultiFileDragSource: NSObject, NSDraggingSource {
+    /// A session is running; the gesture keeps reporting changes until the mouse comes up.
+    private(set) var isDragging = false
+
+    func begin(_ items: [NSPasteboardItem], files: [URL], event: NSEvent) {
+        guard !isDragging, let view = event.window?.contentView else { return }
+        let point = view.convert(event.locationInWindow, from: nil)
+        let side: CGFloat = 32
+        // Fanned out a little, so it reads as a stack of files.
+        let dragged = zip(items, files).enumerated().map { index, pair in
+            let item = NSDraggingItem(pasteboardWriter: pair.0)
+            let offset = CGFloat(min(index, 4)) * 4
+            item.setDraggingFrame(NSRect(x: point.x - side / 2 + offset, y: point.y - side / 2 - offset, width: side, height: side),
+                                  contents: NSWorkspace.shared.icon(forFile: pair.1.path))
+            return item
+        }
+        isDragging = true
+        let session = view.beginDraggingSession(with: dragged, event: event, source: self)
+        session.draggingFormation = .pile
+    }
+
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        .copy
+    }
+
+    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        isDragging = false
     }
 }
