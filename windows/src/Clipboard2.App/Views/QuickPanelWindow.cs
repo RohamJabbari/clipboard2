@@ -179,6 +179,7 @@ public sealed class QuickPanelWindow : Window
     private void CloseAfterDeactivation()
     {
         const int VK_LBUTTON = 0x01;
+        if (_choosingFolder) return;   // "Save to…": the folder picker is in front, the panel stays
         if (_services.Secrets.IsAuthenticating)
         {
             // Windows Hello took focus for something asked from the panel: stay, and come back once it's answered.
@@ -205,6 +206,25 @@ public sealed class QuickPanelWindow : Window
             if (IsVisible && !IsActive) _services.ClosePanel();
         };
         timer.Start();
+    }
+
+    private bool _choosingFolder;
+
+    /// <summary>"Save to…": a folder picker owned by the panel, which stays open behind it. Null when cancelled.</summary>
+    public string? ChooseFolder(string initial)
+    {
+        var dialog = new Microsoft.Win32.OpenFolderDialog { Title = "Save to", InitialDirectory = Directory.Exists(initial) ? initial : "" };
+        _choosingFolder = true;
+        try
+        {
+            var chosen = IsVisible ? dialog.ShowDialog(this) : dialog.ShowDialog();
+            return chosen == true ? dialog.FolderName : null;
+        }
+        finally
+        {
+            _choosingFolder = false;
+            if (IsVisible) ReactivateAfterDrop();
+        }
     }
 
     /// <summary>Brings the panel back to the front after something was dropped on it from another app.</summary>
@@ -686,6 +706,13 @@ public sealed class QuickPanelWindow : Window
             menu.Items.Add(new Separator());
             menu.Items.Add(Item(item.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
             if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Labelled", () => Model.RemoveFromLabelled([item])));
+            if (item != Model.SelectionItem)
+            {
+                // Right-clicking one of several selected items saves them all.
+                List<ClipItem> Targets() => Model.IsMultiSelecting && Model.IsSelected(entry) ? Model.SelectedClips : [item];
+                menu.Items.Add(Item($"Save to {Model.SaveFolderName}", () => Model.Save(Targets(), _services.SaveFolder)));
+                menu.Items.Add(Item("Save to…", () => { if (_services.ChooseSaveFolder() is { } folder) Model.Save(Targets(), folder); }));
+            }
             if (item.Kind.IsTextual()) menu.Items.Add(Item("Save as Secret…", () => Model.BeginSaveSecret(item)));
             menu.Items.Add(Item("Delete", () => { _services.Store.Delete(item); Model.Refresh(); }));
         }

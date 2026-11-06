@@ -395,6 +395,13 @@ public sealed class AppServices : IPanelHost
     }
     public string? CurrentClipboardText() => ClipboardIO.CurrentText();
 
+    // MARK: Saving to a folder
+
+    public string SaveFolder => Settings.SaveFolder is { Length: > 0 } folder ? folder : Native.DownloadsFolder();
+
+    /// <summary>The folder picker, over the panel (which stays open while it's shown).</summary>
+    public string? ChooseSaveFolder() => PanelWindow.ChooseFolder(SaveFolder);
+
     /// <summary>Pastes text, then puts the previous clipboard back.</summary>
     public async Task PasteKeepingClipboardAsync(string text, IntPtr target)
     {

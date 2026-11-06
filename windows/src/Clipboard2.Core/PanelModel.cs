@@ -59,6 +59,10 @@ public abstract record PanelAction
     public sealed record ClearSlot(int Slot) : PanelAction;
     /// <summary>For items pinned without a label: labels are the only way to keep items now.</summary>
     public sealed record RemoveFromLabelled : PanelAction;
+    /// <summary>Saves into the folder chosen in Settings (Downloads unless changed), named after it.</summary>
+    public sealed record SaveToFolder(string FolderName) : PanelAction;
+    /// <summary>Asks for a folder, then saves there.</summary>
+    public sealed record SaveToChosenFolder : PanelAction;
     public sealed record ShareToGroup : PanelAction;
     public sealed record ShareTo(string GroupId, string GroupName) : PanelAction;
     public sealed record SendTo(string DeviceId, string DeviceName) : PanelAction;
@@ -87,6 +91,8 @@ public abstract record PanelAction
         SetUpAI => "Set Up AI…",
         ClearSlot c => $"Remove from Quick Slot Ctrl+{c.Slot}",
         RemoveFromLabelled => "Remove from Labelled",
+        SaveToFolder f => $"Save to {f.FolderName}",
+        SaveToChosenFolder => "Save to…",
         ShareToGroup => "Share to Group…",
         ShareTo s => s.GroupName,
         SendTo d => $"Send to {d.DeviceName}",
@@ -113,6 +119,10 @@ public interface IPanelHost
     void ShareSecret(SecretRef secret, string groupId, string groupName);
     string? CurrentClipboardText();
     void OpenSettings();
+    /// <summary>The folder "Save to ‹folder›" writes to (Settings, or the user's Downloads folder).</summary>
+    string SaveFolder { get; }
+    /// <summary>Asks the user for a folder; null when cancelled.</summary>
+    string? ChooseSaveFolder();
     IAIStreamingClient MakeAIClient();
     string AIProviderTitle { get; }
     bool IsAIReady { get; }
@@ -720,6 +730,14 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     private static bool IsPinnedWithoutLabel(ClipItem item) => item.IsPinned && item.Label is null;
 
+    /// <summary>The save folder's name for "Save to Downloads" and its notice.</summary>
+    public string SaveFolderName => FolderName(host.SaveFolder);
+
+    public static string FolderName(string folder) =>
+        Path.GetFileName(folder.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)) is { Length: > 0 } name ? name : folder;
+
+    private PanelAction[] SaveActions => [new PanelAction.SaveToFolder(SaveFolderName), new PanelAction.SaveToChosenFolder()];
+
     public List<PanelAction> AvailableActions
     {
         get
@@ -732,6 +750,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 if (clips.All(c => c.Kind.IsTextual())) multi.AddRange([new PanelAction.PastePlain(), new PanelAction.Copy(), .. TransformActions]);
                 else multi.Add(new PanelAction.Copy());
                 if (CanShare) multi.Add(new PanelAction.ShareToGroup());
+                multi.AddRange(SaveActions);
                 if (clips.Any(IsPinnedWithoutLabel)) multi.Add(new PanelAction.RemoveFromLabelled());
                 return [.. multi, new PanelAction.Delete()];
             }
@@ -753,6 +772,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                     }
                     actions.Add(new PanelAction.SetLabel());
                     if (IsPinnedWithoutLabel(c.Item)) actions.Add(new PanelAction.RemoveFromLabelled());
+                    actions.AddRange(SaveActions);
                     break;
                 case PanelEntry.SecretEntry:
                     actions.Add(new PanelAction.Copy());
@@ -839,6 +859,12 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             case PanelAction.RemoveFromLabelled when item is not null:
                 RemoveFromLabelled([item]);
                 break;
+            case PanelAction.SaveToFolder when item is not null:
+                Save([item], host.SaveFolder);
+                break;
+            case PanelAction.SaveToChosenFolder when item is not null:
+                if (host.ChooseSaveFolder() is { } folder) Save([item], folder);
+                break;
             case PanelAction.ShareToGroup:
                 BeginShareToGroup();
                 break;
@@ -880,6 +906,12 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 break;
             case PanelAction.RemoveFromLabelled:
                 RemoveFromLabelled(clips);
+                break;
+            case PanelAction.SaveToFolder:
+                Save(clips, host.SaveFolder);
+                break;
+            case PanelAction.SaveToChosenFolder:
+                if (host.ChooseSaveFolder() is { } folder) Save(clips, folder);
                 break;
             case PanelAction.ShareToGroup:
                 BeginShareToGroup();
@@ -990,6 +1022,16 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         ResetMode();
         Refresh();
         ShowNotice(unpinned.Count == 1 ? "Removed from Labelled" : $"Removed {unpinned.Count} items from Labelled");
+    }
+
+    /// <summary>Writes each item into <paramref name="folder"/> (text as .txt, images as .png, files as copies) and
+    /// says how it went in the footer.</summary>
+    public void Save(IReadOnlyList<ClipItem> items, string folder)
+    {
+        if (items.Count == 0) return;
+        var outcome = ItemSaver.Save(items, folder, store.Blobs);
+        ResetMode();
+        ShowNotice(outcome.Notice(FolderName(folder)));
     }
 
     /// <summary>Delete never removes secrets by accident; Ctrl+K → Delete does.</summary>

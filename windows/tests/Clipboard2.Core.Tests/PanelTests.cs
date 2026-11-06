@@ -49,6 +49,9 @@ internal sealed class FakeHost : IPanelHost
     public void ShareSecret(SecretRef secret, string groupId, string groupName) => Log.Add($"share-secret:{secret.Name}:{groupName}");
     public string? CurrentClipboardText() => "CLIP";
     public void OpenSettings() => Log.Add("settings");
+    public string SaveFolder { get; set; } = Path.Combine(Path.GetTempPath(), "c2save-" + Guid.NewGuid(), "Downloads");
+    public string? ChosenFolder { get; set; }
+    public string? ChooseSaveFolder() { Log.Add("choose-folder"); return ChosenFolder; }
     public IAIStreamingClient MakeAIClient() => throw new AIException(AIErrorKind.NotSignedIn, "not signed in");
     public string AIProviderTitle => "Test";
     public bool IsAIReady => AIReady;
@@ -224,6 +227,48 @@ public sealed class PanelTests : IDisposable
         _model.HandleKey(K(PanelKey.Enter));
         Assert.Equal((null, false), (_store.Find(item.Id)!.Label, _store.Find(item.Id)!.IsPinned));
         Assert.Equal("Label removed", _model.Notice);
+    }
+
+    [Fact]
+    public void SaveActionsAreNamedAfterTheFolderAndWriteFiles()
+    {
+        var item = Add("Meeting notes for Monday");
+        _model.PrepareForOpen(null);
+        Assert.Contains(new PanelAction.SaveToFolder("Downloads"), _model.AvailableActions);
+        Assert.Contains(new PanelAction.SaveToChosenFolder(), _model.AvailableActions);
+        Assert.Equal("Save to Downloads", new PanelAction.SaveToFolder("Downloads").Title);
+
+        _model.OpenActions();
+        _model.Perform(new PanelAction.SaveToFolder("Downloads"));
+        Assert.Equal(PanelMode.Browse, _model.Mode);
+        Assert.Equal("Saved to Downloads", _model.Notice);
+        Assert.Equal("Meeting notes for Monday", File.ReadAllText(Path.Combine(_host.SaveFolder, "Meeting notes for Monday.txt")));
+
+        // Cancelling the picker does nothing; a chosen folder gets the item.
+        _model.Perform(new PanelAction.SaveToChosenFolder());
+        Assert.Contains("choose-folder", _host.Log);
+        Assert.Equal("Saved to Downloads", _model.Notice);
+        _host.ChosenFolder = Path.Combine(Path.GetDirectoryName(_host.SaveFolder)!, "Elsewhere");
+        _model.Perform(new PanelAction.SaveToChosenFolder());
+        Assert.Equal("Saved to Elsewhere", _model.Notice);
+        Assert.True(File.Exists(Path.Combine(_host.ChosenFolder, "Meeting notes for Monday.txt")));
+
+        // Several selected items are saved each; errors are reported.
+        Add("second");
+        _model.PrepareForOpen(null);
+        _model.SelectAll();
+        Assert.Contains(new PanelAction.SaveToFolder("Downloads"), _model.AvailableActions);
+        _model.Perform(new PanelAction.SaveToFolder("Downloads"));
+        Assert.Equal("Saved 2 items to Downloads", _model.Notice);
+        Assert.True(File.Exists(Path.Combine(_host.SaveFolder, "Meeting notes for Monday (2).txt")));
+        Assert.True(File.Exists(Path.Combine(_host.SaveFolder, "second.txt")));
+
+        var files = _store.Ingest(ProcessedCapture.ForFiles([Path.Combine(_host.SaveFolder, "gone.txt")]));
+        _model.PrepareForOpen(null);
+        _model.Select(new PanelEntry.Clip(files).Id);
+        _model.Perform(new PanelAction.SaveToFolder("Downloads"));
+        Assert.Equal("Couldn't save to Downloads: The file is gone.", _model.Notice);
+        Directory.Delete(Path.GetDirectoryName(_host.SaveFolder)!, recursive: true);
     }
 
     [Fact]
