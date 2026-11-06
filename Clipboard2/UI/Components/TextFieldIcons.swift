@@ -342,7 +342,8 @@ private struct SelectionResultView: View {
 // MARK: - Paste icon in text fields
 
 /// A quiet icon in the corner of the focused text field in another app. Hovering it shows the
-/// newest copies; clicking one pastes it where the cursor is, without leaving the app.
+/// newest copies; clicking one pastes it where the cursor is, without leaving the app. It stays
+/// faint until the pointer reaches it, so it never competes with what's being typed.
 final class PasteIconController {
     private let env: AppEnvironment
     private var field: TextFieldWatcher.Field?
@@ -354,6 +355,8 @@ final class PasteIconController {
     private var pendingHover: DispatchWorkItem?
 
     private static let iconSize = CGSize(width: 22, height: 22)
+    /// Opacity while nobody's reaching for it; full on hover and while its list is open.
+    static let idleAlpha: CGFloat = 0.35
     static let itemCount = 6
 
     init(env: AppEnvironment) {
@@ -372,6 +375,7 @@ final class PasteIconController {
 
     func hide() {
         field = nil
+        overIcon = false   // it may vanish under the pointer, with no exit to report
         closePopover()
         icon?.orderOut(nil)
     }
@@ -394,15 +398,28 @@ final class PasteIconController {
         if !panel.isVisible {
             panel.alphaValue = 0
             panel.orderFrontRegardless()
-            NSAnimationContext.runAnimationGroup { $0.duration = 0.15; panel.animator().alphaValue = 1 }
+            NSAnimationContext.runAnimationGroup { $0.duration = 0.15; panel.animator().alphaValue = iconAlpha }
         }
         if popover != nil { positionPopover() }
+    }
+
+    private var iconAlpha: CGFloat { overIcon || popover != nil ? 1 : Self.idleAlpha }
+
+    /// Brightens the icon the moment the pointer arrives, and dims it once the list is gone.
+    private func updateIconAlpha() {
+        guard let icon, icon.isVisible, icon.alphaValue != iconAlpha else { return }
+        let alpha = iconAlpha
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = alpha == 1 ? 0.1 : 0.25
+            icon.animator().alphaValue = alpha
+        }
     }
 
     // MARK: Hover
 
     private func hoverChanged() {
         pendingHover?.cancel()
+        updateIconAlpha()
         let open = overIcon || overPopover
         guard open != (popover != nil) else { return }
         let work = DispatchWorkItem { [weak self] in
@@ -447,6 +464,7 @@ final class PasteIconController {
             self?.hoverChanged()
         }
         popover = panel
+        updateIconAlpha()
         positionPopover()
         panel.alphaValue = 0
         panel.orderFrontRegardless()
@@ -469,6 +487,7 @@ final class PasteIconController {
         overPopover = false
         popover?.orderOut(nil)
         popover = nil
+        updateIconAlpha()
     }
 }
 
