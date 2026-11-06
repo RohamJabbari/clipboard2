@@ -719,14 +719,23 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
     /// task completes when both are done.</summary>
     public Task SyncNowAsync(CancellationToken ct = default)
     {
-        if (_running is { IsCompleted: false })
+        if (_running is { IsCompleted: false } running)
         {
             _again = true;
-            return _running;
+            return AgainAfterAsync(running, ct);
         }
         if (Phase != SyncPhase.SignedIn || _engine is null) return Task.CompletedTask;
         if (RetryAfter is { } until && until > _now()) return Task.CompletedTask;
         return _running = RunTicksAsync(ct.CanBeCanceled ? CancellationTokenSource.CreateLinkedTokenSource(ct, _ticks.Token).Token : _ticks.Token);
+    }
+
+    /// <summary>A request that came while a tick was finishing: the running ticks normally take it (<c>_again</c>),
+    /// but if they had already decided to stop, it runs one more. Without this, a request from another thread than
+    /// the ticks' (tests have no UI thread) could be dropped.</summary>
+    private async Task AgainAfterAsync(Task running, CancellationToken ct)
+    {
+        await running;
+        if (_again) await SyncNowAsync(ct);
     }
 
     /// <summary>Stops a running tick and waits for it: nothing it does may land after the local data is reset,

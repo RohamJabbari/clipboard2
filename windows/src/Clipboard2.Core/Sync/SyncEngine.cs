@@ -899,7 +899,11 @@ public sealed partial class SyncEngine
             var fingerprint = SyncPayload.Fingerprint(rendered.Payload);
             if (meta is not null && meta.Category == rendered.Category && meta.Fingerprint == fingerprint) continue;
             if (refused.GetValueOrDefault(local.Id) == fingerprint) continue;
-            if (_refusedForNow.TryGetValue((space.Id, local.Id), out var now) && now.Fingerprint == fingerprint) continue;
+            if (_refusedForNow.TryGetValue((space.Id, local.Id), out var now) && now.Fingerprint == fingerprint)
+            {
+                if (now.Reason == "clock_skew") report.ClockSkew = true;   // still waiting for the clock
+                continue;
+            }
             try
             {
                 if (await PushItemAsync(space, local, meta, ct)) report.Pushed++;

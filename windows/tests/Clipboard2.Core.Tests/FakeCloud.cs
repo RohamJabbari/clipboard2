@@ -41,6 +41,7 @@ internal sealed class FakeCloud : HttpMessageHandler
     public int Count(string prefix) => Log.Count(l => l.StartsWith(prefix));
 
     private long _seq;
+    private readonly Lock _serial = new();
     private readonly Dictionary<string, User> _users = [];               // by email
     private readonly Dictionary<string, Session> _sessions = [];         // by token
     private readonly Dictionary<string, Space> _spaces = [];
@@ -193,21 +194,26 @@ internal sealed class FakeCloud : HttpMessageHandler
         var url = request.RequestUri!;
         if (Offline) throw new HttpRequestException("No route to host");
         var body = request.Content?.ReadAsStringAsync(cancellationToken).GetAwaiter().GetResult() ?? "";
-        Log.Add($"{request.Method} {url.Host}{url.AbsolutePath}");
         HttpResponseMessage response;
-        try
+        // One request at a time, like a database transaction: a tick started in the background (after sign-in or a
+        // join) runs on the thread pool next to the test's own calls.
+        lock (_serial)
         {
-            response = url.Host switch
+            Log.Add($"{request.Method} {url.Host}{url.AbsolutePath}");
+            try
             {
-                "storage.fake" => StorageRequest(request, url),
-                _ => Api(request, url, body),
-            };
-        }
-        catch (HttpError e)
-        {
-            var json = new JsonObject { ["error"] = e.Code, ["message"] = e.Code };
-            if (e.Scope is not null) json["scope"] = e.Scope;
-            response = Json(e.Status, json);
+                response = url.Host switch
+                {
+                    "storage.fake" => StorageRequest(request, url),
+                    _ => Api(request, url, body),
+                };
+            }
+            catch (HttpError e)
+            {
+                var json = new JsonObject { ["error"] = e.Code, ["message"] = e.Code };
+                if (e.Scope is not null) json["scope"] = e.Scope;
+                response = Json(e.Status, json);
+            }
         }
         return Task.FromResult(response);
     }
