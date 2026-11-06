@@ -1,4 +1,5 @@
 import SwiftUI
+import KeyboardShortcuts
 
 // MARK: - Sync tab
 
@@ -24,6 +25,7 @@ struct SyncSettingsView: View {
             case .signedIn(let email):
                 SyncStatusSection(sync: sync, email: email)
                 SyncGroupsSection(sync: sync)
+                GroupSafetySection()
                 SyncContactsSection(sync: sync)
                 SyncDevicesSection(sync: sync)
                 InviteSomeoneSection(sync: sync)
@@ -340,7 +342,7 @@ private struct SyncGroupsSection: View {
         } header: {
             Text("Groups")
         } footer: {
-            Text("Items shared with a group are visible to all its members, encrypted with a key only members hold. To add someone, create an invite code under Manage… and send it to them. The “Send selection to default group” shortcut (⌥⌘C, change it in General) stores the selected text there; in the quick panel, use ⌘K → Share to Group… for any item.")
+            Text("Items shared with a group are visible to all its members, encrypted with a key only members hold. To add someone, create an invite code under Manage… and send it to them. In the quick panel, use ⌘K → Share to Group… for any item.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -365,6 +367,33 @@ private struct SyncGroupsSection: View {
                 self.error = error.localizedDescription
             }
             busy = false
+        }
+    }
+}
+
+/// What happens before anything leaves this Mac for a group.
+private struct GroupSafetySection: View {
+    @Environment(AppEnvironment.self) private var env
+
+    var body: some View {
+        @Bindable var prefs = env.prefs
+        Section {
+            LabeledContent {
+                KeyboardShortcuts.Recorder(for: .sendToGroup)
+            } label: {
+                Text("Send selection to default group")
+                Text("Off until you choose a shortcut.")
+            }
+            Toggle(isOn: $prefs.confirmGroupSends) {
+                Text("Show a preview with Undo")
+                Text("Waits 3 seconds before the selection is sent, so you can stop it.")
+            }
+            Toggle(isOn: $prefs.blockSensitiveGroupSends) {
+                Text("Never send passwords, keys or codes")
+                Text("Checked on this Mac before anything leaves it. You can still send one on purpose.")
+            }
+        } header: {
+            Text("Before anything is shared")
         }
     }
 }

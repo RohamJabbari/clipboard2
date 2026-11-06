@@ -143,9 +143,12 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         }
     }
 
-    /// Opens straight into the action menu for text selected in `target`.
-    func showForSelection(_ text: String, target: NSRunningApplication?) {
-        present(target: target) { [model] in model.prepareForSelection(text, target: target) }
+    /// Opens straight into the action menu for text selected in `target`; `then` runs once it's ready.
+    func showForSelection(_ text: String, target: NSRunningApplication?, then: (() -> Void)? = nil) {
+        present(target: target) { [model] in
+            model.prepareForSelection(text, target: target)
+            then?()
+        }
     }
 
     /// Builds the panel and renders it once, invisibly, so the first real open has no setup cost:
@@ -180,6 +183,9 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
     private func present(target: NSRunningApplication?, prepare: @escaping () -> Void) {
         let t0 = CACurrentMediaTime()
         let interval = Self.signposter.beginInterval("PanelOpen")
+        // The panel takes over from the icons in other apps' text fields.
+        env.selectionIcon.hideAll()
+        env.pasteIcon.hide()
         let panel = self.panel ?? makePanel()
         self.panel = panel
 
@@ -660,11 +666,16 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
 
     private func installKeyMonitor() {
         guard keyMonitor == nil else { return }
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
             // Local monitors are always invoked on the main thread.
             nonisolated(unsafe) let event = event
             let handled = MainActor.assumeIsolated { () -> Bool in
                 guard let self, let window = self.panel, event.window === window else { return false }
+                if event.type == .flagsChanged {
+                    // Holding ⌘ reveals every row's ⌘-number; the event still goes on to the field.
+                    self.model.isCommandHeld = event.modifierFlags.contains(.command)
+                    return false
+                }
                 if window.firstResponder is ClipEditorTextView { return self.model.handleEditorKey(event) }
                 return self.model.handleKeyDown(event)
             }

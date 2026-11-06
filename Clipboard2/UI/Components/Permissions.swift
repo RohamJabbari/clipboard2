@@ -115,15 +115,18 @@ enum ScreenRecordingPermission {
 final class PermissionsWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
 
-    func show() {
+    /// `welcome` starts with the first-run welcome (the main shortcuts), then the permissions.
+    func show(welcome: Bool = false) {
         if let window {
             NSApp.activate()
             window.makeKeyAndOrderFront(nil)
             return
         }
-        let hosting = NSHostingController(rootView: PermissionsView { [weak self] in self?.window?.close() })
+        let root = FirstRunView(startWithWelcome: welcome) { [weak self] in self?.window?.close() }
+            .environment(AppEnvironment.shared)
+        let hosting = NSHostingController(rootView: root)
         let window = NSWindow(contentViewController: hosting)
-        window.title = "Clipboard2 Permissions"
+        window.title = welcome ? "Welcome to Clipboard2" : "Clipboard2 Permissions"
         window.styleMask = [.titled, .closable, .fullSizeContentView]
         window.titlebarAppearsTransparent = true
         window.isReleasedWhenClosed = false

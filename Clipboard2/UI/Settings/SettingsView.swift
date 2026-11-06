@@ -107,6 +107,8 @@ struct GeneralSettingsView: View {
                 }
             }
 
+            TextFieldIconsSection()
+
             UpdatesSection()
 
             PermissionsSection(permissions: [.accessibility, .screenRecording])
@@ -137,6 +139,56 @@ struct GeneralSettingsView: View {
             while !Task.isCancelled {
                 axTrusted = AXPermission.isTrusted
                 try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+}
+
+/// The icon beside selected text in other apps, and where it stays away.
+private struct TextFieldIconsSection: View {
+    @Environment(AppEnvironment.self) private var env
+
+    var body: some View {
+        @Bindable var prefs = env.prefs
+        Section {
+            Toggle(isOn: $prefs.selectionIcon) {
+                Text("Icon next to selected text")
+                Text("Click it to fix, translate or summarize the selection without leaving the app.")
+            }
+            Toggle(isOn: $prefs.pasteIcon) {
+                Text("Paste icon in text fields")
+                Text("Hover it to see your newest copies and paste one where you're typing.")
+            }
+            ForEach(prefs.selectionIconHiddenApps, id: \.bundleID) { app in
+                hiddenRow(app, "Selection icon hidden in \(app.name)") {
+                    prefs.selectionIconHiddenApps.removeAll { $0.bundleID == app.bundleID }
+                }
+            }
+            ForEach(prefs.pasteIconHiddenApps, id: \.bundleID) { app in
+                hiddenRow(app, "Paste icon hidden in \(app.name)") {
+                    prefs.pasteIconHiddenApps.removeAll { $0.bundleID == app.bundleID }
+                }
+            }
+        } header: {
+            Text("In other apps")
+        } footer: {
+            Hint("Never in password fields, or in the apps under History → Never record from these apps. Needs Accessibility.")
+        }
+        .onChange(of: prefs.selectionIcon) { env.updateTextFieldIcons() }
+        .onChange(of: prefs.pasteIcon) { env.updateTextFieldIcons() }
+    }
+
+    /// An app one of the icons was hidden in ("Don't Show in …"), with a way back.
+    private func hiddenRow(_ app: AppRef, _ title: String, showAgain: @escaping () -> Void) -> some View {
+        LabeledContent {
+            Button("Show Again", action: showAgain)
+        } label: {
+            HStack(spacing: 8) {
+                Image(nsImage: AppIconCache.icon(for: app.bundleID))
+                    .resizable()
+                    .frame(width: 18, height: 18)
+                    .accessibilityHidden(true)
+                Text(title)
             }
         }
     }
@@ -378,14 +430,14 @@ struct ShortcutsSettingsView: View {
 
             Section {
                 shortcut(.sendToGroup, "Send selection to default group",
-                         "Copies what's selected into your default sync group.")
+                         "Copies what's selected into your default sync group, after a short preview you can undo. Off until you set it.")
                 shortcut(.pasteFromGroup, "Paste from default group",
                          "Pastes the newest item a group member sent.")
             } header: {
                 Text("Sync groups")
             } footer: {
                 Hint(env.sync.isSignedIn
-                     ? "While you're signed in, these replace ⌥⌘C and ⌥⌘V in other apps (e.g. Chrome's Inspect Elements, Finder's Copy as Pathname). Change them here if you use those."
+                     ? "While you're signed in, these replace the same keys in other apps (⌥⌘V is Finder's Move Item Here). Change them here if you use those."
                      : "Only active while you're signed in to Sync.")
             }
 

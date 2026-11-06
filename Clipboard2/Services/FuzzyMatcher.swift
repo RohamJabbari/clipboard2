@@ -18,6 +18,29 @@ nonisolated enum FuzzyMatcher {
         return total
     }
 
+    /// Character offsets in `candidate` the query matched, for highlighting. Follows `score`: an
+    /// exact substring when there is one, otherwise the subsequence. Nil when a token doesn't match.
+    static func matchedIndices(query: String, in candidate: String) -> [Int]? {
+        let tokens = query.lowercased().split(whereSeparator: \.isWhitespace)
+        guard !tokens.isEmpty else { return [] }
+        let haystack = Array(candidate.prefix(maxCandidateLength).lowercased())
+        var indices = Set<Int>()
+        for token in tokens {
+            let needle = Array(token)
+            if let start = firstIndex(of: needle, in: haystack) {
+                indices.formUnion(start..<start + needle.count)
+                continue
+            }
+            var next = 0
+            for (i, ch) in haystack.enumerated() where next < needle.count && ch == needle[next] {
+                indices.insert(i)
+                next += 1
+            }
+            guard next == needle.count else { return nil }
+        }
+        return indices.sorted()
+    }
+
     private static func score(token: [Character], in haystack: [Character]) -> Int? {
         guard !token.isEmpty else { return 0 }
         guard token.count <= haystack.count else { return nil }

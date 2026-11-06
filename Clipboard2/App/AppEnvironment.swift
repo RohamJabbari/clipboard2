@@ -8,7 +8,8 @@ extension KeyboardShortcuts.Name {
     static let selectionActions = Self("selectionActions", default: .init(.k, modifiers: [.command, .option]))
     static let captureText = Self("captureText", default: .init(.two, modifiers: [.command, .shift, .option]))
     static let pasteAsText = Self("pasteAsText", default: .init(.v, modifiers: [.command, .shift, .option]))
-    static let sendToGroup = Self("sendToGroup", default: .init(.c, modifiers: [.command, .option]))
+    /// No default: one stray ⌥⌘C used to share the selection with a whole group. Opt-in in Settings.
+    static let sendToGroup = Self("sendToGroup")
     static let pasteFromGroup = Self("pasteFromGroup", default: .init(.v, modifiers: [.command, .option]))
 }
 
@@ -43,6 +44,9 @@ final class AppEnvironment {
     @ObservationIgnored private var maintenanceTimer: Timer?
     @ObservationIgnored private lazy var serviceProvider = ServiceProvider(env: self)
     @ObservationIgnored private(set) lazy var contextMenu = ContextMenuController(env: self)
+    @ObservationIgnored private(set) lazy var textFieldWatcher = TextFieldWatcher()
+    @ObservationIgnored private(set) lazy var selectionIcon = SelectionIconController(env: self)
+    @ObservationIgnored private(set) lazy var pasteIcon = PasteIconController(env: self)
     @ObservationIgnored private var maintenanceRuns = 0
     /// On-device text recognition for image items (search finds screenshots by their words).
     @ObservationIgnored private(set) lazy var imageText = ImageTextIndexer(store: store, blobs: blobs)
@@ -134,6 +138,7 @@ final class AppEnvironment {
         snippets.onCommit = { [weak self] in self?.sync.localChange() }
         // Retention only stops tracking items (ClipStore drops their sync metadata itself), so
         // they're never deleted on other devices.
+        clearOldSendToGroupDefault()
         sync.onSessionChange = { [weak self] active in self?.setSendToGroupShortcut(active: active) }
         sync.onItemSentHere = { device in HUD.show("Sent from \(device)", symbol: "arrow.down.circle.fill") }
         // Contacts: a quiet notice, never a dialog. The Inbox and Settings → Sync hold the rest.
@@ -178,6 +183,7 @@ final class AppEnvironment {
         }
 
         contextMenu.update()
+        updateTextFieldIcons()
         // Build and render the quick panel once, off screen, so the first ⇧⌘V has nothing to set up.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.panel.warmUp() }
         Task {
@@ -199,10 +205,10 @@ final class AppEnvironment {
             prefs.hasLaunchedBefore = true
             LoginItem.setEnabled(true)
         }
-        // First launch after install: walk through the permissions.
+        // First launch after install: the welcome, then the permissions.
         if !prefs.hasShownPermissions {
             prefs.hasShownPermissions = true
-            showPermissions()
+            permissionsWindow.show(welcome: true)
         }
     }
 
@@ -251,6 +257,7 @@ final class AppEnvironment {
 
     func runMaintenance() {
         contextMenu.update()   // starts the right-click tap once Accessibility is granted
+        updateTextFieldIcons()   // and the text field icons
         guard storeOpenError == nil else { return }
         store.enforceRetention(maxItems: prefs.maxItems, maxAge: prefs.maxAge)
         // Sync polls on its own cadence (3 s / 15 s / 60 s).
@@ -260,6 +267,42 @@ final class AppEnvironment {
             store.removeOrphanedBlobs()
             store.removeOrphanedSyncedFiles()
         }
+    }
+
+    // MARK: Icons in other apps' text fields
+
+    /// Watches other apps' text fields while an icon that needs it is on and Accessibility is allowed.
+    func updateTextFieldIcons() {
+        guard prefs.selectionIcon || prefs.pasteIcon, AXPermission.isTrusted else {
+            textFieldWatcher.stop()
+            selectionIcon.hideAll()
+            pasteIcon.hide()
+            return
+        }
+        textFieldWatcher.onChange = { [weak self] selection, field in self?.textFieldChanged(selection, field) }
+        textFieldWatcher.start()
+    }
+
+    /// Selected text gets the action icon; a focused field with nothing selected gets the paste icon.
+    private func textFieldChanged(_ selection: TextFieldWatcher.Selection?, _ field: TextFieldWatcher.Field?) {
+        let shownSelection = selection.flatMap { selection in
+            prefs.selectionIcon && !isTextIconHidden(in: selection.app, hiddenApps: prefs.selectionIconHiddenApps)
+                ? selection : nil
+        }
+        selectionIcon.update(shownSelection)
+        let shownField = field.flatMap { field in
+            prefs.pasteIcon && shownSelection == nil && !isTextIconHidden(in: field.app, hiddenApps: prefs.pasteIconHiddenApps)
+                ? field : nil
+        }
+        pasteIcon.update(shownField)
+    }
+
+    /// Never while the quick panel is open, in apps the user hid that icon in, or in apps whose
+    /// copies aren't recorded (password managers).
+    private func isTextIconHidden(in app: NSRunningApplication, hiddenApps: [AppRef]) -> Bool {
+        guard !panel.isVisible, let bundleID = app.bundleIdentifier else { return true }
+        return hiddenApps.contains { $0.bundleID == bundleID }
+            || prefs.ignoredApps.contains { $0.bundleID == bundleID }
     }
 
     func applyAppearance() {
@@ -317,12 +360,12 @@ final class AppEnvironment {
         }
     }
 
-    // MARK: Send selection to the default group (⌥⌘C)
+    // MARK: Send selection to the default group
 
     @ObservationIgnored private var sendToGroupRegistered = false
 
-    /// ⌥⌘C belongs to Chrome, Safari and Finder until the user signs in to sync, so the shortcut
-    /// is registered only while a sync session exists.
+    /// The group shortcuts (send has none by default; paste is ⌥⌘V) take keys other apps use, so
+    /// they're registered only while a sync session exists.
     private func setSendToGroupShortcut(active: Bool) {
         guard active != sendToGroupRegistered else { return }
         sendToGroupRegistered = active
@@ -334,6 +377,7 @@ final class AppEnvironment {
                 self?.pasteFromDefaultGroup()
             }
             warnAboutSendToGroupShortcutOnce()
+            explainSendToGroupChangeOnce()
         } else {
             KeyboardShortcuts.removeHandler(for: .sendToGroup)
             KeyboardShortcuts.removeHandler(for: .pasteFromGroup)
@@ -402,8 +446,8 @@ final class AppEnvironment {
     }
 
     /// Copies the selection in the frontmost app (text, rich text, images or files) and stores it
-    /// as history in the default sync group, then confirms with a HUD. Without a default group it
-    /// opens Settings → Sync.
+    /// as history in the default sync group: after a short countdown with Undo, and never at once
+    /// for text that looks like a password or key. Without a default group it opens Settings → Sync.
     func sendSelectionToGroup() {
         guard sync.isSignedIn, let group = sync.defaultGroup else {
             SettingsOpener.open(tab: .sync)
@@ -425,10 +469,13 @@ final class AppEnvironment {
                 NSSound.beep()
                 return
             }
-            if monitor.shouldDiscard?(capture) == true || (capture.kind.isTextual && capture.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
-                // A saved secret (or blank text) never goes to a group this way.
+            let discard = { [store] in
                 store.blobs.delete(capture.imageFile)
                 store.blobs.delete(capture.thumbnailFile)
+            }
+            if monitor.shouldDiscard?(capture) == true || (capture.kind.isTextual && capture.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
+                // A saved secret (or blank text) never goes to a group this way.
+                discard()
                 NSSound.beep()
                 return
             }
@@ -437,9 +484,71 @@ final class AppEnvironment {
                 HUD.show(problem, symbol: "exclamationmark.triangle.fill", duration: .seconds(3.5))
                 return
             }
-            store.ingest(capture, spaceID: group.id)
-            HUD.show("Sent to \(group.name)", symbol: "person.2.fill")
+            if prefs.blockSensitiveGroupSends, capture.kind.isTextual, let kind = SensitiveText.detect(capture.text) {
+                GroupSendToast.blocked(kind, group: group,
+                                       sendAnyway: { [weak self] in self?.commitGroupSend(capture, to: group) },
+                                       saveAsSecret: { [weak self] in self?.saveSelectionAsSecret(capture, kind: kind) },
+                                       dismissed: discard)
+                return
+            }
+            guard prefs.confirmGroupSends else {
+                commitGroupSend(capture, to: group)
+                return
+            }
+            GroupSendToast.confirm(group: group, preview: capture.preview.isEmpty ? capture.kind.displayName : capture.preview,
+                                   send: { [weak self] in self?.commitGroupSend(capture, to: group) },
+                                   undo: discard)
+        }
+    }
+
+    /// Stores the capture in the group and confirms, with Remove unless it was already there.
+    private func commitGroupSend(_ capture: ProcessedCapture, to group: SyncGroup) {
+        let existed = store.item(withHash: capture.hash, inSpace: group.id) != nil
+        let item = store.ingest(capture, spaceID: group.id)
+        sync.syncNow()
+        GroupSendToast.sent(group: group, remove: existed ? nil : { [weak self] in
+            guard let self else { return }
+            store.delete(item)
             sync.syncNow()
+            HUD.show("Removed from \(group.name)", symbol: "arrow.uturn.backward.circle.fill")
+        })
+    }
+
+    /// "Save as Secret" from the blocked toast: into the Keychain, never into history or a group.
+    private func saveSelectionAsSecret(_ capture: ProcessedCapture, kind: SensitiveText.Kind) {
+        let name = capture.source.map { "\(kind.shortName) from \($0.name)" } ?? kind.shortName
+        if secrets.add(name: name, value: capture.text) != nil {
+            HUD.show("Saved as secret “\(name)”", symbol: "key.fill")
+        } else {
+            HUD.show("Couldn't save to the Keychain", symbol: "exclamationmark.triangle.fill")
+        }
+    }
+
+    /// Until 1.3, ⌥⌘C sent the selection to the group by default, and KeyboardShortcuts stored that
+    /// default for every install. Clear it once; anyone who wants a shortcut records one in Settings.
+    private func clearOldSendToGroupDefault() {
+        guard !prefs.clearedSendToGroupDefault else { return }
+        prefs.clearedSendToGroupDefault = true
+        if KeyboardShortcuts.getShortcut(for: .sendToGroup) == .init(.c, modifiers: [.command, .option]) {
+            KeyboardShortcuts.setShortcut(nil, for: .sendToGroup)
+            prefs.explainSendToGroupChange = prefs.hasShownSendToGroupWarning
+        }
+    }
+
+    /// For people who had been using ⌥⌘C with a group: say once, while signed in, where it went.
+    private func explainSendToGroupChangeOnce() {
+        guard prefs.explainSendToGroupChange else { return }
+        prefs.explainSendToGroupChange = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            let alert = NSAlert()
+            alert.messageText = "⌥⌘C No Longer Sends to Your Group"
+            alert.informativeText = "To keep things from being shared by accident, sending the selection to a group now uses a shortcut you choose, waits a few seconds with Undo, and holds back anything that looks like a password or key.\n\nSet a shortcut in Settings → Sync → Before anything is shared."
+            alert.addButton(withTitle: "Choose a Shortcut…")
+            alert.addButton(withTitle: "Not Now")
+            NSApp.activate()
+            if alert.runModal() == .alertFirstButtonReturn {
+                SettingsOpener.open(tab: .sync)
+            }
         }
     }
 
@@ -618,6 +727,19 @@ final class AppEnvironment {
             }
         case "check-updates":
             updates.checkForUpdates()
+        case "welcome":
+            // Debug aid: the first-run window, welcome step first.
+            permissionsWindow.show(welcome: true)
+        case "group-toast":
+            // Debug aid: clipboard2://group-toast?state=pending|blocked|sent shows the toast with
+            // inert buttons, so it can be reviewed without sending anything to a real group.
+            let state = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "state" }?.value
+            let group = SyncGroup(id: "preview", name: "Team", isOwner: true, memberCount: 4)
+            switch state {
+            case "blocked": GroupSendToast.blocked(.apiKey, group: group, sendAnyway: {}, saveAsSecret: {}, dismissed: {})
+            case "sent": GroupSendToast.sent(group: group, remove: {})
+            default: GroupSendToast.confirm(group: group, preview: "Release notes: smoother panel, quieter updates", delay: .seconds(8), send: {}, undo: {})
+            }
         case "demo":
             // Debug aid: neutral sample history for screenshots (Debug builds keep separate data).
             guard store.count() == 0 else { return }

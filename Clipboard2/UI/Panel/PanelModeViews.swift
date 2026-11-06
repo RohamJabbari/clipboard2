@@ -210,6 +210,13 @@ struct ShareToGroupView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if let kind = form.sensitiveKind {
+                Label("This looks like \(kind.description). Everyone in the group will be able to see it.",
+                      systemImage: "exclamationmark.shield.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             VStack(spacing: 2) {
                 ForEach(Array(form.groups.enumerated()), id: \.element.id) { index, group in
                     let selected = index == form.selection
@@ -242,7 +249,7 @@ struct ShareToGroupView: View {
             Spacer(minLength: 0)
             HStack {
                 Spacer()
-                Button("Share", action: onSubmit)
+                Button(form.sensitiveKind == nil ? "Share" : "Share Anyway", action: onSubmit)
                     .keyboardShortcut(.defaultAction)
                     .disabled(form.selectedGroup == nil)
             }

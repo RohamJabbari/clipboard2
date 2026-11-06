@@ -141,13 +141,14 @@ final class ContextMenuController: NSObject {
             self?.inTarget { $0.env.showQuickPanel() }
         })
         if !isFinder {
-            menu.addItem(item("Actions on Selection…", symbol: "wand.and.stars", shortcut: .selectionActions) { [weak self] in
+            menu.addItem(item("Fix, Translate or Ask AI…", symbol: "wand.and.stars", shortcut: .selectionActions) { [weak self] in
                 self?.inTarget { $0.env.showSelectionActions() }
             })
         }
+        // One action, named for what it does with what's on the clipboard now.
         let imageOnClipboard = ClipboardImage.current(in: .general) != nil
-        menu.addItem(item("Paste Text from Clipboard Image", symbol: "text.viewfinder", enabled: imageOnClipboard,
-                          shortcut: .pasteAsText) { [weak self] in
+        menu.addItem(item(imageOnClipboard ? "Paste Text from Clipboard Image" : "Paste as Plain Text",
+                          symbol: imageOnClipboard ? "text.viewfinder" : "doc.plaintext", shortcut: .pasteAsText) { [weak self] in
             self?.inTarget { $0.env.pasteClipboardAsText() }
         })
         menu.addItem(item("Capture Text from Screen…", symbol: "rectangle.dashed", shortcut: .captureText) { [weak self] in
@@ -185,9 +186,6 @@ final class ContextMenuController: NSObject {
             menu.addItem(keyItem("Cut", symbol: "scissors", key: 7, flags: .maskCommand))
             menu.addItem(keyItem("Copy", symbol: "doc.on.doc", key: 8, flags: .maskCommand))
             menu.addItem(keyItem("Paste", symbol: "doc.on.clipboard", key: 9, flags: .maskCommand))
-            menu.addItem(item("Paste as Plain Text", symbol: "doc.plaintext", shortcut: .pasteAsText) { [weak self] in
-                self?.inTarget { $0.env.pasteClipboardAsText() }
-            })
             menu.addItem(.separator())
             menu.addItem(keyItem("Select All", symbol: "selection.pin.in.out", key: 0, flags: .maskCommand))
             let location = clickLocation
@@ -218,18 +216,33 @@ final class ContextMenuController: NSObject {
         }
     }
 
+    /// The newest items, ⌘1–⌘9 like the quick panel's rows. Hidden credentials stay masked.
     private func recentItems() -> [NSMenuItem] {
         // Contacts' items live in the panel's Inbox only.
         let sync = env.sync
         let recent = Array(env.store.allItems().lazy.filter { sync.isListed($0, inInbox: false) }.prefix(12))
         guard !recent.isEmpty else { return [disabled("No History")] }
-        return recent.map { clip in
-            let title = String(clip.displayTitle.prefix(60))
-            let menuItem = item(title, symbol: clip.isPinned ? "pin" : clip.kind.symbol) { [weak self] in
+        var items = recent.enumerated().map { index, clip in
+            let content = ClipContentCache.content(of: clip)
+            var title = clip.displayTitle
+            if clip.label == nil, case .sensitive(let kind) = content, kind.isConfident {
+                title = SensitiveText.masked(clip.text, kind: kind)
+            }
+            let symbol = clip.isPinned ? "tag" : clip.kind.isTextual ? ContentBadge.symbol(for: content) : clip.kind.symbol
+            let menuItem = item(String(title.prefix(60)), symbol: symbol) { [weak self] in
                 self?.inTarget { controller in controller.env.paste.paste(clip, into: controller.target) }
+            }
+            if index < 9 {
+                menuItem.keyEquivalent = "\(index + 1)"
+                menuItem.keyEquivalentModifierMask = .command
             }
             return menuItem
         }
+        items.append(.separator())
+        items.append(item("Show All…", symbol: "rectangle.and.text.magnifyingglass", shortcut: .toggleQuickPanel) { [weak self] in
+            self?.inTarget { $0.env.showQuickPanel() }
+        })
+        return items
     }
 
     private func snippetItems() -> [NSMenuItem] {
