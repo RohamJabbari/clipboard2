@@ -325,8 +325,9 @@ final class ClipStore {
 
     /// Copies an item into a sync group (or, for nil, the personal space) with a new id. Images
     /// and synced files get their own copies, so deleting one item never breaks the other.
+    /// `keepLabel: false` (sending to a contact) leaves this user's label and pin behind.
     @discardableResult
-    func shareCopy(of item: ClipItem, toSpace spaceID: String?, now: Date = .now) -> ClipItem {
+    func shareCopy(of item: ClipItem, toSpace spaceID: String?, keepLabel: Bool = true, now: Date = .now) -> ClipItem {
         if let existing = self.item(withHash: item.contentHash, inSpace: spaceID), !item.contentHash.isEmpty {
             existing.lastCopiedAt = now
             existing.copyCount += 1
@@ -347,9 +348,11 @@ final class ClipStore {
         copy.byteCount = item.byteCount
         copy.sourceBundleID = item.sourceBundleID
         copy.sourceAppName = item.sourceAppName
-        copy.label = item.label
-        copy.isPinned = item.isPinned
-        copy.pinnedAt = item.pinnedAt
+        if keepLabel {
+            copy.label = item.label
+            copy.isPinned = item.isPinned
+            copy.pinnedAt = item.pinnedAt
+        }
         let base = UUID().uuidString
         copy.imageFile = copyBlob(item.imageFile, to: base + ".png")
         copy.thumbnailFile = copyBlob(item.thumbnailFile, to: base + "-thumb.png")

@@ -355,6 +355,16 @@ final class SyncAccount {
         return author != session?.uid
     }
 
+    /// Whether an item is in a contact's space, sent or received. Those live in the Inbox only:
+    /// never in All, the other chips, the menu bar popover or the right-click menu.
+    func isContactItem(_ item: ClipItem) -> Bool { contact(for: item.spaceID) != nil }
+
+    /// Whether a list shows an item: the Inbox only what contacts sent you; everything else
+    /// nothing of a contact's (what you sent is still in your history as the original).
+    func isListed(_ item: ClipItem, inInbox: Bool) -> Bool {
+        inInbox ? isFromContact(item) : !isContactItem(item)
+    }
+
     /// The row badge of a group or contact item; nil for personal ones.
     func badge(for item: ClipItem) -> SyncBadge? {
         guard let spaceID = item.spaceID else { return nil }

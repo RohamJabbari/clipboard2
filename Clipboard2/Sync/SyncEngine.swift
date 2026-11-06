@@ -973,6 +973,13 @@ final class SyncEngine {
         var metaByID: [String: SyncMeta] = [:]
         for meta in metas(inSpace: spaceId) { metaByID[meta.localId] = meta }
         let nowMs = now().syncMillis
+        // A contact's item stays theirs: the server would make an edit (a label, a copy) ours, and
+        // it would show up in their Inbox as sent by us. The edit stays on this Mac.
+        let isDirect = space.isDirect
+        func theirs(_ meta: SyncMeta?) -> Bool {
+            guard isDirect, let author = meta?.authorUid else { return false }
+            return author != identity.uid
+        }
 
         var jobs: [PushJob] = []
         var history = 0
@@ -983,11 +990,13 @@ final class SyncEngine {
                 if history > SyncConfig.historyLimit { continue }
             }
             let meta = metaByID[item.id.uuidString.lowercased()]
+            if theirs(meta) { continue }
             await prepareFolders(item, meta: meta)
             if let job = clipJob(item, meta: meta, nowMs: nowMs) { jobs.append(job) }
         }
         for snippet in snippets.snippets(inSpace: localSpace) {
             let id = snippet.id.uuidString.lowercased()
+            if theirs(metaByID[id]) { continue }
             let payload = SyncPayload.snippet(SnippetPayload(snippet: snippet))
             if let job = makeJob(id: id, payload: payload, meta: metaByID[id], sortAt: snippet.updatedAt.syncMillis,
                                  updatedAt: snippet.updatedAt.syncMillis) { jobs.append(job) }
@@ -995,6 +1004,7 @@ final class SyncEngine {
         for ref in secrets.syncSecrets where ref.spaceID == localSpace {
             let id = ref.id.lowercased()
             let meta = metaByID[id]
+            if theirs(meta) { continue }
             let stamp = Self.secretStamp(ref)
             // Unchanged since it was last synced: don't read the Keychain to find out.
             if let meta, let stamp, !meta.localStamp.isEmpty, meta.localStamp == stamp { continue }
@@ -1172,7 +1182,7 @@ final class SyncEngine {
                 if let target = job.toDevice, pendingToDevice[job.id] == target { pendingToDevice[job.id] = nil }
                 recordMeta(id: job.id, spaceId: spaceId, category: job.category, fingerprint: job.fingerprint,
                            seq: seq, updatedAt: job.updatedAt, blobIds: job.blobIds, fileBlobs: job.fileBlobs,
-                           localStamp: job.localStamp, authorUid: identity.uid)
+                           localStamp: job.localStamp, authorUid: meta(for: job.id)?.authorUid ?? identity.uid)
                 for id in trimmed { handleTrimmed(id, spaceId: spaceId) }
             case .conflict(let current):
                 try await apply(current, spaceId: spaceId, itemKey: itemKey, force: true)

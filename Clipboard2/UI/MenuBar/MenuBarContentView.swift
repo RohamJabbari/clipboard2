@@ -47,8 +47,10 @@ struct MenuBarContentView: View {
 
     private var filtered: [ClipItem] {
         let query = search.trimmingCharacters(in: .whitespaces)
-        guard !query.isEmpty else { return pinnedItems + recentItems }
+        // Contacts' items live in the panel's Inbox only.
+        guard !query.isEmpty else { return (pinnedItems + recentItems).filter { env.sync.isListed($0, inInbox: false) } }
         return env.store.allItems()
+            .filter { env.sync.isListed($0, inInbox: false) }
             .compactMap { item in FuzzyMatcher.score(query: query, in: item.searchableText).map { (item, $0) } }
             .sorted { $0.1 > $1.1 }
             .prefix(200)

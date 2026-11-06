@@ -523,8 +523,10 @@ final class PanelViewModel {
         if let groupFilter {
             clips = env.store.allItems().filter { $0.spaceID == groupFilter }
         } else if filter != .snippets && filter != .secrets {
+            // What contacts send lives in the Inbox only; what you sent them isn't listed again.
             clips = env.store.allItems().filter { item in
-                switch filter {
+                guard env.sync.isListed(item, inInbox: filter == .inbox) else { return false }
+                return switch filter {
                 case .all: true
                 case .labelled: item.isPinned
                 case .text: item.kind.isTextual
@@ -532,8 +534,7 @@ final class PanelViewModel {
                 case .files: item.kind == .file
                 case .snippets, .secrets: false
                 case .thisApp: targetBundle != nil && item.sourceBundleID == targetBundle
-                // What contacts sent you (not what you sent them), newest first like everything else.
-                case .inbox: env.sync.isFromContact(item)
+                case .inbox: true
                 }
             }
         }
@@ -901,13 +902,14 @@ final class PanelViewModel {
         }
     }
 
-    /// Stores copies in a group's or contact's space; the next sync uploads them.
-    private func copy(_ items: [ClipItem], intoSpace spaceID: String) {
+    /// Stores copies in a group's or contact's space; the next sync uploads them. A contact gets
+    /// them without this user's labels.
+    private func copy(_ items: [ClipItem], intoSpace spaceID: String, keepLabel: Bool = true) {
         for item in items {
             if item.isTransient {
                 env.store.ingest(.text(item.text, source: item.source), spaceID: spaceID)
             } else if item.spaceID != spaceID {
-                env.store.shareCopy(of: item, toSpace: spaceID)
+                env.store.shareCopy(of: item, toSpace: spaceID, keepLabel: keepLabel)
             }
         }
         env.sync.syncNow()
@@ -929,7 +931,7 @@ final class PanelViewModel {
             refuseGroupShare(problem.replacingOccurrences(of: "Groups take", with: "Sync takes"))
             return
         }
-        copy(items, intoSpace: contact.id)
+        copy(items, intoSpace: contact.id, keepLabel: false)
         if isSelectionMode {
             onClose()
             HUD.show("Sent to \(contact.name)", symbol: "paperplane.fill")

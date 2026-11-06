@@ -208,6 +208,60 @@ struct ContactsTests {
         #expect(alice.store.items(inSpace: space).map(\.text) == ["thanks!"])
     }
 
+    @Test func labelsStayWithTheSenderAndEditsOfReceivedItemsStayLocal() async throws {
+        let server = FakeSyncServer()
+        let (alice, bob) = try await pair(server)
+        let space = try await befriend(alice, bob)
+        let aliceUid = try #require(alice.credentials.saved?.uid)
+
+        // Alice's label is hers: the copy she sends carries none.
+        let original = alice.store.ingest(.text("label me"))
+        alice.store.setLabel("Mine", for: original)
+        let sent = alice.store.shareCopy(of: original, toSpace: space, keepLabel: false)
+        #expect(sent.label == nil && !sent.isPinned)
+        await alice.settle()
+        await bob.settle()
+        let received = try #require(bob.store.items(inSpace: space).first)
+        #expect(received.label == nil && !received.isPinned)
+
+        // Bob labels it: that stays on his Mac, so it never shows up in Alice's Inbox as his.
+        let puts = await server.putCount
+        bob.store.setLabel("Kept", for: received)
+        await bob.settle()
+        #expect(await server.putCount == puts)
+        #expect(await server.live(space: space).map(\.authorUid) == [aliceUid])
+        #expect(bob.store.item(withID: received.id)?.label == "Kept")
+        #expect(bob.account.isFromContact(received))
+        await alice.settle()
+        #expect(alice.store.items(inSpace: space).filter(alice.account.isFromContact).isEmpty)
+        #expect(alice.store.item(withID: sent.id)?.label == nil)
+
+        // Deleting still syncs: it's gone for both.
+        bob.store.delete(received)
+        await bob.settle()
+        await alice.settle()
+        #expect(await server.live(space: space).isEmpty)
+        #expect(alice.store.items(inSpace: space).isEmpty)
+    }
+
+    @Test func contactItemsAreListedInTheInboxOnly() async throws {
+        let server = FakeSyncServer()
+        let (alice, bob) = try await pair(server)
+        let space = try await befriend(alice, bob)
+        let original = alice.store.ingest(.text("for bob"))
+        let sent = alice.store.shareCopy(of: original, toSpace: space, keepLabel: false)
+        await alice.settle()
+        await bob.settle()
+        let received = try #require(bob.store.items(inSpace: space).first)
+
+        // Bob: only in his Inbox.
+        #expect(bob.account.isListed(received, inInbox: true))
+        #expect(!bob.account.isListed(received, inInbox: false))
+        // Alice: her original stays in history; what she sent isn't listed again, nor in her Inbox.
+        #expect(alice.account.isListed(original, inInbox: false) && !alice.account.isListed(original, inInbox: true))
+        #expect(!alice.account.isListed(sent, inInbox: false) && !alice.account.isListed(sent, inInbox: true))
+    }
+
     @Test func endingAContactRemovesItsItemsOnBothSides() async throws {
         let server = FakeSyncServer()
         let (alice, bob) = try await pair(server)

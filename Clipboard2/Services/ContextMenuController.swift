@@ -219,7 +219,9 @@ final class ContextMenuController: NSObject {
     }
 
     private func recentItems() -> [NSMenuItem] {
-        let recent = env.store.allItems().prefix(12)
+        // Contacts' items live in the panel's Inbox only.
+        let sync = env.sync
+        let recent = Array(env.store.allItems().lazy.filter { sync.isListed($0, inInbox: false) }.prefix(12))
         guard !recent.isEmpty else { return [disabled("No History")] }
         return recent.map { clip in
             let title = String(clip.displayTitle.prefix(60))
