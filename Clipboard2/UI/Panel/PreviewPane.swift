@@ -36,7 +36,13 @@ struct PreviewPane: View {
                     }
                 }
             case .file:
-                FilePreviewView(urls: item.fileURLs)
+                if let model, item.fileURLs.count > 1 {
+                    FilePreviewView(urls: item.fileURLs, picked: model.pickedFiles,
+                                    onClick: { model.clickFile($0, in: item) },
+                                    onClear: model.clearPickedFiles)
+                } else {
+                    FilePreviewView(urls: item.fileURLs)
+                }
             }
         case .snippet(let snippet):
             TextPreviewView(text: snippet.body)
@@ -211,33 +217,93 @@ struct ImageTextView: View {
     }
 }
 
+/// The files of a file item. With `onClick` set (several files), rows can be picked so that
+/// paste, copy, save and drag use only those.
 struct FilePreviewView: View {
     let urls: [URL]
+    var picked: Set<URL> = []
+    var onClick: ((URL) -> Void)?
+    var onClear: () -> Void = {}
+
+    private var pickedCount: Int { urls.filter(picked.contains).count }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(urls, id: \.self) { url in
-                    HStack(spacing: 10) {
-                        Image(nsImage: FileIconCache.icon(for: url))
-                            .resizable()
-                            .frame(width: 32, height: 32)
-                            .accessibilityHidden(true)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(url.lastPathComponent).lineLimit(1)
-                            Text(url.deletingLastPathComponent().path)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        }
-                    }
-                    .accessibilityElement(children: .combine)
-                }
+        VStack(alignment: .leading, spacing: 0) {
+            if onClick != nil {
+                pickHeader
+                    .padding(.horizontal, 14)
+                    .padding(.top, 10)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(14)
+            ScrollView {
+                VStack(alignment: .leading, spacing: onClick == nil ? 10 : 2) {
+                    ForEach(urls, id: \.self) { url in
+                        row(url, isPicked: picked.contains(url))
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(onClick == nil ? 14 : 8)
+            }
         }
+    }
+
+    /// Says what Return will do: everything, or only the picked files.
+    private var pickHeader: some View {
+        HStack(spacing: 8) {
+            Text(pickedCount == 0 || pickedCount == urls.count
+                 ? "Click files to paste only some of them"
+                 : "Paste \(pickedCount) of \(urls.count) files")
+                .font(.caption.weight(pickedCount == 0 ? .regular : .semibold))
+                .foregroundStyle(pickedCount == 0 ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+            Spacer(minLength: 0)
+            if pickedCount > 0 {
+                Button("Clear", action: onClear)
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .controlSize(.small)
+                    .help("Use all files again")
+            }
+        }
+    }
+
+    private func row(_ url: URL, isPicked: Bool) -> some View {
+        HStack(spacing: 10) {
+            if onClick != nil {
+                Image(systemName: isPicked ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 15))
+                    .foregroundStyle(isPicked ? AnyShapeStyle(.white) : AnyShapeStyle(.tertiary))
+                    .accessibilityHidden(true)
+            }
+            Image(nsImage: FileIconCache.icon(for: url))
+                .resizable()
+                .frame(width: 32, height: 32)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(url.lastPathComponent)
+                    .lineLimit(1)
+                    .foregroundStyle(isPicked ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+                Text(url.deletingLastPathComponent().path)
+                    .font(.caption)
+                    .foregroundStyle(isPicked ? AnyShapeStyle(.white.opacity(0.8)) : AnyShapeStyle(.secondary))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, onClick == nil ? 0 : 6)
+        .padding(.vertical, onClick == nil ? 0 : 4)
+        .background {
+            if isPicked {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.accentColor.gradient)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { onClick?(url) }
+        // Each file can also be dragged out on its own.
+        .onDrag { NSItemProvider(object: url as NSURL) }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(onClick == nil ? [] : (isPicked ? [.isButton, .isSelected] : .isButton))
+        .accessibilityHint(onClick == nil ? "" : "Pick to paste only some files")
     }
 }
 

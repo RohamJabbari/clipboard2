@@ -8,8 +8,9 @@ extension UTType {
 
 enum PanelDrag {
     /// What a row carries when dragged: its id for drops inside the panel, plus the content
-    /// (text, the file, or the image file) for drops into other apps.
-    static func provider(for item: ClipItem, blobs: BlobStore) -> NSItemProvider {
+    /// (text, the file, or the image file) for drops into other apps. A SwiftUI drag carries one
+    /// file, so a file item offers its first file — or the first of `files`, the ones picked in the preview.
+    static func provider(for item: ClipItem, blobs: BlobStore, files: [URL]? = nil) -> NSItemProvider {
         let provider = NSItemProvider()
         let id = Data(item.id.uuidString.utf8)
         provider.registerDataRepresentation(forTypeIdentifier: UTType.clipboard2Clip.identifier, visibility: .ownProcess) { completion in
@@ -20,7 +21,7 @@ enum PanelDrag {
         case .text, .richText:
             provider.registerObject(item.text as NSString, visibility: .all)
         case .file:
-            if let url = item.fileURLs.first { provider.registerObject(url as NSURL, visibility: .all) }
+            if let url = (files ?? item.fileURLs).first { provider.registerObject(url as NSURL, visibility: .all) }
         case .image:
             if let file = item.imageFile { provider.registerObject(blobs.url(for: file) as NSURL, visibility: .all) }
         }
@@ -124,10 +125,12 @@ struct PanelDropDelegate: DropDelegate {
 struct ClipDragSource: ViewModifier {
     let item: ClipItem?
     let blobs: BlobStore
+    /// The files picked in the preview, read when the drag starts.
+    var pickedFiles: (ClipItem) -> [URL]? = { _ in nil }
 
     func body(content: Content) -> some View {
         if let item {
-            content.onDrag { PanelDrag.provider(for: item, blobs: blobs) }
+            content.onDrag { PanelDrag.provider(for: item, blobs: blobs, files: pickedFiles(item)) }
         } else {
             content
         }

@@ -205,6 +205,47 @@ struct PanelKeyboardTests {
         #expect(!model.entries.contains { $0.clip?.id == item.id })
     }
 
+    @Test func pickingFilesOfAMultiFileItem() {
+        let urls = ["One.pdf", "Two.pdf", "Three.pdf", "Four.pdf"].map { URL(filePath: "/tmp/pick-\(UUID())/\($0)") }
+        var capture = ProcessedCapture.text("pick-files \(UUID())")
+        capture.kind = .file
+        capture.fileURLs = urls
+        capture.hash = UUID().uuidString
+        let item = env.store.ingest(capture)
+        let other = env.store.ingest(.text("pick-files other \(UUID())"))
+        defer { [item, other].forEach(env.store.delete) }
+        model.query = "pick-files"
+        model.refresh(resetSelection: true)
+        model.selectedID = PanelEntry.clip(item).id
+
+        #expect(model.pickedFileURLs(for: item) == nil)         // nothing picked: the whole item
+        model.togglePickedFile(urls[2])
+        model.togglePickedFile(urls[0])
+        #expect(model.pickedFileURLs(for: item) == [urls[0], urls[2]])   // in item order
+        #expect(model.pickedFileCount?.picked == 2 && model.pickedFileCount?.total == 4)
+        #expect(model.title(for: .paste) == "Paste 2 of 4 Files")
+
+        model.togglePickedFile(urls[0])                        // click again unpicks
+        #expect(model.pickedFileURLs(for: item) == [urls[2]])
+        model.clearPickedFiles()
+        model.togglePickedFile(urls[2])
+        model.extendPickedFiles(to: urls[1], in: item)          // ⇧-click: range from the last click
+        #expect(model.pickedFileURLs(for: item) == [urls[1], urls[2]])
+
+        model.extendPickedFiles(to: urls[3], in: item)
+        model.extendPickedFiles(to: urls[0], in: item)          // everything picked = the whole item
+        #expect(model.pickedFileURLs(for: item) == nil)
+        #expect(model.title(for: .paste) == "Paste")
+
+        model.togglePickedFile(urls[1])
+        model.selectedID = PanelEntry.clip(other).id            // another item resets the subset
+        #expect(model.pickedFiles.isEmpty)
+        model.selectedID = PanelEntry.clip(item).id
+        model.togglePickedFile(urls[1])
+        model.didClose()                                        // so does closing the panel
+        #expect(model.pickedFiles.isEmpty)
+    }
+
     @Test func openingAlwaysSelectsTheNewestItem() {
         let older = env.store.ingest(.text("open-older \(UUID())"), now: .now.addingTimeInterval(-10))
         let newer = env.store.ingest(.text("open-newer \(UUID())"))

@@ -276,6 +276,7 @@ final class PanelViewModel {
     /// The focused row (drives the preview and keyboard navigation).
     var selectedID: String? {
         didSet {
+            if selectedID != oldValue { clearPickedFiles() }
             guard !adjustingSelection else { return }
             selectedIDs = selectedID.map { [$0] } ?? []
             anchorID = selectedID
@@ -357,7 +358,67 @@ final class PanelViewModel {
         flushEditor?()
         isEditingText = false
         selectionItem = nil
+        clearPickedFiles()
         resetMode()
+    }
+
+    // MARK: Picking files of a multi-file item
+
+    /// Files chosen in the preview of the selected multi-file item. While some (not all) are
+    /// chosen, paste, copy, save and drag use only those; the item itself is unchanged.
+    private(set) var pickedFiles: Set<URL> = []
+    @ObservationIgnored private var pickedFileAnchor: URL?
+
+    /// Click toggles a file, ⇧-click adds the range from the last clicked one.
+    func clickFile(_ url: URL, in item: ClipItem) {
+        if NSEvent.modifierFlags.contains(.shift) {
+            extendPickedFiles(to: url, in: item)
+        } else {
+            togglePickedFile(url)
+        }
+    }
+
+    func togglePickedFile(_ url: URL) {
+        if pickedFiles.contains(url) { pickedFiles.remove(url) } else { pickedFiles.insert(url) }
+        pickedFileAnchor = url
+    }
+
+    func extendPickedFiles(to url: URL, in item: ClipItem) {
+        let urls = item.fileURLs
+        guard let anchor = pickedFileAnchor, let from = urls.firstIndex(of: anchor), let to = urls.firstIndex(of: url) else {
+            togglePickedFile(url)
+            return
+        }
+        pickedFiles.formUnion(urls[min(from, to)...max(from, to)])
+        pickedFileAnchor = url
+    }
+
+    func clearPickedFiles() {
+        if !pickedFiles.isEmpty { pickedFiles = [] }
+        pickedFileAnchor = nil
+    }
+
+    /// The chosen files of `item` in item order, or nil when the whole item applies (nothing or
+    /// everything chosen, another item, or several rows selected).
+    func pickedFileURLs(for item: ClipItem) -> [URL]? {
+        guard !pickedFiles.isEmpty, item.kind == .file, !isMultiSelecting, selectedEntry?.clip?.id == item.id else { return nil }
+        let urls = item.fileURLs.filter(pickedFiles.contains)
+        return urls.isEmpty || urls.count == item.fileURLs.count ? nil : urls
+    }
+
+    /// "2 of 3" for the footer and the preview while a subset is chosen.
+    var pickedFileCount: (picked: Int, total: Int)? {
+        guard let item = selectedEntry?.clip, let urls = pickedFileURLs(for: item) else { return nil }
+        return (urls.count, item.fileURLs.count)
+    }
+
+    /// Copies the item, or just its chosen files.
+    func copy(_ item: ClipItem) {
+        if let files = pickedFileURLs(for: item) {
+            env.paste.write(fileURLs: files)
+        } else {
+            env.paste.copy(item)
+        }
     }
 
     // MARK: Editing the previewed text
@@ -653,8 +714,13 @@ final class PanelViewModel {
         switch entry {
         case .clip(let item):
             let target = targetApp
+            let files = pickedFileURLs(for: item)
             onClose()
-            env.paste.paste(item, transform: transform, into: target)
+            if let files {
+                env.paste.paste(fileURLs: files, into: target)
+            } else {
+                env.paste.paste(item, transform: transform, into: target)
+            }
         case .snippet(let snippet):
             let fields = SnippetExpander.customFields(in: snippet.body)
             if fields.isEmpty {
@@ -860,7 +926,7 @@ final class PanelViewModel {
     func save(_ items: [ClipItem], to folder: URL) {
         guard !items.isEmpty else { return }
         if mode == .actions { mode = .browse }
-        let outcome = FolderSaver(blobs: env.blobs).save(items, to: folder)
+        let outcome = FolderSaver(blobs: env.blobs).save(items, to: folder) { self.pickedFileURLs(for: $0) ?? $0.fileURLs }
         let name = FileManager.default.displayName(atPath: folder.path)
         let saved = outcome.saved.count
         if outcome.failures.isEmpty {
@@ -1026,7 +1092,14 @@ final class PanelViewModel {
 
     /// An action's title for the current selection.
     func title(for action: PanelAction) -> String {
-        action.title(folderName: env.prefs.saveFolderName)
+        if let count = pickedFileCount {
+            switch action {
+            case .paste: return "Paste \(count.picked) of \(count.total) Files"
+            case .copy: return "Copy \(count.picked) of \(count.total) Files"
+            default: break
+            }
+        }
+        return action.title(folderName: env.prefs.saveFolderName)
     }
 
     var filteredActions: [PanelAction] {
@@ -1066,7 +1139,7 @@ final class PanelViewModel {
         case .copy:
             switch entry {
             case .clip(let item) where item.isTransient: env.paste.write(text: item.text)
-            case .clip(let item): env.paste.copy(item)
+            case .clip(let item): copy(item)
             case .secret(let ref): env.copySecret(ref)
             case .snippet: break
             }

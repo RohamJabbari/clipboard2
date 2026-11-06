@@ -68,6 +68,7 @@ struct QuickPanelView: View {
                     isEditingText: model.isEditingText,
                     canEditText: model.selectedEntry?.clip.map(model.isEditable) ?? false,
                     selectionCount: model.isMultiSelecting ? model.selectedClips.count : nil,
+                    pickedFiles: model.pickedFileCount,
                     updateVersion: env.updates.readyVersion,
                     syncIndicator: env.sync.indicator,
                     onUpdate: { env.updates.installNow() })
@@ -214,7 +215,7 @@ struct QuickPanelView: View {
                                     }
                                     .contextMenu { contextMenu(for: entry) }
                                     .modifier(ClipDragSource(item: entry.clip.flatMap { $0.isTransient ? nil : $0 },
-                                                             blobs: env.blobs))
+                                                             blobs: env.blobs, pickedFiles: model.pickedFileURLs))
                             }
                         }
                         .padding(.horizontal, 8)
@@ -258,7 +259,7 @@ struct QuickPanelView: View {
         }
         if let item = entry.clip {
             Button("Paste as Plain Text") { model.activate(entry, transform: .plainText) }
-            Button("Copy") { env.paste.copy(item) }
+            Button("Copy") { model.copy(item) }
             Divider()
             Button(item.label == nil ? "Label…" : "Edit Label…") { model.beginLabel(entry) }
             if item.isPinned && item.label == nil {
@@ -599,6 +600,8 @@ struct HintBar: View {
     var isEditingText = false
     var canEditText = false
     var selectionCount: Int?
+    /// Some files of a multi-file item are picked in the preview: Return pastes only those.
+    var pickedFiles: (picked: Int, total: Int)?
     /// A downloaded update waiting for a relaunch: shown quietly at the trailing end.
     var updateVersion: String?
     /// Sync state, shown as a dot and a few words at the trailing end while signed in.
@@ -619,7 +622,7 @@ struct HintBar: View {
                 hint("⌘K", "Actions")
                 hint("⌫", "Delete")
             case .browse:
-                hint("⏎", "Paste")
+                hint("⏎", pickedFiles.map { "Paste \($0.picked) of \($0.total) Files" } ?? "Paste")
                 if entry?.clip != nil {
                     hint("⌥⏎", "Plain Text")
                 }

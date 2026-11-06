@@ -59,6 +59,25 @@ struct PasteTests {
         #expect(pasteboard.string(forType: .string) == "hello\nworld")
     }
 
+    /// Some files picked from a multi-file item: only those go out, the item stays whole.
+    @Test func pickedFilesPasteOnlyThoseURLs() throws {
+        let a = try file("a.txt"), b = try file("b.txt"), c = try file("c.txt")
+        var capture = ProcessedCapture.text("a.txt b.txt c.txt")
+        capture.kind = .file
+        capture.fileURLs = a.fileURLs + b.fileURLs + c.fileURLs
+        capture.hash = UUID().uuidString
+        let item = store.ingest(capture)
+
+        let chosen = [item.fileURLs[0], item.fileURLs[2]]
+        paste.write(fileURLs: chosen)
+        #expect(pastedURLs == chosen)
+        let legacy = pasteboard.propertyList(forType: .init("NSFilenamesPboardType")) as? [String]
+        #expect(legacy == chosen.map(\.path))
+        let types = pasteboard.types?.map(\.rawValue) ?? []
+        #expect(ClipboardFilter.decide(types: types, sourceBundleID: nil, ignoredBundleIDs: []) == .ownWrite)
+        #expect(item.fileURLs.count == 3)
+    }
+
     /// "Text in image" → Copy: plain text, marked so the monitor doesn't capture it as a new item.
     @Test func copiedImageTextIsAnOwnWrite() {
         paste.write(text: "INVOICE 2026-114")
