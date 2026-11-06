@@ -245,6 +245,63 @@ Space = {"id","kind":"personal|group","role":"owner|member","ownerUid",
 
 **Rate limits:** invite fetches and accepts have their own limit of 20/min per user.
 
+### Contacts
+
+A **contact** is a `direct` space: exactly two members, no name, otherwise a normal space (same
+`SK`, item and blob encryption, changes and pushes). Sending something to a contact is pushing an
+item into that space. The client shows items the *other* member wrote there in its **Inbox**.
+
+- **Listing:** `GET /v1/spaces` leaves `direct` spaces out unless the client asks with
+  `?include=direct` (clients from before contacts would show them as unnamed groups). Every
+  direct space the caller is a full member of is listed, `kind: "direct"`, `encryptedName: null`;
+  `members` names both people, so the contact's name is the member who isn't the caller.
+- **One per pair:** two people have at most one direct space, counting pending requests and
+  accepted contacts, in either direction. A second request or code accept between them is `409 conflict`.
+- **Either member** may delete any item in a direct space (not only its author), and either may end
+  the contact.
+
+**Two ways to add someone:**
+
+1. **Username + accept.** The requester looks up the other person's public key, makes the space and
+   wraps `SK` to both of them. The other person sees a pending request and accepts or declines. Until
+   then they aren't a member: they can't read the space and nothing can be sent.
+2. **One-time code.** Exactly like a group invite code ([Invite codes](#invite-codes), the same
+   `inviteId`/`sealedKey` derivation with `spaceId` the direct space). Whoever enters the code
+   becomes the contact immediately; no accept step, since sharing the code was the consent.
+
+| Request | Response |
+|---|---|
+| `GET /v1/users/:username` | `{uid, username, name, publicKey}`. Case-insensitive match. `404 not_found` if nobody has it; `400 invalid` for your own. Shares the invite rate limit (20/min per user). |
+| `POST /v1/contacts/requests` `{username, spaceId, wrappedKey, recipientWrappedKey}` | `201 ContactRequest`. Creates direct space `spaceId` with the caller as owner (`wrappedKey` = SK wrapped to the caller) and stores `recipientWrappedKey` (SK wrapped to the recipient's public key, AAD with the recipient's uid) until accepted. `404` unknown username, `400 invalid` yourself, `409 conflict` already contacts or a pending request either way. |
+| `GET /v1/contacts/requests` | `{incoming: [ContactRequest], outgoing: [ContactRequest]}`, pending only, newest first |
+| `POST /v1/contacts/requests/:spaceId/accept` | `201 Space`. Recipient only. Adds the recipient as `member` with the stored `recipientWrappedKey`. |
+| `DELETE /v1/contacts/requests/:spaceId` | `204`. Recipient declines or requester cancels; deletes the space. |
+| `POST /v1/contacts/invites` `{spaceId, wrappedKey, inviteId, sealedKey}` | `201 {spaceId, inviteId, expiresAt}`. Creates direct space `spaceId` (caller as owner) and a single-use code invite, valid 7 days. |
+| `GET /v1/contacts/invites` | `{invites: [{spaceId, inviteId, createdAt, expiresAt}]}`, the caller's open contact codes |
+| `DELETE /v1/contacts/invites/:inviteId` | `204`, revokes the code and deletes its still-empty space |
+| `DELETE /v1/contacts/:spaceId` | `204`. Either member ends the contact: the space, its items and blobs are deleted for both. |
+
+```jsonc
+ContactRequest = {"spaceId","uid","username":null|"<string>","name","createdAt"}
+// incoming: uid/name are the requester; outgoing: the recipient
+```
+
+**Codes for direct spaces** use the normal invite routes:
+- `GET /v1/invites/:inviteId` also returns `kind` (`"group"` or `"direct"`) and, for `direct`,
+  `ownerName` (the code's creator) so the app can ask "Add ‹name› as a contact?". `encryptedName` is `null` there.
+- `POST /v1/invites/:inviteId/accept` on a direct space: `400 invalid` for your own code, `409 conflict` if you're
+  already contacts (or have a pending request) with its creator. Old clients that don't know `kind` would try to show
+  it as a group; accepting still works.
+- Group-only routes (`PATCH`/`DELETE /v1/groups/:id`, members, group invites) answer `404` for direct spaces.
+
+**Housekeeping:** a direct space that still has one member and no pending request or live code
+(declined, cancelled, expired) is deleted by the server, at the latest a day after its code expires.
+
+**Limits:** 200 contacts per user (pending requests and open codes included, both directions),
+50 pending outgoing requests, 20 open contact codes. Over a limit → `403 quota_exceeded`. A direct
+space has the group storage limits (2 GB, 5 000 live items) and history retention (newest 200).
+Deleting an account deletes all its direct spaces.
+
 ### Items
 
 **Endpoints:**
@@ -320,7 +377,7 @@ Item = {"id","category":"history|pinned|snippet|secret","seq","sortAt","updatedA
 - the scrypt of `authKey`
 - KDF salt and iterations
 - session hashes, device names and last use
-- group membership and roles
+- group membership and roles, and who is whose contact (including pending requests)
 - invite ids and expiry
 - sign-up code hashes, who made and used each, and expiry
 - for about two minutes, auth attempt counts keyed by an HMAC of the IP or email
