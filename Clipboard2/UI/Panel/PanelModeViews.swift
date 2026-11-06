@@ -8,7 +8,6 @@ struct ActionMenuView: View {
 
     var body: some View {
         let actions = model.filteredActions
-        let isPinned = model.selectedEntry?.clip?.isPinned ?? false
 
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
@@ -42,7 +41,7 @@ struct ActionMenuView: View {
                                         .padding(.bottom, 2)
                                         .accessibilityAddTraits(.isHeader)
                                 }
-                                ActionRow(action: action, title: action.title(isPinned: isPinned),
+                                ActionRow(action: action, title: model.title(for: action),
                                           isSelected: index == model.actionSelection)
                                     .id(action.id)
                                     .onTapGesture { model.perform(action) }

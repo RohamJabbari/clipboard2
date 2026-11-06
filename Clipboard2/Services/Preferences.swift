@@ -101,6 +101,7 @@ final class Preferences {
         static let hasShownPermissions = "hasShownPermissions"
         static let syncDefaultGroupID = "syncDefaultGroupID"
         static let hasShownSendToGroupWarning = "hasShownSendToGroupWarning"
+        static let saveFolder = "saveFolder"
     }
 
     /// 0 means "ask every time".
@@ -156,6 +157,13 @@ final class Preferences {
     var hasShownSendToGroupWarning: Bool {
         didSet { defaults.set(hasShownSendToGroupWarning, forKey: Key.hasShownSendToGroupWarning) }
     }
+    /// Where "Save to …" writes items. Stored as a plain path (the app isn't sandboxed).
+    var saveFolder: URL { didSet { defaults.set(saveFolder.path, forKey: Key.saveFolder) } }
+
+    static var defaultSaveFolder: URL {
+        FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: "Downloads")
+    }
 
     init(defaults: UserDefaults) {
         self.defaults = defaults
@@ -204,6 +212,13 @@ final class Preferences {
         hasShownPermissions = defaults.bool(forKey: Key.hasShownPermissions)
         syncDefaultGroupID = defaults.string(forKey: Key.syncDefaultGroupID)
         hasShownSendToGroupWarning = defaults.bool(forKey: Key.hasShownSendToGroupWarning)
+        saveFolder = defaults.string(forKey: Key.saveFolder).map { URL(filePath: $0, directoryHint: .isDirectory) }
+            ?? Self.defaultSaveFolder
+    }
+
+    /// The save folder's name as Finder shows it ("Downloads", "Desktop").
+    var saveFolderName: String {
+        FileManager.default.displayName(atPath: saveFolder.path)
     }
 
     var maxAge: TimeInterval? {

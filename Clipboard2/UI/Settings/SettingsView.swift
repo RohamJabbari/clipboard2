@@ -184,6 +184,25 @@ struct HistorySettingsView: View {
             }
 
             Section {
+                LabeledContent {
+                    HStack(spacing: 8) {
+                        Button("Choose…") { chooseSaveFolder() }
+                        if prefs.saveFolder.standardizedFileURL != Preferences.defaultSaveFolder.standardizedFileURL {
+                            Button("Use Downloads") { prefs.saveFolder = Preferences.defaultSaveFolder }
+                        }
+                    }
+                } label: {
+                    Text("Save folder")
+                    Text(prefs.saveFolder.path(percentEncoded: false))
+                        .textSelection(.enabled)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            } footer: {
+                Hint("“Save to \(prefs.saveFolderName)” in the quick panel writes items here: text as .txt, images as .png, files as copies.")
+            }
+
+            Section {
                 List(selection: $selection) {
                     ForEach(prefs.ignoredApps) { app in
                         AppRow(app: app).tag(app.id)
@@ -224,6 +243,19 @@ struct HistorySettingsView: View {
         } message: {
             Text("Snippets and secrets are kept. This can't be undone.")
         }
+    }
+
+    private func chooseSaveFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = env.prefs.saveFolder
+        panel.prompt = "Choose"
+        panel.message = "Choose where “Save to” puts items"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        env.prefs.saveFolder = url
     }
 }
 

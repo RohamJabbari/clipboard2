@@ -280,6 +280,12 @@ struct QuickPanelView: View {
                     }
                 }
             }
+            Divider()
+            Button("Save to \(env.prefs.saveFolderName)") {
+                model.save(model.clipsForContextAction(on: entry), to: env.prefs.saveFolder)
+            }
+            Button("Save to…") { model.saveChoosingFolder(model.clipsForContextAction(on: entry)) }
+            Divider()
             Button("Delete", role: .destructive) { env.store.delete(item); model.refresh() }
         }
     }

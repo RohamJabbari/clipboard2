@@ -112,6 +112,11 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
             self.lastDropAt = .now
             panel.makeKey()
         }
+        // The "Save to…" folder picker is modal and takes focus; the panel stays up behind it.
+        model.onRefocus = { [weak self] in
+            guard let self, let panel = self.panel, self.isVisible else { return }
+            panel.makeKey()
+        }
         // Touch ID takes key focus; take it back afterwards if the panel is still meant to be up.
         authObserver = NotificationCenter.default.addObserver(forName: SecretStore.authenticationEnded, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
@@ -517,7 +522,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
 
     func windowDidResignKey(_ notification: Notification) {
         // The Touch ID / password sheet steals focus; that isn't the user leaving the panel.
-        if env.secrets.isAuthenticating { return }
+        if env.secrets.isAuthenticating || model.isChoosingFolder { return }
         guard isVisible else { return }
         // A mouse button is down in another app: maybe the start of a drag from Finder into the
         // panel. Decide when the button comes up; a drop takes focus back by then.

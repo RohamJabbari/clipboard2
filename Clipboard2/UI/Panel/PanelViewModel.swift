@@ -88,6 +88,8 @@ enum PanelAction: Identifiable, Hashable {
     case setUpAI
     case clearSlot(Int)
     case togglePin
+    case saveToFolder
+    case saveToChosenFolder
     case delete
 
     var id: String {
@@ -104,6 +106,8 @@ enum PanelAction: Identifiable, Hashable {
         case .setUpAI: "setUpAI"
         case .clearSlot(let n): "clearSlot-\(n)"
         case .togglePin: "pin"
+        case .saveToFolder: "saveToFolder"
+        case .saveToChosenFolder: "saveToChosenFolder"
         case .delete: "delete"
         }
     }
@@ -114,11 +118,13 @@ enum PanelAction: Identifiable, Hashable {
         case .transform: "Transform & Paste"
         case .ai, .setUpAI: "Ask \(aiName)"
         case .sendToDevice: "Send"
+        case .saveToFolder, .saveToChosenFolder: "Save"
         case .saveAsSecret, .setLabel, .shareToGroup, .clearSlot, .togglePin, .delete: "Item"
         }
     }
 
-    func title(isPinned: Bool) -> String {
+    /// `folderName` is the save folder's name ("Save to Downloads").
+    func title(isPinned: Bool, folderName: String = "Downloads") -> String {
         switch self {
         case .paste: "Paste"
         case .pastePlain: "Paste as Plain Text"
@@ -133,6 +139,8 @@ enum PanelAction: Identifiable, Hashable {
         case .setUpAI: "Set Up AI…"
         case .clearSlot(let n): "Remove from Quick Slot ⌘\(n)"
         case .togglePin: isPinned ? "Unpin" : "Pin"
+        case .saveToFolder: "Save to \(folderName)"
+        case .saveToChosenFolder: "Save to…"
         case .delete: "Delete"
         }
     }
@@ -151,6 +159,8 @@ enum PanelAction: Identifiable, Hashable {
         case .setUpAI: "sparkles"
         case .clearSlot: "number.square"
         case .togglePin: "pin"
+        case .saveToFolder: "square.and.arrow.down"
+        case .saveToChosenFolder: "folder"
         case .delete: "trash"
         }
     }
@@ -840,6 +850,56 @@ final class PanelViewModel {
         showNotice("Sent to \(device.name)")
     }
 
+    // MARK: Save to folder
+
+    /// True while the folder picker is up, so the panel doesn't close when it loses focus.
+    @ObservationIgnored private(set) var isChoosingFolder = false
+    /// Set by the controller: makes the panel key again (after the folder picker).
+    @ObservationIgnored var onRefocus: () -> Void = {}
+
+    /// The clips a context-menu action on `entry` applies to: the whole selection if it's part of one.
+    func clipsForContextAction(on entry: PanelEntry) -> [ClipItem] {
+        guard let item = entry.clip else { return [] }
+        return isMultiSelecting && isSelected(entry) ? selectedClips : [item]
+    }
+
+    /// Writes the items into `folder` as files and says how it went. The panel stays open, like Copy.
+    func save(_ items: [ClipItem], to folder: URL) {
+        guard !items.isEmpty else { return }
+        if mode == .actions { mode = .browse }
+        let outcome = FolderSaver(blobs: env.blobs).save(items, to: folder)
+        let name = FileManager.default.displayName(atPath: folder.path)
+        let saved = outcome.saved.count
+        if outcome.failures.isEmpty {
+            showNotice(saved == 1 ? "Saved to \(name)" : "Saved \(saved) files to \(name)")
+        } else if saved == 0 {
+            NSSound.beep()
+            showNotice("Not saved: \(outcome.failures[0])")
+        } else {
+            showNotice("Saved \(saved) to \(name) · \(outcome.failures.count) failed: \(outcome.failures[0])")
+        }
+    }
+
+    /// Asks for a folder first (starting in the usual save folder).
+    func saveChoosingFolder(_ items: [ClipItem]) {
+        guard !items.isEmpty else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = env.prefs.saveFolder
+        panel.prompt = "Save"
+        panel.message = items.count == 1 ? "Choose where to save this item" : "Choose where to save \(items.count) items"
+        isChoosingFolder = true
+        NSApp.activate()
+        let response = panel.runModal()
+        isChoosingFolder = false
+        onRefocus()
+        guard response == .OK, let folder = panel.url else { return }
+        save(items, to: folder)
+    }
+
     // MARK: Drag and drop
 
     /// Called after a drop was accepted, so the panel takes keyboard focus back (a drag from
@@ -926,7 +986,7 @@ final class PanelViewModel {
                 actions.append(.copy)
             }
             if canShareToGroup { actions.append(.shareToGroup) }
-            return actions + [.togglePin, .delete]
+            return actions + [.saveToFolder, .saveToChosenFolder, .togglePin, .delete]
         }
         guard let entry = selectedEntry else { return [] }
         var actions: [PanelAction] = [.paste]
@@ -952,6 +1012,7 @@ final class PanelViewModel {
             actions.append(.setLabel)
             if canShareToGroup { actions.append(.shareToGroup) }
             actions += PanelAction.sendToDeviceActions(for: item, multiSelecting: false, targets: DeviceTarget.others(in: env.sync))
+            actions += [.saveToFolder, .saveToChosenFolder]
             actions.append(.togglePin)
         case .snippet:
             break
@@ -969,13 +1030,17 @@ final class PanelViewModel {
         return actions
     }
 
+    /// An action's title for the current selection.
+    func title(for action: PanelAction) -> String {
+        action.title(isPinned: selectedEntry?.clip?.isPinned ?? false, folderName: env.prefs.saveFolderName)
+    }
+
     var filteredActions: [PanelAction] {
-        let isPinned = selectedEntry?.clip?.isPinned ?? false
         let q = actionQuery.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return availableActions }
         var matches = availableActions
             .compactMap { action in
-                FuzzyMatcher.score(query: q, in: action.title(isPinned: isPinned) + " " + action.section(aiName: aiName))
+                FuzzyMatcher.score(query: q, in: title(for: action) + " " + action.section(aiName: aiName))
                     .map { (action, $0) }
             }
             .sorted { $0.1 > $1.1 }
@@ -1059,6 +1124,12 @@ final class PanelViewModel {
         case .togglePin:
             togglePinOnSelection()
             mode = .browse
+        case .saveToFolder:
+            guard let item = entry.clip else { return }
+            save([item], to: env.prefs.saveFolder)
+        case .saveToChosenFolder:
+            guard let item = entry.clip else { return }
+            saveChoosingFolder([item])
         case .delete:
             mode = .browse
             deleteSelection(includingSecrets: true)
@@ -1089,6 +1160,10 @@ final class PanelViewModel {
             mode = .browse
         case .shareToGroup:
             beginShare(clips)
+        case .saveToFolder:
+            save(clips, to: env.prefs.saveFolder)
+        case .saveToChosenFolder:
+            saveChoosingFolder(clips)
         case .delete:
             mode = .browse
             deleteSelectedClips()
