@@ -32,7 +32,7 @@ struct PreviewPane: View {
                     ImagePreviewView(item: item)
                     if let text = item.imageText, !text.isEmpty {
                         Divider()
-                        ImageTextView(text: text)
+                        ImageTextView(text: text, onCopy: model.map { model in { model.copyImageText(text) } })
                     }
                 }
             case .file:
@@ -164,13 +164,29 @@ struct ImagePreviewView: View {
 /// The words recognised in an image, selectable, under the picture.
 struct ImageTextView: View {
     let text: String
+    /// Copies the recognised text (the header's Copy button); hidden when nil.
+    var onCopy: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Label("Text in image", systemImage: "text.viewfinder")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .accessibilityAddTraits(.isHeader)
+            HStack(spacing: 6) {
+                Label("Text in image", systemImage: "text.viewfinder")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer(minLength: 0)
+                if let onCopy {
+                    Button(action: onCopy) {
+                        Label("Copy", systemImage: "doc.on.doc")
+                            .labelStyle(.titleAndIcon)
+                            .font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                    .help("Copy the recognised text")
+                    .accessibilityLabel("Copy text in image")
+                }
+            }
             // Short text sits at its own height; longer text scrolls inside a fixed strip.
             ViewThatFits(in: .vertical) {
                 textBlock(text)

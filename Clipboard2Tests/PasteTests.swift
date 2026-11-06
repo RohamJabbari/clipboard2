@@ -59,6 +59,14 @@ struct PasteTests {
         #expect(pasteboard.string(forType: .string) == "hello\nworld")
     }
 
+    /// "Text in image" → Copy: plain text, marked so the monitor doesn't capture it as a new item.
+    @Test func copiedImageTextIsAnOwnWrite() {
+        paste.write(text: "INVOICE 2026-114")
+        #expect(pasteboard.string(forType: .string) == "INVOICE 2026-114")
+        let types = pasteboard.types?.map(\.rawValue) ?? []
+        #expect(ClipboardFilter.decide(types: types, sourceBundleID: nil, ignoredBundleIDs: []) == .ownWrite)
+    }
+
     @Test func textOnlySelectionsStillJoinWithLineBreaks() {
         paste.write([store.ingest(.text("a")), store.ingest(.text("b"))], transform: nil)
         #expect(pasteboard.string(forType: .string) == "a\nb")

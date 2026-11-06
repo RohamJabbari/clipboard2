@@ -1189,6 +1189,14 @@ final class PanelViewModel {
         showNotice("Copied")
     }
 
+    /// The words recognised in an image, copied as plain text (marked as our own write, so it
+    /// doesn't come back as a new history item).
+    func copyImageText(_ text: String) {
+        guard !text.isEmpty else { return }
+        env.paste.write(text: text)
+        showNotice("Copied text")
+    }
+
     func replaceItemWithAIOutput() {
         guard let run = aiRun, run.isFinished, !run.item.isTransient else { return }
         env.store.replaceText(of: run.item, with: run.output)
