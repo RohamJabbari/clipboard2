@@ -706,7 +706,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         switch (form.Entry)
         {
             case PanelEntry.Clip c:
-                store.SetLabel(form.Text, c.Item);
+                // An item in a quick slot stays kept without its label, so the slot can't lose it.
+                store.SetLabel(form.Text, c.Item, keepPinned: slots.SlotFor(form.Entry.SlotTarget) is not null);
                 ShowNotice(c.Item.Label is null ? "Label removed" : "Labelled");
                 break;
             case PanelEntry.SecretEntry s when form.Text.Trim().Length > 0:
@@ -1034,7 +1035,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 break;
             case PanelAction.SendToContact send:
                 // All or nothing, like sharing to a group.
-                if (clips.Where(c => c.SpaceId != send.SpaceId).Select(SyncEngine.GroupShareProblem).FirstOrDefault(p => p is not null) is { } tooBig)
+                if (clips.Where(c => c.SpaceId != send.SpaceId).Select(SyncEngine.ContactSendProblem).FirstOrDefault(p => p is not null) is { } tooBig)
                 {
                     ResetMode();
                     ShowNotice(tooBig);
@@ -1100,7 +1101,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             return;
         }
         ResetMode();
-        if (SyncEngine.GroupShareProblem(item) is { } problem)
+        if (SyncEngine.ContactSendProblem(item) is { } problem)
         {
             ShowNotice(problem);
             return;

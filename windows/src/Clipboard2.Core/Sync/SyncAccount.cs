@@ -1043,12 +1043,21 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
 
     private string KeyChangedMessage(SyncEngine engine)
     {
-        var names = engine.KeyChangedSpaces
-            .Select(id => id == engine.Identity.PersonalSpaceId ? "your personal space" : _store.SyncSpaces().FirstOrDefault(s => s.Id == id)?.DisplayName ?? "a group")
+        var spaces = _store.SyncSpaces().ToDictionary(s => s.Id);
+        var changed = engine.KeyChangedSpaces.ToList();
+        // A contact has no group to leave and rejoin: it's removed and added again.
+        var contacts = changed.Select(id => spaces.GetValueOrDefault(id)).OfType<SpaceRecord>().Where(s => s.IsDirect).Select(s => s.DisplayName).ToList();
+        var names = changed.Where(id => spaces.GetValueOrDefault(id) is not { IsDirect: true })
+            .Select(id => id == engine.Identity.PersonalSpaceId ? "your personal space" : spaces.GetValueOrDefault(id)?.DisplayName ?? "a group")
             .ToList();
-        return names.Count == 1 && names[0] == "your personal space"
+        var contactMessage = contacts.Count == 1
+            ? $"The key you share with {contacts[0]} changed unexpectedly, so what you send each other isn't syncing. Remove the contact and add them again."
+            : $"The keys you share with {string.Join(", ", contacts)} changed unexpectedly, so what you send each other isn't syncing. Remove those contacts and add them again.";
+        if (names.Count == 0) return contactMessage;
+        var message = names.Count == 1 && names[0] == "your personal space"
             ? "The key of your personal space changed unexpectedly, so it isn't syncing. Sign out and in again; if this keeps happening, don't trust the sync server."
             : $"This group's key changed unexpectedly ({string.Join(", ", names)}), so it isn't syncing. Leave the group and join again with a new invite code.";
+        return contacts.Count == 0 ? message : message + " " + contactMessage;
     }
 
     private void HandleSyncFailure(Exception ex)

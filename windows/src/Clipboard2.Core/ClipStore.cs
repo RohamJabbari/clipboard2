@@ -215,8 +215,9 @@ public sealed class ClipStore : IDisposable
     }
 
     /// <summary>Sets (or clears, for empty text) a label. Labels are how items are kept: labelled items are pinned so
-    /// they never expire, and removing the label unpins the item again.</summary>
-    public void SetLabel(string? label, ClipItem item)
+    /// they never expire, and removing the label unpins the item again, unless <paramref name="keepPinned"/> (a quick
+    /// slot still needs the item).</summary>
+    public void SetLabel(string? label, ClipItem item, bool keepPinned = false)
     {
         var trimmed = label?.Trim() ?? "";
         var hadLabel = item.Label is not null;
@@ -226,7 +227,7 @@ public sealed class ClipStore : IDisposable
             item.IsPinned = true;
             item.PinnedAt = DateTime.UtcNow;
         }
-        else if (item.Label is null && hadLabel)
+        else if (item.Label is null && hadLabel && !keepPinned)
         {
             item.IsPinned = false;
             item.PinnedAt = null;

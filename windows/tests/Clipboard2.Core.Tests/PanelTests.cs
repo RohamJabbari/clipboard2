@@ -230,6 +230,24 @@ public sealed class PanelTests : IDisposable
     }
 
     [Fact]
+    public void RemovingTheLabelOfASlottedItemKeepsIt()
+    {
+        var item = Add("value");
+        _model.PrepareForOpen(null);
+        _model.BeginLabel(_model.Entries[0]);
+        _model.LabelForm!.Text = "Name";
+        _model.HandleKey(K(PanelKey.Enter));
+        _model.AssignSelection(3);
+        _model.BeginLabel(_model.Entries[0]);
+        _model.LabelForm!.Text = "";
+        _model.HandleKey(K(PanelKey.Enter));
+        // The slot still needs it: it stays kept, so it can't expire out of the slot.
+        Assert.Equal((null, true), (_store.Find(item.Id)!.Label, _store.Find(item.Id)!.IsPinned));
+        Assert.Equal("Label removed", _model.Notice);
+        Assert.Equal(3, new QuickSlots(_settings).SlotFor(SlotTarget.ForClip(item.Id)));
+    }
+
+    [Fact]
     public void SaveActionsAreNamedAfterTheFolderAndWriteFiles()
     {
         var item = Add("Meeting notes for Monday");

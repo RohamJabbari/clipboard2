@@ -285,7 +285,7 @@ public sealed partial class SyncEngineTests
         var panel = Panel(a);
         panel.Select(new PanelEntry.Clip(item).Id);
         panel.Perform(new PanelAction.SendToContact(space, "friend"));
-        Assert.Equal(SyncEngine.GroupShareProblem(item), panel.Notice);
+        Assert.Equal($"Sync takes at most {SyncEngine.MaxFilesPerItem} files at a time.", panel.Notice);
         Assert.Empty(a.Store.ItemsInSpace(space));
     }
 
@@ -362,6 +362,20 @@ public sealed partial class SyncEngineTests
 
         // They can be added again.
         Assert.True(await a.Account.RequestContactAsync("friend"), a.Account.Error);
+    }
+
+    [Fact]
+    public async Task AChangedContactKeySaysToRemoveAndAddThemAgain()
+    {
+        var (a, b, space) = await Contacts();
+        var evil = SyncCrypto.WrapSpaceKey(SyncCrypto.RandomKey(), space, b.Account.Uid!, _cloud.PublicKey(Friend));
+        _cloud.ReplaceWrappedKey(space, b.Account.Uid!, evil);
+        Send(a, a.Copy("after"), space);
+        await a.Sync();
+        await b.Sync();
+        Assert.Equal("The key you share with roham changed unexpectedly, so what you send each other isn't syncing. Remove the contact and add them again.",
+            b.Account.Error);
+        Assert.Empty(b.Store.ItemsInSpace(space));
     }
 
     [Fact]

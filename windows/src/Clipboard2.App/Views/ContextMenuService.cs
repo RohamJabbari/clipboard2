@@ -161,7 +161,10 @@ public sealed class ContextMenuService : IDisposable
             foreach (var device in _services.OtherDevices)
                 menu.Items.Add(Item($"Send to {device.Name}", Glyphs.Cloud, () => Do(() => _services.SendSelectionToDeviceAsync(device))));
         }
-        menu.Items.Add(Submenu("Recent", Glyphs.Clock, _services.Store.AllItems().Take(12).Select(item =>
+        // Contacts' items live in the panel's Inbox only.
+        var contactSpaces = _services.Store.Contacts().Select(c => c.Id).ToHashSet();
+        var recent = _services.Store.AllItems().Where(i => i.SpaceId is null || !contactSpaces.Contains(i.SpaceId)).Take(12);
+        menu.Items.Add(Submenu("Recent", Glyphs.Clock, recent.Select(item =>
             Item(item.DisplayTitle.Length > 60 ? item.DisplayTitle[..60] + "…" : item.DisplayTitle, item.IsPinned ? Glyphs.Tag : Glyphs.Text,
                 () => Do(() => { _services.Paste(item, null); return Task.CompletedTask; })))));
         menu.Items.Add(Submenu("Snippets", Glyphs.Snippet, _services.Store.AllSnippets().Select(snippet =>

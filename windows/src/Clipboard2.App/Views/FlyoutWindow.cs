@@ -186,7 +186,7 @@ public sealed class FlyoutWindow : Window
         menu.Items.Add(Item(item.Label is null ? "Label…" : "Edit Label…", () =>
         {
             if (InputDialog.Ask("Label", "Labelled items are kept: they never expire. Leave empty to remove the label.", item.Label ?? "") is { } label)
-                _services.Store.SetLabel(label, item);
+                _services.Store.SetLabel(label, item, keepPinned: _services.Slots.SlotFor(SlotTarget.ForClip(item.Id)) is not null);
         }));
         if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Labelled", () => _services.Store.Unpin(item)));
         if (item.Kind.IsTextual())

@@ -207,7 +207,12 @@ public sealed partial class SyncEngine
     /// <summary><see cref="GroupShareProblem(ClipItem)"/> for files about to become an item. A folder counts as one
     /// file, sized by its zip estimate (its files' bytes + 1 KB per entry) and shown with its files' total. Missing
     /// files don't count: they're never sent. Walks folders on the calling thread.</summary>
-    public static string? GroupShareProblem(IEnumerable<string> files)
+    public static string? GroupShareProblem(IEnumerable<string> files) => ShareProblem(files, "Groups take");
+
+    /// <summary><see cref="GroupShareProblem(ClipItem)"/> worded for sending to a contact: "Sync takes files up to 100 MB."</summary>
+    public static string? ContactSendProblem(ClipItem item) => item.Kind == ClipKind.File ? ShareProblem(item.Files, "Sync takes") : null;
+
+    private static string? ShareProblem(IEnumerable<string> files, string takes)
     {
         var sized = new List<(string Name, long Shown, bool TooLarge)>();
         foreach (var path in files.Distinct())
@@ -216,8 +221,8 @@ public sealed partial class SyncEngine
             else if (FolderZip.Measure(path) is { } folder) sized.Add((FolderZip.Name(path), folder.TotalBytes, folder.Estimate > MaxFileBytes));
         }
         if (sized.FirstOrDefault(f => f.TooLarge) is { Name: not null } big)
-            return $"“{big.Name}” is {IncomingDownload.FormatSize(big.Shown)}. Groups take files up to {IncomingDownload.FormatSize(MaxFileBytes)}.";
-        return sized.Count > MaxFilesPerItem ? $"Groups take at most {MaxFilesPerItem} files at a time." : null;
+            return $"“{big.Name}” is {IncomingDownload.FormatSize(big.Shown)}. {takes} files up to {IncomingDownload.FormatSize(MaxFileBytes)}.";
+        return sized.Count > MaxFilesPerItem ? $"{takes} at most {MaxFilesPerItem} files at a time." : null;
     }
 
     // MARK: Folder archives

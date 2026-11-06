@@ -585,7 +585,7 @@ public sealed class AppServices : IPanelHost
     /// <summary>Sends a history item to a contact from outside the panel (it lands in their Inbox), or says why it can't.</summary>
     public void SendToContact(ClipItem item, SpaceRecord contact)
     {
-        if (SyncEngine.GroupShareProblem(item) is { } problem)
+        if (SyncEngine.ContactSendProblem(item) is { } problem)
         {
             Hud.ShowWarning(Tracker.TargetWindow, $"Can't send to {contact.DisplayName}", problem);
             return;
