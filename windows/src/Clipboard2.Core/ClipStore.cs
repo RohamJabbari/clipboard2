@@ -207,15 +207,29 @@ public sealed class ClipStore : IDisposable
         Commit();
     }
 
-    /// <summary>Sets (or clears, for empty text) a label. Labelled items are pinned so they never expire.</summary>
+    /// <summary>"Remove from Labelled" for items pinned without a label (pinned before labels replaced pins).</summary>
+    public void Unpin(ClipItem item)
+    {
+        if (!item.IsPinned) return;
+        TogglePin(item);
+    }
+
+    /// <summary>Sets (or clears, for empty text) a label. Labels are how items are kept: labelled items are pinned so
+    /// they never expire, and removing the label unpins the item again.</summary>
     public void SetLabel(string? label, ClipItem item)
     {
         var trimmed = label?.Trim() ?? "";
+        var hadLabel = item.Label is not null;
         item.Label = trimmed.Length == 0 ? null : trimmed;
         if (item.Label is not null && !item.IsPinned)
         {
             item.IsPinned = true;
             item.PinnedAt = DateTime.UtcNow;
+        }
+        else if (item.Label is null && hadLabel)
+        {
+            item.IsPinned = false;
+            item.PinnedAt = null;
         }
         Save(item);
         Commit();

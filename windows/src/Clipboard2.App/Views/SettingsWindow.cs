@@ -242,13 +242,31 @@ public sealed partial class SettingsWindow : Window
             Row("Stored", count),
             Row("", Action("Clear History…", () =>
             {
-                var answer = MessageBox.Show(this, "Clear clipboard history? Pinned items are kept.\n\nChoose No to also remove pinned items.", "Clear History",
+                var answer = MessageBox.Show(this, "Clear clipboard history? Labelled items are kept.\n\nChoose No to also remove labelled items.", "Clear History",
                     MessageBoxButton.YesNoCancel, MessageBoxImage.Warning);
                 if (answer == MessageBoxResult.Cancel) return;
                 _services.Store.ClearHistory(includingPinned: answer == MessageBoxResult.No);
                 count.Text = $"{_services.Store.Count()} items";
             }))));
-        page.Children.Add(Hint("Measured from the last time an item was copied. Pinned and labelled items and secrets never expire."));
+        page.Children.Add(Hint("Measured from the last time an item was copied. Labelled items and secrets never expire."));
+
+        page.Children.Add(Header("Saving"));
+        var folder = Fluent.Label(_services.SaveFolder, 13, Fluent.Secondary);
+        folder.MaxWidth = 380;
+        folder.TextTrimming = TextTrimming.CharacterEllipsis;
+        folder.ToolTip = _services.SaveFolder;
+        var folderButtons = new StackPanel { Orientation = Orientation.Horizontal };
+        folderButtons.Children.Add(Action("Choose…", () =>
+        {
+            var dialog = new Microsoft.Win32.OpenFolderDialog { Title = "Save folder", InitialDirectory = Directory.Exists(_services.SaveFolder) ? _services.SaveFolder : "" };
+            if (dialog.ShowDialog(this) != true) return;
+            S.SaveFolder = dialog.FolderName;
+            Save();
+            RefreshTab("General");
+        }));
+        if (S.SaveFolder is not null) folderButtons.Children.Add(Action("Use Downloads", () => { S.SaveFolder = null; Save(); RefreshTab("General"); }));
+        page.Children.Add(Card(Row("Save folder", folder), Row("", folderButtons)));
+        page.Children.Add(Hint($"“Save to {PanelModel.FolderName(_services.SaveFolder)}” in the quick panel writes text as .txt, images as .png and copies files here. “Save to…” asks for a folder each time."));
         AddBackupSection(page);
         return page;
     }

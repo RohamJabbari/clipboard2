@@ -181,4 +181,25 @@ public static partial class Native
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool QueryFullProcessImageName(IntPtr process, int flags, StringBuilder name, ref int size);
     [DllImport("kernel32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool CloseHandle(IntPtr handle);
+
+    // MARK: Known folders
+
+    private static readonly Guid FOLDERID_Downloads = new("374DE290-123F-4565-9164-39C4925E467B");
+
+    [DllImport("shell32.dll")]
+    private static extern int SHGetKnownFolderPath([MarshalAs(UnmanagedType.LPStruct)] Guid id, uint flags, IntPtr token, out IntPtr path);
+
+    /// <summary>The user's Downloads folder, wherever it was moved to (Explorer → Properties → Location).</summary>
+    public static string DownloadsFolder()
+    {
+        if (SHGetKnownFolderPath(FOLDERID_Downloads, 0, IntPtr.Zero, out var buffer) == 0)
+        {
+            try
+            {
+                if (Marshal.PtrToStringUni(buffer) is { Length: > 0 } path) return path;
+            }
+            finally { Marshal.FreeCoTaskMem(buffer); }
+        }
+        return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+    }
 }

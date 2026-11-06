@@ -13,7 +13,7 @@ using Transform = Clipboard2.Core.Transform;
 
 namespace Clipboard2.App.Views;
 
-/// <summary>Opened from the tray icon: search, pinned + recent history, quick actions.</summary>
+/// <summary>Opened from the tray icon: search, labelled + recent history, quick actions.</summary>
 public sealed class FlyoutWindow : Window
 {
     private readonly AppServices _services;
@@ -95,7 +95,7 @@ public sealed class FlyoutWindow : Window
             items = items.Select(i => (Item: i, Score: FuzzyMatcher.Score(query, i.SearchableText)))
                 .Where(x => x.Score is not null).OrderByDescending(x => x.Score).Select(x => x.Item).Take(200).ToList();
         }
-        var pinned = items.Where(i => i.IsPinned).ToList();
+        var labelled = items.Where(i => i.IsPinned).ToList();   // incl. items pinned before labels replaced pins
         var recent = items.Where(i => !i.IsPinned).Take(200).ToList();
         if (items.Count == 0)
         {
@@ -104,7 +104,7 @@ public sealed class FlyoutWindow : Window
             empty.HorizontalAlignment = HorizontalAlignment.Center;
             _list.Children.Add(empty);
         }
-        if (pinned.Count > 0) Section("Pinned", pinned);
+        if (labelled.Count > 0) Section("Labelled", labelled);
         if (recent.Count > 0) Section("Recent", recent);
         RenderFooter();
     }
@@ -152,7 +152,7 @@ public sealed class FlyoutWindow : Window
         grid.Children.Add(texts);
         if (item.SpaceId is { } space && _groupNames.GetValueOrDefault(space) is { } groupName)
             texts.Children.Add(Fluent.Label("In " + groupName, 11, Fluent.Tertiary));
-        var time = Fluent.Label(item.IsPinned ? Glyphs.Pinned : Fluent.Relative(item.LastCopiedAt), 11, Fluent.Tertiary);
+        var time = Fluent.Label(item.IsPinned ? Glyphs.Tag : Fluent.Relative(item.LastCopiedAt), 11, Fluent.Tertiary);
         if (item.IsPinned) time.FontFamily = (FontFamily)Application.Current.Resources["IconFont"];
         time.Margin = new Thickness(8, 0, 0, 0);
         Grid.SetColumn(time, 2);
@@ -181,12 +181,12 @@ public sealed class FlyoutWindow : Window
         if (item.Kind.IsTextual()) menu.Items.Add(Item("Paste as Plain Text", () => Paste(item, Transform.PlainText)));
         menu.Items.Add(Item("Copy", () => _services.Copy(item)));
         menu.Items.Add(new Separator());
-        menu.Items.Add(Item(item.IsPinned ? "Unpin" : "Pin", () => _services.Store.TogglePin(item)));
         menu.Items.Add(Item(item.Label is null ? "Label…" : "Edit Label…", () =>
         {
-            if (InputDialog.Ask("Label", "Labelled items are pinned and never expire. Leave empty to remove the label.", item.Label ?? "") is { } label)
+            if (InputDialog.Ask("Label", "Labelled items are kept: they never expire. Leave empty to remove the label.", item.Label ?? "") is { } label)
                 _services.Store.SetLabel(label, item);
         }));
+        if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Labelled", () => _services.Store.Unpin(item)));
         if (item.Kind.IsTextual())
         {
             menu.Items.Add(Item("Save as Secret…", () =>
@@ -237,7 +237,7 @@ public sealed class FlyoutWindow : Window
             DockPanel.SetDock(cancel, Dock.Right);
             bar.Children.Add(clear);
             bar.Children.Add(cancel);
-            bar.Children.Add(Fluent.Label("Clear history? Pinned items are kept.", 13));
+            bar.Children.Add(Fluent.Label("Clear history? Labelled items are kept.", 13));
             _footer.Child = bar;
             return;
         }

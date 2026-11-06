@@ -49,6 +49,9 @@ internal sealed class FakeHost : IPanelHost
     public void ShareSecret(SecretRef secret, string groupId, string groupName) => Log.Add($"share-secret:{secret.Name}:{groupName}");
     public string? CurrentClipboardText() => "CLIP";
     public void OpenSettings() => Log.Add("settings");
+    public string SaveFolder { get; set; } = Path.Combine(Path.GetTempPath(), "c2save-" + Guid.NewGuid(), "Downloads");
+    public string? ChosenFolder { get; set; }
+    public string? ChooseSaveFolder() { Log.Add("choose-folder"); return ChosenFolder; }
     public IAIStreamingClient MakeAIClient() => throw new AIException(AIErrorKind.NotSignedIn, "not signed in");
     public string AIProviderTitle => "Test";
     public bool IsAIReady => AIReady;
@@ -105,7 +108,7 @@ public sealed class PanelTests : IDisposable
     {
         _model.PrepareForOpen(null);
         _model.HandleKey(K(PanelKey.Tab));
-        Assert.Equal(PanelFilter.Pinned, _model.Filter);
+        Assert.Equal(PanelFilter.Labelled, _model.Filter);
         _model.HandleKey(K(PanelKey.Tab, KeyMods.Shift));
         _model.HandleKey(K(PanelKey.Tab, KeyMods.Shift));
         Assert.Equal(PanelFilter.ThisApp, _model.Filter);
@@ -114,13 +117,13 @@ public sealed class PanelTests : IDisposable
     [Fact]
     public void ContentTypesAreMenuFiltersNotTabStops()
     {
-        Assert.Equal([PanelFilter.All, PanelFilter.Pinned, PanelFilter.Secrets, PanelFilter.ThisApp], PanelFilters.Chips);
+        Assert.Equal([PanelFilter.All, PanelFilter.Labelled, PanelFilter.Secrets, PanelFilter.ThisApp], PanelFilters.Chips);
         Add("some text");
         _model.PrepareForOpen(null);
         _model.SetFilter(PanelFilter.Images);
         Assert.Empty(_model.Entries);
         _model.HandleKey(K(PanelKey.Tab));                 // from a menu filter, Tab goes on to the chips
-        Assert.Equal(PanelFilter.Pinned, _model.Filter);
+        Assert.Equal(PanelFilter.Labelled, _model.Filter);
     }
 
     [Fact]
@@ -167,6 +170,169 @@ public sealed class PanelTests : IDisposable
         _host.Log.Clear();
         _model.HandleKey(K(PanelKey.Digit, KeyMods.Ctrl, digit: 1));   // empty slot → row 1
         Assert.Single(_host.Log, l => l.StartsWith("paste:"));
+    }
+
+    [Fact]
+    public void PinActionsAreGoneLabelsKeepItems()
+    {
+        var plain = Add("plain", 2);
+        var legacy = Add("pinned long ago", 1);
+        _store.TogglePin(legacy);
+        Add("labelled");
+        _store.SetLabel("Kept", _store.AllItems().Single(i => i.Text == "labelled"));
+        _model.PrepareForOpen(null);
+
+        foreach (var entry in _model.Entries)
+        {
+            _model.Select(entry.Id);
+            Assert.DoesNotContain(_model.AvailableActions, a => a.Title is "Pin" or "Unpin");
+        }
+        _model.Select(new PanelEntry.Clip(plain).Id);
+        Assert.DoesNotContain(new PanelAction.RemoveFromLabelled(), _model.AvailableActions);
+        _model.SelectAll();
+        Assert.DoesNotContain(_model.AvailableActions, a => a.Title is "Pin" or "Unpin");
+        Assert.Contains(new PanelAction.RemoveFromLabelled(), _model.AvailableActions);
+
+        // Ctrl+P no longer pins.
+        _model.Select(new PanelEntry.Clip(plain).Id);
+        Assert.False(_model.HandleKey(K(PanelKey.Letter, KeyMods.Ctrl, letter: 'p')));
+        Assert.False(plain.IsPinned);
+
+        _model.SetFilter(PanelFilter.Labelled);
+        Assert.Equal(["Kept", "pinned long ago"], _model.Entries.Select(e => e.ClipItem!.DisplayTitle));
+        Assert.Equal("Labelled", PanelFilter.Labelled.Title());
+
+        // Only an item pinned without a label offers "Remove from Labelled".
+        _model.Select(_model.Entries[0].Id);
+        Assert.DoesNotContain(new PanelAction.RemoveFromLabelled(), _model.AvailableActions);
+        _model.Select(new PanelEntry.Clip(legacy).Id);
+        _model.Perform(Assert.Single(_model.AvailableActions.OfType<PanelAction.RemoveFromLabelled>()));
+        Assert.False(_store.Find(legacy.Id)!.IsPinned);
+        Assert.Equal("Removed from Labelled", _model.Notice);
+        Assert.Equal("Kept", Assert.Single(_model.Entries).ClipItem!.Label);
+    }
+
+    [Fact]
+    public void RemovingTheLabelInTheFormUnpins()
+    {
+        var item = Add("value");
+        _model.PrepareForOpen(null);
+        _model.BeginLabel(_model.Entries[0]);
+        _model.LabelForm!.Text = "Name";
+        _model.HandleKey(K(PanelKey.Enter));
+        Assert.True(_store.Find(item.Id)!.IsPinned);
+        Assert.Equal("Labelled", _model.Notice);
+        _model.BeginLabel(_model.Entries[0]);
+        _model.LabelForm!.Text = "  ";
+        _model.HandleKey(K(PanelKey.Enter));
+        Assert.Equal((null, false), (_store.Find(item.Id)!.Label, _store.Find(item.Id)!.IsPinned));
+        Assert.Equal("Label removed", _model.Notice);
+    }
+
+    [Fact]
+    public void SaveActionsAreNamedAfterTheFolderAndWriteFiles()
+    {
+        var item = Add("Meeting notes for Monday");
+        _model.PrepareForOpen(null);
+        Assert.Contains(new PanelAction.SaveToFolder("Downloads"), _model.AvailableActions);
+        Assert.Contains(new PanelAction.SaveToChosenFolder(), _model.AvailableActions);
+        Assert.Equal("Save to Downloads", new PanelAction.SaveToFolder("Downloads").Title);
+
+        _model.OpenActions();
+        _model.Perform(new PanelAction.SaveToFolder("Downloads"));
+        Assert.Equal(PanelMode.Browse, _model.Mode);
+        Assert.Equal("Saved to Downloads", _model.Notice);
+        Assert.Equal("Meeting notes for Monday", File.ReadAllText(Path.Combine(_host.SaveFolder, "Meeting notes for Monday.txt")));
+
+        // Cancelling the picker does nothing; a chosen folder gets the item.
+        _model.Perform(new PanelAction.SaveToChosenFolder());
+        Assert.Contains("choose-folder", _host.Log);
+        Assert.Equal("Saved to Downloads", _model.Notice);
+        _host.ChosenFolder = Path.Combine(Path.GetDirectoryName(_host.SaveFolder)!, "Elsewhere");
+        _model.Perform(new PanelAction.SaveToChosenFolder());
+        Assert.Equal("Saved to Elsewhere", _model.Notice);
+        Assert.True(File.Exists(Path.Combine(_host.ChosenFolder, "Meeting notes for Monday.txt")));
+
+        // Several selected items are saved each; errors are reported.
+        Add("second");
+        _model.PrepareForOpen(null);
+        _model.SelectAll();
+        Assert.Contains(new PanelAction.SaveToFolder("Downloads"), _model.AvailableActions);
+        _model.Perform(new PanelAction.SaveToFolder("Downloads"));
+        Assert.Equal("Saved 2 items to Downloads", _model.Notice);
+        Assert.True(File.Exists(Path.Combine(_host.SaveFolder, "Meeting notes for Monday (2).txt")));
+        Assert.True(File.Exists(Path.Combine(_host.SaveFolder, "second.txt")));
+
+        var files = _store.Ingest(ProcessedCapture.ForFiles([Path.Combine(_host.SaveFolder, "gone.txt")]));
+        _model.PrepareForOpen(null);
+        _model.Select(new PanelEntry.Clip(files).Id);
+        _model.Perform(new PanelAction.SaveToFolder("Downloads"));
+        Assert.Equal("Couldn't save to Downloads: The file is gone.", _model.Notice);
+        Directory.Delete(Path.GetDirectoryName(_host.SaveFolder)!, recursive: true);
+    }
+
+    [Fact]
+    public void PickingFilesOfAMultiFileItemPastesOnlyThose()
+    {
+        string[] paths = [@"C:\a.txt", @"C:\b.txt", @"C:\c.txt", @"C:\d.txt"];
+        var files = _store.Ingest(ProcessedCapture.ForFiles(paths));
+        Add("text", 10);
+        _model.PrepareForOpen(null);
+        Assert.Equal(files.Id, _model.PickableItem?.Id);
+        Assert.Empty(_model.PickedFiles);
+
+        _model.ClickFile(paths[2], shift: false);
+        _model.ClickFile(paths[0], shift: false);
+        Assert.Equal([paths[0], paths[2]], _model.PickedFiles);   // in the item's order
+        _model.ClickFile(paths[0], shift: false);                  // toggles off
+        Assert.Equal([paths[2]], _model.PickedFiles);
+        _model.ClickFile(paths[2], shift: true);                   // range from the last one clicked
+        Assert.Equal([paths[0], paths[1], paths[2]], _model.PickedFiles);
+
+        _model.Perform(new PanelAction.Copy());
+        Assert.Contains($"copy:{string.Join("\n", paths[..3])}", _host.Log);
+        _model.HandleKey(K(PanelKey.Enter));
+        Assert.Contains($"paste:{string.Join("\n", paths[..3])}:", _host.Log);
+        Assert.Equal(paths, _store.Find(files.Id)!.Files);         // the stored item is untouched
+
+        // Moving the selection lets go of the picked files, and they don't come back.
+        _model.MoveSelection(1);
+        Assert.Empty(_model.PickedFiles);
+        _model.MoveSelection(-1);
+        Assert.Empty(_model.PickedFiles);
+        _model.HandleKey(K(PanelKey.Enter));
+        Assert.Contains($"paste:{string.Join("\n", paths)}:", _host.Log);
+
+        // Escape lets go first; closing the panel does too.
+        _model.ClickFile(paths[3], shift: false);
+        Assert.True(_model.HandleKey(K(PanelKey.Escape)));
+        Assert.Empty(_model.PickedFiles);
+        Assert.DoesNotContain("close", _host.Log.TakeLast(1));
+        _model.ClickFile(paths[3], shift: false);
+        _model.DidClose();
+        Assert.Empty(_model.PickedFiles);
+
+        // Every file picked is just the whole item.
+        foreach (var path in paths) _model.ClickFile(path, shift: false);
+        Assert.Same(files, _model.ItemForUse(files));
+    }
+
+    [Fact]
+    public void SingleFileItemsAndMultiSelectionHaveNothingToPick()
+    {
+        var one = _store.Ingest(ProcessedCapture.ForFiles([@"C:\only.txt"]));
+        _store.Ingest(ProcessedCapture.ForFiles([@"C:\x.txt", @"C:\y.txt"]), DateTime.UtcNow.AddSeconds(-5));
+        _model.PrepareForOpen(null);
+        Assert.Equal(one.Id, _model.SelectedEntry!.ClipItem!.Id);
+        Assert.Null(_model.PickableItem);
+        _model.ClickFile(@"C:\only.txt", shift: false);
+        Assert.Empty(_model.PickedFiles);
+        _model.MoveSelection(1);
+        _model.ClickFile(@"C:\x.txt", shift: false);
+        Assert.Single(_model.PickedFiles);
+        _model.SelectAll();
+        Assert.Null(_model.PickableItem);
+        Assert.Empty(_model.PickedFiles);
     }
 
     [Fact]

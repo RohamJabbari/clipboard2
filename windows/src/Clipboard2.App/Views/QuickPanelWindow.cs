@@ -179,6 +179,7 @@ public sealed class QuickPanelWindow : Window
     private void CloseAfterDeactivation()
     {
         const int VK_LBUTTON = 0x01;
+        if (_choosingFolder) return;   // "Save to…": the folder picker is in front, the panel stays
         if (_services.Secrets.IsAuthenticating)
         {
             // Windows Hello took focus for something asked from the panel: stay, and come back once it's answered.
@@ -205,6 +206,25 @@ public sealed class QuickPanelWindow : Window
             if (IsVisible && !IsActive) _services.ClosePanel();
         };
         timer.Start();
+    }
+
+    private bool _choosingFolder;
+
+    /// <summary>"Save to…": a folder picker owned by the panel, which stays open behind it. Null when cancelled.</summary>
+    public string? ChooseFolder(string initial)
+    {
+        var dialog = new Microsoft.Win32.OpenFolderDialog { Title = "Save to", InitialDirectory = Directory.Exists(initial) ? initial : "" };
+        _choosingFolder = true;
+        try
+        {
+            var chosen = IsVisible ? dialog.ShowDialog(this) : dialog.ShowDialog();
+            return chosen == true ? dialog.FolderName : null;
+        }
+        finally
+        {
+            _choosingFolder = false;
+            if (IsVisible) ReactivateAfterDrop();
+        }
     }
 
     /// <summary>Brings the panel back to the front after something was dropped on it from another app.</summary>
@@ -240,7 +260,7 @@ public sealed class QuickPanelWindow : Window
         var data = new DataObject();
         data.SetData(EntryFormat, entry.Id);
         if (item.Kind.IsTextual()) data.SetText(item.Text);
-        else if (DraggedFiles(item) is { Count: > 0 } files) data.SetFileDropList(files);
+        else if (DraggedFiles(Model.ItemForUse(item)) is { Count: > 0 } files) data.SetFileDropList(files);
         if (item.Kind == ClipKind.Image && item.ImageFile is { } image && File.Exists(_services.Store.Blobs.PathFor(image)))
             data.SetData("PNG", new MemoryStream(File.ReadAllBytes(_services.Store.Blobs.PathFor(image))));
         DragDrop.DoDragDrop(row, data, DragDropEffects.Copy);
@@ -598,9 +618,10 @@ public sealed class QuickPanelWindow : Window
         }
         if (entry.ClipItem is { IsPinned: true })
         {
-            var pin = Glyphs.Icon(Glyphs.Pinned, 12, sub);
-            pin.Margin = new Thickness(6, 0, 6, 0);
-            trailing.Children.Add(pin);
+            var tag = Glyphs.Icon(Glyphs.Tag, 12, sub);
+            tag.Margin = new Thickness(6, 0, 6, 0);
+            tag.ToolTip = "Labelled: kept until you remove the label";
+            trailing.Children.Add(tag);
         }
         if (Model.ShortcutNumber(entry, index) is { } shortcut)
         {
@@ -681,10 +702,17 @@ public sealed class QuickPanelWindow : Window
         if (entry.ClipItem is { } item)
         {
             menu.Items.Add(Item("Paste as Plain Text", () => Model.Activate(entry, Transform.PlainText)));
-            menu.Items.Add(Item("Copy", () => _services.Copy(item)));
+            menu.Items.Add(Item("Copy", () => _services.Copy(Model.ItemForUse(item))));
             menu.Items.Add(new Separator());
-            menu.Items.Add(Item(item.IsPinned ? "Unpin" : "Pin", () => { _services.Store.TogglePin(item); Model.Refresh(); }));
             menu.Items.Add(Item(item.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
+            if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Labelled", () => Model.RemoveFromLabelled([item])));
+            if (item != Model.SelectionItem)
+            {
+                // Right-clicking one of several selected items saves them all.
+                List<ClipItem> Targets() => Model.IsMultiSelecting && Model.IsSelected(entry) ? Model.SelectedClips : [item];
+                menu.Items.Add(Item($"Save to {Model.SaveFolderName}", () => Model.Save(Targets(), _services.SaveFolder)));
+                menu.Items.Add(Item("Save to…", () => { if (_services.ChooseSaveFolder() is { } folder) Model.Save(Targets(), folder); }));
+            }
             if (item.Kind.IsTextual()) menu.Items.Add(Item("Save as Secret…", () => Model.BeginSaveSecret(item)));
             menu.Items.Add(Item("Delete", () => { _services.Store.Delete(item); Model.Refresh(); }));
         }
@@ -731,6 +759,7 @@ public sealed class QuickPanelWindow : Window
             _detailState = state;
             _actionFilter = null;
             _aiOutput = null;
+            _fileRows.Clear();
             _detail.Child = Model.Mode switch
             {
                 PanelMode.Actions => BuildActions(),
@@ -744,6 +773,7 @@ public sealed class QuickPanelWindow : Window
         }
         if (Model.Mode == PanelMode.Actions) FillActionList();
         if (Model.Mode == PanelMode.AI) UpdateAI();
+        if (Model.Mode == PanelMode.Browse) UpdateFileRows();
     }
 
     private static Border Padded(UIElement child, double padding = 14) => new() { Padding = new Thickness(padding), Child = child };
@@ -758,7 +788,7 @@ public sealed class QuickPanelWindow : Window
         UIElement body = entry switch
         {
             PanelEntry.Clip { Item.Kind: ClipKind.Image } c => ImagePreview(c.Item),
-            PanelEntry.Clip { Item.Kind: ClipKind.File } c => Padded(FileList(c.Item.Files)),
+            PanelEntry.Clip { Item.Kind: ClipKind.File } c => Padded(FileList(c.Item)),
             PanelEntry.Clip c => TextView(c.Item.Text),
             PanelEntry.SnippetEntry s => TextView(s.Snippet.Body),
             PanelEntry.SecretEntry k => SecretView(k.Secret),
@@ -789,9 +819,11 @@ public sealed class QuickPanelWindow : Window
         grid.Children.Add(image);
         var section = new StackPanel { Margin = new Thickness(14, 0, 14, 10) };
         var header = new DockPanel { Margin = new Thickness(0, 0, 0, 4) };
-        var copy = new Button { Content = "Copy Text", FontSize = 12, Padding = new Thickness(8, 2, 8, 2) };
+        var copy = new Button { Content = "Copy", FontSize = 12, Padding = new Thickness(8, 1, 8, 1), ToolTip = "Copy the text in the image" };
+        AutomationName(copy, "Copy the text in the image");
         var text = item.OcrText;
-        copy.Click += (_, _) => { _services.CopyText(text); Model.ShowNotice("Copied the text in the image"); };
+        // Written with the internal marker (ClipboardIO.WriteText), so it isn't captured as a new item.
+        copy.Click += (_, _) => { _services.CopyText(text); Model.ShowNotice("Copied text"); };
         DockPanel.SetDock(copy, Dock.Right);
         header.Children.Add(copy);
         header.Children.Add(Fluent.Label("Text in image", 12, Fluent.Secondary, FontWeights.SemiBold));
@@ -818,17 +850,62 @@ public sealed class QuickPanelWindow : Window
         FontSize = 14,
     };
 
-    private static UIElement FileList(IEnumerable<string> files)
+    private readonly List<(string Path, Border Row, TextBlock Check, TextBlock Name, TextBlock Folder)> _fileRows = [];
+
+    /// <summary>The files of a file item. With several, each row toggles: the picked ones are all that Enter, Paste,
+    /// Copy and drag use.</summary>
+    private UIElement FileList(ClipItem item)
     {
+        var pickable = Model.PickableItem == item;
         var stack = new StackPanel();
-        foreach (var path in files)
+        if (pickable)
         {
-            var row = new StackPanel { Margin = new Thickness(0, 0, 0, 10) };
-            row.Children.Add(Fluent.Label(System.IO.Path.GetFileName(path), 14));
-            row.Children.Add(Fluent.Label(System.IO.Path.GetDirectoryName(path) ?? "", 12, Fluent.Secondary));
+            var hint = Fluent.Label("Click files to use only those. Shift+click picks a range.", 12, Fluent.Secondary, wrap: true);
+            hint.Margin = new Thickness(0, 0, 0, 8);
+            stack.Children.Add(hint);
+        }
+        foreach (var path in item.Files)
+        {
+            var grid = new Grid();
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            var check = Glyphs.Icon("\uE739", 15, Fluent.Tertiary);
+            check.Margin = new Thickness(0, 0, 10, 0);
+            check.Visibility = pickable ? Visibility.Visible : Visibility.Collapsed;
+            grid.Children.Add(check);
+            var texts = new StackPanel();
+            var name = Fluent.Label(System.IO.Path.GetFileName(path), 14);
+            var folder = Fluent.Label(System.IO.Path.GetDirectoryName(path) ?? "", 12, Fluent.Secondary);
+            texts.Children.Add(name);
+            texts.Children.Add(folder);
+            Grid.SetColumn(texts, 1);
+            grid.Children.Add(texts);
+            var row = new Border { Child = grid, CornerRadius = new CornerRadius(6), Padding = new Thickness(8, 4, 8, 4), Margin = new Thickness(-8, 0, -8, 4), Background = Brushes.Transparent };
+            if (pickable)
+            {
+                var p = path;
+                row.Cursor = Cursors.Hand;
+                row.MouseLeftButtonUp += (_, e) => { Model.ClickFile(p, Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)); e.Handled = true; };
+                _fileRows.Add((path, row, check, name, folder));
+            }
             stack.Children.Add(row);
         }
+        UpdateFileRows();
         return new ScrollViewer { Content = stack, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+    }
+
+    private void UpdateFileRows()
+    {
+        foreach (var (path, row, check, name, folder) in _fileRows)
+        {
+            var picked = Model.IsFilePicked(path);
+            row.Background = picked ? Fluent.Accent : Brushes.Transparent;
+            check.Text = picked ? "\uE73A" : "\uE739";
+            check.Foreground = picked ? Fluent.AccentText : Fluent.Tertiary;
+            name.Foreground = picked ? Fluent.AccentText : (Brush)Application.Current.Resources[SystemColors.ControlTextBrushKey];
+            folder.Foreground = picked ? Fluent.AccentText : Fluent.Secondary;
+            AutomationName(row, System.IO.Path.GetFileName(path) + (picked ? ", picked" : ""));
+        }
     }
 
     private UIElement SecretView(SecretRef secret)
@@ -925,7 +1002,7 @@ public sealed class QuickPanelWindow : Window
                     ClipKind.File => item.Files.Count == 1 ? "File" : $"{item.Files.Count} files",
                     _ => $"{item.Kind.DisplayName()} · {item.Text.Length} characters",
                 });
-                Line("Expires", item.IsPinned ? "Never (pinned)"
+                Line("Expires", item.IsPinned ? "Never (labelled)"
                     : item.ExpiryDate(_services.Settings.MaxAge) is { } expiry ? expiry.ToLocalTime().ToString("g") : "Never");
                 break;
             case PanelEntry.SnippetEntry s:
@@ -996,7 +1073,6 @@ public sealed class QuickPanelWindow : Window
         if (_actionFilter is not null && _actionFilter.Text != Model.ActionQuery) _actionFilter.Text = Model.ActionQuery;
         if (_actionHint is not null) _actionHint.Text = Model.IsPickingGroup ? "Choose a group to share with" : $"Filter actions or ask {Model.AIName}";
         var actions = Model.FilteredActions;
-        var pinned = Model.SelectedEntry?.ClipItem?.IsPinned ?? false;
         string? section = null;
         Border? selectedRow = null;
         for (var i = 0; i < actions.Count; i++)
@@ -1015,7 +1091,7 @@ public sealed class QuickPanelWindow : Window
             {
                 CornerRadius = new CornerRadius(6), Padding = new Thickness(8, 5, 8, 5),
                 Background = selected ? Fluent.Accent : Brushes.Transparent,
-                Child = Fluent.Label(action.Title(pinned), 14, selected ? Fluent.AccentText : null),
+                Child = Fluent.Label(action.Title, 14, selected ? Fluent.AccentText : null),
             };
             var a = action;
             row.MouseLeftButtonUp += (_, _) => Model.Perform(a);
@@ -1139,7 +1215,7 @@ public sealed class QuickPanelWindow : Window
         var stack = new StackPanel();
         stack.Children.Add(Fluent.Label(form.IsSecret ? "Rename Secret" : "Label", 16, null, FontWeights.SemiBold));
         stack.Children.Add(Fluent.Label(form.IsSecret ? "The name shown for this secret." :
-            "Shown instead of the content and searchable. Labelled items are pinned, so they never expire. Leave empty to remove the label.",
+            "Shown instead of the content and searchable. Labelled items are kept: they never expire. Leave empty to remove the label, and the item expires like the rest of history.",
             13, Fluent.Secondary, wrap: true));
         var box = new TextBox { Text = form.Text, Margin = new Thickness(0, 12, 0, 0) };
         box.TextChanged += (_, _) => form.Text = box.Text;
@@ -1211,7 +1287,9 @@ public sealed class QuickPanelWindow : Window
         _syncStatus.Update();
         _hints.Text = Model.Mode switch
         {
-            PanelMode.Browse when Model.IsMultiSelecting => $"Enter Paste {Model.SelectedClips.Count} items    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+P Pin    Del Delete    Esc Close",
+            PanelMode.Browse when Model.PickedFiles.Count > 0 && Model.PickableItem is { } item =>
+                $"Enter Paste {Model.PickedFiles.Count} of {item.Files.Count} files    Ctrl+K Actions    Esc All Files",
+            PanelMode.Browse when Model.IsMultiSelecting => $"Enter Paste {Model.SelectedClips.Count} items    Shift+Enter Plain Text    Ctrl+K Actions    Del Delete    Esc Close",
             PanelMode.Browse => "Enter Paste    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Shift+1–9 Assign Slot    Tab Filter    Esc Close",
             PanelMode.Actions when Model.IsPickingGroup => "↑↓ Choose Group    Enter Share    Esc Back",
             PanelMode.Actions => "↑↓ Choose    Enter Run    Esc Back",

@@ -162,7 +162,7 @@ public sealed class ContextMenuService : IDisposable
                 menu.Items.Add(Item($"Send to {device.Name}", Glyphs.Cloud, () => Do(() => _services.SendSelectionToDeviceAsync(device))));
         }
         menu.Items.Add(Submenu("Recent", Glyphs.Clock, _services.Store.AllItems().Take(12).Select(item =>
-            Item(item.DisplayTitle.Length > 60 ? item.DisplayTitle[..60] + "…" : item.DisplayTitle, item.IsPinned ? Glyphs.Pin : Glyphs.Text,
+            Item(item.DisplayTitle.Length > 60 ? item.DisplayTitle[..60] + "…" : item.DisplayTitle, item.IsPinned ? Glyphs.Tag : Glyphs.Text,
                 () => Do(() => { _services.Paste(item, null); return Task.CompletedTask; })))));
         menu.Items.Add(Submenu("Snippets", Glyphs.Snippet, _services.Store.AllSnippets().Select(snippet =>
             Item(snippet.Name, Glyphs.Snippet, () => Do(() =>

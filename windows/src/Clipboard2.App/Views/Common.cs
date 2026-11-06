@@ -35,7 +35,7 @@ public static class Glyphs
     public static string For(PanelFilter filter) => filter switch
     {
         PanelFilter.All => All,
-        PanelFilter.Pinned => Pin,
+        PanelFilter.Labelled => Tag,
         PanelFilter.Text => Text,
         PanelFilter.Images => Image,
         PanelFilter.Files => File,
