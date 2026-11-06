@@ -23,6 +23,9 @@ export interface Limits {
   groupItems: number;
   totalBytes: number;
   signupCodesPerUser: number;
+  contactsPerUser: number;
+  pendingContactRequests: number;
+  contactCodesPerUser: number;
   scryptConcurrency: number;
   scryptQueue: number;
 }
@@ -45,6 +48,9 @@ export const limits = (): Limits => ({
   groupItems: int("LIMIT_GROUP_ITEMS", 5000),
   totalBytes: int("LIMIT_TOTAL_BYTES", 20 * 1024 * 1024 * 1024),
   signupCodesPerUser: int("LIMIT_SIGNUP_CODES_PER_USER", 10),
+  contactsPerUser: int("LIMIT_CONTACTS_PER_USER", 200),
+  pendingContactRequests: int("LIMIT_PENDING_CONTACT_REQUESTS", 50),
+  contactCodesPerUser: int("LIMIT_CONTACT_CODES_PER_USER", 20),
   scryptConcurrency: int("SCRYPT_CONCURRENCY", 2),
   scryptQueue: int("SCRYPT_QUEUE", 8),
 });

@@ -178,7 +178,7 @@ Pinning or unpinning changes the category, and the category is part of the AAD, 
 | `PUT /v1/account/password` `{authKey, newAuthKey, kdf: {salt, iterations}, wrappedAccountKey}` | `204`. Checks the current `authKey`, replaces the password verifier and `wrappedAK` (AK itself doesn't change), and revokes every other session. |
 | `GET /v1/account` | `Account` |
 | `PUT /v1/account/username` `{username}` | `200 {username}`; `409 username_taken` |
-| `DELETE /v1/account` `{authKey}` | `204`. Deletes sessions, sign-up codes, the personal space, owned groups (items, blobs, invites) and memberships. Every live item the user wrote in other people's groups becomes a `user` tombstone (its `updatedAt` raised to the deletion time, `authorUid` then `null`), and their blobs there are deleted. |
+| `DELETE /v1/account` `{authKey}` | `204`. Deletes sessions, sign-up codes, the personal space, owned groups (items, blobs, invites), memberships, and every [direct space](#contacts) they are in or were asked into (pending requests both ways), for both people. Every live item the user wrote in other people's groups becomes a `user` tombstone (its `updatedAt` raised to the deletion time, `authorUid` then `null`), and their blobs there are deleted. |
 | `GET /v1/sessions` | `{sessions: [{id, deviceName, createdAt, lastUsedAt, current}]}`, the caller's unexpired sessions, most recently used first. `id` is a UUID; `current` marks the calling session. |
 | `DELETE /v1/sessions/:id` | `204`, signs that device out (it may be the calling session); `404` if it isn't one of the caller's |
 | `POST /v1/signup-codes` | `201 {id, code, expiresAt}`. A new [sign-up code](#sign-up-codes), valid 14 days, single use. `code` is shown only here. `429 too_many_codes` with 10 open (unused, unexpired) codes. |
@@ -199,7 +199,7 @@ Account = {"uid","email","kdf":{"alg":"pbkdf2-sha256","salt","iterations"},
 - **Signup:** `kdf.iterations` must be at least 100 000.
 - **Usernames:** optional; trimmed and NFC-normalized, then 3–24 Unicode letters, digits, `_`, `.` or `-`, starting with a letter or digit (`invalid` otherwise). Stored as typed, unique case-insensitively. Accounts without one have `username: null`.
 - **Sign-up invites:** `signupCode` (as typed; the server normalises it) is consumed by the sign-up.
-  `groupInviteId` must be an unused, unexpired group invite; sign-up doesn't consume it, joining does.
+  `groupInviteId` must be an unused, unexpired group invite (a contact code doesn't count); sign-up doesn't consume it, joining does.
   The invite is checked before the email, so sign-up can't be used to find accounts without one.
   New servers get their first code from `npm run signup-code` (an operator code that belongs to nobody).
 - **Rate limits:** prelogin, signup and login (and the password checks of password change and account
@@ -222,7 +222,7 @@ Account = {"uid","email","kdf":{"alg":"pbkdf2-sha256","salt","iterations"},
 | `DELETE /v1/groups/:id/members/:uid` | `204`. The owner can remove others; a member can remove themselves (leave). The owner can't leave and has to delete the group instead. |
 
 ```jsonc
-Space = {"id","kind":"personal|group","role":"owner|member","ownerUid",
+Space = {"id","kind":"personal|group|direct","role":"owner|member","ownerUid",
          "wrappedKey","encryptedName":null|"<b64>","memberCount",
          "members":[{"uid","name"}],"createdAt"}
 ```
@@ -243,7 +243,7 @@ Space = {"id","kind":"personal|group","role":"owner|member","ownerUid",
 1. **Owner:** generates a code, uploads `{inviteId, sealedKey}`, and shows the code once, with a Copy button.
 2. **Invitee:** pastes the code, then `GET /v1/invites/:inviteId`, opens `sealedKey` to get SK, decrypts `encryptedName` to show "Join ‹name›?", and on confirm calls `accept` with SK wrapped to itself.
 
-**Rate limits:** invite fetches and accepts have their own limit of 20/min per user.
+**Rate limits:** invite fetches and accepts, user lookups and contact requests share their own limit of 20/min per user.
 
 ### Contacts
 
@@ -253,8 +253,10 @@ item into that space. The client shows items the *other* member wrote there in i
 
 - **Listing:** `GET /v1/spaces` leaves `direct` spaces out unless the client asks with
   `?include=direct` (clients from before contacts would show them as unnamed groups). Every
-  direct space the caller is a full member of is listed, `kind: "direct"`, `encryptedName: null`;
+  established contact (a direct space with both people in it) is listed, `kind: "direct"`, `encryptedName: null`;
   `members` names both people, so the contact's name is the member who isn't the caller.
+  Pending ones (an outgoing request, an unused code) aren't listed: they're in `GET /v1/contacts/requests`
+  and `GET /v1/contacts/invites`.
 - **One per pair:** two people have at most one direct space, counting pending requests and
   accepted contacts, in either direction. A second request or code accept between them is `409 conflict`.
 - **Either member** may delete any item in a direct space (not only its author), and either may end
@@ -265,6 +267,8 @@ item into that space. The client shows items the *other* member wrote there in i
 1. **Username + accept.** The requester looks up the other person's public key, makes the space and
    wraps `SK` to both of them. The other person sees a pending request and accepts or declines. Until
    then they aren't a member: they can't read the space and nothing can be sent.
+   The server enforces both: item `PUT`s and blob uploads into a direct space with only one member
+   (a pending request or an unused code) answer `403 forbidden`.
 2. **One-time code.** Exactly like a group invite code ([Invite codes](#invite-codes), the same
    `inviteId`/`sealedKey` derivation with `spaceId` the direct space). Whoever enters the code
    becomes the contact immediately; no accept step, since sharing the code was the consent.
@@ -272,10 +276,10 @@ item into that space. The client shows items the *other* member wrote there in i
 | Request | Response |
 |---|---|
 | `GET /v1/users/:username` | `{uid, username, name, publicKey}`. Case-insensitive match. `404 not_found` if nobody has it; `400 invalid` for your own. Shares the invite rate limit (20/min per user). |
-| `POST /v1/contacts/requests` `{username, spaceId, wrappedKey, recipientWrappedKey}` | `201 ContactRequest`. Creates direct space `spaceId` with the caller as owner (`wrappedKey` = SK wrapped to the caller) and stores `recipientWrappedKey` (SK wrapped to the recipient's public key, AAD with the recipient's uid) until accepted. `404` unknown username, `400 invalid` yourself, `409 conflict` already contacts or a pending request either way. |
+| `POST /v1/contacts/requests` `{username, spaceId, wrappedKey, recipientWrappedKey}` | `201 ContactRequest`. Creates direct space `spaceId` with the caller as owner (`wrappedKey` = SK wrapped to the caller) and stores `recipientWrappedKey` (SK wrapped to the recipient's public key, AAD with the recipient's uid) until accepted. `404` unknown username, `400 invalid` yourself, `409 conflict` already contacts or a pending request either way (or `spaceId` taken), `403 quota_exceeded` over a [limit](#contacts) (yours or the recipient's). Counts against the invite rate limit, like the lookup, since it also answers `404` for unknown usernames. |
 | `GET /v1/contacts/requests` | `{incoming: [ContactRequest], outgoing: [ContactRequest]}`, pending only, newest first |
-| `POST /v1/contacts/requests/:spaceId/accept` | `201 Space`. Recipient only. Adds the recipient as `member` with the stored `recipientWrappedKey`. |
-| `DELETE /v1/contacts/requests/:spaceId` | `204`. Recipient declines or requester cancels; deletes the space. |
+| `POST /v1/contacts/requests/:spaceId/accept` | `201 Space`. Recipient only (`404` for anyone else, or once it's gone). Adds the recipient as `member` with the stored `recipientWrappedKey`. |
+| `DELETE /v1/contacts/requests/:spaceId` | `204`. Recipient declines or requester cancels; deletes the space. `404` if it isn't a pending request of the caller's. |
 | `POST /v1/contacts/invites` `{spaceId, wrappedKey, inviteId, sealedKey}` | `201 {spaceId, inviteId, expiresAt}`. Creates direct space `spaceId` (caller as owner) and a single-use code invite, valid 7 days. |
 | `GET /v1/contacts/invites` | `{invites: [{spaceId, inviteId, createdAt, expiresAt}]}`, the caller's open contact codes |
 | `DELETE /v1/contacts/invites/:inviteId` | `204`, revokes the code and deletes its still-empty space |
@@ -290,15 +294,17 @@ ContactRequest = {"spaceId","uid","username":null|"<string>","name","createdAt"}
 - `GET /v1/invites/:inviteId` also returns `kind` (`"group"` or `"direct"`) and, for `direct`,
   `ownerName` (the code's creator) so the app can ask "Add ‹name› as a contact?". `encryptedName` is `null` there.
 - `POST /v1/invites/:inviteId/accept` on a direct space: `400 invalid` for your own code, `409 conflict` if you're
-  already contacts (or have a pending request) with its creator. Old clients that don't know `kind` would try to show
+  already contacts (or have a pending request) with its creator (the code stays unused), `403 quota_exceeded` if
+  you're at the contact limit. Old clients that don't know `kind` would try to show
   it as a group; accepting still works.
 - Group-only routes (`PATCH`/`DELETE /v1/groups/:id`, members, group invites) answer `404` for direct spaces.
 
 **Housekeeping:** a direct space that still has one member and no pending request or live code
-(declined, cancelled, expired) is deleted by the server, at the latest a day after its code expires.
+(declined, cancelled, expired) is deleted by the server, at the latest a day after its code expires (and never in its first day).
+The server sweeps opportunistically while handling `GET /v1/spaces`, at most every 10 minutes per instance.
 
 **Limits:** 200 contacts per user (pending requests and open codes included, both directions),
-50 pending outgoing requests, 20 open contact codes. Over a limit → `403 quota_exceeded`. A direct
+50 pending outgoing requests, 20 open contact codes. Over a limit → `403 quota_exceeded`; a request to someone who is at the contact limit is refused the same way. A direct
 space has the group storage limits (2 GB, 5 000 live items) and history retention (newest 200).
 Deleting an account deletes all its direct spaces.
 

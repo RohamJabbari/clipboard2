@@ -113,6 +113,10 @@ const groupBody = z.object({ id: uuid, encryptedName: sealed, wrappedKey: sealed
 const renameBody = z.object({ encryptedName: sealed });
 const inviteBody = z.object({ inviteId, sealedKey: sealed });
 const acceptBody = z.object({ wrappedKey: sealed });
+const contactRequestBody = z.object({ username, spaceId: uuid, wrappedKey: sealed, recipientWrappedKey: sealed });
+const contactInviteBody = z.object({ spaceId: uuid, wrappedKey: sealed, inviteId, sealedKey: sealed });
+/** `include=direct` (comma-separated list) adds contacts; older clients would show them as unnamed groups. */
+const spacesQuery = z.object({ include: z.string().max(100).optional() });
 const changesQuery = z.object({
   since: z.coerce.number().int().nonnegative().default(0),
   limit: z.coerce.number().int().min(1).max(500).default(500),
@@ -185,6 +189,34 @@ async function requireGroupOwner(db: Queryable, spaceId: string, uid: string) {
   if (membership.role !== "owner") throw forbidden("Only the group owner can do that");
 }
 
+/** A direct space takes writes only once both people are in it: nothing is sent to a pending request or an unused code. */
+async function requireContactEstablished(db: Queryable, spaceId: string, membership: { kind: string }) {
+  if (membership.kind !== "direct") return;
+  const { rows } = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM space_members WHERE space_id = $1", [spaceId]);
+  if ((rows[0]?.n ?? 0) < 2) throw forbidden("They haven't accepted yet");
+}
+
+const contactExists = () => new ApiError(409, "conflict", "You're already contacts, or a request between you is pending");
+
+/** Locks both people's user rows, in uid order so two requests in opposite directions can't deadlock. */
+async function lockUsers(db: Queryable, uids: string[]) {
+  await db.query("SELECT 1 FROM users WHERE uid = ANY($1::text[]) ORDER BY uid FOR UPDATE", [uids]);
+}
+
+/** True if these two already share a direct space, pending or accepted. */
+async function pairTaken(db: Queryable, a: string, b: string): Promise<boolean> {
+  const [low, high] = orderedPair(a, b);
+  const { rowCount } = await db.query("SELECT 1 FROM direct_pairs WHERE uid_low = $1 AND uid_high = $2", [low, high]);
+  return Boolean(rowCount);
+}
+
+/** Maps unique-index hits from creating a direct space: the pair (a race past pairTaken) or a taken id. */
+const pairConflict = (error: { code?: string; constraint?: string }): never => {
+  if (error.code === "23505" && error.constraint === "direct_pairs_pair") throw contactExists();
+  if (error.code === "23505") throw new ApiError(409, "conflict", "That id is already taken");
+  throw error;
+};
+
 const SERVER_TOTAL_TTL_MS = 30_000;
 
 /** Bytes this user currently occupies: live items they wrote plus blobs they registered. */
@@ -207,7 +239,13 @@ async function bytesStored(db: Queryable, spaceId: string | null): Promise<numbe
   return Number(rows[0]?.total ?? 0);
 }
 
-/** In a group, an existing item (tombstones included) may be overwritten or deleted only by its author or the group owner. */
+/** Groups and direct spaces share the group storage limits; personal spaces only have the per-user one. */
+const isShared = (kind: string) => kind !== "personal";
+
+/** Who a pair of uids is, in the order direct_pairs stores them. */
+const orderedPair = (a: string, b: string): [string, string] => (a < b ? [a, b] : [b, a]);
+
+/** In a group, an existing item (tombstones included) may be overwritten or deleted only by its author or the group owner. In a direct space either member may. */
 function requireItemWriter(membership: { role: string; kind: string }, item: ItemRow, uid: string) {
   if (membership.kind === "group" && membership.role !== "owner" && item.author_uid !== uid) {
     throw forbidden("Only the item's author or the group owner can change it");
@@ -423,7 +461,9 @@ export function buildApp(deps: Deps): FastifyInstance {
       return { signupCodeId: rows[0].id };
     }
     if (body.groupInviteId !== undefined) {
-      const found = await db.query("SELECT 1 FROM invites WHERE id = $1 AND expires_at > now()", [body.groupInviteId]);
+      const found = await db.query("SELECT 1 FROM invites i JOIN spaces s ON s.id = i.space_id WHERE i.id = $1 AND i.expires_at > now() AND s.kind = 'group'", [
+        body.groupInviteId,
+      ]);
       if (!found.rowCount) throw inviteInvalid();
       return { signupCodeId: null };
     }
@@ -538,11 +578,23 @@ export function buildApp(deps: Deps): FastifyInstance {
     await throttleAuth(request, request.caller.email);
     if (!(await checkAuthKey(pool, { uid }, body.authKey))) throw new ApiError(401, "invalid_credentials", "Wrong password");
     const paths = await tx(pool, async (db) => {
+      // Every direct space they're in or were asked into goes for both people, items and blobs included.
+      const { rows: direct } = await db.query<{ id: string }>(
+        `SELECT s.id FROM spaces s WHERE s.kind = 'direct' AND (
+           EXISTS (SELECT 1 FROM space_members m WHERE m.space_id = s.id AND m.uid = $1)
+           OR EXISTS (SELECT 1 FROM contact_requests r WHERE r.space_id = s.id AND r.recipient = $1))
+         ORDER BY s.id FOR UPDATE`,
+        [uid],
+      );
+      const directIds = direct.map((r) => r.id);
+      const directPaths = await blobPathsOfSpaces(db, directIds);
+      await db.query("DELETE FROM spaces WHERE id = ANY($1::uuid[])", [directIds]);
       const owned = await db.query<{ id: string }>("SELECT id FROM spaces WHERE owner_uid = $1", [uid]);
       const paths = await blobPathsOfSpaces(
         db,
         owned.rows.map((r) => r.id),
       );
+      paths.push(...directPaths);
       // Items they wrote in other people's groups become `user` tombstones with their blobs dropped,
       // so nothing is left counting against nobody. Space by space, locked like any item write.
       const { rows: elsewhere } = await db.query<{ space_id: string }>(
@@ -645,6 +697,49 @@ export function buildApp(deps: Deps): FastifyInstance {
     return reply.status(204).send();
   });
 
+  // MARK: Contact helpers
+
+  /** Contacts count pending requests (either way), accepted contacts and open codes. */
+  const requireContactRoom = async (db: Queryable, uid: string, message = `You can have at most ${limits.contactsPerUser} contacts`) => {
+    const { rows } = await db.query<{ n: number }>(
+      `SELECT (SELECT count(*) FROM direct_pairs WHERE uid_low = $1 OR uid_high = $1)
+            + (SELECT count(*) FROM invites i JOIN spaces s ON s.id = i.space_id
+               WHERE i.created_by = $1 AND s.kind = 'direct' AND i.expires_at > now()) AS n`,
+      [uid],
+    );
+    if (Number(rows[0]?.n ?? 0) >= limits.contactsPerUser) throw new ApiError(403, "quota_exceeded", message);
+  };
+
+  /**
+   * Housekeeping: deletes direct spaces that still have one member, no pending request and no code
+   * that expired less than a day ago (declined, cancelled, expired, or the other person's account
+   * went). At most every 10 minutes per instance, piggybacking on GET /v1/spaces, which every client
+   * calls each sync tick. Spaces younger than a day are left alone so nothing mid-creation is touched.
+   */
+  let lastDirectSweep = 0;
+  const sweepDirectSpaces = async (request: FastifyRequest) => {
+    if (Date.now() - lastDirectSweep < 600_000) return;
+    lastDirectSweep = Date.now();
+    const paths = await tx(pool, async (db) => {
+      const { rows } = await db.query<{ id: string }>(
+        `SELECT s.id FROM spaces s
+         WHERE s.kind = 'direct' AND s.created_at < now() - interval '1 day'
+           AND (SELECT count(*) FROM space_members m WHERE m.space_id = s.id) < 2
+           AND NOT EXISTS (SELECT 1 FROM contact_requests r WHERE r.space_id = s.id)
+           AND NOT EXISTS (SELECT 1 FROM invites i WHERE i.space_id = s.id AND i.expires_at > now() - interval '1 day')
+         ORDER BY s.id LIMIT 500 FOR UPDATE SKIP LOCKED`,
+      );
+      const ids = rows.map((r) => r.id);
+      const paths = await blobPathsOfSpaces(db, ids);
+      await db.query("DELETE FROM spaces WHERE id = ANY($1::uuid[])", [ids]);
+      return paths;
+    }).catch((error) => {
+      request.log.warn({ error }, "direct space sweep failed");
+      return [] as string[];
+    });
+    await deleteObjects(paths, request);
+  };
+
   // MARK: Spaces and groups
 
   const spaceJson = (r: {
@@ -678,7 +773,16 @@ export function buildApp(deps: Deps): FastifyInstance {
     FROM space_members m JOIN spaces s ON s.id = m.space_id`;
 
   app.get("/v1/spaces", async (request) => {
-    const { rows } = await pool.query(`${SPACE_SELECT} WHERE m.uid = $1 ORDER BY s.kind DESC, s.created_at`, [request.caller.uid]);
+    const query = spacesQuery.parse(request.query);
+    const withDirect = (query.include ?? "").split(",").includes("direct");
+    await sweepDirectSpaces(request);
+    // Direct spaces only once both people are in: pending ones are in /v1/contacts/requests and /invites.
+    const { rows } = await pool.query(
+      `${SPACE_SELECT} WHERE m.uid = $1
+         AND (s.kind <> 'direct' OR ($2 AND (SELECT count(*) FROM space_members x WHERE x.space_id = s.id) = 2))
+       ORDER BY s.kind DESC, s.created_at`,
+      [request.caller.uid, withDirect],
+    );
     return { spaces: rows.map(spaceJson) };
   });
 
@@ -785,9 +889,18 @@ export function buildApp(deps: Deps): FastifyInstance {
   app.get<{ Params: { inviteId: string } }>("/v1/invites/:inviteId", async (request) => {
     const invite = inviteId.parse(request.params.inviteId);
     throttleInvites(request);
-    const { rows } = await pool.query<{ space_id: string; sealed_key: Buffer; encrypted_name: Buffer | null; member_count: number; expires_at: Date }>(
-      `SELECT i.space_id, i.sealed_key, s.encrypted_name, i.expires_at,
-         (SELECT count(*)::int FROM space_members m WHERE m.space_id = i.space_id) AS member_count
+    const { rows } = await pool.query<{
+      space_id: string;
+      kind: string;
+      sealed_key: Buffer;
+      encrypted_name: Buffer | null;
+      member_count: number;
+      expires_at: Date;
+      owner_name: string | null;
+    }>(
+      `SELECT i.space_id, s.kind, i.sealed_key, s.encrypted_name, i.expires_at,
+         (SELECT count(*)::int FROM space_members m WHERE m.space_id = i.space_id) AS member_count,
+         (SELECT COALESCE(u.username, split_part(u.email, '@', 1)) FROM users u WHERE u.uid = s.owner_uid) AS owner_name
        FROM invites i JOIN spaces s ON s.id = i.space_id WHERE i.id = $1 AND i.expires_at > now()`,
       [invite],
     );
@@ -795,10 +908,12 @@ export function buildApp(deps: Deps): FastifyInstance {
     if (!row) throw new ApiError(404, "not_found", "That invite code is unknown, used or expired");
     return {
       spaceId: row.space_id,
+      kind: row.kind,
       sealedKey: row.sealed_key.toString("base64"),
-      encryptedName: row.encrypted_name ? row.encrypted_name.toString("base64") : null,
+      encryptedName: row.kind === "group" && row.encrypted_name ? row.encrypted_name.toString("base64") : null,
       memberCount: row.member_count,
       expiresAt: row.expires_at.getTime(),
+      ...(row.kind === "direct" ? { ownerName: row.owner_name } : {}),
     };
   });
 
@@ -811,15 +926,27 @@ export function buildApp(deps: Deps): FastifyInstance {
       const { rows } = await db.query<{ space_id: string }>("SELECT space_id FROM invites WHERE id = $1 AND expires_at > now() FOR UPDATE", [invite]);
       const spaceId = rows[0]?.space_id;
       if (!spaceId) throw new ApiError(404, "not_found", "That invite code is unknown, used or expired");
-      await db.query("SELECT 1 FROM spaces WHERE id = $1 FOR UPDATE", [spaceId]);
-      if (await roleIn(db, spaceId, uid)) throw new ApiError(409, "conflict", "You're already in this group");
-      const count = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM space_members WHERE space_id = $1", [spaceId]);
-      if ((count.rows[0]?.n ?? 0) >= limits.membersPerGroup) throw new ApiError(403, "quota_exceeded", `A group can have at most ${limits.membersPerGroup} members`);
+      const { rows: spaceRows } = await db.query<{ kind: string; owner_uid: string }>("SELECT kind, owner_uid FROM spaces WHERE id = $1 FOR UPDATE", [spaceId]);
+      const space = spaceRows[0]!;
+      if (space.kind === "direct") {
+        if (space.owner_uid === uid) throw new ApiError(400, "invalid", "That's your own contact code");
+        await lockUsers(db, [uid, space.owner_uid]);
+        if (await pairTaken(db, uid, space.owner_uid)) throw contactExists();
+        const count = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM space_members WHERE space_id = $1", [spaceId]);
+        if ((count.rows[0]?.n ?? 0) !== 1) throw new ApiError(404, "not_found", "That invite code is unknown, used or expired");
+        await requireContactRoom(db, uid);
+        const [low, high] = orderedPair(uid, space.owner_uid);
+        await db.query("INSERT INTO direct_pairs (space_id, uid_low, uid_high) VALUES ($1, $2, $3)", [spaceId, low, high]);
+      } else {
+        if (await roleIn(db, spaceId, uid)) throw new ApiError(409, "conflict", "You're already in this group");
+        const count = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM space_members WHERE space_id = $1", [spaceId]);
+        if ((count.rows[0]?.n ?? 0) >= limits.membersPerGroup) throw new ApiError(403, "quota_exceeded", `A group can have at most ${limits.membersPerGroup} members`);
+      }
       await db.query("INSERT INTO space_members (space_id, uid, role, wrapped_key) VALUES ($1, $2, 'member', $3)", [spaceId, uid, body.wrappedKey]);
       await db.query("DELETE FROM invites WHERE id = $1", [invite]);
       const { rows: spaces } = await db.query(`${SPACE_SELECT} WHERE m.uid = $1 AND s.id = $2`, [uid, spaceId]);
       return spaces[0];
-    });
+    }).catch(pairConflict);
     return reply.status(201).send(spaceJson(row));
   });
 
@@ -836,6 +963,182 @@ export function buildApp(deps: Deps): FastifyInstance {
     }
     const result = await pool.query("DELETE FROM space_members WHERE space_id = $1 AND uid = $2 AND role = 'member'", [id, target]);
     if (!result.rowCount) throw notFound();
+    return reply.status(204).send();
+  });
+
+  // MARK: Contacts
+
+  const nameOf = "COALESCE(u.username, split_part(u.email, '@', 1))";
+
+  app.get<{ Params: { username: string } }>("/v1/users/:username", async (request) => {
+    const name = username.parse(request.params.username);
+    throttleInvites(request);
+    const { rows } = await pool.query<{ uid: string; username: string; name: string; public_key: Buffer }>(
+      `SELECT u.uid, u.username, ${nameOf} AS name, u.public_key FROM users u WHERE lower(u.username) = lower($1)`,
+      [name],
+    );
+    const user = rows[0];
+    if (!user) throw new ApiError(404, "not_found", "Nobody has that username");
+    if (user.uid === request.caller.uid) throw new ApiError(400, "invalid", "That's your own username");
+    return { uid: user.uid, username: user.username, name: user.name, publicKey: user.public_key.toString("base64") };
+  });
+
+  const contactRequestJson = (r: { space_id: string; uid: string; username: string | null; name: string; created_at: Date }) => ({
+    spaceId: r.space_id,
+    uid: r.uid,
+    username: r.username,
+    name: r.name,
+    createdAt: r.created_at.getTime(),
+  });
+
+  app.post("/v1/contacts/requests", async (request, reply) => {
+    const body = contactRequestBody.parse(request.body);
+    const me = request.caller.uid;
+    // It answers 404 for unknown usernames, so it's throttled like the lookup.
+    throttleInvites(request);
+    const row = await tx(pool, async (db) => {
+      const { rows: found } = await db.query<{ uid: string }>("SELECT uid FROM users WHERE lower(username) = lower($1)", [body.username]);
+      const them = found[0]?.uid;
+      if (!them) throw new ApiError(404, "not_found", "Nobody has that username");
+      if (them === me) throw new ApiError(400, "invalid", "You can't add yourself");
+      await lockUsers(db, [me, them]);
+      if (await pairTaken(db, me, them)) throw contactExists();
+      const outgoing = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM contact_requests WHERE requester = $1", [me]);
+      if ((outgoing.rows[0]?.n ?? 0) >= limits.pendingContactRequests) {
+        throw new ApiError(403, "quota_exceeded", `You can have at most ${limits.pendingContactRequests} pending requests`);
+      }
+      await requireContactRoom(db, me);
+      await requireContactRoom(db, them, "They can't take more contacts");
+      await db.query("INSERT INTO spaces (id, kind, owner_uid) VALUES ($1, 'direct', $2)", [body.spaceId, me]);
+      await db.query("INSERT INTO space_members (space_id, uid, role, wrapped_key) VALUES ($1, $2, 'owner', $3)", [body.spaceId, me, body.wrappedKey]);
+      const [low, high] = orderedPair(me, them);
+      await db.query("INSERT INTO direct_pairs (space_id, uid_low, uid_high) VALUES ($1, $2, $3)", [body.spaceId, low, high]);
+      const { rows } = await db.query(
+        `WITH r AS (
+           INSERT INTO contact_requests (space_id, requester, recipient, recipient_wrapped_key) VALUES ($1, $2, $3, $4) RETURNING *)
+         SELECT r.space_id, u.uid, u.username, ${nameOf} AS name, r.created_at FROM r JOIN users u ON u.uid = r.recipient`,
+        [body.spaceId, me, them, body.recipientWrappedKey],
+      );
+      return rows[0];
+    }).catch(pairConflict);
+    return reply.status(201).send(contactRequestJson(row));
+  });
+
+  app.get("/v1/contacts/requests", async (request) => {
+    const me = request.caller.uid;
+    const list = async (mine: "requester" | "recipient", theirs: "requester" | "recipient") => {
+      const { rows } = await pool.query(
+        `SELECT r.space_id, u.uid, u.username, ${nameOf} AS name, r.created_at
+         FROM contact_requests r JOIN users u ON u.uid = r.${theirs} WHERE r.${mine} = $1 ORDER BY r.created_at DESC, r.space_id`,
+        [me],
+      );
+      return rows.map(contactRequestJson);
+    };
+    return { incoming: await list("recipient", "requester"), outgoing: await list("requester", "recipient") };
+  });
+
+  app.post<{ Params: { spaceId: string } }>("/v1/contacts/requests/:spaceId/accept", async (request, reply) => {
+    const spaceId = uuid.parse(request.params.spaceId);
+    const me = request.caller.uid;
+    const row = await tx(pool, async (db) => {
+      // The space row first, like every other writer to it.
+      await db.query("SELECT 1 FROM spaces WHERE id = $1 FOR UPDATE", [spaceId]);
+      const { rows: pending } = await db.query<{ recipient_wrapped_key: Buffer }>(
+        "SELECT recipient_wrapped_key FROM contact_requests WHERE space_id = $1 AND recipient = $2 FOR UPDATE",
+        [spaceId, me],
+      );
+      if (!pending[0]) throw notFound();
+      await db.query("INSERT INTO space_members (space_id, uid, role, wrapped_key) VALUES ($1, $2, 'member', $3)", [
+        spaceId,
+        me,
+        pending[0].recipient_wrapped_key,
+      ]);
+      await db.query("DELETE FROM contact_requests WHERE space_id = $1", [spaceId]);
+      const { rows } = await db.query(`${SPACE_SELECT} WHERE m.uid = $1 AND s.id = $2`, [me, spaceId]);
+      return rows[0];
+    });
+    return reply.status(201).send(spaceJson(row));
+  });
+
+  /** Deletes a direct space with everything in it, if `allowed` (run under the space lock) says so; 404 otherwise. */
+  const deleteDirectSpace = async (spaceId: string, request: FastifyRequest, allowed: (db: Queryable) => Promise<boolean>) => {
+    const paths = await tx(pool, async (db) => {
+      const locked = await db.query("SELECT 1 FROM spaces WHERE id = $1 AND kind = 'direct' FOR UPDATE", [spaceId]);
+      if (!locked.rowCount || !(await allowed(db))) throw notFound();
+      const paths = await blobPathsOfSpaces(db, [spaceId]);
+      await db.query("DELETE FROM spaces WHERE id = $1", [spaceId]);
+      return paths;
+    });
+    await deleteObjects(paths, request);
+  };
+
+  app.delete<{ Params: { spaceId: string } }>("/v1/contacts/requests/:spaceId", async (request, reply) => {
+    const spaceId = uuid.parse(request.params.spaceId);
+    const me = request.caller.uid;
+    await deleteDirectSpace(spaceId, request, async (db) => {
+      const { rowCount } = await db.query("SELECT 1 FROM contact_requests WHERE space_id = $1 AND (requester = $2 OR recipient = $2)", [spaceId, me]);
+      return Boolean(rowCount);
+    });
+    return reply.status(204).send();
+  });
+
+  app.post("/v1/contacts/invites", async (request, reply) => {
+    const body = contactInviteBody.parse(request.body);
+    const me = request.caller.uid;
+    const created = await tx(pool, async (db) => {
+      await lockUsers(db, [me]);
+      const open = await db.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM invites i JOIN spaces s ON s.id = i.space_id
+         WHERE i.created_by = $1 AND s.kind = 'direct' AND i.expires_at > now()`,
+        [me],
+      );
+      if ((open.rows[0]?.n ?? 0) >= limits.contactCodesPerUser) {
+        throw new ApiError(403, "quota_exceeded", `You can have at most ${limits.contactCodesPerUser} open contact codes`);
+      }
+      await requireContactRoom(db, me);
+      await db.query("INSERT INTO spaces (id, kind, owner_uid) VALUES ($1, 'direct', $2)", [body.spaceId, me]);
+      await db.query("INSERT INTO space_members (space_id, uid, role, wrapped_key) VALUES ($1, $2, 'owner', $3)", [body.spaceId, me, body.wrappedKey]);
+      const { rows } = await db.query<{ expires_at: Date }>(
+        `INSERT INTO invites (id, space_id, sealed_key, created_by, expires_at) VALUES ($1, $2, $3, $4, now() + interval '7 days') RETURNING expires_at`,
+        [body.inviteId, body.spaceId, body.sealedKey, me],
+      );
+      return { spaceId: body.spaceId, inviteId: body.inviteId, expiresAt: rows[0]!.expires_at.getTime() };
+    }).catch(pairConflict);
+    return reply.status(201).send(created);
+  });
+
+  app.get("/v1/contacts/invites", async (request) => {
+    const { rows } = await pool.query<{ space_id: string; id: string; created_at: Date; expires_at: Date }>(
+      `SELECT i.space_id, i.id, i.created_at, i.expires_at FROM invites i JOIN spaces s ON s.id = i.space_id
+       WHERE i.created_by = $1 AND s.kind = 'direct' AND i.expires_at > now() ORDER BY i.created_at`,
+      [request.caller.uid],
+    );
+    return {
+      invites: rows.map((r) => ({ spaceId: r.space_id, inviteId: r.id, createdAt: r.created_at.getTime(), expiresAt: r.expires_at.getTime() })),
+    };
+  });
+
+  app.delete<{ Params: { inviteId: string } }>("/v1/contacts/invites/:inviteId", async (request, reply) => {
+    const invite = inviteId.parse(request.params.inviteId);
+    const { rows } = await pool.query<{ space_id: string }>(
+      "SELECT i.space_id FROM invites i JOIN spaces s ON s.id = i.space_id WHERE i.id = $1 AND i.created_by = $2 AND s.kind = 'direct'",
+      [invite, request.caller.uid],
+    );
+    if (!rows[0]) throw notFound();
+    const spaceId = rows[0].space_id;
+    // The code's space never got a second member (accepting consumes the code), so it goes with it.
+    await deleteDirectSpace(spaceId, request, async (db) => {
+      const still = await db.query("SELECT 1 FROM invites WHERE id = $1", [invite]);
+      const members = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM space_members WHERE space_id = $1", [spaceId]);
+      return Boolean(still.rowCount) && members.rows[0]!.n < 2;
+    });
+    return reply.status(204).send();
+  });
+
+  app.delete<{ Params: { spaceId: string } }>("/v1/contacts/:spaceId", async (request, reply) => {
+    const spaceId = uuid.parse(request.params.spaceId);
+    const me = request.caller.uid;
+    await deleteDirectSpace(spaceId, request, async (db) => Boolean(await roleIn(db, spaceId, me)));
     return reply.status(204).send();
   });
 
@@ -890,6 +1193,7 @@ export function buildApp(deps: Deps): FastifyInstance {
 
     const outcome = await tx(pool, async (db) => {
       const membership = await requireMember(db, spaceId, uid, true);
+      await requireContactEstablished(db, spaceId, membership);
       const { rows: current } = await db.query<ItemRow>(`SELECT ${ITEM_COLUMNS} FROM items WHERE space_id = $1 AND id = $2 FOR UPDATE`, [spaceId, itemId]);
       const existing = current[0];
       if (existing) requireItemWriter(membership, existing, uid);
@@ -918,7 +1222,7 @@ export function buildApp(deps: Deps): FastifyInstance {
       }
       const wasLive = existing && !existing.deleted;
       const replaced = wasLive ? existing.size : 0;
-      if (membership.kind === "group") {
+      if (isShared(membership.kind)) {
         if (!wasLive) {
           // Live items once this one is in and history is trimmed back to its cap.
           const { rows: live } = await db.query<{ history: number; other: number }>(
@@ -928,9 +1232,9 @@ export function buildApp(deps: Deps): FastifyInstance {
           );
           const isHistory = body.category === "history";
           const after = live[0]!.other + (isHistory ? 0 : 1) + Math.min(live[0]!.history + (isHistory ? 1 : 0), limits.historyPerSpace);
-          if (after > limits.groupItems) throw groupFull(`A group can hold at most ${limits.groupItems} items`);
+          if (after > limits.groupItems) throw groupFull(`A shared space can hold at most ${limits.groupItems} items`);
         }
-        if ((await bytesStored(db, spaceId)) - replaced + body.ciphertext.length > limits.groupBytes) throw groupFull("This group's sync storage is full");
+        if ((await bytesStored(db, spaceId)) - replaced + body.ciphertext.length > limits.groupBytes) throw groupFull("This space's sync storage is full");
       }
       if ((await serverBytes(db)) - replaced + body.ciphertext.length > limits.totalBytes) throw serverFull();
 
@@ -1038,6 +1342,7 @@ export function buildApp(deps: Deps): FastifyInstance {
     await sweepUnusedBlobs(uid, request);
     await tx(pool, async (db) => {
       const membership = await requireMember(db, spaceId, uid, true);
+      await requireContactEstablished(db, spaceId, membership);
       const { rows } = await db.query<{ size: number; owner_uid: string | null }>("SELECT size, owner_uid FROM blobs WHERE space_id = $1 AND id = $2", [
         spaceId,
         body.id,
@@ -1052,7 +1357,7 @@ export function buildApp(deps: Deps): FastifyInstance {
         return;
       }
       if ((await bytesUsed(db, uid)) + body.size > limits.userBytes) throw new ApiError(403, "quota_exceeded", "Your sync storage is full");
-      if (membership.kind === "group" && (await bytesStored(db, spaceId)) + body.size > limits.groupBytes) throw groupFull("This group's sync storage is full");
+      if (isShared(membership.kind) && (await bytesStored(db, spaceId)) + body.size > limits.groupBytes) throw groupFull("This space's sync storage is full");
       if ((await serverBytes(db)) + body.size > limits.totalBytes) throw serverFull();
       await db.query("INSERT INTO blobs (space_id, id, size, owner_uid) VALUES ($1, $2, $3, $4)", [spaceId, body.id, body.size, uid]);
       addServerBytes(body.size);

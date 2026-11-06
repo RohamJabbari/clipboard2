@@ -50,7 +50,7 @@ beforeAll(async () => {
   await embedded.start();
   await embedded.createDatabase("c2test");
   pool = new pg.Pool({ connectionString: `postgres://postgres:postgres@localhost:${port}/c2test`, max: 4 });
-  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql", "003_hardening.sql"]);
+  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql", "003_hardening.sql", "004_contacts.sql"]);
   expect(await migrate(pool)).toEqual([]);
 }, 120_000);
 
@@ -1234,5 +1234,424 @@ describe("client IPs, auth limits and logs", () => {
     expect(log).not.toContain("10.0.0.1");
     expect(log).not.toContain("127.0.0.1");
     expect(log).not.toContain("example.com");
+  });
+});
+
+// MARK: Contacts
+
+type Named = TestUser & { username: string };
+
+async function person(name: string): Promise<Named> {
+  return { ...(await signUp(name.toLowerCase(), undefined, { username: name })), username: name };
+}
+
+/** The requester side: look the other person up, make the space, wrap SK to both. */
+async function requestContact(from: TestUser, to: string, opts: { spaceId?: string } = {}) {
+  const spaceId = opts.spaceId ?? randomUUID();
+  const sk = randomBytes(32);
+  const found = await call(from, "GET", `/v1/users/${encodeURIComponent(to)}`);
+  if (found.status !== 200) return { spaceId, sk, ...found };
+  const theirPub = Buffer.from(found.body.publicKey, "base64");
+  const res = await call(from, "POST", "/v1/contacts/requests", {
+    username: to,
+    spaceId,
+    wrappedKey: b64(cc.wrapSpaceKey(sk, spaceId, from.uid, from.id.pub)),
+    recipientWrappedKey: b64(cc.wrapSpaceKey(sk, spaceId, found.body.uid, theirPub)),
+  });
+  return { spaceId, sk, ...res };
+}
+
+/** A one-time contact code: a fresh direct space whose SK is sealed under the code. */
+async function contactCode(owner: TestUser) {
+  const spaceId = randomUUID();
+  const sk = randomBytes(32);
+  const codeBytes = randomBytes(16);
+  const res = await call(owner, "POST", "/v1/contacts/invites", {
+    spaceId,
+    wrappedKey: b64(cc.wrapSpaceKey(sk, spaceId, owner.uid, owner.id.pub)),
+    inviteId: cc.inviteId(codeBytes),
+    sealedKey: b64(cc.aeadSeal(cc.inviteKey(codeBytes), sk, cc.inviteAad(spaceId))),
+  });
+  return { spaceId, sk, code: cc.formatInviteCode(codeBytes), inviteId: cc.inviteId(codeBytes), ...res };
+}
+
+async function contacts(user: TestUser) {
+  const spaces = (await call(user, "GET", "/v1/spaces?include=direct")).body.spaces as { id: string; kind: string }[];
+  return spaces.filter((s) => s.kind === "direct");
+}
+
+describe("contacts", () => {
+  it("looks up users by username, case-insensitively, without their email", async () => {
+    const alice = await person("alice");
+    const bob = await person("Bob.K");
+    await signUp("nameless");
+    const found = await call(alice, "GET", "/v1/users/bob.k");
+    expect(found.status).toBe(200);
+    expect(found.body).toEqual({ uid: bob.uid, username: "Bob.K", name: "Bob.K", publicKey: b64(bob.id.pub) });
+    expect(JSON.stringify(found.body)).not.toContain("example.com");
+    expect((await call(alice, "GET", "/v1/users/nobody")).status).toBe(404);
+    expect((await call(alice, "GET", "/v1/users/ALICE")).body.error).toBe("invalid");
+    expect((await call(alice, "GET", "/v1/users/a")).status).toBe(400);
+    expect((await call(null, "GET", "/v1/users/bob.k")).status).toBe(401);
+  });
+
+  it("shares the invite rate limit between lookups, requests and codes", async () => {
+    rebuild({ invitesPerMinute: 3 });
+    const alice = await person("alice");
+    await person("bob");
+    expect((await call(alice, "GET", "/v1/users/bob")).status).toBe(200);
+    expect((await call(alice, "GET", "/v1/users/nobody")).status).toBe(404);
+    expect((await call(alice, "GET", `/v1/invites/${randomBytes(32).toString("hex")}`)).status).toBe(404);
+    const limited = await call(alice, "GET", "/v1/users/bob");
+    expect(limited.status).toBe(429);
+    expect(limited.body.retryAfter).toBeGreaterThan(0);
+    const request = await call(alice, "POST", "/v1/contacts/requests", {
+      username: "bob",
+      spaceId: randomUUID(),
+      wrappedKey: b64(randomBytes(126)),
+      recipientWrappedKey: b64(randomBytes(126)),
+    });
+    expect(request.status).toBe(429);
+  });
+
+  it("sends a request, keeps the recipient out until they accept, then shares the space", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const req = await requestContact(alice, "BOB");
+    expect(req.status).toBe(201);
+    expect(req.body).toMatchObject({ spaceId: req.spaceId, uid: bob.uid, username: "bob", name: "bob" });
+
+    const bobsView = (await call(bob, "GET", "/v1/contacts/requests")).body;
+    expect(bobsView.outgoing).toEqual([]);
+    expect(bobsView.incoming).toEqual([{ spaceId: req.spaceId, uid: alice.uid, username: "alice", name: "alice", createdAt: expect.any(Number) }]);
+    expect((await call(alice, "GET", "/v1/contacts/requests")).body.outgoing[0]).toMatchObject({ spaceId: req.spaceId, uid: bob.uid });
+
+    // Pending: Bob can't read anything, nobody can send, and it isn't listed as a contact.
+    expect((await call(bob, "GET", `/v1/spaces/${req.spaceId}/changes?since=0`)).status).toBe(404);
+    expect((await call(bob, "GET", `/v1/spaces/${req.spaceId}/blobs/${randomUUID()}`)).status).toBe(404);
+    expect((await call(bob, "POST", `/v1/spaces/${req.spaceId}/blobs`, { id: randomUUID(), size: 10 })).status).toBe(404);
+    expect((await putItem(bob, req.spaceId, req.sk)).status).toBe(404);
+    const early = await putItem(alice, req.spaceId, req.sk);
+    expect(early.status).toBe(403);
+    expect((await call(alice, "POST", `/v1/spaces/${req.spaceId}/blobs`, { id: randomUUID(), size: 10 })).status).toBe(403);
+    expect(await contacts(alice)).toEqual([]);
+    expect(await contacts(bob)).toEqual([]);
+    // Only the recipient accepts.
+    expect((await call(alice, "POST", `/v1/contacts/requests/${req.spaceId}/accept`)).status).toBe(404);
+
+    const accepted = await call(bob, "POST", `/v1/contacts/requests/${req.spaceId}/accept`);
+    expect(accepted.status).toBe(201);
+    expect(accepted.body).toMatchObject({ id: req.spaceId, kind: "direct", role: "member", ownerUid: alice.uid, encryptedName: null, memberCount: 2 });
+    expect(accepted.body.members).toEqual([
+      { uid: alice.uid, name: "alice" },
+      { uid: bob.uid, name: "bob" },
+    ]);
+    const sk = cc.unwrapSpaceKey(Buffer.from(accepted.body.wrappedKey, "base64"), req.spaceId, { uid: bob.uid, ...bob.id });
+    expect(sk.equals(req.sk)).toBe(true);
+    expect((await call(bob, "GET", "/v1/contacts/requests")).body).toEqual({ incoming: [], outgoing: [] });
+    expect((await call(bob, "POST", `/v1/contacts/requests/${req.spaceId}/accept`)).status).toBe(404);
+
+    const sent = await putItem(alice, req.spaceId, req.sk, { payload: { v: 1, type: "clip", kind: "text", text: "for bob" } });
+    expect(sent.status).toBe(200);
+    const inbox = (await call(bob, "GET", `/v1/spaces/${req.spaceId}/changes?since=0`)).body.items;
+    expect(inbox).toHaveLength(1);
+    expect(inbox[0].authorUid).toBe(alice.uid);
+    const plain = cc.aeadOpen(cc.itemKey(sk), Buffer.from(inbox[0].ciphertext, "base64"), cc.aad.item(req.spaceId, sent.id, "history"));
+    expect(JSON.parse(plain.toString()).text).toBe("for bob");
+    expect((await contacts(alice)).map((s) => s.id)).toEqual([req.spaceId]);
+    expect((await contacts(bob)).map((s) => s.id)).toEqual([req.spaceId]);
+  });
+
+  it("lists direct spaces only with include=direct", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const req = await requestContact(alice, "bob");
+    await call(bob, "POST", `/v1/contacts/requests/${req.spaceId}/accept`);
+    await createGroup(alice);
+    const plain = (await call(alice, "GET", "/v1/spaces")).body.spaces;
+    expect(plain.map((s: { kind: string }) => s.kind)).toEqual(["personal", "group"]);
+    const all = (await call(alice, "GET", "/v1/spaces?include=direct")).body.spaces;
+    expect(all.map((s: { kind: string }) => s.kind)).toEqual(["personal", "group", "direct"]);
+    expect((await call(alice, "GET", "/v1/spaces?include=other,direct")).body.spaces).toHaveLength(3);
+    expect((await call(alice, "GET", "/v1/spaces?include=directs")).body.spaces).toHaveLength(2);
+  });
+
+  it("declines or cancels a request by deleting the space", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const carol = await person("carol");
+    const declined = await requestContact(alice, "bob");
+    expect((await call(carol, "DELETE", `/v1/contacts/requests/${declined.spaceId}`)).status).toBe(404);
+    expect((await call(bob, "DELETE", `/v1/contacts/requests/${declined.spaceId}`)).status).toBe(204);
+    expect((await pool.query("SELECT 1 FROM spaces WHERE id = $1", [declined.spaceId])).rowCount).toBe(0);
+    expect((await call(bob, "POST", `/v1/contacts/requests/${declined.spaceId}/accept`)).status).toBe(404);
+
+    // Declining frees the pair for a new request, either way.
+    const cancelled = await requestContact(bob, "alice");
+    expect(cancelled.status).toBe(201);
+    expect((await call(bob, "DELETE", `/v1/contacts/requests/${cancelled.spaceId}`)).status).toBe(204);
+    expect((await call(alice, "GET", "/v1/contacts/requests")).body.incoming).toEqual([]);
+    expect((await requestContact(alice, "bob")).status).toBe(201);
+    // Once accepted, it's no longer a request.
+    const accepted = await requestContact(alice, "carol");
+    await call(carol, "POST", `/v1/contacts/requests/${accepted.spaceId}/accept`);
+    expect((await call(carol, "DELETE", `/v1/contacts/requests/${accepted.spaceId}`)).status).toBe(404);
+  });
+
+  it("allows one direct space per pair, in either direction", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    expect((await requestContact(alice, "alice")).status).toBe(400);
+    expect((await requestContact(alice, "nobody")).status).toBe(404);
+    const first = await requestContact(alice, "bob");
+    expect(first.status).toBe(201);
+    expect((await requestContact(alice, "bob")).status).toBe(409);
+    expect((await requestContact(bob, "alice")).status).toBe(409);
+    await call(bob, "POST", `/v1/contacts/requests/${first.spaceId}/accept`);
+    expect((await requestContact(bob, "alice")).status).toBe(409);
+    // A request with a taken space id is a conflict too, and leaves nothing behind.
+    const carol = await person("carol");
+    const clash = await requestContact(carol, "alice", { spaceId: first.spaceId });
+    expect(clash.status).toBe(409);
+    expect((await call(alice, "GET", "/v1/contacts/requests")).body.incoming).toEqual([]);
+  });
+
+  it("settles concurrent requests in both directions to one space", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    for (let round = 0; round < 3; round++) {
+      const results = await Promise.all([requestContact(alice, "bob"), requestContact(bob, "alice")]);
+      expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
+      expect((await pool.query("SELECT 1 FROM direct_pairs")).rowCount).toBe(1);
+      const winner = results.find((r) => r.status === 201)!;
+      const requester = winner.body.uid === bob.uid ? alice : bob;
+      expect((await call(requester, "DELETE", `/v1/contacts/requests/${winner.spaceId}`)).status).toBe(204);
+    }
+    // The unique index holds even if the explicit check is skipped.
+    await requestContact(alice, "bob");
+    const [low, high] = [alice.uid, bob.uid].sort();
+    const other = randomUUID();
+    await pool.query("INSERT INTO spaces (id, kind, owner_uid) VALUES ($1, 'direct', $2)", [other, bob.uid]);
+    await expect(pool.query("INSERT INTO direct_pairs (space_id, uid_low, uid_high) VALUES ($1, $2, $3)", [other, low, high])).rejects.toThrow(/direct_pairs_pair/);
+  });
+
+  it("adds a contact with a one-time code, refusing your own code and existing pairs", async () => {
+    const alice = await person("alice");
+    const bob = await signUp("bob"); // no username needed for codes
+    const carol = await person("carol");
+    const created = await contactCode(alice);
+    expect(created.status).toBe(201);
+    expect(created.body).toMatchObject({ spaceId: created.spaceId, inviteId: created.inviteId });
+    expect(created.body.expiresAt).toBeGreaterThan(Date.now() + 6.9 * 86_400_000);
+    expect((await call(alice, "GET", "/v1/contacts/invites")).body.invites).toEqual([
+      { spaceId: created.spaceId, inviteId: created.inviteId, createdAt: expect.any(Number), expiresAt: created.body.expiresAt },
+    ]);
+    // Group routes don't see it; group invite listings neither.
+    expect((await call(alice, "GET", `/v1/groups/${created.spaceId}/invites`)).status).toBe(404);
+
+    const fetched = await call(bob, "GET", `/v1/invites/${created.inviteId}`);
+    expect(fetched.body).toMatchObject({ spaceId: created.spaceId, kind: "direct", ownerName: "alice", encryptedName: null, memberCount: 1 });
+    expect((await call(alice, "POST", `/v1/invites/${created.inviteId}/accept`, { wrappedKey: b64(randomBytes(126)) })).body.error).toBe("invalid");
+    // Writes wait for the other person.
+    expect((await putItem(alice, created.spaceId, created.sk)).status).toBe(403);
+
+    const joined = await redeem(bob, created.code);
+    expect(joined.status).toBe(201);
+    expect(joined.body).toMatchObject({ id: created.spaceId, kind: "direct", role: "member", memberCount: 2, encryptedName: null });
+    expect((await call(alice, "GET", "/v1/contacts/invites")).body.invites).toEqual([]);
+    expect((await contacts(alice)).map((s) => s.id)).toEqual([created.spaceId]);
+    expect((await redeem(carol, created.code)).status).toBe(404);
+    expect((await putItem(bob, created.spaceId, created.sk)).status).toBe(200);
+
+    // Already contacts: a second code between them is refused and stays unused.
+    const again = await contactCode(bob);
+    expect((await redeem(alice, again.code)).status).toBe(409);
+    expect((await call(bob, "GET", "/v1/contacts/invites")).body.invites).toHaveLength(1);
+    // A pending request counts too, and blocks a username request afterwards.
+    const req = await requestContact(carol, "alice");
+    const third = await contactCode(alice);
+    expect((await redeem(carol, third.code)).status).toBe(409);
+    expect(req.status).toBe(201);
+    expect((await call(carol, "GET", "/v1/contacts/requests")).body.outgoing).toHaveLength(1);
+  });
+
+  it("keeps group invites and direct codes apart", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const group = await createGroup(alice, "Wien");
+    const groupCode = await createInvite(alice, group);
+    const groupView = await call(bob, "GET", `/v1/invites/${cc.inviteId(cc.parseInviteCode(groupCode.code)!)}`);
+    expect(groupView.body.kind).toBe("group");
+    expect(groupView.body).not.toHaveProperty("ownerName");
+    expect(groupView.body.encryptedName).not.toBeNull();
+
+    // A contact code can't be used to sign up (that needs a group invite or a sign-up code).
+    const code = await contactCode(alice);
+    const { res } = await trySignUp("newbie", "pw", { groupInviteId: code.inviteId });
+    expect(res.body.error).toBe("invite_invalid");
+
+    // Group-only routes answer 404 for a direct space, even to its members.
+    await redeem(bob, code.code);
+    const id = code.spaceId;
+    expect((await call(alice, "PATCH", `/v1/groups/${id}`, { encryptedName: b64(randomBytes(40)) })).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/groups/${id}`)).status).toBe(404);
+    expect((await call(alice, "GET", `/v1/groups/${id}/members`)).status).toBe(404);
+    expect((await call(bob, "DELETE", `/v1/groups/${id}/members/${bob.uid}`)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/groups/${id}/members/${bob.uid}`)).status).toBe(404);
+    expect((await createInvite(alice, { id, sk: code.sk })).status).toBe(404);
+    expect((await call(alice, "GET", `/v1/groups/${id}/invites`)).status).toBe(404);
+  });
+
+  it("revokes a code together with its empty space", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const code = await contactCode(alice);
+    expect((await call(bob, "DELETE", `/v1/contacts/invites/${code.inviteId}`)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/contacts/invites/${code.inviteId}`)).status).toBe(204);
+    expect((await pool.query("SELECT 1 FROM spaces WHERE id = $1", [code.spaceId])).rowCount).toBe(0);
+    expect((await redeem(bob, code.code)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/contacts/invites/${code.inviteId}`)).status).toBe(404);
+    // A group invite isn't a contact code.
+    const group = await createGroup(alice);
+    const groupCode = await createInvite(alice, group);
+    expect((await call(alice, "DELETE", `/v1/contacts/invites/${cc.inviteId(cc.parseInviteCode(groupCode.code)!)}`)).status).toBe(404);
+  });
+
+  it("lets either member overwrite or delete any item, with group limits and retention", async () => {
+    rebuild({ historyPerSpace: 2, groupBytes: 1000 });
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const req = await requestContact(alice, "bob");
+    await call(bob, "POST", `/v1/contacts/requests/${req.spaceId}/accept`);
+    const blobId = randomUUID();
+    expect((await call(alice, "POST", `/v1/spaces/${req.spaceId}/blobs`, { id: blobId, size: 10 })).status).toBe(200);
+    const alices = await putItem(alice, req.spaceId, req.sk, { blobIds: [blobId], category: "pinned" });
+    const bobs = await putItem(bob, req.spaceId, req.sk, { category: "pinned" });
+    expect((await call(bob, "DELETE", `/v1/spaces/${req.spaceId}/items/${alices.id}?updatedAt=${Date.now() + 1000}`)).status).toBe(200);
+    expect(deletedPaths).toEqual([`${req.spaceId}/${blobId}`]);
+    expect((await putItem(alice, req.spaceId, req.sk, { id: bobs.id, category: "pinned", updatedAt: Date.now() + 1000 })).status).toBe(200);
+
+    for (let i = 0; i < 2; i++) expect((await putItem(alice, req.spaceId, req.sk, { sortAt: i + 1 })).body.trimmed).toEqual([]);
+    expect((await putItem(bob, req.spaceId, req.sk, { sortAt: 10 })).body.trimmed).toHaveLength(1);
+
+    const over = await rawPut(alice, req.spaceId, 1200);
+    expect(over.status).toBe(413);
+    expect(over.body).toMatchObject({ error: "quota_exceeded", scope: "group" });
+    expect((await call(bob, "POST", `/v1/spaces/${req.spaceId}/blobs`, { id: randomUUID(), size: 2000 })).body.scope).toBe("group");
+  });
+
+  it("caps a direct space's live items like a group", async () => {
+    rebuild({ groupItems: 2 });
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const req = await requestContact(alice, "bob");
+    await call(bob, "POST", `/v1/contacts/requests/${req.spaceId}/accept`);
+    expect((await putItem(alice, req.spaceId, req.sk, { category: "pinned" })).status).toBe(200);
+    expect((await putItem(bob, req.spaceId, req.sk, { category: "pinned" })).status).toBe(200);
+    expect((await putItem(bob, req.spaceId, req.sk, { category: "pinned" })).body).toMatchObject({ error: "quota_exceeded", scope: "group" });
+  });
+
+  it("ends a contact for both people, items and blobs included", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const carol = await person("carol");
+    const req = await requestContact(alice, "bob");
+    await call(bob, "POST", `/v1/contacts/requests/${req.spaceId}/accept`);
+    const blobId = randomUUID();
+    await call(bob, "POST", `/v1/spaces/${req.spaceId}/blobs`, { id: blobId, size: 10 });
+    await putItem(bob, req.spaceId, req.sk, { blobIds: [blobId] });
+    expect((await call(carol, "DELETE", `/v1/contacts/${req.spaceId}`)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/contacts/${alice.personalSpaceId}`)).status).toBe(404);
+    const group = await createGroup(alice);
+    expect((await call(alice, "DELETE", `/v1/contacts/${group.id}`)).status).toBe(404);
+
+    expect((await call(bob, "DELETE", `/v1/contacts/${req.spaceId}`)).status).toBe(204);
+    expect(deletedPaths).toEqual([`${req.spaceId}/${blobId}`]);
+    expect(await contacts(alice)).toEqual([]);
+    expect(await contacts(bob)).toEqual([]);
+    expect((await call(alice, "GET", `/v1/spaces/${req.spaceId}/changes`)).status).toBe(404);
+    expect((await pool.query("SELECT 1 FROM items WHERE space_id = $1", [req.spaceId])).rowCount).toBe(0);
+    // They can become contacts again.
+    expect((await requestContact(bob, "alice")).status).toBe(201);
+  });
+
+  it("limits contacts, pending requests and open codes", async () => {
+    rebuild({ contactsPerUser: 3, pendingContactRequests: 2, contactCodesPerUser: 1 });
+    const alice = await person("alice");
+    await person("bob");
+    const carol = await person("carol");
+    const dave = await person("dave");
+    expect((await requestContact(alice, "bob")).status).toBe(201);
+    expect((await requestContact(alice, "carol")).status).toBe(201);
+    const tooMany = await requestContact(alice, "dave");
+    expect(tooMany.status).toBe(403);
+    expect(tooMany.body.error).toBe("quota_exceeded");
+
+    expect((await contactCode(alice)).status).toBe(201);
+    expect((await contactCode(alice)).body.error).toBe("quota_exceeded");
+    // Two requests and a code: at the contact limit, so incoming ones are refused too…
+    expect((await requestContact(dave, "alice")).body.error).toBe("quota_exceeded");
+    // …and so is entering someone else's code.
+    const daves = await contactCode(dave);
+    expect((await redeem(alice, daves.code)).body.error).toBe("quota_exceeded");
+    // Accepting doesn't change the count; declining frees room.
+    const outgoing = (await call(alice, "GET", "/v1/contacts/requests")).body.outgoing;
+    expect(outgoing).toHaveLength(2);
+    await call(carol, "DELETE", `/v1/contacts/requests/${outgoing.find((r: { uid: string }) => r.uid === carol.uid).spaceId}`);
+    expect((await redeem(alice, daves.code)).status).toBe(201);
+  });
+
+  it("deletes all direct spaces with the account", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const carol = await person("carol");
+    const dave = await person("dave");
+    const owned = await requestContact(alice, "bob");
+    await call(bob, "POST", `/v1/contacts/requests/${owned.spaceId}/accept`);
+    const joined = await contactCode(carol);
+    await redeem(alice, joined.code);
+    const incoming = await requestContact(dave, "alice");
+    const blobId = randomUUID();
+    await call(carol, "POST", `/v1/spaces/${joined.spaceId}/blobs`, { id: blobId, size: 10 });
+    await putItem(carol, joined.spaceId, joined.sk, { blobIds: [blobId] });
+    await putItem(alice, joined.spaceId, joined.sk);
+
+    expect((await call(alice, "DELETE", "/v1/account", { authKey: await authKeyOf(alice) })).status).toBe(204);
+    for (const id of [owned.spaceId, joined.spaceId, incoming.spaceId]) {
+      expect((await pool.query("SELECT 1 FROM spaces WHERE id = $1", [id])).rowCount).toBe(0);
+    }
+    expect(deletedPaths).toContain(`${joined.spaceId}/${blobId}`);
+    expect(await contacts(bob)).toEqual([]);
+    expect(await contacts(carol)).toEqual([]);
+    expect((await call(dave, "GET", "/v1/contacts/requests")).body.outgoing).toEqual([]);
+    expect((await pool.query("SELECT 1 FROM direct_pairs")).rowCount).toBe(0);
+  });
+
+  it("sweeps abandoned one-member direct spaces a day after their code expires", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const expired = await contactCode(alice);
+    const recent = await contactCode(alice);
+    const open = await contactCode(alice);
+    const pending = await requestContact(alice, "bob");
+    const orphan = randomUUID(); // e.g. left behind without a request or a code
+    await pool.query("INSERT INTO spaces (id, kind, owner_uid) VALUES ($1, 'direct', $2)", [orphan, alice.uid]);
+    await pool.query("INSERT INTO space_members (space_id, uid, role, wrapped_key) VALUES ($1, $2, 'owner', $3)", [orphan, alice.uid, randomBytes(126)]);
+    const fresh = randomUUID();
+    await pool.query("INSERT INTO spaces (id, kind, owner_uid) VALUES ($1, 'direct', $2)", [fresh, alice.uid]);
+    const contact = await contactCode(bob);
+    await redeem(alice, contact.code);
+    await pool.query("UPDATE spaces SET created_at = now() - interval '9 days' WHERE kind = 'direct' AND id <> $1", [fresh]);
+    await pool.query("UPDATE invites SET expires_at = now() - interval '25 hours' WHERE space_id = $1", [expired.spaceId]);
+    await pool.query("UPDATE invites SET expires_at = now() - interval '1 hour' WHERE space_id = $1", [recent.spaceId]);
+
+    rebuild(); // a fresh instance sweeps on its first GET /v1/spaces
+    await call(bob, "GET", "/v1/spaces");
+    const left = (await pool.query("SELECT id FROM spaces WHERE kind = 'direct'")).rows.map((r) => r.id).sort();
+    expect(left).toEqual([recent.spaceId, open.spaceId, pending.spaceId, fresh, contact.spaceId].sort());
+    // Not again within the interval.
+    await pool.query("UPDATE invites SET expires_at = now() - interval '25 hours' WHERE space_id = $1", [recent.spaceId]);
+    await call(bob, "GET", "/v1/spaces");
+    expect((await pool.query("SELECT 1 FROM spaces WHERE id = $1", [recent.spaceId])).rowCount).toBe(1);
   });
 });
