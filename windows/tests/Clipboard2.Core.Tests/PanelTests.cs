@@ -272,6 +272,70 @@ public sealed class PanelTests : IDisposable
     }
 
     [Fact]
+    public void PickingFilesOfAMultiFileItemPastesOnlyThose()
+    {
+        string[] paths = [@"C:\a.txt", @"C:\b.txt", @"C:\c.txt", @"C:\d.txt"];
+        var files = _store.Ingest(ProcessedCapture.ForFiles(paths));
+        Add("text", 10);
+        _model.PrepareForOpen(null);
+        Assert.Equal(files.Id, _model.PickableItem?.Id);
+        Assert.Empty(_model.PickedFiles);
+
+        _model.ClickFile(paths[2], shift: false);
+        _model.ClickFile(paths[0], shift: false);
+        Assert.Equal([paths[0], paths[2]], _model.PickedFiles);   // in the item's order
+        _model.ClickFile(paths[0], shift: false);                  // toggles off
+        Assert.Equal([paths[2]], _model.PickedFiles);
+        _model.ClickFile(paths[2], shift: true);                   // range from the last one clicked
+        Assert.Equal([paths[0], paths[1], paths[2]], _model.PickedFiles);
+
+        _model.Perform(new PanelAction.Copy());
+        Assert.Contains($"copy:{string.Join("\n", paths[..3])}", _host.Log);
+        _model.HandleKey(K(PanelKey.Enter));
+        Assert.Contains($"paste:{string.Join("\n", paths[..3])}:", _host.Log);
+        Assert.Equal(paths, _store.Find(files.Id)!.Files);         // the stored item is untouched
+
+        // Moving the selection lets go of the picked files, and they don't come back.
+        _model.MoveSelection(1);
+        Assert.Empty(_model.PickedFiles);
+        _model.MoveSelection(-1);
+        Assert.Empty(_model.PickedFiles);
+        _model.HandleKey(K(PanelKey.Enter));
+        Assert.Contains($"paste:{string.Join("\n", paths)}:", _host.Log);
+
+        // Escape lets go first; closing the panel does too.
+        _model.ClickFile(paths[3], shift: false);
+        Assert.True(_model.HandleKey(K(PanelKey.Escape)));
+        Assert.Empty(_model.PickedFiles);
+        Assert.DoesNotContain("close", _host.Log.TakeLast(1));
+        _model.ClickFile(paths[3], shift: false);
+        _model.DidClose();
+        Assert.Empty(_model.PickedFiles);
+
+        // Every file picked is just the whole item.
+        foreach (var path in paths) _model.ClickFile(path, shift: false);
+        Assert.Same(files, _model.ItemForUse(files));
+    }
+
+    [Fact]
+    public void SingleFileItemsAndMultiSelectionHaveNothingToPick()
+    {
+        var one = _store.Ingest(ProcessedCapture.ForFiles([@"C:\only.txt"]));
+        _store.Ingest(ProcessedCapture.ForFiles([@"C:\x.txt", @"C:\y.txt"]), DateTime.UtcNow.AddSeconds(-5));
+        _model.PrepareForOpen(null);
+        Assert.Equal(one.Id, _model.SelectedEntry!.ClipItem!.Id);
+        Assert.Null(_model.PickableItem);
+        _model.ClickFile(@"C:\only.txt", shift: false);
+        Assert.Empty(_model.PickedFiles);
+        _model.MoveSelection(1);
+        _model.ClickFile(@"C:\x.txt", shift: false);
+        Assert.Single(_model.PickedFiles);
+        _model.SelectAll();
+        Assert.Null(_model.PickableItem);
+        Assert.Empty(_model.PickedFiles);
+    }
+
+    [Fact]
     public void ActionsOfferSetUpAIWhenNotConfigured()
     {
         Add("text item");

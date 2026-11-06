@@ -251,6 +251,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         Filter = PanelFilter.All;
         GroupFilter = null;
         _userMovedSelection = false;
+        ClearPickedFiles();
         Refresh(resetSelection: true);
         OpenToken++;
         Notify();
@@ -269,6 +270,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     public void DidClose()
     {
         SelectionItem = null;
+        ClearPickedFiles();
         ResetMode();
     }
 
@@ -436,6 +438,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     public void Select(string? id)
     {
+        if (id != SelectedId) ClearPickedFiles();
         SelectedId = id;
         SelectedIds = id is null ? [] : [id];
         _anchorId = id;
@@ -462,6 +465,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     public void ToggleSelection(string id)
     {
+        ClearPickedFiles();
         if (SelectedIds.Contains(id) && SelectedIds.Count > 1)
         {
             SelectedIds.Remove(id);
@@ -481,6 +485,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         var from = Entries.FindIndex(e => e.Id == (_anchorId ?? SelectedId));
         var to = Entries.FindIndex(e => e.Id == id);
         if (from < 0 || to < 0) { Select(id); return; }
+        ClearPickedFiles();
         SelectedIds = Entries.Skip(Math.Min(from, to)).Take(Math.Abs(to - from) + 1).Select(e => e.Id).ToHashSet();
         SelectedId = id;
         Notify();
@@ -489,6 +494,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     public void SelectAll()
     {
         if (Entries.Count == 0) return;
+        ClearPickedFiles();
         _anchorId = Entries[0].Id;
         SelectedIds = Entries.Select(e => e.Id).ToHashSet();
         SelectedId ??= Entries[0].Id;
@@ -504,6 +510,60 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         var next = all[(Math.Max(index, 0) + (forward ? 1 : all.Count - 1)) % all.Count];
         if (next.Group is { } g) SetGroupFilter(g); else SetFilter(next.Filter);
     }
+
+    // MARK: Picking files of a multi-file item
+
+    private Guid? _pickedItem;
+    private List<string> _pickedFiles = [];
+    private int? _fileAnchor;
+
+    /// <summary>The selected item when it holds several files and nothing else is selected: its files can be picked
+    /// in the preview.</summary>
+    public ClipItem? PickableItem =>
+        !IsMultiSelecting && SelectedEntry?.ClipItem is { Kind: ClipKind.File, Files.Count: > 1 } item && item != SelectionItem ? item : null;
+
+    /// <summary>Files picked in the preview of <see cref="PickableItem"/>, in the item's order. Empty: the whole item.</summary>
+    public IReadOnlyList<string> PickedFiles => PickableItem is { } item && _pickedItem == item.Id ? _pickedFiles : [];
+
+    public bool IsFilePicked(string path) => PickedFiles.Contains(path);
+
+    /// <summary>A click on a file in the preview toggles it; Shift adds the range from the last one clicked.</summary>
+    public void ClickFile(string path, bool shift)
+    {
+        if (PickableItem is not { } item) return;
+        var index = item.Files.IndexOf(path);
+        if (index < 0) return;
+        if (_pickedItem != item.Id)
+        {
+            _pickedItem = item.Id;
+            _pickedFiles = [];
+            _fileAnchor = null;
+        }
+        var picked = _pickedFiles.ToHashSet();
+        if (shift && _fileAnchor is { } anchor)
+            picked.UnionWith(item.Files.Skip(Math.Min(anchor, index)).Take(Math.Abs(index - anchor) + 1));
+        else if (!picked.Remove(path))
+            picked.Add(path);
+        _fileAnchor = index;
+        _pickedFiles = [.. item.Files.Where(picked.Contains)];
+        Notify();
+    }
+
+    public void ClearPickedFiles()
+    {
+        if (_pickedItem is null) return;
+        _pickedItem = null;
+        _pickedFiles = [];
+        _fileAnchor = null;
+        Notify();
+    }
+
+    /// <summary>What Enter, Paste, Copy and drag use: a transient item with only the picked files, or the item itself.
+    /// The stored item never changes.</summary>
+    public ClipItem ItemForUse(ClipItem item) =>
+        PickedFiles is { Count: > 0 } files && files.Count < item.Files.Count && PickableItem?.Id == item.Id
+            ? ClipItem.From(ProcessedCapture.ForFiles(files, item.Source), item.LastCopiedAt)
+            : item;
 
     // MARK: Quick slots
 
@@ -555,8 +615,9 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 host.PasteText(transform?.Apply(c.Item.Text) ?? c.Item.Text);
                 break;
             case PanelEntry.Clip c:
+                var item = ItemForUse(c.Item);
                 host.ClosePanel();
-                host.Paste(c.Item, transform);
+                host.Paste(item, transform);
                 break;
             case PanelEntry.SnippetEntry s:
                 var fields = SnippetExpander.CustomFields(s.Snippet.Body);
@@ -824,7 +885,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             case PanelAction.PastePlain: Activate(entry, Transform.PlainText); break;
             case PanelAction.Copy:
                 if (item is not null && item == SelectionItem) host.CopyText(item.Text);
-                else if (item is not null) host.Copy(item);
+                else if (item is not null) host.Copy(ItemForUse(item));
                 else if (entry is PanelEntry.SecretEntry k) host.CopySecret(k.Secret);
                 host.ClosePanel();
                 break;
@@ -1085,7 +1146,10 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     {
         switch (key.Key)
         {
-            case PanelKey.Escape: host.ClosePanel(); return true;
+            case PanelKey.Escape:
+                // Picked files are let go first; the next Escape closes.
+                if (PickedFiles.Count > 0) ClearPickedFiles(); else host.ClosePanel();
+                return true;
             case PanelKey.Up: MoveSelection(-1, key.Shift); return true;
             case PanelKey.Down: MoveSelection(1, key.Shift); return true;
             case PanelKey.PageUp: MoveSelection(-8, key.Shift); return true;

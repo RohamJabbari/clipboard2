@@ -260,7 +260,7 @@ public sealed class QuickPanelWindow : Window
         var data = new DataObject();
         data.SetData(EntryFormat, entry.Id);
         if (item.Kind.IsTextual()) data.SetText(item.Text);
-        else if (DraggedFiles(item) is { Count: > 0 } files) data.SetFileDropList(files);
+        else if (DraggedFiles(Model.ItemForUse(item)) is { Count: > 0 } files) data.SetFileDropList(files);
         if (item.Kind == ClipKind.Image && item.ImageFile is { } image && File.Exists(_services.Store.Blobs.PathFor(image)))
             data.SetData("PNG", new MemoryStream(File.ReadAllBytes(_services.Store.Blobs.PathFor(image))));
         DragDrop.DoDragDrop(row, data, DragDropEffects.Copy);
@@ -702,7 +702,7 @@ public sealed class QuickPanelWindow : Window
         if (entry.ClipItem is { } item)
         {
             menu.Items.Add(Item("Paste as Plain Text", () => Model.Activate(entry, Transform.PlainText)));
-            menu.Items.Add(Item("Copy", () => _services.Copy(item)));
+            menu.Items.Add(Item("Copy", () => _services.Copy(Model.ItemForUse(item))));
             menu.Items.Add(new Separator());
             menu.Items.Add(Item(item.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
             if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Labelled", () => Model.RemoveFromLabelled([item])));
@@ -759,6 +759,7 @@ public sealed class QuickPanelWindow : Window
             _detailState = state;
             _actionFilter = null;
             _aiOutput = null;
+            _fileRows.Clear();
             _detail.Child = Model.Mode switch
             {
                 PanelMode.Actions => BuildActions(),
@@ -772,6 +773,7 @@ public sealed class QuickPanelWindow : Window
         }
         if (Model.Mode == PanelMode.Actions) FillActionList();
         if (Model.Mode == PanelMode.AI) UpdateAI();
+        if (Model.Mode == PanelMode.Browse) UpdateFileRows();
     }
 
     private static Border Padded(UIElement child, double padding = 14) => new() { Padding = new Thickness(padding), Child = child };
@@ -786,7 +788,7 @@ public sealed class QuickPanelWindow : Window
         UIElement body = entry switch
         {
             PanelEntry.Clip { Item.Kind: ClipKind.Image } c => ImagePreview(c.Item),
-            PanelEntry.Clip { Item.Kind: ClipKind.File } c => Padded(FileList(c.Item.Files)),
+            PanelEntry.Clip { Item.Kind: ClipKind.File } c => Padded(FileList(c.Item)),
             PanelEntry.Clip c => TextView(c.Item.Text),
             PanelEntry.SnippetEntry s => TextView(s.Snippet.Body),
             PanelEntry.SecretEntry k => SecretView(k.Secret),
@@ -846,17 +848,62 @@ public sealed class QuickPanelWindow : Window
         FontSize = 14,
     };
 
-    private static UIElement FileList(IEnumerable<string> files)
+    private readonly List<(string Path, Border Row, TextBlock Check, TextBlock Name, TextBlock Folder)> _fileRows = [];
+
+    /// <summary>The files of a file item. With several, each row toggles: the picked ones are all that Enter, Paste,
+    /// Copy and drag use.</summary>
+    private UIElement FileList(ClipItem item)
     {
+        var pickable = Model.PickableItem == item;
         var stack = new StackPanel();
-        foreach (var path in files)
+        if (pickable)
         {
-            var row = new StackPanel { Margin = new Thickness(0, 0, 0, 10) };
-            row.Children.Add(Fluent.Label(System.IO.Path.GetFileName(path), 14));
-            row.Children.Add(Fluent.Label(System.IO.Path.GetDirectoryName(path) ?? "", 12, Fluent.Secondary));
+            var hint = Fluent.Label("Click files to use only those. Shift+click picks a range.", 12, Fluent.Secondary, wrap: true);
+            hint.Margin = new Thickness(0, 0, 0, 8);
+            stack.Children.Add(hint);
+        }
+        foreach (var path in item.Files)
+        {
+            var grid = new Grid();
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            var check = Glyphs.Icon("\uE739", 15, Fluent.Tertiary);
+            check.Margin = new Thickness(0, 0, 10, 0);
+            check.Visibility = pickable ? Visibility.Visible : Visibility.Collapsed;
+            grid.Children.Add(check);
+            var texts = new StackPanel();
+            var name = Fluent.Label(System.IO.Path.GetFileName(path), 14);
+            var folder = Fluent.Label(System.IO.Path.GetDirectoryName(path) ?? "", 12, Fluent.Secondary);
+            texts.Children.Add(name);
+            texts.Children.Add(folder);
+            Grid.SetColumn(texts, 1);
+            grid.Children.Add(texts);
+            var row = new Border { Child = grid, CornerRadius = new CornerRadius(6), Padding = new Thickness(8, 4, 8, 4), Margin = new Thickness(-8, 0, -8, 4), Background = Brushes.Transparent };
+            if (pickable)
+            {
+                var p = path;
+                row.Cursor = Cursors.Hand;
+                row.MouseLeftButtonUp += (_, e) => { Model.ClickFile(p, Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)); e.Handled = true; };
+                _fileRows.Add((path, row, check, name, folder));
+            }
             stack.Children.Add(row);
         }
+        UpdateFileRows();
         return new ScrollViewer { Content = stack, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+    }
+
+    private void UpdateFileRows()
+    {
+        foreach (var (path, row, check, name, folder) in _fileRows)
+        {
+            var picked = Model.IsFilePicked(path);
+            row.Background = picked ? Fluent.Accent : Brushes.Transparent;
+            check.Text = picked ? "\uE73A" : "\uE739";
+            check.Foreground = picked ? Fluent.AccentText : Fluent.Tertiary;
+            name.Foreground = picked ? Fluent.AccentText : (Brush)Application.Current.Resources[SystemColors.ControlTextBrushKey];
+            folder.Foreground = picked ? Fluent.AccentText : Fluent.Secondary;
+            AutomationName(row, System.IO.Path.GetFileName(path) + (picked ? ", picked" : ""));
+        }
     }
 
     private UIElement SecretView(SecretRef secret)
@@ -1238,6 +1285,8 @@ public sealed class QuickPanelWindow : Window
         _syncStatus.Update();
         _hints.Text = Model.Mode switch
         {
+            PanelMode.Browse when Model.PickedFiles.Count > 0 && Model.PickableItem is { } item =>
+                $"Enter Paste {Model.PickedFiles.Count} of {item.Files.Count} files    Ctrl+K Actions    Esc All Files",
             PanelMode.Browse when Model.IsMultiSelecting => $"Enter Paste {Model.SelectedClips.Count} items    Shift+Enter Plain Text    Ctrl+K Actions    Del Delete    Esc Close",
             PanelMode.Browse => "Enter Paste    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Shift+1–9 Assign Slot    Tab Filter    Esc Close",
             PanelMode.Actions when Model.IsPickingGroup => "↑↓ Choose Group    Enter Share    Esc Back",
