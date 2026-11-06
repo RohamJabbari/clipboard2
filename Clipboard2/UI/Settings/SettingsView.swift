@@ -171,7 +171,7 @@ struct HistorySettingsView: View {
                     }
                 } label: {
                     Text("Forget items after")
-                    Text("Counted from the last time you copied an item. Pinned and labelled items never expire.")
+                    Text("Counted from the last time you copied an item. Labelled items never expire.")
                 }
                 LabeledContent {
                     Button("Clear History…", role: .destructive) { confirmClear = true }
@@ -181,6 +181,25 @@ struct HistorySettingsView: View {
                 }
             } header: {
                 Text("How much to keep")
+            }
+
+            Section {
+                LabeledContent {
+                    HStack(spacing: 8) {
+                        Button("Choose…") { chooseSaveFolder() }
+                        if prefs.saveFolder.standardizedFileURL != Preferences.defaultSaveFolder.standardizedFileURL {
+                            Button("Use Downloads") { prefs.saveFolder = Preferences.defaultSaveFolder }
+                        }
+                    }
+                } label: {
+                    Text("Save folder")
+                    Text(prefs.saveFolder.path(percentEncoded: false))
+                        .textSelection(.enabled)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            } footer: {
+                Hint("“Save to \(prefs.saveFolderName)” in the quick panel writes items here: text as .txt, images as .png, files as copies.")
             }
 
             Section {
@@ -220,10 +239,23 @@ struct HistorySettingsView: View {
         .onChange(of: prefs.maxAgeMinutes) { env.runMaintenance() }
         .confirmationDialog("Clear clipboard history?", isPresented: $confirmClear) {
             Button("Clear History", role: .destructive) { env.store.clearHistory() }
-            Button("Clear Including Pinned", role: .destructive) { env.store.clearHistory(includingPinned: true) }
+            Button("Clear Including Labelled", role: .destructive) { env.store.clearHistory(includingPinned: true) }
         } message: {
             Text("Snippets and secrets are kept. This can't be undone.")
         }
+    }
+
+    private func chooseSaveFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = env.prefs.saveFolder
+        panel.prompt = "Choose"
+        panel.message = "Choose where “Save to” puts items"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        env.prefs.saveFolder = url
     }
 }
 
@@ -421,7 +453,7 @@ struct QuickSlotsSection: View {
         } header: {
             Text("Quick slots")
         } footer: {
-            Hint("In the quick panel, ⌘⇧1–9 pins the selected item to a slot and ⌘1–9 pastes it. Give a slot a shortcut to paste it from any app.")
+            Hint("In the quick panel, ⌘⇧1–9 assigns the selected item to a slot and ⌘1–9 pastes it. Give a slot a shortcut to paste it from any app.")
         }
     }
 }

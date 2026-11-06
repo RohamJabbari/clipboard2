@@ -82,12 +82,29 @@ final class PasteService {
                 case .text, .richText: return []
                 }
             }
-            pasteboard.writeObjects(urls as [NSURL])
-            // Older and Chromium-based apps (Slack, Teams, WhatsApp…) still read the legacy list of paths.
-            pasteboard.setPropertyList(urls.map(\.path), forType: NSPasteboard.PasteboardType("NSFilenamesPboardType"))
+            setFiles(urls)
             if !text.isEmpty { pasteboard.setString(text, forType: .string) }
         }
         markAsOwnWrite()
+    }
+
+    /// Just these files (some of a multi-file item), as Finder would copy them.
+    func write(fileURLs urls: [URL]) {
+        pasteboard.clearContents()
+        setFiles(urls)
+        markAsOwnWrite()
+    }
+
+    func paste(fileURLs urls: [URL], into target: NSRunningApplication? = nil) {
+        let target = target ?? tracker.targetApp
+        write(fileURLs: urls)
+        sendPasteKeystroke(to: target)
+    }
+
+    private func setFiles(_ urls: [URL]) {
+        pasteboard.writeObjects(urls as [NSURL])
+        // Older and Chromium-based apps (Slack, Teams, WhatsApp…) still read the legacy list of paths.
+        pasteboard.setPropertyList(urls.map(\.path), forType: NSPasteboard.PasteboardType("NSFilenamesPboardType"))
     }
 
     /// An image clip as a real PNG file, so it can travel with other files. Numbered so several

@@ -16,7 +16,7 @@ struct BackupRows: View {
             Button("Export…") { exporting = true }
         } label: {
             Text("Back up")
-            Text("History, pinned items and snippets — and secrets, if you choose — in one encrypted file.")
+            Text("History, labelled items and snippets — and secrets, if you choose — in one encrypted file.")
         }
         .sheet(isPresented: $exporting) { ExportBackupSheet() }
 
@@ -97,7 +97,7 @@ struct ExportBackupSheet: View {
     private var form: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Export Backup").font(.title3.weight(.semibold))
-            Text("Your history, pinned items and snippets on this Mac, encrypted with a passphrase you choose. Items in sync groups stay in their groups and aren't included.")
+            Text("Your history, labelled items and snippets on this Mac, encrypted with a passphrase you choose. Items in sync groups stay in their groups and aren't included.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

@@ -47,7 +47,7 @@ struct SendToDeviceTests {
         let targets = DeviceTarget.others(devices)
 
         let actions = PanelAction.sendToDeviceActions(for: saved, multiSelecting: false, targets: targets)
-        #expect(actions.map { $0.title(isPinned: false) } == ["Send to MacBook Pro", "Send to Office PC", "Send to Unnamed Device"])
+        #expect(actions.map { $0.title(folderName: "Downloads") } == ["Send to MacBook Pro", "Send to Office PC", "Send to Unnamed Device"])
         #expect(actions.allSatisfy { $0.section(aiName: "AI") == "Send" })
 
         #expect(PanelAction.sendToDeviceActions(for: saved, multiSelecting: false, targets: []).isEmpty)

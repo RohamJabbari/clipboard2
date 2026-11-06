@@ -17,7 +17,7 @@ struct MenuBarLabel: View {
     }
 }
 
-/// The menu bar popover: recent history, search, pinned items and quick actions.
+/// The menu bar popover: recent history, search, labelled items and quick actions.
 struct MenuBarContentView: View {
     @Environment(AppEnvironment.self) private var env
     @Environment(\.dismiss) private var dismiss
@@ -89,7 +89,7 @@ struct MenuBarContentView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 1, pinnedViews: [.sectionHeaders]) {
                         if !pinned.isEmpty {
-                            Section { rows(pinned) } header: { sectionHeader("Pinned") }
+                            Section { rows(pinned) } header: { sectionHeader("Labelled") }
                         }
                         if !recent.isEmpty {
                             Section { rows(Array(recent)) } header: { sectionHeader("Recent") }
@@ -166,12 +166,14 @@ struct MenuBarContentView: View {
                 Button("Paste as Plain Text") { dismiss(); env.paste.paste(item, transform: .plainText) }
                 Button("Copy") { env.paste.copy(item) }
                 Divider()
-                Button(item.isPinned ? "Unpin" : "Pin") { env.store.togglePin(item) }
                 Button(item.label == nil ? "Label…" : "Edit Label…") {
                     confirmClear = false
                     savingSecret = nil
                     labelText = item.label ?? ""
                     labelling = item
+                }
+                if item.isPinned && item.label == nil {
+                    Button("Remove from Labelled") { env.store.removeFromLabelled(item) }
                 }
                 if item.kind.isTextual {
                     Button("Save as Secret…") {
@@ -204,7 +206,7 @@ struct MenuBarContentView: View {
 
     private func labelBar(_ item: ClipItem) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Label — labelled items are pinned and never expire")
+            Text("Label — labelled items never expire")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             HStack(spacing: 8) {
@@ -225,7 +227,7 @@ struct MenuBarContentView: View {
     }
 
     private func saveLabel(_ item: ClipItem) {
-        env.store.setLabel(labelText, for: item)
+        env.store.setLabel(labelText, for: item, keepPinned: env.slots.slot(for: .clip(item.id)) != nil)
         labelling = nil
     }
 
@@ -264,7 +266,7 @@ struct MenuBarContentView: View {
     /// which closes the popover before the click lands.
     private var clearConfirmation: some View {
         HStack(spacing: 8) {
-            Text("Clear history? Pinned items are kept.")
+            Text("Clear history? Labelled items are kept.")
                 .font(.callout)
                 .lineLimit(1)
             Spacer()
@@ -345,7 +347,7 @@ private struct MenuBarRow: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 if item.isPinned {
-                    Image(systemName: "pin.fill").font(.caption2).foregroundStyle(.secondary)
+                    Image(systemName: "tag.fill").font(.caption2).foregroundStyle(.secondary)
                 }
                 Text(item.lastCopiedAt.shortRelative)
                     .font(.caption)

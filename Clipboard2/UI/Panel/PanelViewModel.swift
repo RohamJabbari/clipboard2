@@ -2,13 +2,13 @@ import AppKit
 import Observation
 
 nonisolated enum PanelFilter: String, CaseIterable, Identifiable, Sendable {
-    case all, pinned, text, images, files, snippets, secrets, thisApp
+    case all, labelled, text, images, files, snippets, secrets, thisApp
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .all: "All"
-        case .pinned: "Pinned"
+        case .labelled: "Labelled"
         case .text: "Text"
         case .images: "Images"
         case .files: "Files"
@@ -21,7 +21,7 @@ nonisolated enum PanelFilter: String, CaseIterable, Identifiable, Sendable {
     var symbol: String {
         switch self {
         case .all: "tray.full"
-        case .pinned: "pin"
+        case .labelled: "tag"
         case .text: "text.alignleft"
         case .images: "photo"
         case .files: "doc"
@@ -87,7 +87,9 @@ enum PanelAction: Identifiable, Hashable {
     case sendToDevice(DeviceTarget)
     case setUpAI
     case clearSlot(Int)
-    case togglePin
+    case removeFromLabelled
+    case saveToFolder
+    case saveToChosenFolder
     case delete
 
     var id: String {
@@ -103,7 +105,9 @@ enum PanelAction: Identifiable, Hashable {
         case .sendToDevice(let device): "sendToDevice-" + device.id
         case .setUpAI: "setUpAI"
         case .clearSlot(let n): "clearSlot-\(n)"
-        case .togglePin: "pin"
+        case .removeFromLabelled: "removeFromLabelled"
+        case .saveToFolder: "saveToFolder"
+        case .saveToChosenFolder: "saveToChosenFolder"
         case .delete: "delete"
         }
     }
@@ -114,11 +118,13 @@ enum PanelAction: Identifiable, Hashable {
         case .transform: "Transform & Paste"
         case .ai, .setUpAI: "Ask \(aiName)"
         case .sendToDevice: "Send"
-        case .saveAsSecret, .setLabel, .shareToGroup, .clearSlot, .togglePin, .delete: "Item"
+        case .saveToFolder, .saveToChosenFolder: "Save"
+        case .saveAsSecret, .setLabel, .shareToGroup, .clearSlot, .removeFromLabelled, .delete: "Item"
         }
     }
 
-    func title(isPinned: Bool) -> String {
+    /// `folderName` is the save folder's name ("Save to Downloads").
+    func title(folderName: String) -> String {
         switch self {
         case .paste: "Paste"
         case .pastePlain: "Paste as Plain Text"
@@ -132,7 +138,9 @@ enum PanelAction: Identifiable, Hashable {
         case .sendToDevice(let device): "Send to \(device.name)"
         case .setUpAI: "Set Up AI…"
         case .clearSlot(let n): "Remove from Quick Slot ⌘\(n)"
-        case .togglePin: isPinned ? "Unpin" : "Pin"
+        case .removeFromLabelled: "Remove from Labelled"
+        case .saveToFolder: "Save to \(folderName)"
+        case .saveToChosenFolder: "Save to…"
         case .delete: "Delete"
         }
     }
@@ -150,7 +158,9 @@ enum PanelAction: Identifiable, Hashable {
         case .sendToDevice: "laptopcomputer.and.arrow.down"
         case .setUpAI: "sparkles"
         case .clearSlot: "number.square"
-        case .togglePin: "pin"
+        case .removeFromLabelled: "tag.slash"
+        case .saveToFolder: "square.and.arrow.down"
+        case .saveToChosenFolder: "folder"
         case .delete: "trash"
         }
     }
@@ -266,6 +276,7 @@ final class PanelViewModel {
     /// The focused row (drives the preview and keyboard navigation).
     var selectedID: String? {
         didSet {
+            if selectedID != oldValue { clearPickedFiles() }
             guard !adjustingSelection else { return }
             selectedIDs = selectedID.map { [$0] } ?? []
             anchorID = selectedID
@@ -347,7 +358,67 @@ final class PanelViewModel {
         flushEditor?()
         isEditingText = false
         selectionItem = nil
+        clearPickedFiles()
         resetMode()
+    }
+
+    // MARK: Picking files of a multi-file item
+
+    /// Files chosen in the preview of the selected multi-file item. While some (not all) are
+    /// chosen, paste, copy, save and drag use only those; the item itself is unchanged.
+    private(set) var pickedFiles: Set<URL> = []
+    @ObservationIgnored private var pickedFileAnchor: URL?
+
+    /// Click toggles a file, ⇧-click adds the range from the last clicked one.
+    func clickFile(_ url: URL, in item: ClipItem) {
+        if NSEvent.modifierFlags.contains(.shift) {
+            extendPickedFiles(to: url, in: item)
+        } else {
+            togglePickedFile(url)
+        }
+    }
+
+    func togglePickedFile(_ url: URL) {
+        if pickedFiles.contains(url) { pickedFiles.remove(url) } else { pickedFiles.insert(url) }
+        pickedFileAnchor = url
+    }
+
+    func extendPickedFiles(to url: URL, in item: ClipItem) {
+        let urls = item.fileURLs
+        guard let anchor = pickedFileAnchor, let from = urls.firstIndex(of: anchor), let to = urls.firstIndex(of: url) else {
+            togglePickedFile(url)
+            return
+        }
+        pickedFiles.formUnion(urls[min(from, to)...max(from, to)])
+        pickedFileAnchor = url
+    }
+
+    func clearPickedFiles() {
+        if !pickedFiles.isEmpty { pickedFiles = [] }
+        pickedFileAnchor = nil
+    }
+
+    /// The chosen files of `item` in item order, or nil when the whole item applies (nothing or
+    /// everything chosen, another item, or several rows selected).
+    func pickedFileURLs(for item: ClipItem) -> [URL]? {
+        guard !pickedFiles.isEmpty, item.kind == .file, !isMultiSelecting, selectedEntry?.clip?.id == item.id else { return nil }
+        let urls = item.fileURLs.filter(pickedFiles.contains)
+        return urls.isEmpty || urls.count == item.fileURLs.count ? nil : urls
+    }
+
+    /// "2 of 3" for the footer and the preview while a subset is chosen.
+    var pickedFileCount: (picked: Int, total: Int)? {
+        guard let item = selectedEntry?.clip, let urls = pickedFileURLs(for: item) else { return nil }
+        return (urls.count, item.fileURLs.count)
+    }
+
+    /// Copies the item, or just its chosen files.
+    func copy(_ item: ClipItem) {
+        if let files = pickedFileURLs(for: item) {
+            env.paste.write(fileURLs: files)
+        } else {
+            env.paste.copy(item)
+        }
     }
 
     // MARK: Editing the previewed text
@@ -440,7 +511,7 @@ final class PanelViewModel {
             clips = env.store.allItems().filter { item in
                 switch filter {
                 case .all: true
-                case .pinned: item.isPinned
+                case .labelled: item.isPinned
                 case .text: item.kind.isTextual
                 case .images: item.kind == .image
                 case .files: item.kind == .file
@@ -587,14 +658,6 @@ final class PanelViewModel {
         env.paste.paste(clips, transform: transform, into: target)
     }
 
-    func togglePinOnSelectedClips() {
-        let clips = selectedClips
-        let pin = clips.contains { !$0.isPinned }
-        for item in clips where item.isPinned != pin { env.store.togglePin(item) }
-        refresh()
-        showNotice(pin ? "Pinned \(clips.count) items" : "Unpinned \(clips.count) items")
-    }
-
     func deleteSelectedClips() {
         let clips = selectedClips
         guard !clips.isEmpty else { return }
@@ -651,8 +714,13 @@ final class PanelViewModel {
         switch entry {
         case .clip(let item):
             let target = targetApp
+            let files = pickedFileURLs(for: item)
             onClose()
-            env.paste.paste(item, transform: transform, into: target)
+            if let files {
+                env.paste.paste(fileURLs: files, into: target)
+            } else {
+                env.paste.paste(item, transform: transform, into: target)
+            }
         case .snippet(let snippet):
             let fields = SnippetExpander.customFields(in: snippet.body)
             if fields.isEmpty {
@@ -691,8 +759,9 @@ final class PanelViewModel {
         guard let form = labelForm else { return }
         switch form.target {
         case .clip(let item):
-            env.store.setLabel(form.text, for: item)
-            showNotice(item.label == nil ? "Label removed" : "Labelled and pinned")
+            // A quick slot keeps its item even without a label.
+            env.store.setLabel(form.text, for: item, keepPinned: env.slots.slot(for: .clip(item.id)) != nil)
+            showNotice(item.label == nil ? "Label removed" : "Labelled")
         case .secret(let ref):
             let name = form.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty else { return }
@@ -840,6 +909,56 @@ final class PanelViewModel {
         showNotice("Sent to \(device.name)")
     }
 
+    // MARK: Save to folder
+
+    /// True while the folder picker is up, so the panel doesn't close when it loses focus.
+    @ObservationIgnored private(set) var isChoosingFolder = false
+    /// Set by the controller: makes the panel key again (after the folder picker).
+    @ObservationIgnored var onRefocus: () -> Void = {}
+
+    /// The clips a context-menu action on `entry` applies to: the whole selection if it's part of one.
+    func clipsForContextAction(on entry: PanelEntry) -> [ClipItem] {
+        guard let item = entry.clip else { return [] }
+        return isMultiSelecting && isSelected(entry) ? selectedClips : [item]
+    }
+
+    /// Writes the items into `folder` as files and says how it went. The panel stays open, like Copy.
+    func save(_ items: [ClipItem], to folder: URL) {
+        guard !items.isEmpty else { return }
+        if mode == .actions { mode = .browse }
+        let outcome = FolderSaver(blobs: env.blobs).save(items, to: folder) { self.pickedFileURLs(for: $0) ?? $0.fileURLs }
+        let name = FileManager.default.displayName(atPath: folder.path)
+        let saved = outcome.saved.count
+        if outcome.failures.isEmpty {
+            showNotice(saved == 1 ? "Saved to \(name)" : "Saved \(saved) files to \(name)")
+        } else if saved == 0 {
+            NSSound.beep()
+            showNotice("Not saved: \(outcome.failures[0])")
+        } else {
+            showNotice("Saved \(saved) to \(name) · \(outcome.failures.count) failed: \(outcome.failures[0])")
+        }
+    }
+
+    /// Asks for a folder first (starting in the usual save folder).
+    func saveChoosingFolder(_ items: [ClipItem]) {
+        guard !items.isEmpty else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = env.prefs.saveFolder
+        panel.prompt = "Save"
+        panel.message = items.count == 1 ? "Choose where to save this item" : "Choose where to save \(items.count) items"
+        isChoosingFolder = true
+        NSApp.activate()
+        let response = panel.runModal()
+        isChoosingFolder = false
+        onRefocus()
+        guard response == .OK, let folder = panel.url else { return }
+        save(items, to: folder)
+    }
+
     // MARK: Drag and drop
 
     /// Called after a drop was accepted, so the panel takes keyboard focus back (a drag from
@@ -926,7 +1045,7 @@ final class PanelViewModel {
                 actions.append(.copy)
             }
             if canShareToGroup { actions.append(.shareToGroup) }
-            return actions + [.togglePin, .delete]
+            return actions + [.saveToFolder, .saveToChosenFolder, .delete]
         }
         guard let entry = selectedEntry else { return [] }
         var actions: [PanelAction] = [.paste]
@@ -952,7 +1071,9 @@ final class PanelViewModel {
             actions.append(.setLabel)
             if canShareToGroup { actions.append(.shareToGroup) }
             actions += PanelAction.sendToDeviceActions(for: item, multiSelecting: false, targets: DeviceTarget.others(in: env.sync))
-            actions.append(.togglePin)
+            actions += [.saveToFolder, .saveToChosenFolder]
+            // Kept from before labels replaced pins: the only way to let it expire again.
+            if item.isPinned && item.label == nil { actions.append(.removeFromLabelled) }
         case .snippet:
             break
         case .secret(let ref):
@@ -969,13 +1090,24 @@ final class PanelViewModel {
         return actions
     }
 
+    /// An action's title for the current selection.
+    func title(for action: PanelAction) -> String {
+        if let count = pickedFileCount {
+            switch action {
+            case .paste: return "Paste \(count.picked) of \(count.total) Files"
+            case .copy: return "Copy \(count.picked) of \(count.total) Files"
+            default: break
+            }
+        }
+        return action.title(folderName: env.prefs.saveFolderName)
+    }
+
     var filteredActions: [PanelAction] {
-        let isPinned = selectedEntry?.clip?.isPinned ?? false
         let q = actionQuery.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return availableActions }
         var matches = availableActions
             .compactMap { action in
-                FuzzyMatcher.score(query: q, in: action.title(isPinned: isPinned) + " " + action.section(aiName: aiName))
+                FuzzyMatcher.score(query: q, in: title(for: action) + " " + action.section(aiName: aiName))
                     .map { (action, $0) }
             }
             .sorted { $0.1 > $1.1 }
@@ -1007,7 +1139,7 @@ final class PanelViewModel {
         case .copy:
             switch entry {
             case .clip(let item) where item.isTransient: env.paste.write(text: item.text)
-            case .clip(let item): env.paste.copy(item)
+            case .clip(let item): copy(item)
             case .secret(let ref): env.copySecret(ref)
             case .snippet: break
             }
@@ -1056,9 +1188,16 @@ final class PanelViewModel {
             env.slots.clear(number)
             mode = .browse
             refresh()
-        case .togglePin:
-            togglePinOnSelection()
+        case .removeFromLabelled:
+            guard let item = entry.clip else { return }
             mode = .browse
+            removeFromLabelled(item)
+        case .saveToFolder:
+            guard let item = entry.clip else { return }
+            save([item], to: env.prefs.saveFolder)
+        case .saveToChosenFolder:
+            guard let item = entry.clip else { return }
+            saveChoosingFolder([item])
         case .delete:
             mode = .browse
             deleteSelection(includingSecrets: true)
@@ -1084,11 +1223,12 @@ final class PanelViewModel {
             let target = targetApp
             onClose()
             env.paste.paste(text: parts.compactMap { $0 }.joined(separator: "\n"), into: target)
-        case .togglePin:
-            togglePinOnSelectedClips()
-            mode = .browse
         case .shareToGroup:
             beginShare(clips)
+        case .saveToFolder:
+            save(clips, to: env.prefs.saveFolder)
+        case .saveToChosenFolder:
+            saveChoosingFolder(clips)
         case .delete:
             mode = .browse
             deleteSelectedClips()
@@ -1122,6 +1262,14 @@ final class PanelViewModel {
         showNotice("Copied")
     }
 
+    /// The words recognised in an image, copied as plain text (marked as our own write, so it
+    /// doesn't come back as a new history item).
+    func copyImageText(_ text: String) {
+        guard !text.isEmpty else { return }
+        env.paste.write(text: text)
+        showNotice("Copied text")
+    }
+
     func replaceItemWithAIOutput() {
         guard let run = aiRun, run.isFinished, !run.item.isTransient else { return }
         env.store.replaceText(of: run.item, with: run.output)
@@ -1133,10 +1281,11 @@ final class PanelViewModel {
 
     // MARK: Item actions
 
-    func togglePinOnSelection() {
-        guard let item = selectedEntry?.clip else { return }
-        env.store.togglePin(item)
+    /// Lets an item kept without a label expire like the rest of history.
+    func removeFromLabelled(_ item: ClipItem) {
+        env.store.removeFromLabelled(item)
         refresh()
+        showNotice("Removed from Labelled")
     }
 
     /// ⌫ never deletes secrets (too easy to hit by accident); ⌘K → Delete does.
@@ -1226,9 +1375,6 @@ final class PanelViewModel {
                 return true
             }
             switch chars {
-            case "p":
-                if isMultiSelecting { togglePinOnSelectedClips() } else { togglePinOnSelection() }
-                return true
             case "a":
                 // With an empty search field ⌘A selects every row; otherwise it selects the text.
                 guard query.isEmpty else { return false }
