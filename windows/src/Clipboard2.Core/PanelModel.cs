@@ -3,14 +3,15 @@ using Clipboard2.Core.Sync;
 
 namespace Clipboard2.Core;
 
-public enum PanelFilter { All, Labelled, Text, Images, Files, Snippets, Secrets, ThisApp }
+public enum PanelFilter { All, Labelled, Text, Images, Files, Snippets, Secrets, ThisApp, Inbox }
 
 public static class PanelFilters
 {
     public static readonly PanelFilter[] All = Enum.GetValues<PanelFilter>();
     /// <summary>Content types live in the search box's filter menu; the other filters are chips.</summary>
     public static bool IsContentType(this PanelFilter f) => f is PanelFilter.Text or PanelFilter.Images or PanelFilter.Files or PanelFilter.Snippets;
-    public static readonly PanelFilter[] Chips = [.. All.Where(f => !f.IsContentType())];
+    /// <summary>The chips always shown. Inbox joins them once there are contacts (<see cref="PanelModel.ChipFilters"/>).</summary>
+    public static readonly PanelFilter[] Chips = [.. All.Where(f => !f.IsContentType() && f != PanelFilter.Inbox)];
     public static readonly PanelFilter[] ContentTypes = [.. All.Where(f => f.IsContentType())];
     public static string Title(this PanelFilter f) => f switch
     {
@@ -66,6 +67,8 @@ public abstract record PanelAction
     public sealed record ShareToGroup : PanelAction;
     public sealed record ShareTo(string GroupId, string GroupName) : PanelAction;
     public sealed record SendTo(string DeviceId, string DeviceName) : PanelAction;
+    /// <summary>Sends a copy into a contact's space: it shows up in their Inbox.</summary>
+    public sealed record SendToContact(string SpaceId, string ContactName) : PanelAction;
     public sealed record Delete : PanelAction;
 
     public string Section(string aiName) => this switch
@@ -75,6 +78,7 @@ public abstract record PanelAction
         Ask or SetUpAI => $"Ask {aiName}",
         ShareTo => "Share to Group",
         SendTo => "Send to Device",
+        SendToContact => "Send to Contact",
         _ => "Item",
     };
 
@@ -96,6 +100,7 @@ public abstract record PanelAction
         ShareToGroup => "Share to Group…",
         ShareTo s => s.GroupName,
         SendTo d => $"Send to {d.DeviceName}",
+        SendToContact c => $"Send to {c.ContactName}",
         _ => "Delete",
     };
 }
@@ -214,7 +219,12 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     /// <summary>Sends a history item to one device; the host reports failures with <see cref="ShowNotice"/>.</summary>
     public Action<ClipItem, DeviceTarget>? SendToDevice { get; set; }
     private Dictionary<string, SpaceRecord> _groups = [];
+    private Dictionary<string, SpaceRecord> _contacts = [];
     private Dictionary<(string Space, string LocalId), string?> _authors = [];
+    /// <summary>Contacts (their direct space id → their name), for "Send to ‹contact›".</summary>
+    public IReadOnlyDictionary<string, string> ContactNames { get; private set; } = new Dictionary<string, string>();
+    /// <summary>The chips: the built-in ones, plus Inbox once there are contacts.</summary>
+    public IReadOnlyList<PanelFilter> ChipFilters => _contacts.Count > 0 || Filter == PanelFilter.Inbox ? [.. PanelFilters.Chips, PanelFilter.Inbox] : PanelFilters.Chips;
     /// <summary>In the action menu: picking the group to share with.</summary>
     public bool IsPickingGroup { get; private set; }
     public List<PanelEntry> Entries { get; private set; } = [];
@@ -302,6 +312,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         Filter = filter;
         GroupFilter = null;
         Refresh(resetSelection: true);
+        if (filter == PanelFilter.Inbox) GroupFilterSelected?.Invoke();   // fetch what contacts just sent
     }
 
     public void SetGroupFilter(string groupId)
@@ -317,7 +328,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     /// known (older servers). Null for personal items.</summary>
     public string? GroupBadge(PanelEntry entry)
     {
-        if (SpaceOf(entry) is not { } space) return null;
+        if (SpaceOf(entry) is not { } space || _contacts.ContainsKey(space)) return null;
         if (!_groups.TryGetValue(space, out var group)) return GroupNames.GetValueOrDefault(space, "Group");
         var self = Self?.Invoke();
         // Not on the server yet (no sync meta): copied here, so it's ours.
@@ -325,8 +336,17 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         return group.AuthorName(author, self);
     }
 
-    /// <summary>The name of the group an entry belongs to, or null for personal items.</summary>
-    public string? GroupName(PanelEntry entry) => SpaceOf(entry) is { } space ? GroupNames.GetValueOrDefault(space, "Group") : null;
+    /// <summary>The name of the group an entry belongs to, or null for personal items and contacts' items.</summary>
+    public string? GroupName(PanelEntry entry) =>
+        SpaceOf(entry) is { } space && !_contacts.ContainsKey(space) ? GroupNames.GetValueOrDefault(space, "Group") : null;
+
+    /// <summary>For an Inbox entry: the contact who sent it. Null for everything else, including what this user sent.</summary>
+    public string? SenderName(PanelEntry entry) =>
+        SpaceOf(entry) is { } space && _contacts.TryGetValue(space, out var contact) && IsFromContact(space, entry) ? contact.DisplayName : null;
+
+    /// <summary>Written by the other person of a contact (sent from here, or not on the server yet, is this user's).</summary>
+    private bool IsFromContact(string space, PanelEntry entry) =>
+        _authors.TryGetValue((space, SyncIdOf(entry)), out var author) && author is not null && author != Self?.Invoke()?.Uid;
 
     private static string SyncIdOf(PanelEntry entry) => entry switch
     {
@@ -368,11 +388,18 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         var target = TargetApp?.Id;
         _groups = store.Groups().ToDictionary(g => g.Id);
         GroupNames = _groups.ToDictionary(g => g.Key, g => g.Value.DisplayName);
-        _authors = _groups.Count == 0 ? [] : store.GroupAuthors();
+        _contacts = store.Contacts().ToDictionary(c => c.Id);
+        ContactNames = _contacts.ToDictionary(c => c.Key, c => c.Value.DisplayName);
+        _authors = _groups.Count == 0 && _contacts.Count == 0 ? [] : store.GroupAuthors();
         if (GroupFilter is not null && !GroupNames.ContainsKey(GroupFilter)) GroupFilter = null;
         var group = GroupFilter;
+        // What contacts send lives in the Inbox only; what this user sent them isn't listed again.
+        var inbox = Filter == PanelFilter.Inbox && group is null;
+        bool Listed(string? space, PanelEntry entry) =>
+            space is null || !_contacts.ContainsKey(space) ? !inbox : inbox && IsFromContact(space, entry);
         var clips = group is not null ? store.ItemsInSpace(group)
-            : Filter is PanelFilter.Snippets or PanelFilter.Secrets ? [] : store.AllItems().Where(item => Filter switch
+            : inbox ? [.. store.AllItems().Where(item => Listed(item.SpaceId, new PanelEntry.Clip(item)))]
+            : Filter is PanelFilter.Snippets or PanelFilter.Secrets ? [] : store.AllItems().Where(item => Listed(item.SpaceId, new PanelEntry.Clip(item)) && Filter switch
         {
             // Labelled items, plus any pinned before labels replaced pins: both are kept forever.
             PanelFilter.Labelled => item.IsPinned,
@@ -385,9 +412,11 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         // Snippets and secrets join "All" only while searching, so history stays uncluttered.
         var searchingAll = Filter == PanelFilter.All && q.Length > 0;
         var snippets = group is not null ? store.AllSnippets().Where(s => s.SpaceId == group).ToList()
-            : Filter == PanelFilter.Snippets || searchingAll ? store.AllSnippets() : [];
+            : Filter == PanelFilter.Snippets || searchingAll || inbox
+                ? [.. store.AllSnippets().Where(s => Listed(s.SpaceId, new PanelEntry.SnippetEntry(s)))] : [];
         var secretList = group is not null ? secrets.Secrets.Where(s => s.SpaceId == group).ToList()
-            : Filter == PanelFilter.Secrets || searchingAll ? secrets.Secrets.ToList() : [];
+            : Filter == PanelFilter.Secrets || searchingAll || inbox
+                ? [.. secrets.Secrets.Where(s => Listed(s.SpaceId, new PanelEntry.SecretEntry(s)))] : [];
 
         List<PanelEntry> result;
         if (q.Length == 0)
@@ -504,7 +533,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     /// <summary>Tab: the filter chips, then one per sync group (content types are in the filter menu).</summary>
     public void CycleFilter(bool forward)
     {
-        List<(PanelFilter Filter, string? Group)> all = [.. PanelFilters.Chips.Select(f => (f, (string?)null)),
+        List<(PanelFilter Filter, string? Group)> all = [.. ChipFilters.Select(f => (f, (string?)null)),
             .. store.Groups().Select(g => (PanelFilter.All, (string?)g.Id))];
         var index = all.FindIndex(x => GroupFilter is not null ? x.Group == GroupFilter : x.Group is null && x.Filter == Filter);
         var next = all[(Math.Max(index, 0) + (forward ? 1 : all.Count - 1)) % all.Count];
@@ -771,6 +800,11 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     private IEnumerable<PanelAction> SendActions =>
         OtherDevices.OrderBy(d => d.Name, StringComparer.CurrentCultureIgnoreCase).Select(d => new PanelAction.SendTo(d.Id, d.Name));
 
+    /// <summary>"Send to ‹contact›" for each contact, except the one whose space the item is already in.</summary>
+    private IEnumerable<PanelAction> ContactActions(string? exceptSpace) =>
+        ContactNames.Where(c => c.Key != exceptSpace).OrderBy(c => c.Value, StringComparer.CurrentCultureIgnoreCase)
+            .Select(c => new PanelAction.SendToContact(c.Key, c.Value));
+
     public void SetActionQuery(string query)
     {
         if (query == ActionQuery) return;
@@ -811,6 +845,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 if (clips.All(c => c.Kind.IsTextual())) multi.AddRange([new PanelAction.PastePlain(), new PanelAction.Copy(), .. TransformActions]);
                 else multi.Add(new PanelAction.Copy());
                 if (CanShare) multi.Add(new PanelAction.ShareToGroup());
+                multi.AddRange(ContactActions(null));
                 multi.AddRange(SaveActions);
                 if (clips.Any(IsPinnedWithoutLabel)) multi.Add(new PanelAction.RemoveFromLabelled());
                 return [.. multi, new PanelAction.Delete()];
@@ -821,7 +856,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             {
                 case PanelEntry.Clip c when c.Item == SelectionItem:
                     return [new PanelAction.Copy(), .. AIActions, .. TransformActions, new PanelAction.SaveAsSecret(),
-                            .. CanShare ? [new PanelAction.ShareToGroup()] : Array.Empty<PanelAction>()];
+                            .. CanShare ? [new PanelAction.ShareToGroup()] : Array.Empty<PanelAction>(), .. ContactActions(null)];
                 case PanelEntry.Clip c:
                     if (c.Item.Kind.IsTextual()) actions.Add(new PanelAction.PastePlain());
                     actions.Add(new PanelAction.Copy());
@@ -841,7 +876,11 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                     break;
             }
             if (CanShare) actions.Add(new PanelAction.ShareToGroup());
-            if (entry is PanelEntry.Clip) actions.AddRange(SendActions);
+            if (entry is PanelEntry.Clip c2)
+            {
+                actions.AddRange(ContactActions(c2.Item.SpaceId));
+                actions.AddRange(SendActions);
+            }
             if (slots.SlotFor(entry.SlotTarget) is { } slot) actions.Add(new PanelAction.ClearSlot(slot));
             if (entry is PanelEntry.Clip or PanelEntry.SecretEntry) actions.Add(new PanelAction.Delete());
             return actions;
@@ -937,6 +976,9 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 ResetMode();
                 ShowNotice($"Sending to {send.DeviceName}…");
                 break;
+            case PanelAction.SendToContact send when item is not null:
+                SendToContact(item, send);
+                break;
             case PanelAction.Delete:
                 Mode = PanelMode.Browse;
                 DeleteSelection(includingSecrets: true);
@@ -990,6 +1032,19 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 Refresh();
                 ShowNotice($"Shared {clips.Count} items to “{share.GroupName}”");
                 break;
+            case PanelAction.SendToContact send:
+                // All or nothing, like sharing to a group.
+                if (clips.Where(c => c.SpaceId != send.SpaceId).Select(SyncEngine.GroupShareProblem).FirstOrDefault(p => p is not null) is { } tooBig)
+                {
+                    ResetMode();
+                    ShowNotice(tooBig);
+                    break;
+                }
+                foreach (var c in clips.Where(c => c.SpaceId != send.SpaceId)) store.CopyToSpace(c, send.SpaceId, keepLabel: false);
+                ResetMode();
+                Refresh();
+                ShowNotice($"Sent {clips.Count} items to {send.ContactName}");
+                break;
             case PanelAction.Delete:
                 Mode = PanelMode.Browse;
                 DeleteSelectedClips();
@@ -1032,6 +1087,27 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         ResetMode();
         Refresh();
         ShowNotice($"Shared to “{share.GroupName}”");
+    }
+
+    /// <summary>Copies a clip into the contact's space (without this user's label): it arrives in their Inbox.
+    /// Same limits as sharing to a group.</summary>
+    public void SendToContact(ClipItem item, PanelAction.SendToContact send)
+    {
+        if (item == SelectionItem)
+        {
+            store.Ingest(ProcessedCapture.ForText(item.Text, source: item.Source), spaceId: send.SpaceId);
+            host.ClosePanel();
+            return;
+        }
+        ResetMode();
+        if (SyncEngine.GroupShareProblem(item) is { } problem)
+        {
+            ShowNotice(problem);
+            return;
+        }
+        store.CopyToSpace(item, send.SpaceId, keepLabel: false);
+        Refresh();
+        ShowNotice($"Sent to {send.ContactName}");
     }
 
     // MARK: AI result

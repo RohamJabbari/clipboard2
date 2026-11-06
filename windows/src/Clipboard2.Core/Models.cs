@@ -172,14 +172,17 @@ public sealed record SyncMeta(string SpaceId, string LocalId, string Category, s
 }
 
 /// <summary>A sync space as last seen on the server, cached so group names and badges work offline.</summary>
+/// <param name="Name">A group's decrypted name; for a contact (a "direct" space), the other person's name.</param>
 /// <param name="Members">Member uid → display name (username, or the email's part before @); null when the server
 /// doesn't send members.</param>
 public sealed record SpaceRecord(string Id, string Kind, string Role, string? Name, string OwnerUid, int MemberCount,
                                  IReadOnlyDictionary<string, string>? Members = null)
 {
     public bool IsGroup => Kind == "group";
+    /// <summary>A contact: a two-person space without a name (docs/sync/PROTOCOL.md → Contacts).</summary>
+    public bool IsDirect => Kind == SpaceKinds.Direct;
     public bool IsOwner => Role == "owner";
-    public string DisplayName => string.IsNullOrWhiteSpace(Name) ? "Untitled group" : Name!;
+    public string DisplayName => string.IsNullOrWhiteSpace(Name) ? (IsDirect ? "Contact" : "Untitled group") : Name!;
 
     /// <summary>The badge for an item of this group: who copied it, or the group's name when that isn't known
     /// (no author, a server without members, or no username of our own).</summary>
@@ -199,6 +202,11 @@ public sealed record SpaceRecord(string Id, string Kind, string Role, string? Na
     private static bool SameMembers(IReadOnlyDictionary<string, string>? a, IReadOnlyDictionary<string, string>? b) =>
         a is null || b is null ? a is null && b is null
             : a.Count == b.Count && a.All(p => b.TryGetValue(p.Key, out var name) && name == p.Value);
+}
+
+public static class SpaceKinds
+{
+    public const string Personal = "personal", Group = "group", Direct = "direct";
 }
 
 /// <summary>The signed-in sync user, for telling own items apart in groups.</summary>

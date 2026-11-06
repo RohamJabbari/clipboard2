@@ -29,7 +29,20 @@ public sealed record SessionInfo(string Token, long ExpiresAt, AccountInfo Accou
 
 public sealed record PendingInvite(string InviteId, long CreatedAt, long ExpiresAt);
 
-public sealed record InviteInfo(string SpaceId, byte[] SealedKey, byte[]? EncryptedName, int MemberCount, long ExpiresAt);
+/// <param name="Kind">"group", or "direct" for a contact code (servers before contacts send no kind: "group").</param>
+/// <param name="OwnerName">For a contact code: whoever made it (username, or the email's part before @).</param>
+public sealed record InviteInfo(string SpaceId, byte[] SealedKey, byte[]? EncryptedName, int MemberCount, long ExpiresAt,
+                                string Kind = "group", string? OwnerName = null);
+
+/// <summary>Someone found by username, with the public key to wrap a contact's space key to.</summary>
+public sealed record SyncUser(string Uid, string? Username, string Name, byte[] PublicKey);
+
+/// <summary>A pending contact request (docs/sync/PROTOCOL.md → Contacts). Incoming: <see cref="Uid"/> and
+/// <see cref="Name"/> are the requester's; outgoing: the recipient's.</summary>
+public sealed record ContactRequest(string SpaceId, string Uid, string? Username, string Name, long CreatedAt);
+
+/// <summary>An open one-time contact code (the code itself is never sent again).</summary>
+public sealed record ContactCode(string SpaceId, string InviteId, long CreatedAt, long ExpiresAt);
 
 /// <param name="Name">The username, or the email's part before @ (servers before October 2026 send only the email).</param>
 public sealed record GroupMember(string Uid, string Name, string Role, string? Username = null);
@@ -176,7 +189,8 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
 
     public async Task<List<SpaceInfo>> GetSpacesAsync(CancellationToken ct = default)
     {
-        var (_, json) = await SendAsync(HttpMethod.Get, "/v1/spaces", null, ct);
+        // Contacts are direct spaces, listed only when asked for (older clients would show them as unnamed groups).
+        var (_, json) = await SendAsync(HttpMethod.Get, "/v1/spaces?include=direct", null, ct);
         return (json?["spaces"] as JsonArray ?? []).OfType<JsonObject>().Select(Space).ToList();
     }
 
@@ -228,7 +242,8 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
         var (status, json) = await SendAsync(HttpMethod.Get, $"/v1/invites/{inviteId}", null, ct, allow: [HttpStatusCode.NotFound]);
         if (status == HttpStatusCode.NotFound) return null;
         return new InviteInfo(S(json!, "spaceId"), Bytes(json!, "sealedKey"),
-            json!["encryptedName"] is JsonValue ? Bytes(json, "encryptedName") : null, (int)L(json, "memberCount"), L(json, "expiresAt"));
+            json!["encryptedName"] is JsonValue ? Bytes(json, "encryptedName") : null, (int)L(json, "memberCount"), L(json, "expiresAt"),
+            Str(json, "kind") ?? "group", Str(json, "ownerName"));
     }
 
     public async Task<SpaceInfo> AcceptInviteAsync(string inviteId, byte[] wrappedKey, CancellationToken ct = default)
@@ -236,6 +251,70 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
         var (_, json) = await SendAsync(HttpMethod.Post, $"/v1/invites/{inviteId}/accept", new JsonObject { ["wrappedKey"] = B64(wrappedKey) }, ct);
         return Space(json!);
     }
+
+    // MARK: Contacts
+
+    /// <summary>GET /v1/users/:username: 404 not_found for nobody, 400 invalid for your own.</summary>
+    public async Task<SyncUser> LookupUserAsync(string username, CancellationToken ct = default)
+    {
+        var (_, json) = await SendAsync(HttpMethod.Get, $"/v1/users/{Uri.EscapeDataString(username)}", null, ct);
+        return new SyncUser(S(json!, "uid"), Str(json!, "username"), Str(json!, "name") ?? Str(json!, "username") ?? username, Bytes(json!, "publicKey"));
+    }
+
+    /// <summary>Creates direct space <paramref name="spaceId"/> with the caller in it and asks <paramref name="username"/> to join.</summary>
+    public async Task<ContactRequest> RequestContactAsync(string username, string spaceId, byte[] wrappedKey, byte[] recipientWrappedKey,
+                                                          CancellationToken ct = default)
+    {
+        var (_, json) = await SendAsync(HttpMethod.Post, "/v1/contacts/requests", new JsonObject
+        {
+            ["username"] = username, ["spaceId"] = spaceId, ["wrappedKey"] = B64(wrappedKey), ["recipientWrappedKey"] = B64(recipientWrappedKey),
+        }, ct);
+        return ContactRequestFrom(json!);
+    }
+
+    public async Task<(List<ContactRequest> Incoming, List<ContactRequest> Outgoing)> ContactRequestsAsync(CancellationToken ct = default)
+    {
+        var (_, json) = await SendAsync(HttpMethod.Get, "/v1/contacts/requests", null, ct);
+        List<ContactRequest> List(string key) => [.. (json?[key] as JsonArray ?? []).OfType<JsonObject>().Select(ContactRequestFrom)];
+        return (List("incoming"), List("outgoing"));
+    }
+
+    /// <summary>The recipient joins: the server adds the key the requester wrapped to them.</summary>
+    public async Task<SpaceInfo> AcceptContactAsync(string spaceId, CancellationToken ct = default)
+    {
+        var (_, json) = await SendAsync(HttpMethod.Post, $"/v1/contacts/requests/{spaceId}/accept", new JsonObject(), ct);
+        return Space(json!);
+    }
+
+    /// <summary>Declines an incoming request or cancels an outgoing one.</summary>
+    public Task DeleteContactRequestAsync(string spaceId, CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Delete, $"/v1/contacts/requests/{spaceId}", null, ct);
+
+    public async Task<long> CreateContactCodeAsync(string spaceId, byte[] wrappedKey, string inviteId, byte[] sealedKey, CancellationToken ct = default)
+    {
+        var (_, json) = await SendAsync(HttpMethod.Post, "/v1/contacts/invites", new JsonObject
+        {
+            ["spaceId"] = spaceId, ["wrappedKey"] = B64(wrappedKey), ["inviteId"] = inviteId, ["sealedKey"] = B64(sealedKey),
+        }, ct);
+        return L(json!, "expiresAt");
+    }
+
+    public async Task<List<ContactCode>> ContactCodesAsync(CancellationToken ct = default)
+    {
+        var (_, json) = await SendAsync(HttpMethod.Get, "/v1/contacts/invites", null, ct);
+        return (json?["invites"] as JsonArray ?? []).OfType<JsonObject>()
+            .Select(i => new ContactCode(S(i, "spaceId"), S(i, "inviteId"), L(i, "createdAt"), L(i, "expiresAt"))).ToList();
+    }
+
+    public Task RevokeContactCodeAsync(string inviteId, CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Delete, $"/v1/contacts/invites/{inviteId}", null, ct);
+
+    /// <summary>Ends a contact for both people: the space, its items and blobs are deleted.</summary>
+    public Task RemoveContactAsync(string spaceId, CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Delete, $"/v1/contacts/{spaceId}", null, ct);
+
+    private static ContactRequest ContactRequestFrom(JsonObject j) =>
+        new(S(j, "spaceId"), S(j, "uid"), Str(j, "username"), Str(j, "name") ?? Str(j, "username") ?? "", L(j, "createdAt"));
 
     // MARK: Items
 

@@ -21,7 +21,8 @@ public static class Glyphs
         Unlock = "", Download = "", All = "", App = "", Tag = "", Check = "",
         Panel = "", Clock = "", Cut = "", SelectAll = "", Undo = "", Redo = "",
         OpenWith = "", Info = "", Rename = "", Menu = "", Eye = "", Book = "",
-        Group = "\uE716", Cloud = "\uE753", Filter = "\uE71C", Cancel = "\uE711", Warning = "\uE7BA";
+        Group = "\uE716", Cloud = "\uE753", Filter = "\uE71C", Cancel = "\uE711", Warning = "\uE7BA",
+        Inbox = "\uE715", Contact = "\uE77B";
 
     public static TextBlock Icon(string glyph, double size = 16, Brush? brush = null) => new()
     {
@@ -41,6 +42,7 @@ public static class Glyphs
         PanelFilter.Files => File,
         PanelFilter.Snippets => Snippet,
         PanelFilter.Secrets => Key,
+        PanelFilter.Inbox => Inbox,
         _ => App,
     };
 }
@@ -243,6 +245,7 @@ public sealed class TrayIcon : IDisposable
     private readonly System.Windows.Forms.ToolStripMenuItem _syncStatusItem;
     private readonly System.Windows.Forms.ToolStripMenuItem _syncNowItem;
     private readonly System.Windows.Forms.ToolStripSeparator _syncSeparator;
+    private readonly System.Windows.Forms.ToolStripMenuItem _contactRequestsItem;
     private readonly TrayStatusIcons _statusIcons;
     private readonly System.Windows.Threading.DispatcherTimer _statusTimer = new() { Interval = TimeSpan.FromSeconds(30) };
 
@@ -264,7 +267,9 @@ public sealed class TrayIcon : IDisposable
         _syncStatusItem = new System.Windows.Forms.ToolStripMenuItem("", null, (_, _) => services.OpenSettings("Sync"));
         _syncNowItem = new System.Windows.Forms.ToolStripMenuItem("Sync Now", null, (_, _) => _ = services.Sync.SyncNowAsync());
         _syncSeparator = new System.Windows.Forms.ToolStripSeparator();
+        _contactRequestsItem = new System.Windows.Forms.ToolStripMenuItem("", null, (_, _) => services.OpenSettings("Sync")) { Visible = false };
         menu.Items.Add(_syncStatusItem);
+        menu.Items.Add(_contactRequestsItem);
         menu.Items.Add(_syncNowItem);
         menu.Items.Add(_syncSeparator);
         _pauseItem = new System.Windows.Forms.ToolStripMenuItem("Pause Capture", null, (_, _) => TogglePause());
@@ -319,8 +324,12 @@ public sealed class TrayIcon : IDisposable
         _syncStatusItem.ToolTipText = status.Status is SyncStatus.Error or SyncStatus.Offline ? "Open Settings → Sync" : "";
         _syncNowItem.Enabled = status.CanSyncNow;
         _icon.Icon = _statusIcons.For(status.Status);
+        var requests = status.IsVisible ? _services.Sync.IncomingRequests.Count : 0;
+        _contactRequestsItem.Visible = requests > 0;
+        _contactRequestsItem.Text = requests == 1 ? "1 contact request…" : $"{requests} contact requests…";
         var text = _services.Settings.IsPaused ? "Clipboard2 (paused)" : "Clipboard2";
         if (status.IsVisible) text += "\n" + status.Text;
+        if (requests > 0) text += "\n" + _contactRequestsItem.Text.TrimEnd('…');
         _icon.Text = text.Length > 127 ? text[..127] : text;
     }
 

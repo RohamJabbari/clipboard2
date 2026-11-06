@@ -18,6 +18,8 @@ public sealed class SyncSpace(SpaceInfo info, byte[] key, string? name)
     public string? Name { get; internal set; } = name;
     public string Id => Info.Id;
     public bool IsPersonal => Info.IsPersonal;
+    /// <summary>A contact: two people, no name (docs/sync/PROTOCOL.md → Contacts).</summary>
+    public bool IsDirect => Info.Kind == SpaceKinds.Direct;
     /// <summary>The <c>space_id</c> used locally: null for the personal space.</summary>
     public string? LocalId => IsPersonal ? null : Id;
     public SpaceRecord Record => new(Id, Info.Kind, Info.Role, Name, Info.OwnerUid, Info.MemberCount, Info.Members);
@@ -137,6 +139,9 @@ public sealed partial class SyncEngine
     /// <summary>The zips of the folders of file items, by folder path: made off the UI thread at the start of each
     /// tick (<see cref="PrepareFolderArchivesAsync"/>), so rendering a payload never has to walk or zip a folder.</summary>
     private readonly Dictionary<string, FolderArchive> _archives = [];
+    /// <summary>Contacts this device has never synced but that are new (made here, or that appeared after this
+    /// device's first sync): their very first pull is announced too.</summary>
+    private readonly HashSet<string> _announceFromStart = [];
 
     public SyncEngine(ClipStore store, ISecretVault vault, SyncApi api, SyncIdentity identity, Func<DateTime>? clock = null,
                       SpaceKeyPins? pins = null)
@@ -163,6 +168,9 @@ public sealed partial class SyncEngine
     public string? DeviceId { get; set; }
     /// <summary>A clip another device sent to this one arrived: the item and the sender's name.</summary>
     public event Action<ClipItem, string>? ReceivedFromDevice;
+    /// <summary>A contact sent this user something new: the item and the contact's name. Not raised for what was
+    /// already there when this device first synced the contact (sign-in, an old contact on a new device).</summary>
+    public event Action<ClipItem, string>? ReceivedFromContact;
     /// <summary>Called for every received file once it's written; marks it as downloaded.</summary>
     public Action<string> MarkReceivedFile { get; set; } = ZoneIdentifier.Mark;
 
@@ -266,13 +274,15 @@ public sealed partial class SyncEngine
         if (!infos.Any(s => s.IsPersonal && s.Id == Identity.PersonalSpaceId)) throw new SyncAccountGoneException();
         var live = infos.Select(s => s.Id).ToHashSet();
         var cached = store.SyncSpaces().ToDictionary(r => r.Id);
+        // Nothing cached: this is the first sync after signing in, so whatever contacts send is old news.
+        var firstSync = cached.Count == 0;
         var blocked = new List<SpaceRecord>();
         foreach (var info in infos)
         {
             if (_spaces.TryGetValue(info.Id, out var known) && known.Info.WrappedKey.AsSpan().SequenceEqual(info.WrappedKey))
             {
                 known.Info = info;
-                known.Name = DecryptName(known, info);
+                known.Name = NameOf(known, info);
                 continue;
             }
             byte[] key;
@@ -292,21 +302,24 @@ public sealed partial class SyncEngine
             pins?.Set(info.Id, key);
             _keyChanged.Remove(info.Id);
             var space = new SyncSpace(info, key, null);
-            space.Name = DecryptName(space, info);
+            space.Name = NameOf(space, info);
             _spaces[info.Id] = space;
+            if (space.IsDirect && !firstSync && !cached.ContainsKey(info.Id)) _announceFromStart.Add(info.Id);
         }
         foreach (var gone in _spaces.Keys.Where(id => !live.Contains(id)).ToList()) _spaces.Remove(gone);
         _keyChanged.IntersectWith(live);
-        foreach (var record in store.SyncSpaces().Where(r => r.IsGroup && !live.Contains(r.Id))) RemoveGroupLocally(record.Id);
+        // A group the user left or lost, or a contact either of them ended.
+        foreach (var record in store.SyncSpaces().Where(r => (r.IsGroup || r.IsDirect) && !live.Contains(r.Id))) RemoveGroupLocally(record.Id);
         // A blocked group stays listed (with its local items) so it can be left.
         store.SaveSyncSpaces(_spaces.Values.Select(s => s.Record).Concat(blocked));
     }
 
-    /// <summary>Deletes a group's items, snippets, secrets and sync state on this device. Its key pin stays: a server
-    /// that hides a group can't reset it. Leaving or joining does.</summary>
+    /// <summary>Deletes a group's (or contact's) items, snippets, secrets and sync state on this device. Its key pin
+    /// stays: a server that hides a group can't reset it. Leaving or joining does.</summary>
     public void RemoveGroupLocally(string spaceId)
     {
         _spaces.Remove(spaceId);
+        _announceFromStart.Remove(spaceId);
         _keyChanged.Remove(spaceId);
         foreach (var secret in vault.Secrets.Where(s => s.SpaceId == spaceId).ToList()) vault.Delete(secret);
         store.DeleteSpaceData(spaceId);
@@ -318,9 +331,21 @@ public sealed partial class SyncEngine
     {
         pins?.Set(info.Id, key);
         _keyChanged.Remove(info.Id);
-        _spaces[info.Id] = new SyncSpace(info, key, name);
+        var space = new SyncSpace(info, key, name);
+        if (space.IsDirect)
+        {
+            space.Name = NameOf(space, info) ?? name;
+            _announceFromStart.Add(info.Id);
+        }
+        _spaces[info.Id] = space;
         store.SaveSyncSpaces(_spaces.Values.Select(s => s.Record));
     }
+
+    /// <summary>A group's decrypted name; for a contact, the other member's name (kept when the server sends none).</summary>
+    private string? NameOf(SyncSpace space, SpaceInfo info) =>
+        space.IsDirect
+            ? info.Members?.FirstOrDefault(m => m.Key != Identity.Uid).Value is { Length: > 0 } other ? other : space.Name
+            : DecryptName(space, info);
 
     private static string? DecryptName(SyncSpace space, SpaceInfo info)
     {
@@ -344,6 +369,8 @@ public sealed partial class SyncEngine
         var resync = store.IsResyncing(space.Id);
         var restarted = false;
         var complete = false;
+        // A contact's new items get a notice, except on the first pull of one that was already there (sign-in).
+        var announce = space.IsDirect && !resync && (since > 0 || _announceFromStart.Contains(space.Id));
         while (true)
         {
             var page = await api.ChangesAsync(space.Id, since, PageSize, ct, fullResync: resync);
@@ -358,6 +385,7 @@ public sealed partial class SyncEngine
             }
             var prepared = new List<Prepared>();
             var notices = new List<(ClipItem Item, string From)>();
+            var arrivals = new List<ClipItem>();
             try
             {
                 foreach (var item in page.Items)
@@ -369,7 +397,9 @@ public sealed partial class SyncEngine
                 {
                     foreach (var p in prepared)
                     {
+                        var arrived = announce && IsArrival(space, p);
                         if (Apply(space, p) is { } notice) notices.Add(notice);
+                        if (arrived && store.Find(Guid.Parse(p.Item.Id)) is { } item) arrivals.Add(item);
                         report.Pulled++;
                     }
                     if (resync) store.MarkResyncSeen(space.Id, page.Items.Select(i => i.Id));
@@ -383,6 +413,7 @@ public sealed partial class SyncEngine
                 EndDownloads(page.Items.Select(i => i.Id));
             }
             foreach (var (item, from) in notices) ReceivedFromDevice?.Invoke(item, from);
+            foreach (var item in arrivals) ReceivedFromContact?.Invoke(item, space.Name ?? "A contact");
             if (!page.HasMore || page.Items.Count == 0)
             {
                 complete = true;
@@ -391,6 +422,13 @@ public sealed partial class SyncEngine
         }
         if (resync && complete) Reconcile(space, store.ResyncSeen(space.Id));
     }
+
+    /// <summary>A clip the other person of a contact wrote that this device didn't have yet.</summary>
+    private bool IsArrival(SyncSpace space, Prepared p) =>
+        p is { Payload: ItemPayload.Clip, KeepLocal: false, Item: { Deleted: null, AuthorUid: { } author } }
+        && author != Identity.Uid
+        && store.SyncMetaFor(space.Id, p.Item.Id) is null
+        && Guid.TryParse(p.Item.Id, out var id) && store.Find(id) is null;
 
     /// <summary>After a full re-sync: whatever the server no longer knows was deleted or trimmed long ago.</summary>
     private void Reconcile(SyncSpace space, HashSet<string> seen)
@@ -898,6 +936,9 @@ public sealed partial class SyncEngine
             var rendered = Render(local, meta?.BlobMap ?? new Dictionary<string, string>());
             var fingerprint = SyncPayload.Fingerprint(rendered.Payload);
             if (meta is not null && meta.Category == rendered.Category && meta.Fingerprint == fingerprint) continue;
+            // A contact's item stays theirs: the server would make an edit (a label, a copy) ours, and it would show
+            // up in their Inbox as sent by us. The edit stays on this device.
+            if (space.IsDirect && meta?.AuthorUid is { } author && author != Identity.Uid) continue;
             if (refused.GetValueOrDefault(local.Id) == fingerprint) continue;
             if (_refusedForNow.TryGetValue((space.Id, local.Id), out var now) && now.Fingerprint == fingerprint)
             {
