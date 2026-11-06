@@ -427,7 +427,7 @@ public sealed class SyncStoreTests : IDisposable
 }
 
 /// <summary>Accounts and the engine against <see cref="FakeCloud"/>.</summary>
-public sealed class SyncEngineTests : IDisposable
+public sealed partial class SyncEngineTests : IDisposable
 {
     private const string Email = "roham@example.com", Password = "correct horse battery";
     private readonly FakeCloud _cloud = new();

@@ -429,7 +429,7 @@ public sealed class QuickPanelWindow : Window
     {
         _chips.Children.Clear();
         RenderTypeFilter();
-        foreach (var filter in PanelFilters.Chips)
+        foreach (var filter in Model.ChipFilters)
         {
             var title = filter == PanelFilter.ThisApp && Model.TargetApp is { } app ? app.Name : filter.Title();
             var f = filter;
@@ -444,9 +444,11 @@ public sealed class QuickPanelWindow : Window
         }
     }
 
-    /// <summary>Group items still downloading, while that group (or All) is shown. Updated in place: no list render.</summary>
+    /// <summary>Group items still downloading, while that group (or All) is shown, and contacts' while the Inbox is.
+    /// Updated in place: no list render.</summary>
     private void UpdateIncoming() => _incoming.Update([.. _services.Sync.Downloads.Where(d => Model.GroupFilter is { } group
         ? d.SpaceId == group
+        : Model.Filter == PanelFilter.Inbox ? Model.ContactNames.ContainsKey(d.SpaceId)
         : Model.Filter == PanelFilter.All && Model.GroupNames.ContainsKey(d.SpaceId))]);
 
     private PanelFilter? ActiveContentType => Model.GroupFilter is null && Model.Filter.IsContentType() ? Model.Filter : null;
@@ -514,8 +516,11 @@ public sealed class QuickPanelWindow : Window
             if (Model.Entries.Count == 0)
             {
                 var empty = new StackPanel { Margin = new Thickness(20, 60, 20, 0), HorizontalAlignment = HorizontalAlignment.Center };
-                empty.Children.Add(Fluent.Label(Model.Query.Length == 0 ? "Nothing here yet" : "No matches", 16, null, FontWeights.SemiBold));
-                empty.Children.Add(Fluent.Label(Model.Query.Length == 0 ? "Items appear as you copy them." : "Try fewer letters or another filter.", 13, Fluent.Secondary));
+                var inbox = Model.Filter == PanelFilter.Inbox && Model.GroupFilter is null;
+                empty.Children.Add(Fluent.Label(Model.Query.Length == 0 ? (inbox ? "Your Inbox is empty" : "Nothing here yet") : "No matches", 16, null, FontWeights.SemiBold));
+                empty.Children.Add(Fluent.Label(Model.Query.Length == 0
+                    ? (inbox ? "What your contacts send you appears here." : "Items appear as you copy them.")
+                    : "Try fewer letters or another filter.", 13, Fluent.Secondary));
                 _rows.Children.Add(empty);
             }
             for (var index = 0; index < Model.Entries.Count; index++)
@@ -602,6 +607,20 @@ public sealed class QuickPanelWindow : Window
         var trailing = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
         var groupName = Model.GroupName(entry);
         var author = Model.GroupBadge(entry);
+        if (Model.SenderName(entry) is { } sender)
+        {
+            var badgeContent = new StackPanel { Orientation = Orientation.Horizontal };
+            var contactIcon = Glyphs.Icon(Glyphs.Contact, 10, sub);
+            contactIcon.Margin = new Thickness(0, 0, 4, 0);
+            badgeContent.Children.Add(contactIcon);
+            badgeContent.Children.Add(Fluent.Label(sender.Length > 18 ? sender[..17] + "…" : sender, 11, sub));
+            trailing.Children.Add(new Border
+            {
+                Child = badgeContent, Padding = new Thickness(6, 1, 6, 1), CornerRadius = new CornerRadius(8), Margin = new Thickness(6, 0, 0, 0),
+                Background = selected ? Brushes.Transparent : Fluent.Subtle,
+                ToolTip = $"Sent to you by {sender}",
+            });
+        }
         if (author is not null)
         {
             var badgeContent = new StackPanel { Orientation = Orientation.Horizontal };
@@ -692,6 +711,17 @@ public sealed class QuickPanelWindow : Window
         }
         menu.Items.Add(slots);
         if (ShareMenu(entry) is { } share) menu.Items.Add(share);
+        if (entry.ClipItem is { } forContact && Model.ContactNames.Where(c => c.Key != forContact.SpaceId).ToList() is { Count: > 0 } contacts)
+        {
+            var send = new MenuItem { Header = "Send to Contact" };
+            foreach (var (spaceId, name) in contacts.OrderBy(c => c.Value, StringComparer.CurrentCultureIgnoreCase))
+                send.Items.Add(Item($"Send to {name}", () =>
+                {
+                    Model.Select(entry.Id);
+                    Model.Perform(new PanelAction.SendToContact(spaceId, name));
+                }));
+            menu.Items.Add(send);
+        }
         if (entry.ClipItem is { } sendable && sendable != Model.SelectionItem && _services.OtherDevices is { Count: > 0 } devices)
         {
             var send = new MenuItem { Header = "Send to Device" };

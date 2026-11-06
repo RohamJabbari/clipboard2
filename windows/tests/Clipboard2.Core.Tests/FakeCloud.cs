@@ -38,15 +38,29 @@ internal sealed class FakeCloud : HttpMessageHandler
     /// <summary>Called with the blob id before storage serves a blob's content.</summary>
     public Action<string>? ServingBlob { get; set; }
     public List<string> Log { get; } = [];
+    /// <summary>The query strings GET /v1/spaces was called with, in order.</summary>
+    public List<string> SpacesQueries { get; } = [];
+    /// <summary>Contacts per user (pending requests and open codes included) before <c>403 quota_exceeded</c>.</summary>
+    public int MaxContacts { get; set; } = 200;
+    /// <summary>Behaves like a server before contacts: no contact routes, direct spaces never exist.</summary>
+    public bool NoContacts { get; set; }
     public int Count(string prefix) => Log.Count(l => l.StartsWith(prefix));
 
     private long _seq;
+    private readonly Lock _serial = new();
     private readonly Dictionary<string, User> _users = [];               // by email
     private readonly Dictionary<string, Session> _sessions = [];         // by token
     private readonly Dictionary<string, Space> _spaces = [];
     private readonly Dictionary<(string Space, string Blob), Blob> _blobs = [];
     private readonly Dictionary<string, Invite> _invites = [];
     private readonly Dictionary<string, SignupCodeRow> _signupCodes = [];   // by hash of the normalised code
+    private readonly Dictionary<string, ContactRequestRow> _requests = [];   // by direct space id
+
+    private sealed class ContactRequestRow
+    {
+        public required string SpaceId, Requester, Recipient, RecipientKey;
+        public long CreatedAt;
+    }
 
     private sealed class User
     {
@@ -95,6 +109,7 @@ internal sealed class FakeCloud : HttpMessageHandler
     private sealed class Invite
     {
         public required string Id, SpaceId, SealedKey;
+        public string? CreatedBy;
         public long CreatedAt, ExpiresAt;
         public bool Used;
     }
@@ -135,6 +150,11 @@ internal sealed class FakeCloud : HttpMessageHandler
     }
 
     public int SessionCount(string email) => _sessions.Values.Count(s => s.Email == email);
+    public bool SpaceExists(string spaceId) => _spaces.ContainsKey(spaceId);
+    public int PendingContactRequests => _requests.Count;
+    /// <summary>The key a contact request stored for its recipient (SK wrapped to them).</summary>
+    public byte[] RecipientWrappedKey(string spaceId) => Convert.FromBase64String(_requests[spaceId].RecipientKey);
+    public string Uid(string email) => _users[email].Uid;
     public int PendingInvites(string spaceId) => _invites.Values.Count(i => i.SpaceId == spaceId && !i.Used);
     public bool HasAccount(string email) => _users.ContainsKey(email);
     public string? LastAuthKey(string email) => _users.GetValueOrDefault(email)?.AuthKey;
@@ -193,27 +213,34 @@ internal sealed class FakeCloud : HttpMessageHandler
         var url = request.RequestUri!;
         if (Offline) throw new HttpRequestException("No route to host");
         var body = request.Content?.ReadAsStringAsync(cancellationToken).GetAwaiter().GetResult() ?? "";
-        Log.Add($"{request.Method} {url.Host}{url.AbsolutePath}");
         HttpResponseMessage response;
-        try
+        // One request at a time, like a database transaction: a tick started in the background (after sign-in or a
+        // join) runs on the thread pool next to the test's own calls.
+        lock (_serial)
         {
-            response = url.Host switch
+            Log.Add($"{request.Method} {url.Host}{url.AbsolutePath}");
+            try
             {
-                "storage.fake" => StorageRequest(request, url),
-                _ => Api(request, url, body),
-            };
-        }
-        catch (HttpError e)
-        {
-            var json = new JsonObject { ["error"] = e.Code, ["message"] = e.Code };
-            if (e.Scope is not null) json["scope"] = e.Scope;
-            response = Json(e.Status, json);
+                response = url.Host switch
+                {
+                    "storage.fake" => StorageRequest(request, url),
+                    _ => Api(request, url, body),
+                };
+            }
+            catch (HttpError e)
+            {
+                var json = new JsonObject { ["error"] = e.Code, ["message"] = e.Detail ?? e.Code };
+                if (e.Scope is not null) json["scope"] = e.Scope;
+                response = Json(e.Status, json);
+            }
         }
         return Task.FromResult(response);
     }
 
     private sealed class HttpError(HttpStatusCode status, string code, string? scope = null) : Exception(code)
     {
+        /// <summary>The <c>message</c> sent with it (the code when null).</summary>
+        public string? Detail { get; init; }
         public HttpStatusCode Status { get; } = status;
         public string Code { get; } = code;
         public string? Scope { get; } = scope;
@@ -391,7 +418,9 @@ internal sealed class FakeCloud : HttpMessageHandler
                 return NoContent();
             case "account" when method == "DELETE":
                 if (B("authKey") != caller.AuthKey) throw new HttpError(HttpStatusCode.Unauthorized, "invalid_credentials");
-                foreach (var owned in _spaces.Values.Where(s => s.Owner == caller.Uid).ToList()) DropSpace(owned.Id);
+                foreach (var owned in _spaces.Values.Where(s => s.Owner == caller.Uid || (s.Kind == "direct" && s.Members.ContainsKey(caller.Uid))).ToList())
+                    DropSpace(owned.Id);
+                foreach (var r in _requests.Values.Where(r => r.Requester == caller.Uid || r.Recipient == caller.Uid).ToList()) DropSpace(r.SpaceId);
                 foreach (var s in _spaces.Values) s.Members.Remove(caller.Uid);
                 RevokeSessions(caller.Email);
                 _users.Remove(caller.Email);
@@ -419,7 +448,10 @@ internal sealed class FakeCloud : HttpMessageHandler
                 _signupCodes.Remove(mine.Hash);
                 return NoContent();
             case "spaces" when path.Length == 2:
+                SpacesQueries.Add(url.Query);
+                var withDirect = (query["include"] ?? "").Split(',').Contains("direct");
                 return Ok(new JsonObject { ["spaces"] = new JsonArray([.. _spaces.Values.Where(s => s.Members.ContainsKey(caller.Uid))
+                    .Where(s => s.Kind != "direct" || (withDirect && s.Members.Count == 2))
                     .OrderByDescending(s => s.Kind).ThenBy(s => s.CreatedAt).Select(s => (JsonNode?)SpaceJson(s, caller.Uid))]) });
             case "groups" when path.Length == 2 && method == "POST":
                 var group = new Space { Id = B("id"), Kind = "group", Owner = caller.Uid, Name = B("encryptedName"), CreatedAt = ++_seq };
@@ -460,20 +492,40 @@ internal sealed class FakeCloud : HttpMessageHandler
                 if (!_invites.TryGetValue(path[2], out var inv) || inv.Used || !_spaces.TryGetValue(inv.SpaceId, out var invSpace))
                     throw new HttpError(HttpStatusCode.NotFound, "not_found");
                 if (method == "GET")
-                    return Ok(new JsonObject { ["spaceId"] = inv.SpaceId, ["sealedKey"] = inv.SealedKey, ["encryptedName"] = invSpace.Name,
-                        ["memberCount"] = invSpace.Members.Count, ["expiresAt"] = inv.ExpiresAt });
+                {
+                    var invJson = new JsonObject { ["spaceId"] = inv.SpaceId, ["sealedKey"] = inv.SealedKey, ["encryptedName"] = invSpace.Name,
+                        ["memberCount"] = invSpace.Members.Count, ["expiresAt"] = inv.ExpiresAt };
+                    if (!NoContacts) invJson["kind"] = invSpace.Kind;
+                    if (invSpace.Kind == "direct") invJson["ownerName"] = UserByUid(invSpace.Owner)?.Name;
+                    return Ok(invJson);
+                }
+                if (invSpace.Kind == "direct")
+                {
+                    if (invSpace.Owner == caller.Uid) throw new HttpError(HttpStatusCode.BadRequest, "invalid");
+                    if (PairTaken(caller.Uid, invSpace.Owner)) throw new HttpError(HttpStatusCode.Conflict, "conflict");
+                    RequireContactRoom(caller.Uid);
+                }
                 if (invSpace.Members.ContainsKey(caller.Uid)) throw new HttpError(HttpStatusCode.Conflict, "conflict");
                 inv.Used = true;
                 invSpace.Members[caller.Uid] = ("member", B("wrappedKey"));
                 return Json(HttpStatusCode.Created, SpaceJson(invSpace, caller.Uid));
+            case "users" when !NoContacts && method == "GET":
+                var found = _users.Values.FirstOrDefault(u => string.Equals(u.Username, Uri.UnescapeDataString(path[2]), StringComparison.OrdinalIgnoreCase))
+                    ?? throw new HttpError(HttpStatusCode.NotFound, "not_found");
+                if (found == caller) throw new HttpError(HttpStatusCode.BadRequest, "invalid");
+                return Ok(new JsonObject { ["uid"] = found.Uid, ["username"] = found.Username, ["name"] = found.Name, ["publicKey"] = found.Account["publicKey"]!.GetValue<string>() });
+            case "contacts" when !NoContacts:
+                return Contacts(method, path, body, caller);
+            case "users" or "contacts":   // Fastify's own 404 for a route it doesn't have
+                throw new HttpError(HttpStatusCode.NotFound, "Not Found");
             case "spaces" when path[3] == "changes":
                 return Changes(Member(path[2], caller.Uid), long.Parse(query["since"] ?? "0"), Math.Min(PageLimit, int.Parse(query["limit"] ?? "500")), query["full"] == "1");
             case "spaces" when path[3] == "items" && method == "PUT":
-                return Put(Member(path[2], caller.Uid), path[4], body!, caller.Uid);
+                return Put(Established(Member(path[2], caller.Uid)), path[4], body!, caller.Uid);
             case "spaces" when path[3] == "items" && method == "DELETE":
                 return Delete(Member(path[2], caller.Uid), path[4], long.Parse(query["updatedAt"] ?? "0"), caller.Uid);
             case "spaces" when path[3] == "blobs" && method == "POST":
-                var s2 = Member(path[2], caller.Uid);
+                var s2 = Established(Member(path[2], caller.Uid));
                 var size = body!["size"]!.GetValue<long>();
                 var blobId = B("id");
                 if (s2.Items.Values.Any(i => i.BlobIds.Contains(blobId))) throw new HttpError(HttpStatusCode.Conflict, "conflict");
@@ -490,12 +542,98 @@ internal sealed class FakeCloud : HttpMessageHandler
         throw new HttpError(HttpStatusCode.NotFound, "not_found");
     }
 
+    /// <summary>A direct space takes writes only once both people are in it.</summary>
+    private static Space Established(Space space) =>
+        space.Kind == "direct" && space.Members.Count < 2 ? throw new HttpError(HttpStatusCode.Forbidden, "forbidden") : space;
+
+    /// <summary>Two people have at most one direct space, pending or not.</summary>
+    private bool PairTaken(string a, string b) =>
+        _spaces.Values.Any(s => s.Kind == "direct" && s.Members.ContainsKey(a) && s.Members.ContainsKey(b))
+        || _requests.Values.Any(r => (r.Requester == a && r.Recipient == b) || (r.Requester == b && r.Recipient == a));
+
+    private int ContactCount(string uid) =>
+        _spaces.Values.Count(s => s.Kind == "direct" && s.Members.ContainsKey(uid))
+        + _requests.Values.Count(r => r.Recipient == uid);
+
+    private void RequireContactRoom(string uid, string message = "You can have at most 200 contacts")
+    {
+        if (ContactCount(uid) >= MaxContacts) throw new HttpError(HttpStatusCode.Forbidden, "quota_exceeded") { Detail = message };
+    }
+
+    private JsonObject RequestJson(ContactRequestRow r, string other)
+    {
+        var user = UserByUid(other)!;
+        return new JsonObject { ["spaceId"] = r.SpaceId, ["uid"] = user.Uid, ["username"] = user.Username, ["name"] = user.Name, ["createdAt"] = r.CreatedAt };
+    }
+
+    private HttpResponseMessage Contacts(string method, string[] path, JsonObject? body, User caller)
+    {
+        string B(string k) => body![k]!.GetValue<string>();
+        var me = caller.Uid;
+        switch (path.Length, method)
+        {
+            case (3, "POST") when path[2] == "requests":
+                var them = _users.Values.FirstOrDefault(u => string.Equals(u.Username, B("username"), StringComparison.OrdinalIgnoreCase))
+                    ?? throw new HttpError(HttpStatusCode.NotFound, "not_found");
+                if (them == caller) throw new HttpError(HttpStatusCode.BadRequest, "invalid") { Detail = "You can't add yourself" };
+                if (PairTaken(me, them.Uid) || _spaces.ContainsKey(B("spaceId"))) throw new HttpError(HttpStatusCode.Conflict, "conflict");
+                RequireContactRoom(me);
+                RequireContactRoom(them.Uid, "They can't take more contacts");
+                var space = new Space { Id = B("spaceId"), Kind = "direct", Owner = me, CreatedAt = ++_seq };
+                space.Members[me] = ("owner", B("wrappedKey"));
+                _spaces[space.Id] = space;
+                var row = new ContactRequestRow { SpaceId = space.Id, Requester = me, Recipient = them.Uid, RecipientKey = B("recipientWrappedKey"), CreatedAt = ++_seq };
+                _requests[space.Id] = row;
+                return Json(HttpStatusCode.Created, RequestJson(row, them.Uid));
+            case (3, "GET") when path[2] == "requests":
+                JsonArray List(Func<ContactRequestRow, bool> mine, Func<ContactRequestRow, string> other) =>
+                    new([.. _requests.Values.Where(mine).OrderByDescending(r => r.CreatedAt).Select(r => (JsonNode?)RequestJson(r, other(r)))]);
+                return Ok(new JsonObject { ["incoming"] = List(r => r.Recipient == me, r => r.Requester), ["outgoing"] = List(r => r.Requester == me, r => r.Recipient) });
+            case (5, "POST") when path[2] == "requests" && path[4] == "accept":
+                if (!_requests.TryGetValue(path[3], out var pending) || pending.Recipient != me) throw new HttpError(HttpStatusCode.NotFound, "not_found");
+                var accepted = _spaces[pending.SpaceId];
+                accepted.Members[me] = ("member", pending.RecipientKey);
+                _requests.Remove(pending.SpaceId);
+                return Json(HttpStatusCode.Created, SpaceJson(accepted, me));
+            case (4, "DELETE") when path[2] == "requests":
+                if (!_requests.TryGetValue(path[3], out var withdrawn) || (withdrawn.Requester != me && withdrawn.Recipient != me))
+                    throw new HttpError(HttpStatusCode.NotFound, "not_found");
+                _requests.Remove(withdrawn.SpaceId);
+                DropSpace(withdrawn.SpaceId);
+                return NoContent();
+            case (3, "POST") when path[2] == "invites":
+                RequireContactRoom(me);
+                var coded = new Space { Id = B("spaceId"), Kind = "direct", Owner = me, CreatedAt = ++_seq };
+                if (_spaces.ContainsKey(coded.Id)) throw new HttpError(HttpStatusCode.Conflict, "conflict");
+                coded.Members[me] = ("owner", B("wrappedKey"));
+                _spaces[coded.Id] = coded;
+                var invite = new Invite { Id = B("inviteId"), SpaceId = coded.Id, SealedKey = B("sealedKey"), CreatedBy = me, CreatedAt = ++_seq, ExpiresAt = 9_999_999_999_999 };
+                _invites[invite.Id] = invite;
+                return Json(HttpStatusCode.Created, new JsonObject { ["spaceId"] = coded.Id, ["inviteId"] = invite.Id, ["expiresAt"] = invite.ExpiresAt });
+            case (3, "GET") when path[2] == "invites":
+                return Ok(new JsonObject { ["invites"] = new JsonArray([.. _invites.Values
+                    .Where(i => i.CreatedBy == me && !i.Used && _spaces.TryGetValue(i.SpaceId, out var d) && d.Kind == "direct").OrderBy(i => i.CreatedAt)
+                    .Select(i => (JsonNode?)new JsonObject { ["spaceId"] = i.SpaceId, ["inviteId"] = i.Id, ["createdAt"] = i.CreatedAt, ["expiresAt"] = i.ExpiresAt })]) });
+            case (4, "DELETE") when path[2] == "invites":
+                if (!_invites.TryGetValue(path[3], out var code) || code.CreatedBy != me || code.Used) throw new HttpError(HttpStatusCode.NotFound, "not_found");
+                DropSpace(code.SpaceId);
+                return NoContent();
+            case (3, "DELETE"):
+                if (!_spaces.TryGetValue(path[2], out var ended) || ended.Kind != "direct" || !ended.Members.ContainsKey(me))
+                    throw new HttpError(HttpStatusCode.NotFound, "not_found");
+                DropSpace(ended.Id);
+                return NoContent();
+        }
+        throw new HttpError(HttpStatusCode.NotFound, "not_found");
+    }
+
     private Space Member(string spaceId, string uid) =>
         _spaces.TryGetValue(spaceId, out var s) && s.Members.ContainsKey(uid) ? s : throw new HttpError(HttpStatusCode.NotFound, "not_found");
 
     private void DropSpace(string id)
     {
         _spaces.Remove(id);
+        _requests.Remove(id);
         foreach (var invite in _invites.Values.Where(i => i.SpaceId == id).ToList()) _invites.Remove(invite.Id);
         foreach (var key in _blobs.Keys.Where(k => k.Space == id).ToList()) _blobs.Remove(key);
     }

@@ -11,7 +11,7 @@ using Clipboard2.Core.Sync;
 namespace Clipboard2.App.Views;
 
 /// <summary>A small notice near the bottom of the screen that never takes focus or clicks: a group item's download
-/// while "Paste from group" waits for it, or a one-line message that hides itself.</summary>
+/// while "Paste from group" waits for it, a one-line message that hides itself, or what a contact just sent.</summary>
 public sealed class HudWindow : Window
 {
     private readonly TextBlock _icon = Glyphs.Icon(Glyphs.Download, 20);
@@ -79,6 +79,16 @@ public sealed class HudWindow : Window
         Set(Glyphs.Warning, title, detail, bar: false);
         ShowNear(near);
         _hideTimer.Interval = TimeSpan.FromSeconds(5);
+        _hideTimer.Stop();
+        _hideTimer.Start();
+    }
+
+    /// <summary>A quiet notice ("anna sent you “hello”") with a line of detail; it hides itself.</summary>
+    public void ShowNotice(IntPtr near, string glyph, string title, string? detail)
+    {
+        Set(glyph, title, detail, bar: false);
+        ShowNear(near);
+        _hideTimer.Interval = TimeSpan.FromSeconds(4);
         _hideTimer.Stop();
         _hideTimer.Start();
     }

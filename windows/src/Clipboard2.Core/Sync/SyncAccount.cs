@@ -30,8 +30,15 @@ public enum SyncStatus
     SignedOut,
 }
 
-/// <summary>An invite code that has been opened: the group it joins and its key, before accepting.</summary>
-public sealed record InvitePreview(string InviteId, string SpaceId, string Name, int MemberCount, DateTime ExpiresAt, byte[] SpaceKey);
+/// <summary>An invite code that has been opened: the group it joins (or, for a contact code, who made it) and its key,
+/// before accepting.</summary>
+/// <param name="Name">The group's name, or for a contact code the name of the person who made it.</param>
+public sealed record InvitePreview(string InviteId, string SpaceId, string Name, int MemberCount, DateTime ExpiresAt, byte[] SpaceKey,
+                                   string Kind = SpaceKinds.Group)
+{
+    /// <summary>A one-time contact code: accepting adds <see cref="Name"/> as a contact.</summary>
+    public bool IsContact => Kind == SpaceKinds.Direct;
+}
 
 /// <summary>What the "Invite code" field of the sign-up form holds.</summary>
 public abstract record SignupInvite
@@ -131,6 +138,12 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
     public event PropertyChangedEventHandler? PropertyChanged;
     /// <summary>Another device sent a clip here: the item (now at the top) and the sender's device name.</summary>
     public event Action<ClipItem, string>? ReceivedFromDevice;
+    /// <summary>A contact sent something new: the item (in the Inbox) and the contact's name. Never for what was
+    /// already there at sign-in.</summary>
+    public event Action<ClipItem, string>? ReceivedFromContact;
+    /// <summary>Someone asked to be a contact since the last look (not raised for requests already pending at the
+    /// first look after sign-in or launch).</summary>
+    public event Action<ContactRequest>? ContactRequested;
     /// <summary>Received clips whose image or files are still downloading (<see cref="SyncEngine.Downloads"/>).</summary>
     public IReadOnlyList<IncomingDownload> Downloads => _engine?.Downloads ?? [];
     /// <summary><see cref="Downloads"/> changed: throttled, and possibly raised off the UI thread.</summary>
@@ -175,6 +188,8 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
     // MARK: Groups
 
     public List<SpaceRecord> Groups => _engine is null ? [] : _store.Groups();
+    /// <summary>Established contacts, by the other person's name.</summary>
+    public List<SpaceRecord> Contacts => _engine is null ? [] : _store.Contacts();
     public SpaceRecord? DefaultGroup => Groups.FirstOrDefault(g => g.Id == _settings.DefaultGroupId) ?? (Groups.Count == 1 ? Groups[0] : null);
 
     public void SetDefaultGroup(string? id)
@@ -624,6 +639,9 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
         byte[] key;
         try { key = SyncCrypto.OpenInvite(bytes, invite.SealedKey, invite.SpaceId); }
         catch (CryptographicException) { throw new SyncUserException("That invite code doesn't match its group."); }
+        if (invite.Kind == SpaceKinds.Direct)
+            return new InvitePreview(inviteId, invite.SpaceId, invite.OwnerName is { Length: > 0 } owner ? owner : "someone", invite.MemberCount,
+                SyncPayload.FromMillis(invite.ExpiresAt), key, SpaceKinds.Direct);
         var name = "Untitled group";
         if (invite.EncryptedName is { Length: > 0 } sealedName)
         {
@@ -633,11 +651,12 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
         return new InvitePreview(inviteId, invite.SpaceId, name, invite.MemberCount, SyncPayload.FromMillis(invite.ExpiresAt), key);
     }
 
-    /// <summary>Accepts an opened invite: the group key is wrapped to this account's own public key.</summary>
-    public Task<bool> JoinAsync(InvitePreview invite) => Run($"Joining {invite.Name}…", async ct =>
+    /// <summary>Accepts an opened invite: the group key is wrapped to this account's own public key. A contact code
+    /// adds its maker as a contact.</summary>
+    public Task<bool> JoinAsync(InvitePreview invite) => Run(invite.IsContact ? $"Adding {invite.Name}…" : $"Joining {invite.Name}…", async ct =>
     {
         await AcceptAsync(invite, ct);
-        Status = $"You joined {invite.Name}.";
+        Status = invite.IsContact ? $"{invite.Name} is now a contact." : $"You joined {invite.Name}.";
     }, keepStatus: true);
 
     private async Task AcceptAsync(InvitePreview invite, CancellationToken ct)
@@ -651,14 +670,24 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
         }
         catch (SyncApiException ex) when (ex.Code == "conflict")
         {
-            throw new SyncUserException($"You're already in {invite.Name}.");
+            throw new SyncUserException(invite.IsContact
+                ? $"You and {invite.Name} are already contacts, or one of you has asked already. See Contacts."
+                : $"You're already in {invite.Name}.");
         }
         catch (SyncApiException ex) when (ex.Code == "not_found")
         {
             throw new SyncUserException("That invite was used or has expired. Ask for a new one.");
         }
+        catch (SyncApiException ex) when (invite.IsContact && ex.Code == "invalid")
+        {
+            throw new SyncUserException("That's your own contact code. Send it to the person you want to add.");
+        }
+        catch (SyncApiException ex) when (invite.IsContact && ex.Code == "quota_exceeded")
+        {
+            throw new SyncUserException(ContactLimitMessage);
+        }
         engine.AddSpace(info, invite.SpaceKey, invite.Name);
-        if (DefaultGroup is null) _settings.DefaultGroupId = invite.SpaceId;
+        if (!invite.IsContact && DefaultGroup is null) _settings.DefaultGroupId = invite.SpaceId;
         _settings.Save();
         _ = SyncNowAsync();
     }
@@ -674,6 +703,221 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
             _settings.Save();
         }
     }
+
+    // MARK: Contacts
+
+    /// <summary>The server's contact limits (PROTOCOL.md → Contacts), for the messages.</summary>
+    public const int MaxContacts = 200, MaxPendingRequests = 50, MaxContactCodes = 20;
+    private const string ContactLimitMessage = "You've reached the contact limit (200, counting pending requests and open codes). Remove a contact or cancel a request first.";
+    /// <summary>How often a tick also asks for pending contact requests.</summary>
+    public static readonly TimeSpan ContactRequestsInterval = TimeSpan.FromSeconds(60);
+
+    /// <summary>Requests from others waiting for Accept or Decline, newest first (as of the last look).</summary>
+    public IReadOnlyList<ContactRequest> IncomingRequests { get; private set; } = [];
+    /// <summary>This user's requests the other person hasn't answered yet.</summary>
+    public IReadOnlyList<ContactRequest> OutgoingRequests { get; private set; } = [];
+    /// <summary>Open one-time contact codes this user made.</summary>
+    public IReadOnlyList<ContactCode> ContactCodes { get; private set; } = [];
+    /// <summary>False once the server turned out not to know contacts (an older server).</summary>
+    public bool ContactsSupported { get; private set; } = true;
+    private DateTime? _contactsFetched;
+    /// <summary>Incoming requests already seen in this session: only others are announced. Null before the first look.</summary>
+    private HashSet<string>? _seenRequests;
+
+    /// <summary>Fetches pending requests and open codes. <paramref name="force"/> false: only when the last look is
+    /// older than <see cref="ContactRequestsInterval"/>. Failures are logged; the lists keep their last state.</summary>
+    public async Task RefreshContactsAsync(bool force = true, CancellationToken ct = default)
+    {
+        if (Phase != SyncPhase.SignedIn || !ContactsSupported) return;
+        if (!force && _contactsFetched is { } last && _now() - last < ContactRequestsInterval) return;
+        _contactsFetched = _now();
+        try
+        {
+            var (incoming, outgoing) = await _api.ContactRequestsAsync(ct);
+            var codes = await _api.ContactCodesAsync(ct);
+            ApplyContactRequests(incoming, outgoing);
+            ContactCodes = codes;
+        }
+        catch (SyncApiException ex) when (ex.Status == HttpStatusCode.NotFound)
+        {
+            ContactsSupported = false;   // a server from before contacts: the route itself is unknown
+            Logger?.Invoke("The sync server doesn't know contacts");
+        }
+        catch (SyncApiException ex) when (ex.Code != "unauthenticated")
+        {
+            Logger?.Invoke("Couldn't list contact requests: " + ex.Message);
+        }
+        Notify();
+    }
+
+    private void ApplyContactRequests(List<ContactRequest> incoming, List<ContactRequest> outgoing)
+    {
+        var fresh = _seenRequests is { } seen ? incoming.Where(r => !seen.Contains(r.SpaceId)).ToList() : [];
+        _seenRequests = [.. incoming.Select(r => r.SpaceId)];
+        IncomingRequests = incoming;
+        OutgoingRequests = outgoing;
+        foreach (var request in fresh) ContactRequested?.Invoke(request);
+    }
+
+    /// <summary>Looks the username up, makes the contact's space and key, wraps the key to both people and sends the
+    /// request. The other person becomes a contact once they accept.</summary>
+    public Task<bool> RequestContactAsync(string username) => Run("Sending the request…", async ct =>
+    {
+        var engine = RequireEngine();
+        username = NormalizeUsername(NormalizeUsername(username).TrimStart('@'));
+        if (username.Length == 0) throw new SyncUserException("Enter their username.");
+        if (!UsernamePattern().IsMatch(username)) throw new SyncUserException($"“{username}” isn't a username. {UsernameRule}");
+        if (Username is { } mine && string.Equals(mine, username, StringComparison.OrdinalIgnoreCase))
+            throw new SyncUserException("That's your own username. Enter the username of the person you want to add.");
+        if (Contacts.FirstOrDefault(c => string.Equals(c.Name, username, StringComparison.OrdinalIgnoreCase)) is { } existing)
+            throw new SyncUserException($"{existing.DisplayName} is already a contact.");
+        SyncUser user;
+        try { user = await _api.LookupUserAsync(username, ct); }
+        catch (SyncApiException ex) when (ex.Code == "not_found")
+        {
+            throw new SyncUserException($"Nobody has the username “{username}”. Check the spelling, or send them a contact code instead.");
+        }
+        catch (SyncApiException ex) when (ex.Status == HttpStatusCode.NotFound)
+        {
+            ContactsSupported = false;
+            throw new SyncUserException("The sync server doesn't support contacts yet.");
+        }
+        catch (SyncApiException ex) when (ex.Code == "invalid")
+        {
+            throw new SyncUserException("That's your own username. Enter the username of the person you want to add.");
+        }
+        var name = user.Username ?? user.Name;
+        var id = Guid.NewGuid().ToString("D");
+        var key = SyncCrypto.RandomKey();
+        byte[] theirs;
+        try { theirs = SyncCrypto.WrapSpaceKey(key, id, user.Uid, user.PublicKey); }
+        catch (CryptographicException) { throw new SyncUserException($"The sync server sent an unusable key for {name}, so no request was sent."); }
+        try
+        {
+            await _api.RequestContactAsync(user.Username ?? username, id, SyncCrypto.WrapSpaceKey(key, id, engine.Identity.Uid, engine.Identity.Keys.Public), theirs, ct);
+        }
+        catch (SyncApiException ex) when (ex.Code == "conflict")
+        {
+            throw new SyncUserException($"You and {name} are already contacts, or one of you has asked already. Check the requests below.");
+        }
+        catch (SyncApiException ex) when (ex.Code == "not_found")
+        {
+            throw new SyncUserException($"Nobody has the username “{username}”. Check the spelling, or send them a contact code instead.");
+        }
+        catch (SyncApiException ex) when (ex.Code == "invalid" && ex.Message.Contains("yourself", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new SyncUserException("That's your own username. Enter the username of the person you want to add.");
+        }
+        catch (SyncApiException ex) when (ex.Code == "quota_exceeded")
+        {
+            throw new SyncUserException(ex.Message.Contains("They", StringComparison.Ordinal)
+                ? $"{name} can't take more contacts right now."
+                : ex.Message.Contains("pending", StringComparison.OrdinalIgnoreCase)
+                    ? $"You have {MaxPendingRequests} requests waiting for an answer. Cancel one first."
+                    : ContactLimitMessage);
+        }
+        // The key made here is the one to expect when the space shows up: a server can't swap it in between.
+        _pins.Set(id, key);
+        await RefreshContactsAsync(force: true, ct);
+        Status = $"Request sent to {name}.";
+    }, keepStatus: true);
+
+    /// <summary>Accepts a request: the contact's space (with the key they wrapped for this account) is synced right away.</summary>
+    public Task<bool> AcceptContactAsync(ContactRequest request) => Run($"Adding {request.Name}…", async ct =>
+    {
+        var engine = RequireEngine();
+        try { await _api.AcceptContactAsync(request.SpaceId, ct); }
+        catch (SyncApiException ex) when (ex.Code == "not_found")
+        {
+            await RefreshContactsAsync(force: true, ct);
+            throw new SyncUserException($"{request.Name} withdrew the request.");
+        }
+        catch (SyncApiException ex) when (ex.Code == "quota_exceeded")
+        {
+            throw new SyncUserException(ContactLimitMessage);
+        }
+        _seenRequests?.Remove(request.SpaceId);
+        IncomingRequests = [.. IncomingRequests.Where(r => r.SpaceId != request.SpaceId)];
+        await engine.RefreshSpacesAsync(ct);
+        Status = $"{request.Name} is now a contact.";
+        _ = SyncNowAsync();
+    }, keepStatus: true);
+
+    /// <summary>Declines an incoming request; nothing is kept.</summary>
+    public Task<bool> DeclineContactAsync(ContactRequest request) => Run("Declining…", async ct =>
+    {
+        await DeleteRequestAsync(request.SpaceId, ct);
+        IncomingRequests = [.. IncomingRequests.Where(r => r.SpaceId != request.SpaceId)];
+    });
+
+    /// <summary>Withdraws an outgoing request.</summary>
+    public Task<bool> CancelContactRequestAsync(ContactRequest request) => Run("Cancelling the request…", async ct =>
+    {
+        await DeleteRequestAsync(request.SpaceId, ct);
+        OutgoingRequests = [.. OutgoingRequests.Where(r => r.SpaceId != request.SpaceId)];
+        _pins.Remove(request.SpaceId);
+    });
+
+    private async Task DeleteRequestAsync(string spaceId, CancellationToken ct)
+    {
+        RequireEngine();
+        try { await _api.DeleteContactRequestAsync(spaceId, ct); }
+        catch (SyncApiException ex) when (ex.Code == "not_found") { }   // answered or withdrawn meanwhile
+        await RefreshContactsAsync(force: true, ct);
+    }
+
+    /// <summary>Makes a one-time contact code (valid 7 days) and returns it formatted, shown once. Whoever enters it
+    /// becomes a contact right away.</summary>
+    public async Task<string?> CreateContactCodeAsync()
+    {
+        string? code = null;
+        await Run("Creating a contact code…", async ct =>
+        {
+            var engine = RequireEngine();
+            var id = Guid.NewGuid().ToString("D");
+            var key = SyncCrypto.RandomKey();
+            var bytes = InviteCode.Generate();
+            try
+            {
+                await _api.CreateContactCodeAsync(id, SyncCrypto.WrapSpaceKey(key, id, engine.Identity.Uid, engine.Identity.Keys.Public),
+                    SyncCrypto.InviteId(bytes), SyncCrypto.SealInvite(bytes, key, id), ct);
+            }
+            catch (SyncApiException ex) when (ex.Code == "quota_exceeded")
+            {
+                throw new SyncUserException(ex.Message.Contains("code", StringComparison.OrdinalIgnoreCase)
+                    ? $"You already have {MaxContactCodes} open contact codes. Revoke one you don't need first."
+                    : ContactLimitMessage);
+            }
+            catch (SyncApiException ex) when (ex.Status == HttpStatusCode.NotFound)
+            {
+                ContactsSupported = false;
+                throw new SyncUserException("The sync server doesn't support contacts yet.");
+            }
+            _pins.Set(id, key);
+            code = InviteCode.Format(bytes);
+            await RefreshContactsAsync(force: true, ct);
+        });
+        return code;
+    }
+
+    public Task<bool> RevokeContactCodeAsync(ContactCode code) => Run("Revoking…", async ct =>
+    {
+        RequireEngine();
+        try { await _api.RevokeContactCodeAsync(code.InviteId, ct); }
+        catch (SyncApiException ex) when (ex.Code == "not_found") { }   // used or expired meanwhile
+        _pins.Remove(code.SpaceId);
+        ContactCodes = [.. ContactCodes.Where(c => c.InviteId != code.InviteId)];
+        await RefreshContactsAsync(force: true, ct);
+    });
+
+    /// <summary>Ends a contact for both people: everything either sent is deleted, here and on the server.</summary>
+    public Task<bool> RemoveContactAsync(string spaceId) => Run("Removing the contact…", async ct =>
+    {
+        RequireEngine();
+        try { await _api.RemoveContactAsync(spaceId, ct); }
+        catch (SyncApiException ex) when (ex.Code == "not_found") { }   // they ended it first
+        ForgetGroup(spaceId);
+    });
 
     private async Task<SyncSpace> SpaceAsync(string id, CancellationToken ct)
     {
@@ -719,14 +963,23 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
     /// task completes when both are done.</summary>
     public Task SyncNowAsync(CancellationToken ct = default)
     {
-        if (_running is { IsCompleted: false })
+        if (_running is { IsCompleted: false } running)
         {
             _again = true;
-            return _running;
+            return AgainAfterAsync(running, ct);
         }
         if (Phase != SyncPhase.SignedIn || _engine is null) return Task.CompletedTask;
         if (RetryAfter is { } until && until > _now()) return Task.CompletedTask;
         return _running = RunTicksAsync(ct.CanBeCanceled ? CancellationTokenSource.CreateLinkedTokenSource(ct, _ticks.Token).Token : _ticks.Token);
+    }
+
+    /// <summary>A request that came while a tick was finishing: the running ticks normally take it (<c>_again</c>),
+    /// but if they had already decided to stop, it runs one more. Without this, a request from another thread than
+    /// the ticks' (tests have no UI thread) could be dropped.</summary>
+    private async Task AgainAfterAsync(Task running, CancellationToken ct)
+    {
+        await running;
+        if (_again) await SyncNowAsync(ct);
     }
 
     /// <summary>Stops a running tick and waits for it: nothing it does may land after the local data is reset,
@@ -755,6 +1008,7 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
                 if (!_accountFresh) await RefreshAccountAsync(ct);
                 if (!_devicesFresh) await RefreshDevicesQuietlyAsync(ct);
                 var report = await engine.TickAsync(ct);
+                await RefreshContactsAsync(force: false, ct);
                 LastSync = _now();
                 _offline = false;
                 RetryAfter = null;
@@ -862,6 +1116,10 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
         _engine?.ClearDownloads();
         _engine = new SyncEngine(_store, _vault, _api, identity, _now, _pins) { Logger = m => Logger?.Invoke(m) };
         _engine.ReceivedFromDevice += (item, from) => ReceivedFromDevice?.Invoke(item, from);
+        _engine.ReceivedFromContact += (item, from) => ReceivedFromContact?.Invoke(item, from);
+        _contactsFetched = null;
+        _seenRequests = null;
+        ContactsSupported = true;
         _engine.DownloadsChanged += () => DownloadsChanged?.Invoke();
     }
 
@@ -874,6 +1132,9 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
             engine.ClearDownloads();
         }
         foreach (var record in _store.SyncSpaces()) _pins.Remove(record.Id);
+        foreach (var id in OutgoingRequests.Select(r => r.SpaceId).Concat(ContactCodes.Select(c => c.SpaceId))) _pins.Remove(id);
+        IncomingRequests = OutgoingRequests = [];
+        ContactCodes = [];
         _engine = null;
         ResetLocalSync();
         foreach (var key in new[] { TokenKey, AccountKey, AccountKeyKey, IdentityKeyKey }) _keys.Delete(key);

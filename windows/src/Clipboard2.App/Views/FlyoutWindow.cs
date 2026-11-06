@@ -89,7 +89,9 @@ public sealed class FlyoutWindow : Window
         _list.Children.Clear();
         _groupNames = _services.Store.Groups().ToDictionary(g => g.Id, g => g.DisplayName);
         var query = _search.Text.Trim();
-        var items = _services.Store.AllItems();
+        // Contacts' items live in the panel's Inbox only.
+        var contactSpaces = _services.Store.Contacts().Select(c => c.Id).ToHashSet();
+        var items = _services.Store.AllItems().Where(i => i.SpaceId is null || !contactSpaces.Contains(i.SpaceId)).ToList();
         if (query.Length > 0)
         {
             items = items.Select(i => (Item: i, Score: FuzzyMatcher.Score(query, i.SearchableText)))
@@ -218,6 +220,14 @@ public sealed class FlyoutWindow : Window
             foreach (var group in groups)
                 share.Items.Add(Item(group.DisplayName, () => _services.ShareToGroup(item, group)));
             menu.Items.Add(share);
+        }
+        var contacts = _services.Store.Contacts().Where(c => c.Id != item.SpaceId).ToList();
+        if (contacts.Count > 0)
+        {
+            var send = new MenuItem { Header = "Send to Contact" };
+            foreach (var contact in contacts)
+                send.Items.Add(Item($"Send to {contact.DisplayName}", () => _services.SendToContact(item, contact)));
+            menu.Items.Add(send);
         }
         menu.Items.Add(new Separator());
         menu.Items.Add(Item("Delete", () => _services.Store.Delete(item)));

@@ -46,7 +46,12 @@ public sealed partial class SettingsWindow : Window
         Action secrets = () => Dispatcher.BeginInvoke(() => RefreshTab("Secrets"));
         Action ai = () => Dispatcher.BeginInvoke(() => RefreshTab("AI"));
         Action about = () => Dispatcher.BeginInvoke(() => RefreshTab("About"));
-        Action sync = () => Dispatcher.BeginInvoke(() => RefreshTab("Sync"));
+        Action sync = () => Dispatcher.BeginInvoke(() =>
+        {
+            UpdateSyncTabTitle();
+            RefreshTab("Sync");
+        });
+        UpdateSyncTabTitle();
         _services.Secrets.Changed += secrets;
         _services.ClaudeAccount.Changed += ai;
         _services.ChatGptAccount.Changed += ai;
@@ -69,6 +74,16 @@ public sealed partial class SettingsWindow : Window
     }
 
     private readonly Dictionary<string, (TabItem Tab, Func<UIElement> Build)> _pages = [];
+    private readonly Dictionary<string, TextBlock> _tabTitles = [];
+
+    /// <summary>"Sync (2)" while contact requests wait for an answer: the only nudge besides a one-time notice.</summary>
+    private void UpdateSyncTabTitle()
+    {
+        if (!_tabTitles.TryGetValue("Sync", out var title)) return;
+        var waiting = _services.Sync.IsSignedIn ? _services.Sync.IncomingRequests.Count : 0;
+        title.Text = waiting > 0 ? $"Sync ({waiting})" : "Sync";
+        title.ToolTip = waiting > 0 ? (waiting == 1 ? "A contact request is waiting" : $"{waiting} contact requests are waiting") : null;
+    }
 
     private void AddTab(string title, string glyph, Func<UIElement> build)
     {
@@ -76,7 +91,9 @@ public sealed partial class SettingsWindow : Window
         var icon = Glyphs.Icon(glyph, 14);
         icon.Margin = new Thickness(0, 0, 6, 0);
         header.Children.Add(icon);
-        header.Children.Add(new TextBlock { Text = title });
+        var titleText = new TextBlock { Text = title };
+        _tabTitles[title] = titleText;
+        header.Children.Add(titleText);
         var tab = new TabItem { Header = header, Tag = title };
         tab.GotFocus += (_, _) => { if (tab.Content is null) tab.Content = Scroll(build()); };
         _tabs.Items.Add(tab);
@@ -981,6 +998,8 @@ public sealed partial class SettingsWindow : Window
         page.Children.Add(Card([.. rows]));
         page.Children.Add(Hint(WhatSyncs));
 
+        BuildContacts(page, sync);
+
         // Groups
         page.Children.Add(Header("Groups"));
         var groups = sync.Groups;
@@ -1027,7 +1046,7 @@ public sealed partial class SettingsWindow : Window
             {
                 if (InputDialog.Ask("New Group", "Name (only members can read it):", okTitle: "Create") is { Length: > 0 } groupName) await sync.CreateGroupAsync(groupName);
             }),
-            Action("Join a Group…", JoinGroup)));
+            Action("Join a Group…", () => EnterCode("Join a Group"))));
         if (sync.Error is { } groupError && !sync.IsSyncing && sync.LastSync is not null)
             groupRows.Add(Fluent.Label(groupError, 12, Brushes.OrangeRed, wrap: true));
         page.Children.Add(Card([.. groupRows]));
@@ -1108,7 +1127,8 @@ public sealed partial class SettingsWindow : Window
         var button = Action(sync.Username is null ? "Set a Username…" : "Change…", async () =>
         {
             var title = sync.Username is null ? "Set a Username" : "Change Username";
-            if (InputDialog.Ask(title, "Shown to people in your groups on the items you copy. " + SyncAccount.UsernameRule, sync.Username ?? "", okTitle: "Save")
+            if (InputDialog.Ask(title, "Shown to people in your groups on the items you copy, and how people add you as a contact. " + SyncAccount.UsernameRule,
+                    sync.Username ?? "", okTitle: "Save")
                 is not { Length: > 0 } typed) return;
             if (!await sync.ChangeUsernameAsync(typed) && sync.Error is { } e) MessageBox.Show(this, e, title);
         }, accent: sync.Username is null);
@@ -1117,13 +1137,22 @@ public sealed partial class SettingsWindow : Window
         return panel;
     }
 
-    private async void JoinGroup()
+    /// <summary>One field for both kinds of code: a group invite asks "Join ‹group›?", a contact code "Add ‹name› as a contact?".</summary>
+    private async void EnterCode(string title)
     {
         var sync = _services.Sync;
-        if (InputDialog.Ask("Join a Group", "Paste the invite code you were given (like ABCD-EFGH-…):", okTitle: "Continue") is not { Length: > 0 } code) return;
+        if (InputDialog.Ask(title, "Paste the code you were given (like ABCD-EFGH-…). Group invites and contact codes both work here:", okTitle: "Continue")
+            is not { Length: > 0 } code) return;
         if (await sync.PreviewInviteAsync(code) is not { } invite)
         {
-            MessageBox.Show(this, sync.Error ?? "That code didn't work.", "Join a Group");
+            MessageBox.Show(this, sync.Error ?? "That code didn't work.", title);
+            return;
+        }
+        if (invite.IsContact)
+        {
+            if (MessageBox.Show(this, $"Add {invite.Name} as a contact? You can send each other items; what {invite.Name} sends you appears in your Inbox.",
+                    "Add Contact", MessageBoxButton.OKCancel, MessageBoxImage.Question) != MessageBoxResult.OK) return;
+            if (!await sync.JoinAsync(invite) && sync.Error is { } failed) MessageBox.Show(this, failed, "Add Contact");
             return;
         }
         var members = invite.MemberCount == 1 ? "1 member" : $"{invite.MemberCount} members";
@@ -1132,24 +1161,138 @@ public sealed partial class SettingsWindow : Window
         if (!await sync.JoinAsync(invite) && sync.Error is { } e) MessageBox.Show(this, e, "Join a Group");
     }
 
+    // MARK: Contacts
+
+    private string _contactUsername = "";
+
+    /// <summary>Your username, add by username, contact codes, pending requests both ways and the contacts themselves.</summary>
+    private void BuildContacts(StackPanel page, SyncAccount sync)
+    {
+        page.Children.Add(Header("Contacts"));
+        if (!sync.ContactsSupported)
+        {
+            page.Children.Add(Card(Fluent.Label("The sync server doesn't support contacts yet.", 13, Fluent.Secondary, wrap: true)));
+            return;
+        }
+        _ = sync.RefreshContactsAsync(force: false);   // at most once a minute; rebuilds this page when it's in
+        var rows = new List<UIElement>();
+
+        rows.Add(Row("Your username", UsernameControls(sync)));
+        rows.Add(Fluent.Label(sync.Username is null
+            ? "You don't have a username yet, so nobody can add you by name. Set one, or send a contact code instead."
+            : $"People add you as “{sync.Username}”.", 12, sync.Username is null ? Fluent.Accent : Fluent.Secondary, wrap: true));
+
+        var field = new TextBox { Text = _contactUsername, MinWidth = 200, MaxLength = 64 };
+        field.TextChanged += (_, _) => _contactUsername = field.Text;
+        async void Request()
+        {
+            if (_contactUsername.Trim().Length == 0) return;
+            if (await sync.RequestContactAsync(_contactUsername)) _contactUsername = "";
+            else if (sync.Error is { } e) MessageBox.Show(this, e, "Add Contact");
+        }
+        field.KeyDown += (_, e) => { if (e.Key == Key.Enter) { e.Handled = true; Request(); } };
+        var send = Action("Send Request", Request, accent: true);
+        send.IsEnabled = !sync.IsBusy;
+        var add = new StackPanel { Orientation = Orientation.Horizontal };
+        add.Children.Add(field);
+        add.Children.Add(send);
+        rows.Add(Row("Add by username", add));
+        rows.Add(Row("Or with a one-time code", Buttons(
+            Action("Create Contact Code…", async () =>
+            {
+                if (await sync.CreateContactCodeAsync() is { } code) ShowContactCode(code);
+                else if (sync.Error is { } e) MessageBox.Show(this, e, "Contact Code");
+            }),
+            Action("Enter a Code…", () => EnterCode("Enter a Code")))));
+        page.Children.Add(Card([.. rows]));
+
+        // Waiting for an answer, either way, and open codes
+        var pending = new List<UIElement>();
+        foreach (var request in sync.IncomingRequests)
+        {
+            var r = request;
+            var controls = new StackPanel { Orientation = Orientation.Horizontal };
+            controls.Children.Add(Fluent.Label($"Asked {SyncPayload.FromMillis(r.CreatedAt).ToLocalTime():g}  ", 12, Fluent.Secondary));
+            controls.Children.Add(Action("Accept", async () =>
+            {
+                if (!await sync.AcceptContactAsync(r) && sync.Error is { } e) MessageBox.Show(this, e, "Accept");
+            }, accent: true));
+            controls.Children.Add(Action("Decline", async () =>
+            {
+                if (!await sync.DeclineContactAsync(r) && sync.Error is { } e) MessageBox.Show(this, e, "Decline");
+            }));
+            pending.Add(Row($"{r.Name} wants to add you", controls));
+        }
+        foreach (var request in sync.OutgoingRequests)
+        {
+            var r = request;
+            var controls = new StackPanel { Orientation = Orientation.Horizontal };
+            controls.Children.Add(Fluent.Label("Waiting for them to accept  ", 12, Fluent.Secondary));
+            controls.Children.Add(Action("Cancel", async () =>
+            {
+                if (!await sync.CancelContactRequestAsync(r) && sync.Error is { } e) MessageBox.Show(this, e, "Cancel Request");
+            }));
+            pending.Add(Row($"Request to {r.Name}", controls));
+        }
+        foreach (var contactCode in sync.ContactCodes)
+        {
+            var c = contactCode;
+            var controls = new StackPanel { Orientation = Orientation.Horizontal };
+            controls.Children.Add(Fluent.Label($"Created {SyncPayload.FromMillis(c.CreatedAt).ToLocalTime():g} · expires {SyncPayload.FromMillis(c.ExpiresAt).ToLocalTime():g}  ", 12, Fluent.Secondary));
+            controls.Children.Add(Action("Revoke", async () =>
+            {
+                if (!await sync.RevokeContactCodeAsync(c) && sync.Error is { } e) MessageBox.Show(this, e, "Revoke");
+            }));
+            pending.Add(Row("Open contact code", controls));
+        }
+        if (pending.Count > 0) page.Children.Add(Card([.. pending]));
+
+        // The contacts
+        var contactRows = new List<UIElement>();
+        foreach (var contact in sync.Contacts)
+        {
+            var id = contact.Id;
+            var name = contact.DisplayName;
+            contactRows.Add(Row(name, Action("Remove…", async () =>
+            {
+                if (MessageBox.Show(this, $"Remove {name} as a contact? This deletes everything you've sent each other, for both of you.",
+                        "Remove Contact", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
+                if (!await sync.RemoveContactAsync(id) && sync.Error is { } e) MessageBox.Show(this, e, "Remove Contact");
+            })));
+        }
+        if (contactRows.Count == 0)
+            contactRows.Add(Fluent.Label("No contacts yet. A contact is one person you can send items to without making a group.", 13, Fluent.Secondary, wrap: true));
+        page.Children.Add(Card([.. contactRows]));
+        page.Children.Add(Hint("Send an item with Ctrl+K → Send to ‹name›, or right-click it. What contacts send you appears under Inbox in the panel. " +
+            "Removing a contact deletes everything you've sent each other, for both of you."));
+    }
+
+    /// <summary>A contact code, shown once like a group invite (only its hash is on the server).</summary>
+    private void ShowContactCode(string code) => ShowCode("Contact Code",
+        "Send this code to the person you want to add. They choose Settings → Sync → Contacts → Enter a Code and paste it.",
+        "It works once and expires in 7 days. You won't see it again — whoever enters it becomes your contact, so share it privately.", code);
+
     /// <summary>The code is shown once; only its hash is on the server.</summary>
-    private void ShowInviteCode(string groupName, string code)
+    private void ShowInviteCode(string groupName, string code) => ShowCode($"Invite to {groupName}",
+        "Send this code to the person you want to invite. They choose Settings → Sync → Join a Group and paste it.",
+        "It works once and expires in 7 days. You won't see it again — anyone with the code can join, so share it privately.", code);
+
+    private void ShowCode(string title, string instructions, string footnote, string code)
     {
         var window = new Window
         {
-            Title = $"Invite to {groupName}", Width = 460, SizeToContent = SizeToContent.Height, Owner = this,
+            Title = title, Width = 460, SizeToContent = SizeToContent.Height, Owner = this,
             WindowStartupLocation = WindowStartupLocation.CenterOwner, ResizeMode = ResizeMode.NoResize,
         };
         var stack = new StackPanel { Margin = new Thickness(20) };
-        stack.Children.Add(Fluent.Label("Send this code to the person you want to invite. They choose Settings → Sync → Join a Group and paste it.", 13, null, wrap: true));
+        stack.Children.Add(Fluent.Label(instructions, 13, null, wrap: true));
         var box = new TextBox
         {
             Text = code, IsReadOnly = true, FontFamily = new FontFamily("Cascadia Mono, Consolas"), FontSize = 20,
             HorizontalContentAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 14, 0, 10),
         };
         stack.Children.Add(box);
-        stack.Children.Add(Fluent.Label("It works once and expires in 7 days. You won't see it again — anyone with the code can join, so share it privately.",
-            12, Fluent.Secondary, wrap: true));
+        stack.Children.Add(Fluent.Label(footnote, 12, Fluent.Secondary, wrap: true));
         // Copied like a secret: kept out of the history (and so out of sync) and out of Win+V.
         var copy = Action("Copy", () => ClipboardIO.WriteSecret(code), accent: true);
         var close = Action("Done", window.Close);

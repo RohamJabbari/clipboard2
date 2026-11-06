@@ -459,8 +459,9 @@ public sealed class ClipStore : IDisposable
     }
 
     /// <summary>Copies an item into another space with a new id and its own blob files.
-    /// If that space already has the same content, it's moved to the top instead.</summary>
-    public ClipItem CopyToSpace(ClipItem item, string? spaceId, DateTime? now = null)
+    /// If that space already has the same content, it's moved to the top instead. <paramref name="keepLabel"/> false
+    /// (sending to a contact) leaves the label and pin behind: they're this user's own.</summary>
+    public ClipItem CopyToSpace(ClipItem item, string? spaceId, DateTime? now = null, bool keepLabel = true)
     {
         var time = now ?? DateTime.UtcNow;
         if (ItemWithHash(item.ContentHash, spaceId) is { } existing)
@@ -475,7 +476,8 @@ public sealed class ClipStore : IDisposable
             CreatedAt = time, LastCopiedAt = time, Kind = item.Kind, Text = item.Text, Preview = item.Preview, Rtf = item.Rtf,
             Html = item.Html, ContentHash = item.ContentHash, Files = [.. item.Files], ImageWidth = item.ImageWidth,
             ImageHeight = item.ImageHeight, ByteCount = item.ByteCount, SourceId = item.SourceId, SourceName = item.SourceName,
-            IsPinned = item.IsPinned, PinnedAt = item.PinnedAt, Label = item.Label, SpaceId = spaceId,
+            IsPinned = keepLabel && item.IsPinned, PinnedAt = keepLabel ? item.PinnedAt : null, Label = keepLabel ? item.Label : null,
+            SpaceId = spaceId,
         };
         copy.ImageFile = CopyBlob(item.ImageFile, copy.Id.ToString("N") + ".png");
         copy.ThumbnailFile = CopyBlob(item.ThumbnailFile, copy.Id.ToString("N") + "-thumb.png");
@@ -597,12 +599,12 @@ public sealed class ClipStore : IDisposable
         return list;
     }
 
-    /// <summary>The author of every group item the server knows about, by (space, item id); null where it isn't known.
-    /// Group items missing here haven't been sent yet, so they're this user's own.</summary>
+    /// <summary>The author of every group and contact item the server knows about, by (space, item id); null where it
+    /// isn't known. Items missing here haven't been sent yet, so they're this user's own.</summary>
     public Dictionary<(string Space, string LocalId), string?> GroupAuthors()
     {
         using var cmd = _db.CreateCommand();
-        cmd.CommandText = "SELECT space_id, local_id, author_uid FROM sync_meta WHERE space_id IN (SELECT id FROM sync_spaces WHERE kind = 'group')";
+        cmd.CommandText = "SELECT space_id, local_id, author_uid FROM sync_meta WHERE space_id IN (SELECT id FROM sync_spaces WHERE kind IN ('group', 'direct'))";
         using var r = cmd.ExecuteReader();
         var authors = new Dictionary<(string, string), string?>();
         while (r.Read()) authors[(r.GetString(0), r.GetString(1))] = r.IsDBNull(2) ? null : r.GetString(2);
@@ -696,11 +698,14 @@ public sealed class ClipStore : IDisposable
         while (r.Read())
             list.Add(new SpaceRecord(r.GetString(0), r.GetString(1), r.GetString(2), r.IsDBNull(3) ? null : r.GetString(3), r.GetString(4), r.GetInt32(5),
                 r.IsDBNull(6) ? null : JsonSerializer.Deserialize<Dictionary<string, string>>(r.GetString(6))));
-        return list.OrderBy(s => s.IsGroup).ThenBy(s => s.DisplayName, StringComparer.CurrentCultureIgnoreCase).ToList();
+        return list.OrderBy(s => s.IsGroup).ThenBy(s => s.IsDirect).ThenBy(s => s.DisplayName, StringComparer.CurrentCultureIgnoreCase).ToList();
     }
 
     /// <summary>Groups the user belongs to, by name.</summary>
     public List<SpaceRecord> Groups() => SyncSpaces().Where(s => s.IsGroup).ToList();
+
+    /// <summary>Established contacts (direct spaces with both people in them), by the other person's name.</summary>
+    public List<SpaceRecord> Contacts() => SyncSpaces().Where(s => s.IsDirect).ToList();
 
     /// <summary>Replaces the cached spaces; a no-op (and no <see cref="Changed"/>) when nothing differs.</summary>
     public void SaveSyncSpaces(IEnumerable<SpaceRecord> spaces)

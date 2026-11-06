@@ -126,6 +126,10 @@ public sealed class AppServices : IPanelHost
             UpdateSendToGroupHotkey();
         };
         Sync.ReceivedFromDevice += (item, from) => _tray?.ShowBalloon($"Sent from {from}", item.Preview);
+        Sync.ReceivedFromContact += (item, from) => Dispatcher.BeginInvoke(() => QueueContactNotice(from, item.Preview));
+        Sync.ContactRequested += request => Dispatcher.BeginInvoke(() => Hud.ShowNotice(Tracker.TargetWindow, Glyphs.Contact,
+            $"{request.Name} wants to add you as a contact", "Accept or decline in Settings → Sync."));
+        _contactNoticeTimer.Tick += (_, _) => ShowContactNotice();
         RunMaintenance();
         ScheduleSync();
         _maintenance.Tick += (_, _) => RunMaintenance();
@@ -577,6 +581,38 @@ public sealed class AppServices : IPanelHost
 
     private void ShowGroupShareProblem(string groupName, string problem) =>
         Hud.ShowWarning(Tracker.TargetWindow, $"Can't share to {groupName}", problem);
+
+    /// <summary>Sends a history item to a contact from outside the panel (it lands in their Inbox), or says why it can't.</summary>
+    public void SendToContact(ClipItem item, SpaceRecord contact)
+    {
+        if (SyncEngine.GroupShareProblem(item) is { } problem)
+        {
+            Hud.ShowWarning(Tracker.TargetWindow, $"Can't send to {contact.DisplayName}", problem);
+            return;
+        }
+        Store.CopyToSpace(item, contact.Id, keepLabel: false);
+        Hud.ShowMessage(Tracker.TargetWindow, Glyphs.Check, $"Sent to {contact.DisplayName}");
+    }
+
+    // What contacts send arrives in a burst per sync: one quiet notice for all of it, never a dialog.
+    private readonly List<(string From, string Preview)> _contactArrivals = [];
+    private readonly DispatcherTimer _contactNoticeTimer = new() { Interval = TimeSpan.FromSeconds(1) };
+
+    private void QueueContactNotice(string from, string preview)
+    {
+        _contactArrivals.Add((from, preview));
+        _contactNoticeTimer.Stop();
+        _contactNoticeTimer.Start();
+    }
+
+    private void ShowContactNotice()
+    {
+        _contactNoticeTimer.Stop();
+        if (_contactArrivals.Count == 0) return;
+        var title = ContactNotice.Title(_contactArrivals);
+        _contactArrivals.Clear();
+        Hud.ShowNotice(Tracker.TargetWindow, Glyphs.Inbox, title, $"In your Inbox ({Settings.Hotkeys.GetValueOrDefault(Hotkey.QuickPanel)} → Inbox)");
+    }
 
     private HudWindow? _hud;
     private HudWindow Hud => _hud ??= new HudWindow();
