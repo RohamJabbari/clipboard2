@@ -3,7 +3,7 @@ using Clipboard2.Core.Sync;
 
 namespace Clipboard2.Core;
 
-public enum PanelFilter { All, Pinned, Text, Images, Files, Snippets, Secrets, ThisApp }
+public enum PanelFilter { All, Labelled, Text, Images, Files, Snippets, Secrets, ThisApp }
 
 public static class PanelFilters
 {
@@ -57,7 +57,8 @@ public abstract record PanelAction
     public sealed record SetLabel : PanelAction;
     public sealed record SetUpAI : PanelAction;
     public sealed record ClearSlot(int Slot) : PanelAction;
-    public sealed record TogglePin : PanelAction;
+    /// <summary>For items pinned without a label: labels are the only way to keep items now.</summary>
+    public sealed record RemoveFromLabelled : PanelAction;
     public sealed record ShareToGroup : PanelAction;
     public sealed record ShareTo(string GroupId, string GroupName) : PanelAction;
     public sealed record SendTo(string DeviceId, string DeviceName) : PanelAction;
@@ -73,7 +74,7 @@ public abstract record PanelAction
         _ => "Item",
     };
 
-    public string Title(bool isPinned) => this switch
+    public string Title => this switch
     {
         Paste => "Paste",
         PastePlain => "Paste as Plain Text",
@@ -85,7 +86,7 @@ public abstract record PanelAction
         SetLabel => "Label…",
         SetUpAI => "Set Up AI…",
         ClearSlot c => $"Remove from Quick Slot Ctrl+{c.Slot}",
-        TogglePin => isPinned ? "Unpin" : "Pin",
+        RemoveFromLabelled => "Remove from Labelled",
         ShareToGroup => "Share to Group…",
         ShareTo s => s.GroupName,
         SendTo d => $"Send to {d.DeviceName}",
@@ -361,7 +362,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         var clips = group is not null ? store.ItemsInSpace(group)
             : Filter is PanelFilter.Snippets or PanelFilter.Secrets ? [] : store.AllItems().Where(item => Filter switch
         {
-            PanelFilter.Pinned => item.IsPinned,
+            // Labelled items, plus any pinned before labels replaced pins: both are kept forever.
+            PanelFilter.Labelled => item.IsPinned,
             PanelFilter.Text => item.Kind.IsTextual(),
             PanelFilter.Images => item.Kind == ClipKind.Image,
             PanelFilter.Files => item.Kind == ClipKind.File,
@@ -605,7 +607,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         {
             case PanelEntry.Clip c:
                 store.SetLabel(form.Text, c.Item);
-                ShowNotice(c.Item.Label is null ? "Label removed" : "Labelled and pinned");
+                ShowNotice(c.Item.Label is null ? "Label removed" : "Labelled");
                 break;
             case PanelEntry.SecretEntry s when form.Text.Trim().Length > 0:
                 secrets.Rename(s.Secret, form.Text.Trim());
@@ -716,6 +718,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     private static IEnumerable<PanelAction> TransformActions =>
         Transforms.All.Where(t => t != Transform.PlainText).Select(t => new PanelAction.ApplyTransform(t));
 
+    private static bool IsPinnedWithoutLabel(ClipItem item) => item.IsPinned && item.Label is null;
+
     public List<PanelAction> AvailableActions
     {
         get
@@ -728,7 +732,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 if (clips.All(c => c.Kind.IsTextual())) multi.AddRange([new PanelAction.PastePlain(), new PanelAction.Copy(), .. TransformActions]);
                 else multi.Add(new PanelAction.Copy());
                 if (CanShare) multi.Add(new PanelAction.ShareToGroup());
-                return [.. multi, new PanelAction.TogglePin(), new PanelAction.Delete()];
+                if (clips.Any(IsPinnedWithoutLabel)) multi.Add(new PanelAction.RemoveFromLabelled());
+                return [.. multi, new PanelAction.Delete()];
             }
             if (SelectedEntry is not { } entry) return [];
             List<PanelAction> actions = [new PanelAction.Paste()];
@@ -747,7 +752,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                         actions.Add(new PanelAction.SaveAsSecret());
                     }
                     actions.Add(new PanelAction.SetLabel());
-                    actions.Add(new PanelAction.TogglePin());
+                    if (IsPinnedWithoutLabel(c.Item)) actions.Add(new PanelAction.RemoveFromLabelled());
                     break;
                 case PanelEntry.SecretEntry:
                     actions.Add(new PanelAction.Copy());
@@ -771,13 +776,12 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             {
                 var groups = ShareActions(!IsMultiSelecting && SelectedEntry is { } e ? SpaceOf(e) : null);
                 return q.Length == 0 ? groups
-                    : [.. groups.Select(a => (Action: a, Score: FuzzyMatcher.Score(q, a.Title(false)))).Where(x => x.Score is not null)
+                    : [.. groups.Select(a => (Action: a, Score: FuzzyMatcher.Score(q, a.Title))).Where(x => x.Score is not null)
                         .OrderByDescending(x => x.Score).Select(x => x.Action)];
             }
             if (q.Length == 0) return AvailableActions;
-            var pinned = SelectedEntry?.ClipItem?.IsPinned ?? false;
             var matches = AvailableActions
-                .Select(a => (Action: a, Score: FuzzyMatcher.Score(q, a.Title(pinned) + " " + a.Section(AIName))))
+                .Select(a => (Action: a, Score: FuzzyMatcher.Score(q, a.Title + " " + a.Section(AIName))))
                 .Where(x => x.Score is not null).OrderByDescending(x => x.Score).Select(x => x.Action).ToList();
             // Anything typed can also be sent as a one-off instruction for the selected text.
             if (!IsMultiSelecting && SelectedEntry?.ClipItem?.Kind.IsTextual() == true)
@@ -832,10 +836,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 Mode = PanelMode.Browse;
                 Refresh();
                 break;
-            case PanelAction.TogglePin:
-                TogglePinOnSelection();
-                Mode = PanelMode.Browse;
-                Notify();
+            case PanelAction.RemoveFromLabelled when item is not null:
+                RemoveFromLabelled([item]);
                 break;
             case PanelAction.ShareToGroup:
                 BeginShareToGroup();
@@ -876,9 +878,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 host.ClosePanel();
                 host.PasteText(string.Join("\n", parts));
                 break;
-            case PanelAction.TogglePin:
-                TogglePinOnSelectedClips();
-                Mode = PanelMode.Browse;
+            case PanelAction.RemoveFromLabelled:
+                RemoveFromLabelled(clips);
                 break;
             case PanelAction.ShareToGroup:
                 BeginShareToGroup();
@@ -980,20 +981,15 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     // MARK: Item actions
 
-    public void TogglePinOnSelection()
+    /// <summary>Unpins items pinned without a label, so they expire like the rest of history. Labelled items keep
+    /// their pin: removing the label is what lets them go.</summary>
+    public void RemoveFromLabelled(IReadOnlyList<ClipItem> items)
     {
-        if (SelectedEntry?.ClipItem is not { } item) return;
-        store.TogglePin(item);
+        var unpinned = items.Where(IsPinnedWithoutLabel).ToList();
+        foreach (var item in unpinned) store.Unpin(item);
+        ResetMode();
         Refresh();
-    }
-
-    public void TogglePinOnSelectedClips()
-    {
-        var clips = SelectedClips;
-        var pin = clips.Any(c => !c.IsPinned);
-        foreach (var c in clips.Where(c => c.IsPinned != pin)) store.TogglePin(c);
-        Refresh();
-        ShowNotice(pin ? $"Pinned {clips.Count} items" : $"Unpinned {clips.Count} items");
+        ShowNotice(unpinned.Count == 1 ? "Removed from Labelled" : $"Removed {unpinned.Count} items from Labelled");
     }
 
     /// <summary>Delete never removes secrets by accident; Ctrl+K → Delete does.</summary>
@@ -1068,9 +1064,6 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             case PanelKey.Letter when key.Ctrl:
                 switch (char.ToLowerInvariant(key.Letter))
                 {
-                    case 'p':
-                        if (IsMultiSelecting) TogglePinOnSelectedClips(); else TogglePinOnSelection();
-                        return true;
                     case 'k': OpenActions(); return true;
                     case 'a' when Query.Length == 0: SelectAll(); return true;
                     case ',':

@@ -119,6 +119,26 @@ public sealed class StoreTests : IDisposable
     }
 
     [Fact]
+    public void RemovingALabelUnpinsSoTheItemExpiresAgain()
+    {
+        var now = T(10_000_000);
+        var item = _store.Ingest(ProcessedCapture.ForText("temp"), now.AddDays(-400));
+        _store.SetLabel("Keep", item);
+        Assert.True(item.IsPinned);
+        _store.SetLabel("", item);
+        Assert.Equal((null, false, null), (item.Label, item.IsPinned, item.PinnedAt));
+        // Pinned without a label (from before labels replaced pins): an empty label changes nothing.
+        var legacy = _store.Ingest(ProcessedCapture.ForText("legacy"), now.AddDays(-400));
+        _store.TogglePin(legacy);
+        _store.SetLabel(" ", legacy);
+        Assert.True(legacy.IsPinned);
+        _store.EnforceRetention(0, TimeSpan.FromDays(30), now);
+        Assert.Equal(["legacy"], _store.AllItems().Select(i => i.Text));
+        _store.Unpin(legacy);
+        Assert.False(legacy.IsPinned);
+    }
+
+    [Fact]
     public void RetentionDeletesImageBlobs()
     {
         _blobs.Write([0], "img.png");

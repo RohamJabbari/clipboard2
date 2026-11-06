@@ -242,13 +242,13 @@ public sealed partial class SettingsWindow : Window
             Row("Stored", count),
             Row("", Action("Clear History…", () =>
             {
-                var answer = MessageBox.Show(this, "Clear clipboard history? Pinned items are kept.\n\nChoose No to also remove pinned items.", "Clear History",
+                var answer = MessageBox.Show(this, "Clear clipboard history? Labelled items are kept.\n\nChoose No to also remove labelled items.", "Clear History",
                     MessageBoxButton.YesNoCancel, MessageBoxImage.Warning);
                 if (answer == MessageBoxResult.Cancel) return;
                 _services.Store.ClearHistory(includingPinned: answer == MessageBoxResult.No);
                 count.Text = $"{_services.Store.Count()} items";
             }))));
-        page.Children.Add(Hint("Measured from the last time an item was copied. Pinned and labelled items and secrets never expire."));
+        page.Children.Add(Hint("Measured from the last time an item was copied. Labelled items and secrets never expire."));
         AddBackupSection(page);
         return page;
     }

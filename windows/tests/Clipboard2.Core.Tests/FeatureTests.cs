@@ -384,7 +384,7 @@ public sealed class SendToDeviceTests : IDisposable
         _model.PrepareForOpen(null);
         _model.OpenActions();
         var sends = _model.AvailableActions.OfType<PanelAction.SendTo>().ToList();
-        Assert.Equal(new[] { "Send to Laptop", "Send to Work Mac" }, sends.Select(a => a.Title(false)));
+        Assert.Equal(new[] { "Send to Laptop", "Send to Work Mac" }, sends.Select(a => a.Title));
         Assert.All(sends, a => Assert.Equal("Send to Device", a.Section("AI")));
 
         _model.SetActionQuery("laptop");

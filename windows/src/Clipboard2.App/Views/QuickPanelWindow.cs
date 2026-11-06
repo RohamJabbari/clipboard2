@@ -598,9 +598,10 @@ public sealed class QuickPanelWindow : Window
         }
         if (entry.ClipItem is { IsPinned: true })
         {
-            var pin = Glyphs.Icon(Glyphs.Pinned, 12, sub);
-            pin.Margin = new Thickness(6, 0, 6, 0);
-            trailing.Children.Add(pin);
+            var tag = Glyphs.Icon(Glyphs.Tag, 12, sub);
+            tag.Margin = new Thickness(6, 0, 6, 0);
+            tag.ToolTip = "Labelled: kept until you remove the label";
+            trailing.Children.Add(tag);
         }
         if (Model.ShortcutNumber(entry, index) is { } shortcut)
         {
@@ -683,8 +684,8 @@ public sealed class QuickPanelWindow : Window
             menu.Items.Add(Item("Paste as Plain Text", () => Model.Activate(entry, Transform.PlainText)));
             menu.Items.Add(Item("Copy", () => _services.Copy(item)));
             menu.Items.Add(new Separator());
-            menu.Items.Add(Item(item.IsPinned ? "Unpin" : "Pin", () => { _services.Store.TogglePin(item); Model.Refresh(); }));
             menu.Items.Add(Item(item.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
+            if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Labelled", () => Model.RemoveFromLabelled([item])));
             if (item.Kind.IsTextual()) menu.Items.Add(Item("Save as Secret…", () => Model.BeginSaveSecret(item)));
             menu.Items.Add(Item("Delete", () => { _services.Store.Delete(item); Model.Refresh(); }));
         }
@@ -925,7 +926,7 @@ public sealed class QuickPanelWindow : Window
                     ClipKind.File => item.Files.Count == 1 ? "File" : $"{item.Files.Count} files",
                     _ => $"{item.Kind.DisplayName()} · {item.Text.Length} characters",
                 });
-                Line("Expires", item.IsPinned ? "Never (pinned)"
+                Line("Expires", item.IsPinned ? "Never (labelled)"
                     : item.ExpiryDate(_services.Settings.MaxAge) is { } expiry ? expiry.ToLocalTime().ToString("g") : "Never");
                 break;
             case PanelEntry.SnippetEntry s:
@@ -996,7 +997,6 @@ public sealed class QuickPanelWindow : Window
         if (_actionFilter is not null && _actionFilter.Text != Model.ActionQuery) _actionFilter.Text = Model.ActionQuery;
         if (_actionHint is not null) _actionHint.Text = Model.IsPickingGroup ? "Choose a group to share with" : $"Filter actions or ask {Model.AIName}";
         var actions = Model.FilteredActions;
-        var pinned = Model.SelectedEntry?.ClipItem?.IsPinned ?? false;
         string? section = null;
         Border? selectedRow = null;
         for (var i = 0; i < actions.Count; i++)
@@ -1015,7 +1015,7 @@ public sealed class QuickPanelWindow : Window
             {
                 CornerRadius = new CornerRadius(6), Padding = new Thickness(8, 5, 8, 5),
                 Background = selected ? Fluent.Accent : Brushes.Transparent,
-                Child = Fluent.Label(action.Title(pinned), 14, selected ? Fluent.AccentText : null),
+                Child = Fluent.Label(action.Title, 14, selected ? Fluent.AccentText : null),
             };
             var a = action;
             row.MouseLeftButtonUp += (_, _) => Model.Perform(a);
@@ -1139,7 +1139,7 @@ public sealed class QuickPanelWindow : Window
         var stack = new StackPanel();
         stack.Children.Add(Fluent.Label(form.IsSecret ? "Rename Secret" : "Label", 16, null, FontWeights.SemiBold));
         stack.Children.Add(Fluent.Label(form.IsSecret ? "The name shown for this secret." :
-            "Shown instead of the content and searchable. Labelled items are pinned, so they never expire. Leave empty to remove the label.",
+            "Shown instead of the content and searchable. Labelled items are kept: they never expire. Leave empty to remove the label, and the item expires like the rest of history.",
             13, Fluent.Secondary, wrap: true));
         var box = new TextBox { Text = form.Text, Margin = new Thickness(0, 12, 0, 0) };
         box.TextChanged += (_, _) => form.Text = box.Text;
@@ -1211,7 +1211,7 @@ public sealed class QuickPanelWindow : Window
         _syncStatus.Update();
         _hints.Text = Model.Mode switch
         {
-            PanelMode.Browse when Model.IsMultiSelecting => $"Enter Paste {Model.SelectedClips.Count} items    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+P Pin    Del Delete    Esc Close",
+            PanelMode.Browse when Model.IsMultiSelecting => $"Enter Paste {Model.SelectedClips.Count} items    Shift+Enter Plain Text    Ctrl+K Actions    Del Delete    Esc Close",
             PanelMode.Browse => "Enter Paste    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Shift+1–9 Assign Slot    Tab Filter    Esc Close",
             PanelMode.Actions when Model.IsPickingGroup => "↑↓ Choose Group    Enter Share    Esc Back",
             PanelMode.Actions => "↑↓ Choose    Enter Run    Esc Back",

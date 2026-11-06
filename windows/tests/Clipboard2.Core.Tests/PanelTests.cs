@@ -105,7 +105,7 @@ public sealed class PanelTests : IDisposable
     {
         _model.PrepareForOpen(null);
         _model.HandleKey(K(PanelKey.Tab));
-        Assert.Equal(PanelFilter.Pinned, _model.Filter);
+        Assert.Equal(PanelFilter.Labelled, _model.Filter);
         _model.HandleKey(K(PanelKey.Tab, KeyMods.Shift));
         _model.HandleKey(K(PanelKey.Tab, KeyMods.Shift));
         Assert.Equal(PanelFilter.ThisApp, _model.Filter);
@@ -114,13 +114,13 @@ public sealed class PanelTests : IDisposable
     [Fact]
     public void ContentTypesAreMenuFiltersNotTabStops()
     {
-        Assert.Equal([PanelFilter.All, PanelFilter.Pinned, PanelFilter.Secrets, PanelFilter.ThisApp], PanelFilters.Chips);
+        Assert.Equal([PanelFilter.All, PanelFilter.Labelled, PanelFilter.Secrets, PanelFilter.ThisApp], PanelFilters.Chips);
         Add("some text");
         _model.PrepareForOpen(null);
         _model.SetFilter(PanelFilter.Images);
         Assert.Empty(_model.Entries);
         _model.HandleKey(K(PanelKey.Tab));                 // from a menu filter, Tab goes on to the chips
-        Assert.Equal(PanelFilter.Pinned, _model.Filter);
+        Assert.Equal(PanelFilter.Labelled, _model.Filter);
     }
 
     [Fact]
@@ -167,6 +167,63 @@ public sealed class PanelTests : IDisposable
         _host.Log.Clear();
         _model.HandleKey(K(PanelKey.Digit, KeyMods.Ctrl, digit: 1));   // empty slot → row 1
         Assert.Single(_host.Log, l => l.StartsWith("paste:"));
+    }
+
+    [Fact]
+    public void PinActionsAreGoneLabelsKeepItems()
+    {
+        var plain = Add("plain", 2);
+        var legacy = Add("pinned long ago", 1);
+        _store.TogglePin(legacy);
+        Add("labelled");
+        _store.SetLabel("Kept", _store.AllItems().Single(i => i.Text == "labelled"));
+        _model.PrepareForOpen(null);
+
+        foreach (var entry in _model.Entries)
+        {
+            _model.Select(entry.Id);
+            Assert.DoesNotContain(_model.AvailableActions, a => a.Title is "Pin" or "Unpin");
+        }
+        _model.Select(new PanelEntry.Clip(plain).Id);
+        Assert.DoesNotContain(new PanelAction.RemoveFromLabelled(), _model.AvailableActions);
+        _model.SelectAll();
+        Assert.DoesNotContain(_model.AvailableActions, a => a.Title is "Pin" or "Unpin");
+        Assert.Contains(new PanelAction.RemoveFromLabelled(), _model.AvailableActions);
+
+        // Ctrl+P no longer pins.
+        _model.Select(new PanelEntry.Clip(plain).Id);
+        Assert.False(_model.HandleKey(K(PanelKey.Letter, KeyMods.Ctrl, letter: 'p')));
+        Assert.False(plain.IsPinned);
+
+        _model.SetFilter(PanelFilter.Labelled);
+        Assert.Equal(["Kept", "pinned long ago"], _model.Entries.Select(e => e.ClipItem!.DisplayTitle));
+        Assert.Equal("Labelled", PanelFilter.Labelled.Title());
+
+        // Only an item pinned without a label offers "Remove from Labelled".
+        _model.Select(_model.Entries[0].Id);
+        Assert.DoesNotContain(new PanelAction.RemoveFromLabelled(), _model.AvailableActions);
+        _model.Select(new PanelEntry.Clip(legacy).Id);
+        _model.Perform(Assert.Single(_model.AvailableActions.OfType<PanelAction.RemoveFromLabelled>()));
+        Assert.False(_store.Find(legacy.Id)!.IsPinned);
+        Assert.Equal("Removed from Labelled", _model.Notice);
+        Assert.Equal("Kept", Assert.Single(_model.Entries).ClipItem!.Label);
+    }
+
+    [Fact]
+    public void RemovingTheLabelInTheFormUnpins()
+    {
+        var item = Add("value");
+        _model.PrepareForOpen(null);
+        _model.BeginLabel(_model.Entries[0]);
+        _model.LabelForm!.Text = "Name";
+        _model.HandleKey(K(PanelKey.Enter));
+        Assert.True(_store.Find(item.Id)!.IsPinned);
+        Assert.Equal("Labelled", _model.Notice);
+        _model.BeginLabel(_model.Entries[0]);
+        _model.LabelForm!.Text = "  ";
+        _model.HandleKey(K(PanelKey.Enter));
+        Assert.Equal((null, false), (_store.Find(item.Id)!.Label, _store.Find(item.Id)!.IsPinned));
+        Assert.Equal("Label removed", _model.Notice);
     }
 
     [Fact]
