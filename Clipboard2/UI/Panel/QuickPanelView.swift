@@ -260,8 +260,10 @@ struct QuickPanelView: View {
             Button("Paste as Plain Text") { model.activate(entry, transform: .plainText) }
             Button("Copy") { env.paste.copy(item) }
             Divider()
-            Button(item.isPinned ? "Unpin" : "Pin") { env.store.togglePin(item); model.refresh() }
             Button(item.label == nil ? "Label…" : "Edit Label…") { model.beginLabel(entry) }
+            if item.isPinned && item.label == nil {
+                Button("Remove from Labelled") { model.removeFromLabelled(item) }
+            }
             if item.kind.isTextual {
                 Button("Save as Secret…") { model.beginSaveSecret(item) }
             }
@@ -495,7 +497,7 @@ struct PanelRow: View {
                     .accessibilityHidden(true)
             }
             if case .clip(let item) = entry, item.isPinned {
-                Image(systemName: "pin.fill")
+                Image(systemName: "tag.fill")
                     .font(.caption)
                     .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
                     .accessibilityHidden(true)
@@ -615,7 +617,6 @@ struct HintBar: View {
                 hint("⏎", "Paste \(selectionCount ?? 0) Items")
                 hint("⌥⏎", "Plain Text")
                 hint("⌘K", "Actions")
-                hint("⌘P", "Pin")
                 hint("⌫", "Delete")
             case .browse:
                 hint("⏎", "Paste")

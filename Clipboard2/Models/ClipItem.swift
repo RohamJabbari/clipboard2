@@ -52,7 +52,7 @@ final class ClipItem {
     var sourceBundleID: String?
     var sourceAppName: String?
     var isPinned: Bool = false
-    /// User-chosen name for pinned items ("Prod DB host"); the content stays in `text`.
+    /// User-chosen name; a labelled item is pinned (kept forever) ("Prod DB host"); the content stays in `text`.
     var label: String?
     var pinnedAt: Date?
     var copyCount: Int = 1
@@ -124,7 +124,7 @@ final class ClipItem {
 
     var accessibilityDescription: String {
         let app = sourceAppName.map { ", from \($0)" } ?? ""
-        let pin = isPinned ? ", pinned" : ""
+        let pin = isPinned && label == nil ? ", kept" : ""
         let name = label.map { "\($0), " } ?? ""
         return "\(name)\(kind.displayName): \(preview)\(app)\(pin)"
     }

@@ -633,7 +633,7 @@ final class AppEnvironment {
             for (index, sample) in samples.enumerated().reversed() {
                 let item = store.ingest(.text(sample.0, source: AppRef(bundleID: sample.1, name: sample.2)),
                                         now: .now.addingTimeInterval(-Double(sample.3 * 60)))
-                if index == 5 { store.togglePin(item) }
+                if index == 5 { store.setLabel("Meeting notes", for: item) }
             }
             if snippets.all().isEmpty {
                 _ = snippets.create(name: "Email sign-off", keyword: ";sig", body: "Best,\n{name}")

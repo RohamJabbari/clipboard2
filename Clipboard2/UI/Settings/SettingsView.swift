@@ -171,7 +171,7 @@ struct HistorySettingsView: View {
                     }
                 } label: {
                     Text("Forget items after")
-                    Text("Counted from the last time you copied an item. Pinned and labelled items never expire.")
+                    Text("Counted from the last time you copied an item. Labelled items never expire.")
                 }
                 LabeledContent {
                     Button("Clear History…", role: .destructive) { confirmClear = true }
@@ -239,7 +239,7 @@ struct HistorySettingsView: View {
         .onChange(of: prefs.maxAgeMinutes) { env.runMaintenance() }
         .confirmationDialog("Clear clipboard history?", isPresented: $confirmClear) {
             Button("Clear History", role: .destructive) { env.store.clearHistory() }
-            Button("Clear Including Pinned", role: .destructive) { env.store.clearHistory(includingPinned: true) }
+            Button("Clear Including Labelled", role: .destructive) { env.store.clearHistory(includingPinned: true) }
         } message: {
             Text("Snippets and secrets are kept. This can't be undone.")
         }
@@ -453,7 +453,7 @@ struct QuickSlotsSection: View {
         } header: {
             Text("Quick slots")
         } footer: {
-            Hint("In the quick panel, ⌘⇧1–9 pins the selected item to a slot and ⌘1–9 pastes it. Give a slot a shortcut to paste it from any app.")
+            Hint("In the quick panel, ⌘⇧1–9 assigns the selected item to a slot and ⌘1–9 pastes it. Give a slot a shortcut to paste it from any app.")
         }
     }
 }

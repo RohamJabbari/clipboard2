@@ -93,7 +93,7 @@ struct PreviewPane: View {
     }
 
     private func expiryText(_ item: ClipItem) -> String {
-        if item.isPinned { return "Never (pinned)" }
+        if item.isPinned { return item.label == nil ? "Never (kept)" : "Never (labelled)" }
         guard let date = item.expiryDate(maxAge: AppEnvironment.shared.prefs.maxAge) else { return "Never" }
         if date <= .now { return "Now" }
         return date.formatted(.relative(presentation: .named))

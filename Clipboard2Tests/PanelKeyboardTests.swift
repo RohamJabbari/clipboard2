@@ -20,7 +20,7 @@ struct PanelKeyboardTests {
     @Test func tabCyclesFiltersBothWays() {
         model.filter = .all
         #expect(model.handleKeyDown(key(KeyCode.tab, "\t")))
-        #expect(model.filter == .pinned)
+        #expect(model.filter == .labelled)
         #expect(model.handleKeyDown(key(KeyCode.tab, "\t", flags: .shift)))
         #expect(model.filter == .all)
         #expect(model.handleKeyDown(key(KeyCode.tab, "\t", flags: .shift)))
@@ -146,13 +146,63 @@ struct PanelKeyboardTests {
         let actions = model.availableActions
         #expect(actions.contains(.ai(.fixGrammar)))
         #expect(actions.contains(.transform(.uppercase)))
-        #expect(!actions.contains(.delete) && !actions.contains(.togglePin) && !actions.contains(.setLabel))
+        #expect(!actions.contains(.delete) && !actions.contains(.removeFromLabelled) && !actions.contains(.setLabel))
         #expect(env.store.count() == before)       // never written to history
 
         var closed = false
         model.onClose = { closed = true }
         #expect(model.handleKeyDown(key(KeyCode.escape, "\u{1b}")))
         #expect(closed)
+    }
+
+    @Test func labelsAreTheOnlyWayToKeepItems() {
+        let plain = env.store.ingest(.text("keep-plain \(UUID())"))
+        let legacy = env.store.ingest(.text("keep-legacy \(UUID())"))
+        env.store.togglePin(legacy)                      // pinned before labels replaced pins
+        defer { [plain, legacy].forEach(env.store.delete) }
+        model.query = "keep-"
+        model.refresh(resetSelection: true)
+
+        model.selectedID = PanelEntry.clip(plain).id
+        #expect(model.availableActions.contains(.setLabel))
+        #expect(!model.availableActions.contains(.removeFromLabelled))
+        #expect(!model.availableActions.map(\.id).contains("pin"))
+
+        model.selectedID = PanelEntry.clip(legacy).id
+        #expect(model.availableActions.contains(.removeFromLabelled))
+        model.perform(.removeFromLabelled)
+        #expect(!legacy.isPinned)
+
+        model.selectAll()
+        #expect(model.isMultiSelecting)
+        #expect(!model.availableActions.contains(.removeFromLabelled))
+        #expect(!model.availableActions.map(\.id).contains("pin"))
+
+        // ⌘P no longer does anything in the panel.
+        model.selectedID = PanelEntry.clip(plain).id
+        #expect(model.handleKeyDown(key(35, "p", flags: .command)) == false)
+        #expect(!plain.isPinned)
+    }
+
+    @Test func removingALabelReleasesTheItem() {
+        let item = env.store.ingest(.text("label-release \(UUID())"))
+        defer { env.store.delete(item) }
+        model.query = "label-release"
+        model.refresh(resetSelection: true)
+        #expect(PanelFilter.labelled.title == "Labelled")
+
+        model.beginLabel(.clip(item))
+        model.labelForm?.text = "Release me"
+        model.submitLabel()
+        #expect(item.isPinned)
+        model.filter = .labelled
+        #expect(model.entries.contains { $0.clip?.id == item.id })
+
+        model.beginLabel(.clip(item))
+        model.labelForm?.text = ""
+        model.submitLabel()
+        #expect(item.label == nil && !item.isPinned)
+        #expect(!model.entries.contains { $0.clip?.id == item.id })
     }
 
     @Test func openingAlwaysSelectsTheNewestItem() {

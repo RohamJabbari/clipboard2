@@ -251,7 +251,7 @@ struct ShareToGroupView: View {
     }
 }
 
-/// Label for a pinned item, or the name of a secret. Shows the value it belongs to.
+/// Label for a history item (labelled items are kept), or the name of a secret. Shows the value it belongs to.
 struct LabelFormView: View {
     @Bindable var form: LabelFormState
     let onSubmit: () -> Void
@@ -263,7 +263,7 @@ struct LabelFormView: View {
                 .font(.headline)
             Text(form.isSecret
                  ? "The name shown for this secret in the panel and in search."
-                 : "Shown instead of the content in lists and searchable. Labelled items are pinned, so they never expire. Leave empty to remove the label.")
+                 : "Shown instead of the content in lists and searchable. Labelled items never expire and are listed under Labelled. Leave empty to remove the label and let it expire again.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

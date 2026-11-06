@@ -2,13 +2,13 @@ import AppKit
 import Observation
 
 nonisolated enum PanelFilter: String, CaseIterable, Identifiable, Sendable {
-    case all, pinned, text, images, files, snippets, secrets, thisApp
+    case all, labelled, text, images, files, snippets, secrets, thisApp
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .all: "All"
-        case .pinned: "Pinned"
+        case .labelled: "Labelled"
         case .text: "Text"
         case .images: "Images"
         case .files: "Files"
@@ -21,7 +21,7 @@ nonisolated enum PanelFilter: String, CaseIterable, Identifiable, Sendable {
     var symbol: String {
         switch self {
         case .all: "tray.full"
-        case .pinned: "pin"
+        case .labelled: "tag"
         case .text: "text.alignleft"
         case .images: "photo"
         case .files: "doc"
@@ -87,7 +87,7 @@ enum PanelAction: Identifiable, Hashable {
     case sendToDevice(DeviceTarget)
     case setUpAI
     case clearSlot(Int)
-    case togglePin
+    case removeFromLabelled
     case saveToFolder
     case saveToChosenFolder
     case delete
@@ -105,7 +105,7 @@ enum PanelAction: Identifiable, Hashable {
         case .sendToDevice(let device): "sendToDevice-" + device.id
         case .setUpAI: "setUpAI"
         case .clearSlot(let n): "clearSlot-\(n)"
-        case .togglePin: "pin"
+        case .removeFromLabelled: "removeFromLabelled"
         case .saveToFolder: "saveToFolder"
         case .saveToChosenFolder: "saveToChosenFolder"
         case .delete: "delete"
@@ -119,12 +119,12 @@ enum PanelAction: Identifiable, Hashable {
         case .ai, .setUpAI: "Ask \(aiName)"
         case .sendToDevice: "Send"
         case .saveToFolder, .saveToChosenFolder: "Save"
-        case .saveAsSecret, .setLabel, .shareToGroup, .clearSlot, .togglePin, .delete: "Item"
+        case .saveAsSecret, .setLabel, .shareToGroup, .clearSlot, .removeFromLabelled, .delete: "Item"
         }
     }
 
     /// `folderName` is the save folder's name ("Save to Downloads").
-    func title(isPinned: Bool, folderName: String = "Downloads") -> String {
+    func title(folderName: String) -> String {
         switch self {
         case .paste: "Paste"
         case .pastePlain: "Paste as Plain Text"
@@ -138,7 +138,7 @@ enum PanelAction: Identifiable, Hashable {
         case .sendToDevice(let device): "Send to \(device.name)"
         case .setUpAI: "Set Up AI…"
         case .clearSlot(let n): "Remove from Quick Slot ⌘\(n)"
-        case .togglePin: isPinned ? "Unpin" : "Pin"
+        case .removeFromLabelled: "Remove from Labelled"
         case .saveToFolder: "Save to \(folderName)"
         case .saveToChosenFolder: "Save to…"
         case .delete: "Delete"
@@ -158,7 +158,7 @@ enum PanelAction: Identifiable, Hashable {
         case .sendToDevice: "laptopcomputer.and.arrow.down"
         case .setUpAI: "sparkles"
         case .clearSlot: "number.square"
-        case .togglePin: "pin"
+        case .removeFromLabelled: "tag.slash"
         case .saveToFolder: "square.and.arrow.down"
         case .saveToChosenFolder: "folder"
         case .delete: "trash"
@@ -450,7 +450,7 @@ final class PanelViewModel {
             clips = env.store.allItems().filter { item in
                 switch filter {
                 case .all: true
-                case .pinned: item.isPinned
+                case .labelled: item.isPinned
                 case .text: item.kind.isTextual
                 case .images: item.kind == .image
                 case .files: item.kind == .file
@@ -597,14 +597,6 @@ final class PanelViewModel {
         env.paste.paste(clips, transform: transform, into: target)
     }
 
-    func togglePinOnSelectedClips() {
-        let clips = selectedClips
-        let pin = clips.contains { !$0.isPinned }
-        for item in clips where item.isPinned != pin { env.store.togglePin(item) }
-        refresh()
-        showNotice(pin ? "Pinned \(clips.count) items" : "Unpinned \(clips.count) items")
-    }
-
     func deleteSelectedClips() {
         let clips = selectedClips
         guard !clips.isEmpty else { return }
@@ -701,8 +693,9 @@ final class PanelViewModel {
         guard let form = labelForm else { return }
         switch form.target {
         case .clip(let item):
-            env.store.setLabel(form.text, for: item)
-            showNotice(item.label == nil ? "Label removed" : "Labelled and pinned")
+            // A quick slot keeps its item even without a label.
+            env.store.setLabel(form.text, for: item, keepPinned: env.slots.slot(for: .clip(item.id)) != nil)
+            showNotice(item.label == nil ? "Label removed" : "Labelled")
         case .secret(let ref):
             let name = form.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty else { return }
@@ -986,7 +979,7 @@ final class PanelViewModel {
                 actions.append(.copy)
             }
             if canShareToGroup { actions.append(.shareToGroup) }
-            return actions + [.saveToFolder, .saveToChosenFolder, .togglePin, .delete]
+            return actions + [.saveToFolder, .saveToChosenFolder, .delete]
         }
         guard let entry = selectedEntry else { return [] }
         var actions: [PanelAction] = [.paste]
@@ -1013,7 +1006,8 @@ final class PanelViewModel {
             if canShareToGroup { actions.append(.shareToGroup) }
             actions += PanelAction.sendToDeviceActions(for: item, multiSelecting: false, targets: DeviceTarget.others(in: env.sync))
             actions += [.saveToFolder, .saveToChosenFolder]
-            actions.append(.togglePin)
+            // Kept from before labels replaced pins: the only way to let it expire again.
+            if item.isPinned && item.label == nil { actions.append(.removeFromLabelled) }
         case .snippet:
             break
         case .secret(let ref):
@@ -1032,7 +1026,7 @@ final class PanelViewModel {
 
     /// An action's title for the current selection.
     func title(for action: PanelAction) -> String {
-        action.title(isPinned: selectedEntry?.clip?.isPinned ?? false, folderName: env.prefs.saveFolderName)
+        action.title(folderName: env.prefs.saveFolderName)
     }
 
     var filteredActions: [PanelAction] {
@@ -1121,9 +1115,10 @@ final class PanelViewModel {
             env.slots.clear(number)
             mode = .browse
             refresh()
-        case .togglePin:
-            togglePinOnSelection()
+        case .removeFromLabelled:
+            guard let item = entry.clip else { return }
             mode = .browse
+            removeFromLabelled(item)
         case .saveToFolder:
             guard let item = entry.clip else { return }
             save([item], to: env.prefs.saveFolder)
@@ -1155,9 +1150,6 @@ final class PanelViewModel {
             let target = targetApp
             onClose()
             env.paste.paste(text: parts.compactMap { $0 }.joined(separator: "\n"), into: target)
-        case .togglePin:
-            togglePinOnSelectedClips()
-            mode = .browse
         case .shareToGroup:
             beginShare(clips)
         case .saveToFolder:
@@ -1208,10 +1200,11 @@ final class PanelViewModel {
 
     // MARK: Item actions
 
-    func togglePinOnSelection() {
-        guard let item = selectedEntry?.clip else { return }
-        env.store.togglePin(item)
+    /// Lets an item kept without a label expire like the rest of history.
+    func removeFromLabelled(_ item: ClipItem) {
+        env.store.removeFromLabelled(item)
         refresh()
+        showNotice("Removed from Labelled")
     }
 
     /// ⌫ never deletes secrets (too easy to hit by accident); ⌘K → Delete does.
@@ -1301,9 +1294,6 @@ final class PanelViewModel {
                 return true
             }
             switch chars {
-            case "p":
-                if isMultiSelecting { togglePinOnSelectedClips() } else { togglePinOnSelection() }
-                return true
             case "a":
                 // With an empty search field ⌘A selects every row; otherwise it selects the text.
                 guard query.isEmpty else { return false }

@@ -224,6 +224,28 @@ struct StoreTests {
         store.setLabel("   ", for: item)
         #expect(item.label == nil)
         #expect(item.displayTitle == "10.0.4.12:5432")
+        #expect(!item.isPinned)                    // removing the label releases it
+        #expect(item.pinnedAt == nil)
+    }
+
+    @Test func labelRemovalKeepsSlotItemsAndOnlyReleasesUnlabelledOnes() {
+        let slotted = store.ingest(.text("in a slot"))
+        store.setLabel("Slot", for: slotted)
+        store.setLabel(nil, for: slotted, keepPinned: true)
+        #expect(slotted.label == nil && slotted.isPinned)
+
+        // An empty label on an item that never had one doesn't release a legacy pin.
+        let legacy = store.ingest(.text("legacy pin"))
+        store.togglePin(legacy)
+        store.setLabel("", for: legacy)
+        #expect(legacy.isPinned)
+
+        let labelled = store.ingest(.text("labelled"))
+        store.setLabel("Keep", for: labelled)
+        store.removeFromLabelled(labelled)         // only for items without a label
+        #expect(labelled.isPinned)
+        store.removeFromLabelled(legacy)
+        #expect(!legacy.isPinned)
     }
 
     @Test func clearHistoryKeepsPinned() {

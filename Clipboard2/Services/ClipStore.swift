@@ -89,21 +89,34 @@ final class ClipStore {
         commit()
     }
 
-    /// Sets (or clears, for empty text) a label. Labelled items are pinned so they never expire.
-    func setLabel(_ label: String?, for item: ClipItem) {
+    /// Sets (or clears, for empty text) a label. Labels are how items are kept: a labelled item is
+    /// pinned so it never expires, and removing the label releases it again — unless `keepPinned`
+    /// (a quick slot still needs the item).
+    func setLabel(_ label: String?, for item: ClipItem, keepPinned: Bool = false) {
         let trimmed = label?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hadLabel = item.label != nil
         item.label = trimmed.isEmpty ? nil : trimmed
         if item.label != nil && !item.isPinned {
             item.isPinned = true
             item.pinnedAt = .now
+        } else if item.label == nil && hadLabel && item.isPinned && !keepPinned {
+            item.isPinned = false
+            item.pinnedAt = nil
         }
         commit()
     }
 
+    /// Pinning is internal ("kept forever"): labels and quick slots set it; users only see labels.
     func togglePin(_ item: ClipItem) {
         item.isPinned.toggle()
         item.pinnedAt = item.isPinned ? .now : nil
         commit()
+    }
+
+    /// Releases an item kept without a label (pinned before labels replaced pins), so it expires normally.
+    func removeFromLabelled(_ item: ClipItem) {
+        guard item.isPinned, item.label == nil else { return }
+        togglePin(item)
     }
 
     func delete(_ item: ClipItem) {

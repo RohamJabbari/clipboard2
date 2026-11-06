@@ -106,15 +106,15 @@ API keys/secrets), because those grants are tied to the signing certificate.
 | Open quick panel | **⌘⇧V** (change in Settings → General; where it opens from — top, bottom, left, right or center — in Settings → Appearance) |
 | Navigate / paste | ↑ ↓, **Return** pastes into the app you came from, **⌥Return** pastes as plain text |
 | Quick slots | **⌘1–9** paste the item bound to that slot (or the Nth row if the slot is empty); **⌘⇧1–9** binds the selection |
-| Actions | **⌘K**: transforms, AI actions, Save as Secret, pin, delete |
+| Actions | **⌘K**: transforms, AI actions, Save as Secret, label, save to a folder, delete |
 | Multi-select | **⌘-click** toggles, **⇧-click** selects a range, **⇧↑/⇧↓** extend, **⌘A** selects all (empty search); Return pastes them all, text joined by line breaks |
 | Selected text, any app | **⌥⌘K**: transform it or ask AI; Return replaces the selection (also right-click → Services → Clipboard2 Actions…) |
 | Text from screen | **⌥⇧⌘2**: drag over anything; the text is recognised on-device and pasted |
 | Right-click menu | **⌘-right-click** anywhere: Clipboard2 items (text from image, actions on selection, recent, snippets, secrets, search) + Cut/Copy/Paste/Select All/Select Word/Look Up/Undo/Redo, Finder items in Finder, and “Show ‹App› Menu” for the app's own menu |
 | Paste as text | **⌥⇧⌘V**: plain text; if the clipboard holds an image or screenshot, the text in it (on-device OCR). Clipboard is restored afterwards. In native apps also Services → *Paste Text from Clipboard Image* |
-| Other | **⌘P** pin, **⌫** delete (history only), **Tab** cycles filters, **Esc** closes |
+| Other | **⌫** delete (history only), **Tab** cycles filters, **Esc** closes |
 
-Filters: All, Pinned, Text, Images, Files, Snippets, Secrets, This App (items copied from the
+Filters: All, Labelled, Text, Images, Files, Snippets, Secrets, This App (items copied from the
 app you were in when you opened the panel).
 
 **Auto-paste** needs Accessibility access (System Settings → Privacy & Security →
@@ -193,8 +193,8 @@ Design notes:
 - **Retention:** max age (15 min – 1 year or never, default 30 days, counted from the last
   copy) and max items (default 500, or unlimited); pinned, labelled and slot-bound items
   and secrets are exempt. Runs after each capture and every minute.
-- **Labels:** pinned items can carry a label shown above their value and matched by search;
-  labelling pins. Secrets show their name and a masked value with Touch ID "Show".
+- **Labels:** the way to keep an item: a label is shown above the value and matched by search,
+  and labelled items never expire (internally pinned; removing the label releases the item). Secrets show their name and a masked value with Touch ID "Show".
 - **Non-activating panel:** the frontmost app keeps focus, so ⌘V lands where you were typing.
 - **Concurrency:** default MainActor isolation (Swift 6.2); hashing and image work run
   `@concurrent` off the main actor; nothing blocks the main thread on capture.
