@@ -146,17 +146,56 @@ nonisolated struct PendingInvite: Codable, Sendable, Equatable, Identifiable {
 }
 
 /// `GET /v1/invites/:inviteId`: what an invitee needs to open the group key and show its name.
+/// A contact code (`kind` "direct") has no name; `ownerName` says whose code it is.
 nonisolated struct InviteDetails: Codable, Sendable, Equatable {
     var spaceId: String
     var sealedKey: Data
     var encryptedName: Data?
     var memberCount: Int
     var expiresAt: Int64
+    /// group | direct (absent on servers from before contacts: a group).
+    var kind: String? = nil
+    var ownerName: String? = nil
+
+    var isContactCode: Bool { kind == "direct" }
+}
+
+/// `GET /v1/users/:username`: someone a contact request can be sent to.
+nonisolated struct RemoteUser: Codable, Sendable, Equatable {
+    var uid: String
+    var username: String
+    var name: String
+    var publicKey: Data
+}
+
+/// A pending contact request. Incoming: `uid` and `name` are the requester's; outgoing: the recipient's.
+nonisolated struct ContactRequest: Codable, Sendable, Equatable, Identifiable {
+    var spaceId: String
+    var uid: String
+    var username: String?
+    var name: String
+    var createdAt: Int64
+    var id: String { spaceId }
+}
+
+/// `GET /v1/contacts/requests`: pending only, newest first.
+nonisolated struct ContactRequests: Codable, Sendable, Equatable {
+    var incoming: [ContactRequest] = []
+    var outgoing: [ContactRequest] = []
+}
+
+/// `GET /v1/contacts/invites`: an open contact code (the code itself is never listed again).
+nonisolated struct ContactCode: Codable, Sendable, Equatable, Identifiable {
+    var spaceId: String
+    var inviteId: String
+    var createdAt: Int64
+    var expiresAt: Int64
+    var id: String { inviteId }
 }
 
 nonisolated struct RemoteSpace: Codable, Sendable, Equatable {
     var id: String
-    var kind: String          // personal | group
+    var kind: String          // personal | group | direct
     var role: String          // owner | member
     var ownerUid: String
     var wrappedKey: Data
@@ -167,6 +206,8 @@ nonisolated struct RemoteSpace: Codable, Sendable, Equatable {
     var members: [MemberName]?
 
     var isPersonal: Bool { kind == "personal" }
+    /// A contact: two people, no name.
+    var isDirect: Bool { kind == "direct" }
 }
 
 /// A space member's display name: the username, or the part of the email before the @.
@@ -246,6 +287,11 @@ nonisolated enum SyncAPIError: LocalizedError, Equatable {
 
     var status: Int? {
         if case .server(let status, _, _, _, _) = self { return status }
+        return nil
+    }
+
+    var message: String? {
+        if case .server(_, _, let message, _, _) = self { return message }
         return nil
     }
 
@@ -338,6 +384,21 @@ nonisolated protocol SyncService: Sendable {
     func invite(id: String) async throws -> InviteDetails?
     func acceptInvite(id: String, wrappedKey: Data) async throws -> RemoteSpace
 
+    // Contacts (PROTOCOL.md → Contacts)
+    /// `not_found` (404) when nobody has that username, `invalid` (400) for your own.
+    func user(named username: String) async throws -> RemoteUser
+    /// Creates direct space `spaceId` with SK wrapped to the caller and, held until accepted, to the recipient.
+    func requestContact(username: String, spaceId: String, wrappedKey: Data, recipientWrappedKey: Data) async throws -> ContactRequest
+    func contactRequests() async throws -> ContactRequests
+    func acceptContactRequest(spaceId: String) async throws -> RemoteSpace
+    /// Declines an incoming request or cancels an outgoing one (the space goes with it).
+    func deleteContactRequest(spaceId: String) async throws
+    func createContactCode(spaceId: String, wrappedKey: Data, inviteId: String, sealedKey: Data) async throws
+    func contactCodes() async throws -> [ContactCode]
+    func revokeContactCode(inviteId: String) async throws
+    /// Ends the contact for both people: the space, its items and blobs are deleted.
+    func deleteContact(spaceId: String) async throws
+
     /// `full` while walking a space from 0 after a reset, so passing the purge horizon doesn't reset again.
     func changes(spaceId: String, since: Int64, limit: Int, full: Bool) async throws -> ChangesPage
     func putItem(spaceId: String, itemId: String, _ body: ItemUpload) async throws -> WriteOutcome
@@ -384,6 +445,11 @@ nonisolated struct SyncAPI: SyncService {
     nonisolated private struct BlobBody: Codable { var id: String; var size: Int; var ifGenerationMatch = true }
     nonisolated private struct SignupCodesBody: Codable { var codes: [OpenSignupCode] }
     nonisolated private struct SessionsBody: Codable { var sessions: [RemoteDevice] }
+    nonisolated private struct ContactRequestBody: Codable {
+        var username: String; var spaceId: String; var wrappedKey: Data; var recipientWrappedKey: Data
+    }
+    nonisolated private struct ContactCodeBody: Codable { var spaceId: String; var wrappedKey: Data; var inviteId: String; var sealedKey: Data }
+    nonisolated private struct ContactCodesBody: Codable { var invites: [ContactCode] }
 
     // MARK: Auth and account
 
@@ -449,8 +515,9 @@ nonisolated struct SyncAPI: SyncService {
 
     // MARK: Spaces and groups
 
+    /// Contacts are listed only when asked for; older clients would show them as unnamed groups.
     func spaces() async throws -> [RemoteSpace] {
-        try await send("GET", "v1/spaces", as: SpacesBody.self).spaces
+        try await send("GET", "v1/spaces", query: ["include": "direct"], as: SpacesBody.self).spaces
     }
 
     func createGroup(id: String, encryptedName: Data, wrappedKey: Data) async throws -> RemoteSpace {
@@ -500,6 +567,50 @@ nonisolated struct SyncAPI: SyncService {
 
     func acceptInvite(id: String, wrappedKey: Data) async throws -> RemoteSpace {
         try await send("POST", "v1/invites/\(id)/accept", body: AcceptBody(wrappedKey: wrappedKey), as: RemoteSpace.self)
+    }
+
+    // MARK: Contacts
+
+    func user(named username: String) async throws -> RemoteUser {
+        // `appending(path:)` percent-encodes whatever a username holds.
+        try await send("GET", "v1/users/\(username)", as: RemoteUser.self)
+    }
+
+    func requestContact(username: String, spaceId: String, wrappedKey: Data, recipientWrappedKey: Data) async throws -> ContactRequest {
+        try await send("POST", "v1/contacts/requests",
+                       body: ContactRequestBody(username: username, spaceId: spaceId, wrappedKey: wrappedKey,
+                                                recipientWrappedKey: recipientWrappedKey),
+                       as: ContactRequest.self)
+    }
+
+    func contactRequests() async throws -> ContactRequests {
+        try await send("GET", "v1/contacts/requests", as: ContactRequests.self)
+    }
+
+    func acceptContactRequest(spaceId: String) async throws -> RemoteSpace {
+        try await send("POST", "v1/contacts/requests/\(spaceId)/accept", body: Empty(), as: RemoteSpace.self)
+    }
+
+    func deleteContactRequest(spaceId: String) async throws {
+        _ = try await send("DELETE", "v1/contacts/requests/\(spaceId)", as: Empty.self)
+    }
+
+    func createContactCode(spaceId: String, wrappedKey: Data, inviteId: String, sealedKey: Data) async throws {
+        _ = try await send("POST", "v1/contacts/invites",
+                           body: ContactCodeBody(spaceId: spaceId, wrappedKey: wrappedKey, inviteId: inviteId, sealedKey: sealedKey),
+                           as: Empty.self)
+    }
+
+    func contactCodes() async throws -> [ContactCode] {
+        try await send("GET", "v1/contacts/invites", as: ContactCodesBody.self).invites
+    }
+
+    func revokeContactCode(inviteId: String) async throws {
+        _ = try await send("DELETE", "v1/contacts/invites/\(inviteId)", as: Empty.self)
+    }
+
+    func deleteContact(spaceId: String) async throws {
+        _ = try await send("DELETE", "v1/contacts/\(spaceId)", as: Empty.self)
     }
 
     // MARK: Items

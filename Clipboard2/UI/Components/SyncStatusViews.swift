@@ -132,6 +132,33 @@ struct SyncStatusRow: View {
     }
 }
 
+/// People waiting for an answer to their contact request, in the menu bar popover. Quiet: one
+/// line and a button to Settings → Sync, where they're accepted or declined.
+struct ContactRequestsRow: View {
+    let requests: [ContactRequest]
+    let review: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "person.crop.circle.badge.plus")
+                .foregroundStyle(.tint)
+                .accessibilityHidden(true)
+            Text(requests.count == 1 ? "\(requests[0].name) wants to add you as a contact"
+                                     : "\(requests.count) contact requests")
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 8)
+            Button("Review…", action: review)
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+        }
+        .font(.callout)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .accessibilityElement(children: .combine)
+    }
+}
+
 /// The menu bar icon, with a small mark cut into its corner when sync needs attention.
 /// Always drawn as a template image so it follows the menu bar's colour.
 enum MenuBarIcon {

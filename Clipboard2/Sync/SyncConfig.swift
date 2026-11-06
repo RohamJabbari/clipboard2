@@ -34,6 +34,8 @@ nonisolated enum SyncConfig {
     static let pollWhileActive: Duration = .seconds(15)
     static let pollWhileIdle: Duration = .seconds(60)
     static let activeWindow: TimeInterval = 5 * 60
+    /// How often a sync also looks for new contact requests.
+    static let contactsRefreshInterval: TimeInterval = 60
     /// Synced Files folders without an item are swept once they are this old.
     static let orphanedFilesAge: TimeInterval = 60 * 60
 }

@@ -2,12 +2,13 @@ import AppKit
 import Observation
 
 nonisolated enum PanelFilter: String, CaseIterable, Identifiable, Sendable {
-    case all, labelled, text, images, files, snippets, secrets, thisApp
+    case all, labelled, text, images, files, snippets, secrets, thisApp, inbox
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .all: "All"
+        case .inbox: "Inbox"
         case .labelled: "Labelled"
         case .text: "Text"
         case .images: "Images"
@@ -28,12 +29,15 @@ nonisolated enum PanelFilter: String, CaseIterable, Identifiable, Sendable {
         case .snippets: "text.badge.star"
         case .secrets: "key"
         case .thisApp: "app"
+        case .inbox: "tray.and.arrow.down"
         }
     }
 
-    /// Content types live in the search bar's filter menu; the other filters are chips.
+    /// Content types live in the search bar's filter menu; the other filters are chips. The Inbox
+    /// chip shows only once there are contacts (see `chips(hasContacts:)`).
     var isContentType: Bool { self == .text || self == .images || self == .files || self == .snippets }
-    static let chips = allCases.filter { !$0.isContentType }
+    static let chips = allCases.filter { !$0.isContentType && $0 != .inbox }
+    static func chips(hasContacts: Bool) -> [PanelFilter] { hasContacts ? chips + [.inbox] : chips }
     static let contentTypes = allCases.filter(\.isContentType)
 }
 
@@ -85,6 +89,7 @@ enum PanelAction: Identifiable, Hashable {
     case setLabel
     case shareToGroup
     case sendToDevice(DeviceTarget)
+    case sendToContact(SyncContact)
     case setUpAI
     case clearSlot(Int)
     case removeFromLabelled
@@ -103,6 +108,7 @@ enum PanelAction: Identifiable, Hashable {
         case .setLabel: "setLabel"
         case .shareToGroup: "shareToGroup"
         case .sendToDevice(let device): "sendToDevice-" + device.id
+        case .sendToContact(let contact): "sendToContact-" + contact.id
         case .setUpAI: "setUpAI"
         case .clearSlot(let n): "clearSlot-\(n)"
         case .removeFromLabelled: "removeFromLabelled"
@@ -117,7 +123,7 @@ enum PanelAction: Identifiable, Hashable {
         case .paste, .pastePlain, .copy: "Paste"
         case .transform: "Transform & Paste"
         case .ai, .setUpAI: "Ask \(aiName)"
-        case .sendToDevice: "Send"
+        case .sendToDevice, .sendToContact: "Send"
         case .saveToFolder, .saveToChosenFolder: "Save"
         case .saveAsSecret, .setLabel, .shareToGroup, .clearSlot, .removeFromLabelled, .delete: "Item"
         }
@@ -136,6 +142,7 @@ enum PanelAction: Identifiable, Hashable {
         case .setLabel: "Label…"
         case .shareToGroup: "Share to Group…"
         case .sendToDevice(let device): "Send to \(device.name)"
+        case .sendToContact(let contact): "Send to \(contact.name)"
         case .setUpAI: "Set Up AI…"
         case .clearSlot(let n): "Remove from Quick Slot ⌘\(n)"
         case .removeFromLabelled: "Remove from Labelled"
@@ -156,6 +163,7 @@ enum PanelAction: Identifiable, Hashable {
         case .setLabel: "tag"
         case .shareToGroup: "person.2"
         case .sendToDevice: "laptopcomputer.and.arrow.down"
+        case .sendToContact: "paperplane"
         case .setUpAI: "sparkles"
         case .clearSlot: "number.square"
         case .removeFromLabelled: "tag.slash"
@@ -262,7 +270,14 @@ final class PanelViewModel {
     @ObservationIgnored var onClose: () -> Void = {}
 
     var query = "" { didSet { if query != oldValue { refresh(resetSelection: true) } } }
-    var filter: PanelFilter = .all { didSet { if filter != oldValue { refresh(resetSelection: true) } } }
+    var filter: PanelFilter = .all {
+        didSet {
+            guard filter != oldValue else { return }
+            refresh(resetSelection: true)
+            // Fetch what contacts sent since the last sync; the list refreshes when it lands.
+            if filter == .inbox { env.sync.syncNow() }
+        }
+    }
     /// A sync group chosen in the filter row; when set it replaces `filter`.
     var groupFilter: String? {
         didSet {
@@ -517,6 +532,8 @@ final class PanelViewModel {
                 case .files: item.kind == .file
                 case .snippets, .secrets: false
                 case .thisApp: targetBundle != nil && item.sourceBundleID == targetBundle
+                // What contacts sent you (not what you sent them), newest first like everything else.
+                case .inbox: env.sync.isFromContact(item)
                 }
             }
         }
@@ -671,9 +688,11 @@ final class PanelViewModel {
         showNotice("Deleted \(clips.count) items")
     }
 
-    /// ⇥ walks the filter chips, then each sync group (content types are in the search bar's menu).
+    /// ⇥ walks the filter chips (the Inbox once there are contacts), then each sync group
+    /// (content types are in the search bar's menu).
     func cycleFilter(forward: Bool) {
-        let choices: [(PanelFilter, String?)] = PanelFilter.chips.map { ($0, nil) } + env.sync.groups.map { (.all, $0.id) }
+        let chips = PanelFilter.chips(hasContacts: !env.sync.contacts.isEmpty)
+        let choices: [(PanelFilter, String?)] = chips.map { ($0, nil) } + env.sync.groups.map { (.all, $0.id) }
         let current = choices.firstIndex { groupFilter == nil ? $0.0 == filter && $0.1 == nil : $0.1 == groupFilter } ?? 0
         let next = choices[(current + (forward ? 1 : choices.count - 1)) % choices.count]
         groupFilter = next.1
@@ -872,20 +891,52 @@ final class PanelViewModel {
             refuseGroupShare(problem)
             return
         }
-        for item in items {
-            if item.isTransient {
-                env.store.ingest(.text(item.text, source: item.source), spaceID: group.id)
-            } else if item.spaceID != group.id {
-                env.store.shareCopy(of: item, toSpace: group.id)
-            }
-        }
-        env.sync.syncNow()
+        copy(items, intoSpace: group.id)
         if isSelectionMode {
             onClose()
             HUD.show("Sent to \(group.name)", symbol: "person.2.fill")
         } else {
             refresh()
             showNotice(items.count == 1 ? "Shared to \(group.name)" : "Shared \(items.count) items to \(group.name)")
+        }
+    }
+
+    /// Stores copies in a group's or contact's space; the next sync uploads them.
+    private func copy(_ items: [ClipItem], intoSpace spaceID: String) {
+        for item in items {
+            if item.isTransient {
+                env.store.ingest(.text(item.text, source: item.source), spaceID: spaceID)
+            } else if item.spaceID != spaceID {
+                env.store.shareCopy(of: item, toSpace: spaceID)
+            }
+        }
+        env.sync.syncNow()
+    }
+
+    // MARK: Send to contact
+
+    /// Contacts the selection can be sent to (established ones: both people are in the space).
+    var sendableContacts: [SyncContact] { env.sync.isSignedIn ? env.sync.contacts : [] }
+
+    /// "Send to ‹contact›" rows, one per contact, for saved and transient items alike.
+    var sendToContactActions: [PanelAction] { sendableContacts.map(PanelAction.sendToContact) }
+
+    /// Puts copies of the items in the contact's space: they show up in the contact's Inbox. Same
+    /// limits as sharing to a group.
+    func send(_ items: [ClipItem], to contact: SyncContact) {
+        guard !items.isEmpty else { return }
+        if let problem = items.lazy.compactMap(SyncEngine.groupShareProblem).first {
+            refuseGroupShare(problem.replacingOccurrences(of: "Groups take", with: "Sync takes"))
+            return
+        }
+        copy(items, intoSpace: contact.id)
+        if isSelectionMode {
+            onClose()
+            HUD.show("Sent to \(contact.name)", symbol: "paperplane.fill")
+        } else {
+            if mode == .actions { mode = .browse }
+            refresh()
+            showNotice(items.count == 1 ? "Sent to \(contact.name)" : "Sent \(items.count) items to \(contact.name)")
         }
     }
 
@@ -1045,6 +1096,7 @@ final class PanelViewModel {
                 actions.append(.copy)
             }
             if canShareToGroup { actions.append(.shareToGroup) }
+            actions += sendToContactActions
             return actions + [.saveToFolder, .saveToChosenFolder, .delete]
         }
         guard let entry = selectedEntry else { return [] }
@@ -1057,7 +1109,7 @@ final class PanelViewModel {
             actions += Transform.allCases.filter { $0 != .plainText }.map(PanelAction.transform)
             actions.append(.saveAsSecret)
             if canShareToGroup { actions.append(.shareToGroup) }
-            return actions
+            return actions + sendToContactActions
         case .clip(let item):
             if item.kind.isTextual { actions.append(.pastePlain) }
             actions.append(.copy)
@@ -1071,6 +1123,7 @@ final class PanelViewModel {
             actions.append(.setLabel)
             if canShareToGroup { actions.append(.shareToGroup) }
             actions += PanelAction.sendToDeviceActions(for: item, multiSelecting: false, targets: DeviceTarget.others(in: env.sync))
+            actions += sendableContacts.filter { $0.id != item.spaceID }.map(PanelAction.sendToContact)
             actions += [.saveToFolder, .saveToChosenFolder]
             // Kept from before labels replaced pins: the only way to let it expire again.
             if item.isPinned && item.label == nil { actions.append(.removeFromLabelled) }
@@ -1181,6 +1234,9 @@ final class PanelViewModel {
         case .sendToDevice(let device):
             guard let item = entry.clip else { return }
             send(item, to: device)
+        case .sendToContact(let contact):
+            guard let item = entry.clip else { return }
+            send([item], to: contact)
         case .setUpAI:
             onClose()
             SettingsOpener.open()
@@ -1225,6 +1281,8 @@ final class PanelViewModel {
             env.paste.paste(text: parts.compactMap { $0 }.joined(separator: "\n"), into: target)
         case .shareToGroup:
             beginShare(clips)
+        case .sendToContact(let contact):
+            send(clips, to: contact)
         case .saveToFolder:
             save(clips, to: env.prefs.saveFolder)
         case .saveToChosenFolder:

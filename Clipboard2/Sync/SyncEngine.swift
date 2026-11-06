@@ -50,6 +50,13 @@ final class SyncEngine {
     /// and every 150 ms while any is running.
     var onDownloadsChanged: (([IncomingDownload]) -> Void)?
     private(set) var downloads: [IncomingDownload] = []
+    /// New items a contact sent, after each pull of their space that brought some.
+    var onContactArrivals: (([ContactArrival]) -> Void)?
+    /// Off while a fresh sign-in downloads what's already there, so that isn't announced as new.
+    var announcesArrivals = true
+    /// The space being pulled whose new items count as arrivals (a contact's, not resyncing).
+    private var announcingSpace: String?
+    private var arrivals: [ContactArrival] = []
     private var activeDownloads: [UUID: ActiveDownload] = [:]
     private var downloadsTicker: Task<Void, Never>?
 
@@ -149,7 +156,12 @@ final class SyncEngine {
             if id == identity.personalSpaceId {
                 return "Your personal sync key changed unexpectedly, so your own items aren't syncing. Sign out of Sync and in again."
             }
-            let name = allSpaces().first { $0.id == id }?.name ?? "A group"
+            let space = allSpaces().first { $0.id == id }
+            if space?.isDirect == true {
+                let name = space?.name ?? "a contact"
+                return "The key you share with \(name) changed unexpectedly, so what you send each other isn't syncing. Remove the contact and add them again."
+            }
+            let name = space?.name ?? "A group"
             return "This group's key changed unexpectedly, so “\(name)” isn't syncing. Leave the group and join it again."
         }
         if clockSkew {
@@ -208,6 +220,7 @@ final class SyncEngine {
         for space in spaces {
             // Duplicates can only appear where something arrived.
             try await inSpace(space, merging: .quietly) { try await self.pull(space, itemKey: $0) }
+            announceArrivals()
         }
         let fullPassDue = lastFullPush.map { now().timeIntervalSince($0) > Self.fullPushInterval } ?? true
         guard localChangesPending || fullPassDue || !pendingToDevice.isEmpty else { return }
@@ -292,6 +305,9 @@ final class SyncEngine {
             }
             if space.isPersonal {
                 row.name = "Personal"
+            } else if space.isDirect {
+                // No name of its own: it's called after the other person.
+                row.name = space.members?.first { $0.uid != identity.uid }?.name ?? (row.name.isEmpty ? "Contact" : row.name)
             } else if let sealed = space.encryptedName, let key = spaceKeys[space.id] {
                 row.name = (try? SyncCrypto.decryptGroupName(sealed, spaceKey: key, spaceId: space.id)) ?? "Group"
             } else if row.name.isEmpty {
@@ -367,8 +383,10 @@ final class SyncEngine {
         let spaceId = space.id
         var received = false
         commitsDeferred += 1
+        announcingSpace = announcesArrivals && space.isDirect && !space.resyncing ? spaceId : nil
         defer {
             commitsDeferred -= 1
+            announcingSpace = nil
             flushCommits()
             endDownloads(inSpace: spaceId)
         }
@@ -379,6 +397,7 @@ final class SyncEngine {
             if page.resetRequired {
                 guard since > 0 else { break }
                 Log.sync.notice("Full resync of space \(spaceId, privacy: .public)")
+                announcingSpace = nil   // everything comes again; none of it is new
                 space.since = 0
                 space.resyncing = true
                 space.resyncSeen = []
@@ -613,6 +632,16 @@ final class SyncEngine {
                    seq: remote.seq, updatedAt: remote.updatedAt, blobIds: blobIds, fileBlobs: fileBlobs,
                    localStamp: dirty ? "" : Self.stamp(item), authorUid: remote.authorUid)
         if forThisDevice { onSentToThisDevice?(uuid, payload.fromDevice) }
+        if existing == nil, announcingSpace == spaceId, let author = remote.authorUid, author != identity.uid {
+            arrivals.append(ContactArrival(itemID: uuid, spaceId: spaceId))
+        }
+    }
+
+    private func announceArrivals() {
+        guard !arrivals.isEmpty else { return }
+        let batch = arrivals
+        arrivals = []
+        if !isStopped { onContactArrivals?(batch) }
     }
 
     nonisolated struct ReceivedFile: Sendable {
@@ -1478,6 +1507,12 @@ final class SyncEngine {
         for space in spaces { context.delete(space) }
         try? context.save()
     }
+}
+
+/// A new item a contact sent (it's in the store, in their direct space).
+nonisolated struct ContactArrival: Sendable, Equatable {
+    var itemID: UUID
+    var spaceId: String
 }
 
 /// A synced clip whose image or files are still downloading ("Receiving report.pdf, 12 of 80 MB").

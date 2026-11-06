@@ -61,5 +61,7 @@ final class SyncSpace {
     }
 
     var isPersonal: Bool { kind == "personal" }
+    /// A contact's space: its `name` is the other person's.
+    var isDirect: Bool { kind == "direct" }
     var isOwner: Bool { role == "owner" }
 }

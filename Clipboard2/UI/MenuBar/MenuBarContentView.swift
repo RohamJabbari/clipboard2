@@ -78,6 +78,14 @@ struct MenuBarContentView: View {
                 Divider()
             }
 
+            if env.sync.isSignedIn && !env.sync.contactRequests.incoming.isEmpty {
+                ContactRequestsRow(requests: env.sync.contactRequests.incoming) {
+                    dismiss()
+                    SettingsOpener.open(tab: .sync)
+                }
+                Divider()
+            }
+
             if results.isEmpty {
                 ContentUnavailableView {
                     Label(search.isEmpty ? "No Clipboard History" : "No Results", systemImage: search.isEmpty ? "list.clipboard" : "magnifyingglass")

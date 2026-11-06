@@ -89,6 +89,22 @@ nonisolated struct SyncGroup: Identifiable, Hashable, Sendable {
     var memberCount: Int
 }
 
+/// Someone items can be sent to: a two-person space with no name (PROTOCOL.md → Contacts).
+nonisolated struct SyncContact: Identifiable, Hashable, Sendable {
+    /// The direct space's id.
+    var id: String
+    /// The other person's username (or the part of their email before the @).
+    var name: String
+    var uid: String?
+}
+
+/// The badge on a synced item's row: who copied a group item, or who a contact's item is from or to.
+nonisolated struct SyncBadge: Equatable, Sendable {
+    var text: String
+    var symbol: String
+    var help: String
+}
+
 /// A device signed in to the account (one session).
 nonisolated struct SyncDevice: Identifiable, Hashable, Sendable {
     var id: String
@@ -107,14 +123,17 @@ nonisolated struct SyncDevice: Identifiable, Hashable, Sendable {
     }
 }
 
-/// A pasted invite code, opened: enough to ask "Join ‹name›?" and then join.
+/// A pasted invite code, opened: enough to ask "Join ‹name›?" (or, for a contact code,
+/// "Add ‹name› as a contact?") and then join.
 nonisolated struct InvitePreview: Sendable, Equatable {
     var inviteId: String
     var spaceId: String
+    /// The group's name, or for a contact code the name of whoever made it.
     var name: String
     var memberCount: Int
     var expiresAt: Date
     var spaceKey: Data
+    var isContact = false
 }
 
 nonisolated enum SyncAccountError: LocalizedError, Equatable {
@@ -130,6 +149,12 @@ nonisolated enum SyncAccountError: LocalizedError, Equatable {
     case weakerPasswordSettings
     case cantSendToThisDevice
     case notSaved
+    case unknownUsername(String)
+    case cantAddYourself
+    case alreadyContacts(String)
+    case ownContactCode
+    /// Over a contact limit; the server's words.
+    case contactLimit(String)
 
     var errorDescription: String? {
         switch self {
@@ -147,6 +172,12 @@ nonisolated enum SyncAccountError: LocalizedError, Equatable {
             "The sync service asked for weaker password protection than this Mac used before, so your password wasn't used."
         case .cantSendToThisDevice: "That's this Mac. Pick another device."
         case .notSaved: "Only items in your history can be sent."
+        case .unknownUsername(let name): "Nobody has the username “\(name)”. Check the spelling."
+        case .cantAddYourself: "That's your own username."
+        case .alreadyContacts(let name): "You and \(name) are already contacts, or a request between you is waiting."
+        case .ownContactCode: "That's your own contact code. Send it to the person you want to add."
+        case .contactLimit(let message):
+            message.isEmpty ? "You've reached the limit for contacts." : message.hasSuffix(".") ? message : message + "."
         }
     }
 }
@@ -190,6 +221,17 @@ final class SyncAccount {
     private(set) var memberNames: [String: [String: String]] = [:]
     /// Synced item id → uid of whoever last wrote it (nil: synced, author not known yet).
     @ObservationIgnored private var authors: [String: String?] = [:]
+    /// Established contacts (both people in the space), by name.
+    private(set) var contacts: [SyncContact] = []
+    /// Pending requests both ways, after `refreshContacts()`.
+    private(set) var contactRequests = ContactRequests()
+    /// This account's unused contact codes, after `refreshContacts()`.
+    private(set) var contactCodes: [ContactCode] = []
+    @ObservationIgnored private var lastContactsRefresh: Date?
+    /// Bumped by every contact action, so a refresh that started before one doesn't undo it.
+    @ObservationIgnored private var contactsGeneration = 0
+    /// Incoming requests already seen this session (nil before the first look).
+    @ObservationIgnored private var seenRequests: Set<String>?
 
     @ObservationIgnored private let credentials: any SyncSessionStore
     @ObservationIgnored private let prefs: Preferences
@@ -223,6 +265,10 @@ final class SyncAccount {
     @ObservationIgnored var onSessionChange: ((Bool) -> Void)?
     /// Another device sent an item here; the argument is that device's name.
     @ObservationIgnored var onItemSentHere: ((String) -> Void)?
+    /// Contacts sent something: what to say ("Sam sent you “Report.pdf”").
+    @ObservationIgnored var onContactArrivals: ((String) -> Void)?
+    /// A new contact request came in: what to say ("Sam wants to add you as a contact").
+    @ObservationIgnored var onContactRequest: ((String) -> Void)?
 
     /// `makeService` builds the API client from a token provider (tests pass an in-memory server).
     init(prefs: Preferences, context: ModelContext, store: ClipStore, snippets: SnippetStore,
@@ -280,10 +326,45 @@ final class SyncAccount {
     /// known (no username yet, or a server that doesn't list member names). Unsynced items are yours.
     func copiedBy(_ item: ClipItem) -> String? {
         guard let spaceID = item.spaceID else { return nil }
-        let author = authors[item.id.uuidString.lowercased()] ?? session?.uid
+        let author = author(of: item)
         if let author, author == session?.uid { return username ?? groupName(for: spaceID) }
         if let author, let name = memberNames[spaceID]?[author] { return name }
         return groupName(for: spaceID)
+    }
+
+    /// Whoever last wrote a synced item. Items never synced are yours; nil when synced but the
+    /// author isn't known yet. Looks up what arrived since the last `loadGroups()`.
+    private func author(of item: ClipItem) -> String? {
+        let key = item.id.uuidString.lowercased()
+        if let known = authors[key] { return known }
+        if let meta = engine?.meta(for: key) {
+            authors[key] = meta.authorUid
+            return meta.authorUid
+        }
+        return session?.uid
+    }
+
+    func contact(for spaceID: String?) -> SyncContact? {
+        guard let spaceID else { return nil }
+        return contacts.first { $0.id == spaceID }
+    }
+
+    /// An item a contact sent you: it's in their space and they wrote it. These make up the Inbox.
+    func isFromContact(_ item: ClipItem) -> Bool {
+        guard contact(for: item.spaceID) != nil, let author = author(of: item) else { return false }
+        return author != session?.uid
+    }
+
+    /// The row badge of a group or contact item; nil for personal ones.
+    func badge(for item: ClipItem) -> SyncBadge? {
+        guard let spaceID = item.spaceID else { return nil }
+        if let contact = contact(for: spaceID) {
+            return isFromContact(item)
+                ? SyncBadge(text: contact.name, symbol: "tray.and.arrow.down.fill", help: "\(contact.name) sent you this")
+                : SyncBadge(text: contact.name, symbol: "paperplane.fill", help: "You sent this to \(contact.name)")
+        }
+        guard let name = copiedBy(item) else { return nil }
+        return SyncBadge(text: name, symbol: "person.2.fill", help: "Shared with \(groupName(for: spaceID) ?? "the group") by \(name)")
     }
 
     /// Why a username can't be used, or nil when it's fine (PROTOCOL.md → Usernames).
@@ -336,16 +417,20 @@ final class SyncAccount {
         return SyncIdentity(uid: session.uid, privateKey: session.privateKey, publicKey: pub, personalSpaceId: session.personalSpaceId)
     }
 
-    private func activate(_ identity: SyncIdentity, adopting keys: [String: Data] = [:]) {
+    /// `signingIn`: a fresh sign-in, whose first sync downloads what's already there without
+    /// announcing it as new.
+    private func activate(_ identity: SyncIdentity, adopting keys: [String: Data] = [:], signingIn: Bool = false) {
         self.engine?.stop()
         let engine = SyncEngine(api: makeAPI(), identity: identity, context: context, store: store,
                                 snippets: snippets, secrets: secrets, keyPins: session?.spaceKeyPins ?? [:])
         engine.deviceId = session?.deviceId
         engine.deviceName = deviceName
+        engine.announcesArrivals = !signingIn
         engine.onPinsChanged = { [weak self] pins in self?.rememberPins(pins) }
         engine.onSpacesUpdated = { [weak self] in self?.loadGroups() }
         engine.onDownloadsChanged = { [weak self] in self?.downloads = $0 }
         engine.onSentToThisDevice = { [weak self] _, from in self?.onItemSentHere?(from ?? "another device") }
+        engine.onContactArrivals = { [weak self] in self?.announce($0) }
         for (space, key) in keys { engine.adoptSpaceKey(key, for: space) }
         self.engine = engine
         backoffUntil = nil
@@ -522,7 +607,7 @@ final class SyncAccount {
         username = account.username
         credentials.save(stored)
         guard let identity = identity(from: stored) else { throw SyncCryptoError.badKey }
-        activate(identity, adopting: keys)
+        activate(identity, adopting: keys, signingIn: true)
         Task { await refreshDevices() }
     }
 
@@ -636,6 +721,12 @@ final class SyncAccount {
         credentials.clear()
         session = nil
         groups = []
+        contacts = []
+        contactRequests = ContactRequests()
+        contactCodes = []
+        seenRequests = nil
+        lastContactsRefresh = nil
+        contactsGeneration += 1
         devices = []
         lastSyncAt = nil
         lastSyncError = nil
@@ -845,6 +936,7 @@ final class SyncAccount {
             startedTicks &+= 1
             do {
                 try await engine.tick()
+                engine.announcesArrivals = true   // from the second sync after signing in on
                 lastSyncAt = .now
                 isOffline = false
                 lastSyncError = engine.problem
@@ -858,6 +950,11 @@ final class SyncAccount {
         } while tickRequested && self.engine === engine
         isTicking = false
         isSyncing = false
+        // Contact requests aren't part of a tick; look for new ones about once a minute.
+        if self.engine === engine, lastContactsRefresh.map({ clock().timeIntervalSince($0) >= SyncConfig.contactsRefreshInterval }) ?? true {
+            lastContactsRefresh = clock()
+            Task { await refreshContacts() }
+        }
         // A request that arrived while this tick failed, or a new session started meanwhile.
         if tickRequested, self.engine != nil {
             tickRequested = false
@@ -904,10 +1001,23 @@ final class SyncAccount {
 
     func loadGroups() {
         let spaces = (try? context.fetch(FetchDescriptor<SyncSpace>(sortBy: [SortDescriptor(\.createdAt)]))) ?? []
-        let loaded = spaces.filter { !$0.isPersonal }.map {
+        let loaded = spaces.filter { !$0.isPersonal && !$0.isDirect }.map {
             SyncGroup(id: $0.id, name: $0.name.isEmpty ? "Group" : $0.name, isOwner: $0.isOwner, memberCount: $0.memberCount)
         }
         if loaded != groups { groups = loaded }
+        let me = session?.uid
+        let people = spaces.filter(\.isDirect).map {
+            SyncContact(id: $0.id, name: $0.name.isEmpty ? "Contact" : $0.name, uid: $0.memberNames.keys.first { $0 != me })
+        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        if people != contacts { contacts = people }
+        // A request accepted or a code used on the other side: it's a contact now, not pending.
+        let established = Set(people.map(\.id))
+        if contactRequests.outgoing.contains(where: { established.contains($0.spaceId) }) {
+            contactRequests.outgoing.removeAll { established.contains($0.spaceId) }
+        }
+        if contactCodes.contains(where: { established.contains($0.spaceId) }) {
+            contactCodes.removeAll { established.contains($0.spaceId) }
+        }
         let names = Dictionary(spaces.map { ($0.id, $0.memberNames) }, uniquingKeysWith: { first, _ in first })
         if names != memberNames { memberNames = names }
         let metas = (try? context.fetch(FetchDescriptor<SyncMeta>())) ?? []
@@ -1013,6 +1123,12 @@ final class SyncAccount {
             guard let key = try? SyncCrypto.Invite.openSpaceKey(details.sealedKey, code: code, spaceId: details.spaceId) else {
                 throw SyncAccountError.invalidInviteCode
             }
+            if details.isContactCode {
+                let name = details.ownerName ?? "Someone"
+                if contacts.contains(where: { $0.id == details.spaceId }) { throw SyncAccountError.alreadyContacts(name) }
+                return InvitePreview(inviteId: id, spaceId: details.spaceId, name: name, memberCount: details.memberCount,
+                                     expiresAt: Date(syncMillis: details.expiresAt), spaceKey: key, isContact: true)
+            }
             let name = details.encryptedName.flatMap {
                 try? SyncCrypto.decryptGroupName($0, spaceKey: key, spaceId: details.spaceId)
             } ?? "Group"
@@ -1022,10 +1138,12 @@ final class SyncAccount {
         }
     }
 
-    /// Accepts the invite with the group key wrapped to this account's own public key.
+    /// Accepts the invite with the group key wrapped to this account's own public key. A contact
+    /// code makes its creator a contact instead (see `addContact(_:)`).
     @discardableResult
     func join(_ invite: InvitePreview) async throws -> SyncGroup {
         try await call { engine in
+            guard !invite.isContact else { throw SyncAccountError.invalidInviteCode }
             let wrapped = try SyncCrypto.wrapSpaceKey(invite.spaceKey, spaceId: invite.spaceId, memberUid: engine.identity.uid,
                                                      memberPublicKey: engine.identity.publicKey)
             let space: RemoteSpace
@@ -1042,6 +1160,216 @@ final class SyncAccount {
             if prefs.syncDefaultGroupID == nil { prefs.syncDefaultGroupID = group.id }
             syncNow()
             return group
+        }
+    }
+
+    // MARK: Contacts
+
+    /// Looks the username up and asks them to become a contact: a new direct space whose key is
+    /// wrapped to both of you. Nothing can be sent until they accept.
+    @discardableResult
+    func requestContact(username raw: String) async throws -> ContactRequest {
+        var name = raw.trimmingCharacters(in: .whitespacesAndNewlines).precomposedStringWithCanonicalMapping
+        if name.hasPrefix("@") { name.removeFirst() }
+        if Self.usernameProblem(name) != nil { throw SyncAccountError.unknownUsername(name) }
+        if let mine = username, mine.caseInsensitiveCompare(name) == .orderedSame { throw SyncAccountError.cantAddYourself }
+        return try await call { engine in
+            let user: RemoteUser
+            do {
+                user = try await engine.api.user(named: name)
+            } catch {
+                throw Self.contactError(error, name: name)
+            }
+            if contacts.contains(where: { $0.uid == user.uid }) { throw SyncAccountError.alreadyContacts(user.name) }
+            let id = SyncCrypto.newID()
+            let key = SyncCrypto.randomBytes(32)
+            let request: ContactRequest
+            do {
+                request = try await engine.api.requestContact(
+                    username: user.username, spaceId: id,
+                    wrappedKey: try SyncCrypto.wrapSpaceKey(key, spaceId: id, memberUid: engine.identity.uid,
+                                                           memberPublicKey: engine.identity.publicKey),
+                    recipientWrappedKey: try SyncCrypto.wrapSpaceKey(key, spaceId: id, memberUid: user.uid,
+                                                                    memberPublicKey: user.publicKey))
+            } catch {
+                throw Self.contactError(error, name: user.name)
+            }
+            engine.adoptSpaceKey(key, for: id)
+            contactsGeneration += 1
+            contactRequests.outgoing.removeAll { $0.spaceId == request.spaceId }
+            contactRequests.outgoing.insert(request, at: 0)
+            return request
+        }
+    }
+
+    /// Server refusals of a contact action, in the user's terms.
+    private static func contactError(_ error: any Error, name: String) -> any Error {
+        guard let api = error as? SyncAPIError else { return error }
+        switch api.code {
+        case "not_found": return SyncAccountError.unknownUsername(name)
+        case "invalid": return SyncAccountError.cantAddYourself
+        case "conflict": return SyncAccountError.alreadyContacts(name)
+        case "quota_exceeded": return SyncAccountError.contactLimit(api.message ?? "")
+        default: return error
+        }
+    }
+
+    func accept(_ request: ContactRequest) async throws {
+        try await call { engine in
+            do {
+                _ = try await engine.api.acceptContactRequest(spaceId: request.spaceId)
+            } catch let error as SyncAPIError where error.status == 404 {
+                // Cancelled meanwhile; the refresh below drops it.
+                Log.sync.notice("Contact request \(request.spaceId, privacy: .public) is gone")
+            }
+            contactsGeneration += 1
+            contactRequests.incoming.removeAll { $0.spaceId == request.spaceId }
+        }
+        syncNow()   // brings the new space and its key
+        await refreshContacts()
+    }
+
+    /// Declines an incoming request or cancels an outgoing one.
+    func dismiss(_ request: ContactRequest) async throws {
+        try await call { engine in
+            do {
+                try await engine.api.deleteContactRequest(spaceId: request.spaceId)
+            } catch let error as SyncAPIError where error.status == 404 {
+                Log.sync.notice("Contact request \(request.spaceId, privacy: .public) is already gone")
+            }
+            contactsGeneration += 1
+            contactRequests.incoming.removeAll { $0.spaceId == request.spaceId }
+            contactRequests.outgoing.removeAll { $0.spaceId == request.spaceId }
+        }
+    }
+
+    /// A one-time code that makes whoever enters it a contact, formatted for display. Shown once:
+    /// the server only keeps its hash.
+    func createContactCode() async throws -> String {
+        try await call { engine in
+            let id = SyncCrypto.newID()
+            let key = SyncCrypto.randomBytes(32)
+            let code = SyncCrypto.Invite.newCode()
+            do {
+                try await engine.api.createContactCode(
+                    spaceId: id,
+                    wrappedKey: try SyncCrypto.wrapSpaceKey(key, spaceId: id, memberUid: engine.identity.uid,
+                                                           memberPublicKey: engine.identity.publicKey),
+                    inviteId: SyncCrypto.Invite.id(code),
+                    sealedKey: try SyncCrypto.Invite.sealSpaceKey(key, code: code, spaceId: id))
+            } catch {
+                throw Self.contactError(error, name: "")
+            }
+            engine.adoptSpaceKey(key, for: id)
+            contactsGeneration += 1
+            await loadContactCodes()
+            return SyncCrypto.Invite.format(code)
+        }
+    }
+
+    func revoke(_ code: ContactCode) async throws {
+        try await call { try await $0.api.revokeContactCode(inviteId: code.inviteId) }
+        contactsGeneration += 1
+        contactCodes.removeAll { $0.inviteId == code.inviteId }
+    }
+
+    /// Enters someone's contact code: they're a contact right away (sharing the code was the consent).
+    @discardableResult
+    func addContact(_ invite: InvitePreview) async throws -> SyncContact {
+        try await call { engine in
+            let wrapped = try SyncCrypto.wrapSpaceKey(invite.spaceKey, spaceId: invite.spaceId, memberUid: engine.identity.uid,
+                                                     memberPublicKey: engine.identity.publicKey)
+            let space: RemoteSpace
+            do {
+                space = try await engine.api.acceptInvite(id: invite.inviteId, wrappedKey: wrapped)
+            } catch let error as SyncAPIError where error.code == "invalid" {
+                throw SyncAccountError.ownContactCode
+            } catch let error as SyncAPIError where error.status == 404 {
+                throw SyncAccountError.inviteNotFound
+            } catch {
+                throw Self.contactError(error, name: invite.name)
+            }
+            engine.adoptSpaceKey(invite.spaceKey, for: invite.spaceId)
+            let them = space.members?.first { $0.uid != engine.identity.uid }
+            let contact = SyncContact(id: space.id, name: them?.name ?? invite.name, uid: them?.uid)
+            if !contacts.contains(where: { $0.id == contact.id }) { contacts.append(contact) }
+            syncNow()
+            return contact
+        }
+    }
+
+    /// Ends the contact for both of you: everything you sent each other is deleted, and its items
+    /// leave this Mac with the next sync.
+    func remove(_ contact: SyncContact) async throws {
+        try await call { engine in
+            do {
+                try await engine.api.deleteContact(spaceId: contact.id)
+            } catch let error as SyncAPIError where error.status == 404 {
+                Log.sync.notice("Contact \(contact.id, privacy: .public) is already gone")
+            }
+        }
+        contacts.removeAll { $0.id == contact.id }
+        syncNow()
+    }
+
+    /// Pending requests and open codes (not part of a sync tick). Announces requests that are new
+    /// since the last look.
+    func refreshContacts() async {
+        guard engine != nil else { return }
+        let generation = contactsGeneration
+        do {
+            let requests = try await call { try await $0.api.contactRequests() }
+            let codes = try await call { try await $0.api.contactCodes() }
+            lastContactsRefresh = clock()
+            guard generation == contactsGeneration, engine != nil else { return }
+            announceNewRequests(requests.incoming)
+            if requests != contactRequests { contactRequests = requests }
+            if codes != contactCodes { contactCodes = codes }
+        } catch {
+            Log.sync.notice("Can't load contact requests: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func loadContactCodes() async {
+        guard let codes = try? await call({ try await $0.api.contactCodes() }) else { return }
+        contactCodes = codes
+    }
+
+    private func announceNewRequests(_ incoming: [ContactRequest]) {
+        let ids = Set(incoming.map(\.spaceId))
+        defer { seenRequests = (seenRequests ?? []).union(ids) }
+        // The first look of a session only shows them in Settings and the menu bar.
+        guard let seen = seenRequests else { return }
+        let new = incoming.filter { !seen.contains($0.spaceId) }
+        guard let first = new.first else { return }
+        onContactRequest?(new.count == 1 ? "\(first.name) wants to add you as a contact"
+                                         : "\(new.count) people want to add you as a contact")
+    }
+
+    /// Contacts sent something: refresh who wrote what, then say so once for the batch.
+    private func announce(_ arrivals: [ContactArrival]) {
+        loadGroups()
+        let items = arrivals.compactMap { store.item(withID: $0.itemID) }
+        guard !items.isEmpty else { return }
+        let senders = Set(arrivals.compactMap { contact(for: $0.spaceId)?.name })
+        onContactArrivals?(Self.arrivalText(items, from: senders.count == 1 ? senders.first : nil))
+    }
+
+    /// "Sam sent you “Report.pdf”", "Sam sent you 3 items", or for several senders "4 new items in your Inbox".
+    static func arrivalText(_ items: [ClipItem], from sender: String?) -> String {
+        guard let sender else { return "\(items.count) new items in your Inbox" }
+        guard items.count == 1, let item = items.first else { return "\(sender) sent you \(items.count) items" }
+        if let label = item.label { return "\(sender) sent you “\(label)”" }
+        switch item.kind {
+        case .image:
+            return "\(sender) sent you an image"
+        case .file:
+            let files = item.fileURLs
+            return files.count == 1 ? "\(sender) sent you “\(files[0].lastPathComponent)”" : "\(sender) sent you \(files.count) files"
+        case .text, .richText:
+            let line = item.preview.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+            let short = line.count > 40 ? line.prefix(39).trimmingCharacters(in: .whitespaces) + "…" : line
+            return short.isEmpty ? "\(sender) sent you some text" : "\(sender) sent you “\(short)”"
         }
     }
 

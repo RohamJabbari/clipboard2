@@ -642,13 +642,19 @@ actor FakeSyncServer {
 
     func invite(id: String) -> InviteDetails? {
         guard let invite = invites[id], !invite.used, let space = spaces[invite.space] else { return nil }
-        return InviteDetails(spaceId: space.id, sealedKey: invite.sealedKey, encryptedName: space.encryptedName,
-                             memberCount: space.members.count, expiresAt: Date.now.addingTimeInterval(86_400).syncMillis)
+        let direct = space.kind == "direct"
+        return InviteDetails(spaceId: space.id, sealedKey: invite.sealedKey, encryptedName: direct ? nil : space.encryptedName,
+                             memberCount: space.members.count, expiresAt: Date.now.addingTimeInterval(86_400).syncMillis,
+                             kind: space.kind, ownerName: direct ? accountByUID(space.owner)?.displayName : nil)
     }
 
     func accept(uid: String, inviteId: String, wrappedKey: Data) throws -> RemoteSpace {
-        guard var invite = invites[inviteId], !invite.used, spaces[invite.space] != nil else {
+        guard var invite = invites[inviteId], !invite.used, let target = spaces[invite.space] else {
             throw SyncAPIError.server(status: 404, code: "not_found", message: "", retryAfter: nil)
+        }
+        if target.kind == "direct" {
+            if target.owner == uid { throw Self.error(400, "invalid") }
+            if pairTaken(uid, target.owner) { throw Self.error(409, "conflict") }
         }
         guard spaces[invite.space]?.members[uid] == nil else {
             throw SyncAPIError.server(status: 409, code: "conflict", message: "", retryAfter: nil)
@@ -675,9 +681,115 @@ actor FakeSyncServer {
         spaces[space]?.members[uid] = nil
     }
 
-    func spaces(for uid: String) -> [RemoteSpace] {
+    // MARK: Contacts
+
+    struct PendingContact {
+        var requester: String
+        var recipient: String
+        var recipientWrappedKey: Data
+        var createdAt: Int64
+    }
+
+    /// Pending contact requests by space id.
+    private(set) var contactRequests: [String: PendingContact] = [:]
+
+    static func error(_ status: Int, _ code: String, _ message: String = "") -> SyncAPIError {
+        .server(status: status, code: code, message: message, retryAfter: nil)
+    }
+
+    private func accountByUID(_ uid: String) -> Account? { accounts.values.first { $0.uid == uid } }
+
+    /// Two people have at most one direct space: a contact or a pending request, either way.
+    private func pairTaken(_ a: String, _ b: String) -> Bool {
+        spaces.values.contains { $0.kind == "direct" && $0.members[a] != nil && $0.members[b] != nil }
+            || contactRequests.values.contains { Set([$0.requester, $0.recipient]) == Set([a, b]) }
+    }
+
+    func user(named name: String, caller: String) throws -> RemoteUser {
+        guard let account = accounts.values.first(where: { $0.username?.lowercased() == name.lowercased() }) else {
+            throw Self.error(404, "not_found", "Nobody has that username")
+        }
+        if account.uid == caller { throw Self.error(400, "invalid", "That's your own username") }
+        return RemoteUser(uid: account.uid, username: account.username ?? "", name: account.displayName, publicKey: account.publicKey)
+    }
+
+    private func contactRequest(_ spaceId: String, _ pending: PendingContact, other: String) -> ContactRequest {
+        let account = accountByUID(other)
+        return ContactRequest(spaceId: spaceId, uid: other, username: account?.username, name: account?.displayName ?? "",
+                              createdAt: pending.createdAt)
+    }
+
+    func requestContact(uid: String, username: String, spaceId: String, wrappedKey: Data, recipientWrappedKey: Data) throws -> ContactRequest {
+        let them = try user(named: username, caller: uid).uid
+        if pairTaken(uid, them) || spaces[spaceId] != nil { throw Self.error(409, "conflict") }
+        createSpace(id: spaceId, kind: "direct", owner: uid, wrappedKey: wrappedKey)
+        let pending = PendingContact(requester: uid, recipient: them, recipientWrappedKey: recipientWrappedKey,
+                                     createdAt: Int64(contactRequests.count))
+        contactRequests[spaceId] = pending
+        return contactRequest(spaceId, pending, other: them)
+    }
+
+    func contactRequests(uid: String) -> ContactRequests {
+        let newestFirst = contactRequests.sorted { $0.value.createdAt > $1.value.createdAt }
+        return ContactRequests(
+            incoming: newestFirst.filter { $0.value.recipient == uid }.map { contactRequest($0.key, $0.value, other: $0.value.requester) },
+            outgoing: newestFirst.filter { $0.value.requester == uid }.map { contactRequest($0.key, $0.value, other: $0.value.recipient) })
+    }
+
+    func acceptContactRequest(uid: String, spaceId: String) throws -> RemoteSpace {
+        guard let pending = contactRequests[spaceId], pending.recipient == uid else { throw Self.error(404, "not_found") }
+        spaces[spaceId]?.members[uid] = ("member", pending.recipientWrappedKey)
+        contactRequests[spaceId] = nil
+        guard let space = spaces(for: uid).first(where: { $0.id == spaceId }) else { throw Self.error(404, "not_found") }
+        return space
+    }
+
+    func deleteContactRequest(uid: String, spaceId: String) throws {
+        guard let pending = contactRequests[spaceId], pending.requester == uid || pending.recipient == uid else {
+            throw Self.error(404, "not_found")
+        }
+        contactRequests[spaceId] = nil
+        dropSpace(spaceId)
+    }
+
+    func createContactCode(uid: String, spaceId: String, wrappedKey: Data, inviteId: String, sealedKey: Data) throws {
+        if spaces[spaceId] != nil { throw Self.error(409, "conflict") }
+        createSpace(id: spaceId, kind: "direct", owner: uid, wrappedKey: wrappedKey)
+        invites[inviteId] = Invite(space: spaceId, sealedKey: sealedKey, createdAt: Int64(invites.count))
+    }
+
+    func contactCodes(uid: String) -> [ContactCode] {
+        invites.filter { !$0.value.used && spaces[$0.value.space]?.kind == "direct" && spaces[$0.value.space]?.owner == uid }
+            .map { ContactCode(spaceId: $0.value.space, inviteId: $0.key, createdAt: $0.value.createdAt,
+                               expiresAt: Date.now.addingTimeInterval(7 * 86_400).syncMillis) }
+            .sorted { $0.createdAt < $1.createdAt }
+    }
+
+    func revokeContactCode(uid: String, inviteId: String) throws {
+        guard let invite = invites[inviteId], spaces[invite.space]?.kind == "direct", spaces[invite.space]?.owner == uid else {
+            throw Self.error(404, "not_found")
+        }
+        invites[inviteId] = nil
+        if spaces[invite.space]?.members.count == 1 { dropSpace(invite.space) }
+    }
+
+    func deleteContact(uid: String, spaceId: String) throws {
+        guard let space = spaces[spaceId], space.kind == "direct", space.members[uid] != nil else { throw Self.error(404, "not_found") }
+        dropSpace(spaceId)
+    }
+
+    /// The space with its items and blobs, gone for everyone.
+    private func dropSpace(_ id: String) {
+        spaces[id] = nil
+        items[id] = nil
+        blobs = blobs.filter { !$0.key.hasPrefix(id + "/") }
+    }
+
+    /// `includeDirect` is `?include=direct`: contacts with both people in them.
+    func spaces(for uid: String, includeDirect: Bool = true) -> [RemoteSpace] {
         spaces.values.compactMap { space in
             guard let member = space.members[uid] else { return nil }
+            if space.kind == "direct" && (!includeDirect || space.members.count < 2) { return nil }
             let names = space.members.keys.sorted().compactMap { uid in
                 accounts.values.first { $0.uid == uid }.map { MemberName(uid: uid, name: $0.displayName) }
             }
@@ -705,6 +817,8 @@ actor FakeSyncServer {
 
     func put(space: String, id: String, body: ItemUpload, uid: String) throws -> WriteOutcome {
         guard spaces[space]?.members[uid] != nil else { throw SyncAPIError.server(status: 404, code: "not_found", message: "", retryAfter: nil) }
+        // Nothing goes into a contact's space before they're in it.
+        if spaces[space]?.kind == "direct" && spaces[space]?.members.count != 2 { throw Self.forbidden }
         putAttempts[id, default: 0] += 1
         if rateLimited { throw Self.rateLimit }
         if let refusal = refusals[id] { throw refusal }
@@ -858,6 +972,30 @@ nonisolated struct FakeClient: SyncService {
     func acceptInvite(id: String, wrappedKey: Data) async throws -> RemoteSpace {
         try await server.accept(uid: try await caller(), inviteId: id, wrappedKey: wrappedKey)
     }
+
+    func user(named username: String) async throws -> RemoteUser {
+        try await server.user(named: username, caller: try await caller())
+    }
+    func requestContact(username: String, spaceId: String, wrappedKey: Data, recipientWrappedKey: Data) async throws -> ContactRequest {
+        try await server.requestContact(uid: try await caller(), username: username, spaceId: spaceId, wrappedKey: wrappedKey,
+                                        recipientWrappedKey: recipientWrappedKey)
+    }
+    func contactRequests() async throws -> ContactRequests { await server.contactRequests(uid: try await caller()) }
+    func acceptContactRequest(spaceId: String) async throws -> RemoteSpace {
+        try await server.acceptContactRequest(uid: try await caller(), spaceId: spaceId)
+    }
+    func deleteContactRequest(spaceId: String) async throws {
+        try await server.deleteContactRequest(uid: try await caller(), spaceId: spaceId)
+    }
+    func createContactCode(spaceId: String, wrappedKey: Data, inviteId: String, sealedKey: Data) async throws {
+        try await server.createContactCode(uid: try await caller(), spaceId: spaceId, wrappedKey: wrappedKey, inviteId: inviteId,
+                                           sealedKey: sealedKey)
+    }
+    func contactCodes() async throws -> [ContactCode] { await server.contactCodes(uid: try await caller()) }
+    func revokeContactCode(inviteId: String) async throws {
+        try await server.revokeContactCode(uid: try await caller(), inviteId: inviteId)
+    }
+    func deleteContact(spaceId: String) async throws { try await server.deleteContact(uid: try await caller(), spaceId: spaceId) }
 
     func changes(spaceId: String, since: Int64, limit: Int, full: Bool) async throws -> ChangesPage {
         _ = try await caller()

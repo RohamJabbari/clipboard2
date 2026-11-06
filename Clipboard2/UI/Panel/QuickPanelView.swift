@@ -42,6 +42,7 @@ struct QuickPanelView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
             FilterChips(selection: $model.filter, groupSelection: $model.groupFilter, groups: env.sync.groups,
+                        showsInbox: !model.sendableContacts.isEmpty,
                         thisAppName: model.targetRef?.name, dropModel: model)
                 .padding(.horizontal, 14)
                 .padding(.bottom, 10)
@@ -184,11 +185,14 @@ struct QuickPanelView: View {
     private var resultsList: some View {
         Group {
             if model.entries.isEmpty {
+                let inbox = model.filter == .inbox && model.groupFilter == nil
                 ContentUnavailableView {
-                    Label(model.query.isEmpty ? "Nothing Here Yet" : "No Matches",
+                    Label(model.query.isEmpty ? (inbox ? "Your Inbox Is Empty" : "Nothing Here Yet") : "No Matches",
                           systemImage: model.query.isEmpty ? model.filter.symbol : "magnifyingglass")
                 } description: {
-                    Text(model.query.isEmpty ? "Items appear as you copy them." : "Try fewer letters or another filter.")
+                    Text(model.query.isEmpty
+                         ? (inbox ? "What your contacts send you shows up here." : "Items appear as you copy them.")
+                         : "Try fewer letters or another filter.")
                 }
             } else {
                 ScrollViewReader { proxy in
@@ -198,7 +202,7 @@ struct QuickPanelView: View {
                                 PanelRow(entry: entry, shortcut: model.shortcutNumber(for: entry, at: index),
                                          isSelected: model.isSelected(entry),
                                          showsCheckmark: model.isMultiSelecting,
-                                         groupName: entry.clip.flatMap(env.sync.copiedBy))
+                                         badge: entry.clip.flatMap(env.sync.badge))
                                     .id(entry.id)
                                     // One recogniser reading AppKit's click count: SwiftUI's stacked
                                     // count:2 / count:1 gestures miss double-clicks in a non-activating panel.
@@ -283,6 +287,7 @@ struct QuickPanelView: View {
                     }
                 }
             }
+            contactSends(for: entry, item: item)
             Divider()
             Button("Save to \(env.prefs.saveFolderName)") {
                 model.save(model.clipsForContextAction(on: entry), to: env.prefs.saveFolder)
@@ -290,6 +295,20 @@ struct QuickPanelView: View {
             Button("Save to…") { model.saveChoosingFolder(model.clipsForContextAction(on: entry)) }
             Divider()
             Button("Delete", role: .destructive) { env.store.delete(item); model.refresh() }
+        }
+    }
+
+    /// "Send to ‹contact›" for the row (or the selection it's part of); a submenu once there are many.
+    @ViewBuilder
+    private func contactSends(for entry: PanelEntry, item: ClipItem) -> some View {
+        let contacts = model.sendableContacts.filter { $0.id != item.spaceID }
+        let send = { (contact: SyncContact) in model.send(model.clipsForContextAction(on: entry), to: contact) }
+        if contacts.count > 4 {
+            Menu("Send to Contact") {
+                ForEach(contacts) { contact in Button(contact.name) { send(contact) } }
+            }
+        } else {
+            ForEach(contacts) { contact in Button("Send to \(contact.name)") { send(contact) } }
         }
     }
 
@@ -342,12 +361,14 @@ struct FilterChips: View {
     @Binding var selection: PanelFilter
     @Binding var groupSelection: String?
     var groups: [SyncGroup] = []
+    /// The Inbox chip: what contacts sent you. Only once there are contacts.
+    var showsInbox = false
     let thisAppName: String?
     /// When set, group chips accept dropped history items and files and share them to the group.
     var dropModel: PanelViewModel?
 
     var body: some View {
-        if groups.isEmpty {
+        if groups.isEmpty && !showsInbox {
             chips
         } else {
             ScrollView(.horizontal, showsIndicators: false) { chips }
@@ -356,7 +377,7 @@ struct FilterChips: View {
 
     private var chips: some View {
         HStack(spacing: 4) {
-            ForEach(PanelFilter.chips) { filter in
+            ForEach(PanelFilter.chips(hasContacts: showsInbox)) { filter in
                 chip(title(for: filter), symbol: filter.symbol, selected: groupSelection == nil && filter == selection) {
                     groupSelection = nil
                     selection = filter
@@ -460,8 +481,8 @@ struct PanelRow: View {
     let shortcut: (number: Int, isSlot: Bool)?
     let isSelected: Bool
     var showsCheckmark = false
-    /// For a sync group item: who copied it (their username), shown as a badge.
-    var groupName: String?
+    /// For a sync group item: who copied it (their username); for a contact's: who it's from or to.
+    var badge: SyncBadge?
 
     var body: some View {
         HStack(spacing: 10) {
@@ -485,8 +506,8 @@ struct PanelRow: View {
                     .foregroundStyle(isSelected ? AnyShapeStyle(.white.opacity(0.8)) : AnyShapeStyle(.secondary))
             }
             Spacer(minLength: 4)
-            if let groupName {
-                Label(groupName, systemImage: "person.2.fill")
+            if let badge {
+                Label(badge.text, systemImage: badge.symbol)
                     .labelStyle(.titleAndIcon)
                     .font(.caption2)
                     .lineLimit(1)
@@ -494,7 +515,7 @@ struct PanelRow: View {
                     .padding(.vertical, 1)
                     .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
                     .background(Capsule().strokeBorder(isSelected ? AnyShapeStyle(.white.opacity(0.6)) : AnyShapeStyle(.quaternary)))
-                    .help("Shared with \(groupName)")
+                    .help(badge.help)
                     .accessibilityHidden(true)
             }
             if case .clip(let item) = entry, item.isPinned {
@@ -532,7 +553,7 @@ struct PanelRow: View {
         }
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityText + (groupName.map { ", in group \($0)" } ?? "")
+        .accessibilityLabel(accessibilityText + (badge.map { ", \($0.help)" } ?? "")
                             + (shortcut?.isSlot == true ? ", quick slot \(shortcut?.number ?? 0)" : ""))
         .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : .isButton)
         .accessibilityHint("Double-click or press Return to paste")

@@ -24,6 +24,7 @@ struct SyncSettingsView: View {
             case .signedIn(let email):
                 SyncStatusSection(sync: sync, email: email)
                 SyncGroupsSection(sync: sync)
+                SyncContactsSection(sync: sync)
                 SyncDevicesSection(sync: sync)
                 InviteSomeoneSection(sync: sync)
                 SyncAccountSection(sync: sync)
@@ -257,7 +258,8 @@ private struct SyncStatusSection: View {
                     .foregroundStyle(.green)
                     .labelStyle(.titleAndIcon)
             }
-            UsernameRow(sync: sync)
+            // Without one, Contacts below asks for it (that's where it matters most).
+            if sync.username != nil { UsernameRow(sync: sync) }
             LabeledContent("Last sync") {
                 HStack(spacing: 8) {
                     if sync.isSyncing {
@@ -539,7 +541,7 @@ private struct GroupManageSheet: View {
     }
 }
 
-/// Paste an invite code, see which group it is, then join.
+/// Paste an invite code, see which group it is (or whose contact code), then join or add them.
 private struct JoinGroupSheet: View {
     let sync: SyncAccount
     @Environment(\.dismiss) private var dismiss
@@ -550,15 +552,21 @@ private struct JoinGroupSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Join a Group").font(.headline)
-            if let preview {
+            Text("Enter an Invite Code").font(.headline)
+            if let preview, preview.isContact {
+                Label("Add \(preview.name) as a contact?", systemImage: "person.crop.circle.badge.plus")
+                    .font(.title3)
+                Text("You'll be able to send each other items. What \(preview.name) sends you shows up in your Inbox.")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let preview {
                 Label("Join “\(preview.name)”?", systemImage: "person.2.fill")
                     .font(.title3)
                 Text("\(preview.memberCount) \(preview.memberCount == 1 ? "member" : "members"). Everything shared there will appear on this Mac, and they'll see what you share.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text("Paste the invite code you were sent.")
+                Text("Paste the group invite code or contact code you were sent.")
                     .foregroundStyle(.secondary)
                 TextField("Code", text: $code, prompt: Text("XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XX"))
                     .font(.body.monospaced())
@@ -575,9 +583,13 @@ private struct JoinGroupSheet: View {
                 if busy { ProgressView().controlSize(.small) }
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 if let preview {
-                    Button("Join") {
+                    Button(preview.isContact ? "Add Contact" : "Join") {
                         run {
-                            try await sync.join(preview)
+                            if preview.isContact {
+                                try await sync.addContact(preview)
+                            } else {
+                                try await sync.join(preview)
+                            }
                             dismiss()
                         }
                     }
@@ -602,6 +614,171 @@ private struct JoinGroupSheet: View {
     private func run(_ operation: @escaping () async throws -> Void) {
         busy = true
         error = nil
+        Task {
+            do {
+                try await operation()
+            } catch {
+                self.error = error.localizedDescription
+            }
+            busy = false
+        }
+    }
+}
+
+/// People you send items to without a group: add them by username (they accept) or with a
+/// one-time code, answer their requests, and end a contact.
+private struct SyncContactsSection: View {
+    let sync: SyncAccount
+    @State private var username = ""
+    @State private var newCode: String?
+    @State private var copied = false
+    @State private var busy = false
+    @State private var error: String?
+    @State private var info: String?
+    @State private var removing: SyncContact?
+    @State private var enteringCode = false
+
+    var body: some View {
+        let requests = sync.contactRequests
+        Section {
+            if let name = sync.username {
+                LabeledContent("Your username") {
+                    Text(name).textSelection(.enabled)
+                }
+                Text("Others add you by this name.").font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text("You don't have a username yet, so nobody can add you by name. Set one, or send someone a contact code.")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                UsernameRow(sync: sync)
+            }
+            ForEach(requests.incoming) { request in
+                HStack {
+                    Image(systemName: "person.crop.circle.badge.plus").foregroundStyle(.tint).accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("\(request.name) wants to add you")
+                        Text("Request from \(Date(syncMillis: request.createdAt).formatted(.relative(presentation: .named)))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Decline") { run { try await sync.dismiss(request) } }
+                    Button("Accept") {
+                        run {
+                            try await sync.accept(request)
+                            info = "You and \(request.name) are now contacts."
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .disabled(busy)
+            }
+            if sync.contacts.isEmpty && requests.incoming.isEmpty {
+                Text("No contacts yet. Add someone to send them items without making a group.")
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(sync.contacts) { contact in
+                HStack {
+                    Image(systemName: "person.crop.circle.fill").foregroundStyle(.tint).accessibilityHidden(true)
+                    Text(contact.name)
+                    Spacer()
+                    Button("Remove…") { removing = contact }
+                }
+            }
+            ForEach(requests.outgoing) { request in
+                HStack {
+                    Image(systemName: "clock").foregroundStyle(.secondary).accessibilityHidden(true)
+                    Text("Waiting for \(request.name) to accept")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Cancel") { run { try await sync.dismiss(request) } }
+                }
+            }
+            HStack {
+                TextField("Add by username", text: $username, prompt: Text("Their username"))
+                    .onSubmit(request)
+                Button("Send Request", action: request)
+                    .disabled(username.trimmingCharacters(in: .whitespaces).isEmpty || busy)
+            }
+            if let newCode {
+                HStack {
+                    Text(newCode)
+                        .font(.body.monospaced())
+                        .textSelection(.enabled)
+                    Spacer()
+                    Button(copied ? "Copied" : "Copy") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(newCode, forType: .string)
+                        copied = true
+                    }
+                }
+                Text("Shown only once. Whoever enters it becomes your contact; it works once, for 7 days.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(sync.contactCodes) { code in
+                HStack {
+                    Text("Code created \(Date(syncMillis: code.createdAt).formatted(date: .abbreviated, time: .shortened))")
+                    Spacer()
+                    Text("expires \(Date(syncMillis: code.expiresAt).formatted(.relative(presentation: .named)))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Revoke") { run { try await sync.revoke(code) } }
+                }
+            }
+            if let error {
+                Text(error).font(.caption).foregroundStyle(.orange)
+            } else if let info {
+                Text(info).font(.caption).foregroundStyle(.secondary)
+            }
+            HStack {
+                Spacer()
+                if busy { ProgressView().controlSize(.small) }
+                Button("Enter a Code…") { enteringCode = true }
+                Button("Create Contact Code") {
+                    run {
+                        newCode = try await sync.createContactCode()
+                        copied = false
+                    }
+                }
+                .disabled(busy)
+            }
+        } header: {
+            Text("Contacts")
+        } footer: {
+            Text("Send items to a contact with ⌘K or the right-click menu in the quick panel; they arrive in their Inbox, encrypted so only the two of you can read them. Add someone by their username (they accept the request) or give them a contact code.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .task { await sync.refreshContacts() }
+        .sheet(isPresented: $enteringCode) {
+            JoinGroupSheet(sync: sync)
+        }
+        .confirmationDialog("Remove \(removing?.name ?? "")?", isPresented: Binding(
+            get: { removing != nil }, set: { if !$0 { removing = nil } })) {
+            Button("Remove Contact", role: .destructive) {
+                guard let contact = removing else { return }
+                run { try await sync.remove(contact) }
+            }
+        } message: {
+            Text("This deletes everything you've sent each other, for both of you.")
+        }
+    }
+
+    private func request() {
+        let name = username.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty, !busy else { return }
+        run {
+            let sent = try await sync.requestContact(username: name)
+            username = ""
+            info = "Request sent to \(sent.name)."
+        }
+    }
+
+    private func run(_ operation: @escaping () async throws -> Void) {
+        busy = true
+        error = nil
+        info = nil
         Task {
             do {
                 try await operation()
@@ -777,7 +954,7 @@ private struct SyncAccountSection: View {
         } header: {
             Text("Account")
         } footer: {
-            Text("Signing out removes group items from this Mac; your own history stays. Changing the password signs out your other devices.")
+            Text("Signing out removes group and contact items from this Mac; your own history stays. Changing the password signs out your other devices.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -853,7 +1030,7 @@ private struct DeleteAccountSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Delete Sync Account").font(.headline)
-            Text("Permanently deletes your account, your synced history, labelled items, snippets and secrets, and the groups you own (for all their members). Items on this Mac stay. This can't be undone.")
+            Text("Permanently deletes your account, your synced history, labelled items, snippets and secrets, the groups you own (for all their members) and everything you and your contacts sent each other. Items on this Mac stay. This can't be undone.")
                 .fixedSize(horizontal: false, vertical: true)
             SecureField("Password", text: $password).textContentType(.password)
             if let error {

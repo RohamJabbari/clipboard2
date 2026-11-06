@@ -136,6 +136,9 @@ final class AppEnvironment {
         // they're never deleted on other devices.
         sync.onSessionChange = { [weak self] active in self?.setSendToGroupShortcut(active: active) }
         sync.onItemSentHere = { device in HUD.show("Sent from \(device)", symbol: "arrow.down.circle.fill") }
+        // Contacts: a quiet notice, never a dialog. The Inbox and Settings → Sync hold the rest.
+        sync.onContactArrivals = { text in HUD.show(text, symbol: "tray.and.arrow.down.fill", duration: .seconds(3)) }
+        sync.onContactRequest = { text in HUD.show(text, symbol: "person.crop.circle.badge.plus", duration: .seconds(3)) }
         applyAppearance()
         if let storeOpenError {
             // On the stand-in store: no capture, no sync, no sweeps (they'd delete every file).
