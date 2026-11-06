@@ -819,9 +819,11 @@ public sealed class QuickPanelWindow : Window
         grid.Children.Add(image);
         var section = new StackPanel { Margin = new Thickness(14, 0, 14, 10) };
         var header = new DockPanel { Margin = new Thickness(0, 0, 0, 4) };
-        var copy = new Button { Content = "Copy Text", FontSize = 12, Padding = new Thickness(8, 2, 8, 2) };
+        var copy = new Button { Content = "Copy", FontSize = 12, Padding = new Thickness(8, 1, 8, 1), ToolTip = "Copy the text in the image" };
+        AutomationName(copy, "Copy the text in the image");
         var text = item.OcrText;
-        copy.Click += (_, _) => { _services.CopyText(text); Model.ShowNotice("Copied the text in the image"); };
+        // Written with the internal marker (ClipboardIO.WriteText), so it isn't captured as a new item.
+        copy.Click += (_, _) => { _services.CopyText(text); Model.ShowNotice("Copied text"); };
         DockPanel.SetDock(copy, Dock.Right);
         header.Children.Add(copy);
         header.Children.Add(Fluent.Label("Text in image", 12, Fluent.Secondary, FontWeights.SemiBold));
