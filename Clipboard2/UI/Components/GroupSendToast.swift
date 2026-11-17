@@ -271,4 +271,6 @@ private extension Duration {
 /// A hosting view whose buttons work on the first click, even while another app is active.
 final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    // Spelled out: Swift 6.2's optimizer crashes generating the implicit one (Release only).
+    deinit {}
 }
