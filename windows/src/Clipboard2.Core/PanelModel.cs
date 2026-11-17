@@ -69,6 +69,8 @@ public abstract record PanelAction
     public sealed record SendTo(string DeviceId, string DeviceName) : PanelAction;
     /// <summary>Sends a copy into a contact's space: it shows up in their Inbox.</summary>
     public sealed record SendToContact(string SpaceId, string ContactName) : PanelAction;
+    /// <summary>The large preview (Ctrl+Y).</summary>
+    public sealed record Preview : PanelAction;
     public sealed record Delete : PanelAction;
 
     public string Section(string aiName) => this switch
@@ -101,6 +103,7 @@ public abstract record PanelAction
         ShareTo s => s.GroupName,
         SendTo d => $"Send to {d.DeviceName}",
         SendToContact c => $"Send to {c.ContactName}",
+        Preview => "Preview",
         _ => "Delete",
     };
 }
@@ -185,7 +188,7 @@ public sealed class SaveSecretForm(ClipItem item)
 }
 
 [Flags] public enum KeyMods { None = 0, Ctrl = 1, Shift = 2, Alt = 4 }
-public enum PanelKey { Other, Escape, Up, Down, PageUp, PageDown, Enter, Tab, Delete, Digit, Letter }
+public enum PanelKey { Other, Escape, Up, Down, Left, Right, PageUp, PageDown, Enter, Tab, Delete, Digit, Letter }
 
 /// <summary>A key press, mapped from the UI framework so the logic is testable anywhere.</summary>
 public readonly record struct KeyInput(PanelKey Key, KeyMods Mods = KeyMods.None, int Digit = 0, char Letter = '\0')
@@ -204,7 +207,16 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     public event Action? Changed;
     /// <summary>A group was picked in the filter row; the host fetches what members sent since the last sync.</summary>
     public event Action? GroupFilterSelected;
-    private void Notify() => Changed?.Invoke();
+    private void Notify()
+    {
+        // The preview follows the selection: a different item (or other picked files) starts at its first page.
+        if (IsPreviewing && PreviewSelectionKey is var key && key != _previewKey)
+        {
+            _previewKey = key;
+            PreviewIndex = 0;
+        }
+        Changed?.Invoke();
+    }
 
     public string Query { get; private set; } = "";
     public PanelFilter Filter { get; private set; } = PanelFilter.All;
@@ -257,6 +269,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         ResetMode();
         Notice = null;
         TargetApp = target;
+        IsPreviewing = false;
         Query = "";
         Filter = PanelFilter.All;
         GroupFilter = null;
@@ -279,6 +292,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     public void DidClose()
     {
+        IsPreviewing = false;
         SelectionItem = null;
         ClearPickedFiles();
         ResetMode();
@@ -594,6 +608,73 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             ? ClipItem.From(ProcessedCapture.ForFiles(files, item.Source), item.LastCopiedAt)
             : item;
 
+    // MARK: Large preview
+
+    /// <summary>The large preview (Ctrl+Y) is open; the app shows <see cref="CurrentPreviewPage"/> in its own window.</summary>
+    public bool IsPreviewing { get; private set; }
+    /// <summary>The page shown, in <see cref="PreviewPages"/>.</summary>
+    public int PreviewIndex { get; private set; }
+    private string? _previewKey;
+
+    /// <summary>What the selection previews: every selected clip (in list order), one page per file of a file item
+    /// (only the picked ones when some are). Secrets and snippets have none.</summary>
+    public List<PreviewPage> PreviewPages =>
+        ItemPreview.Pages(IsMultiSelecting ? SelectedClips : SelectedEntry?.ClipItem is { } item ? [ItemForUse(item)] : []);
+
+    public bool CanPreview => PreviewPages.Count > 0;
+
+    public PreviewPage? CurrentPreviewPage => PreviewPages is { Count: > 0 } pages ? pages[Math.Clamp(PreviewIndex, 0, pages.Count - 1)] : null;
+
+    /// <summary>"2 of 5" with several pages, else null.</summary>
+    public string? PreviewPosition => PreviewPages.Count is var count and > 1 ? $"{Math.Clamp(PreviewIndex, 0, count - 1) + 1} of {count}" : null;
+
+    /// <summary>Why the selection has nothing to preview.</summary>
+    public string PreviewUnavailableReason => SelectedEntry switch
+    {
+        _ when IsMultiSelecting => "Nothing to preview",
+        PanelEntry.SecretEntry => "Secrets aren't previewed",
+        PanelEntry.SnippetEntry => "Snippets aren't previewed",
+        _ => "Nothing to preview",
+    };
+
+    private string PreviewSelectionKey => string.Join(",", SelectedIds.Order()) + "|" + string.Join("\n", PickedFiles);
+
+    public void TogglePreview()
+    {
+        if (IsPreviewing) ClosePreview(); else OpenPreview();
+    }
+
+    public void OpenPreview()
+    {
+        if (!CanPreview)
+        {
+            ShowNotice(PreviewUnavailableReason);
+            return;
+        }
+        IsPreviewing = true;
+        _previewKey = PreviewSelectionKey;
+        PreviewIndex = 0;
+        Notify();
+    }
+
+    public void ClosePreview()
+    {
+        if (!IsPreviewing) return;
+        IsPreviewing = false;
+        Notify();
+    }
+
+    /// <summary>Next or previous page; stops at either end.</summary>
+    public void StepPreview(int delta)
+    {
+        var count = PreviewPages.Count;
+        if (!IsPreviewing || count == 0) return;
+        var next = Math.Clamp(PreviewIndex + delta, 0, count - 1);
+        if (next == PreviewIndex) return;
+        PreviewIndex = next;
+        Notify();
+    }
+
     // MARK: Quick slots
 
     /// <summary>The Ctrl+number shown on a row: its slot, or its position if that number is free.</summary>
@@ -845,6 +926,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 List<PanelAction> multi = [new PanelAction.Paste()];
                 if (clips.All(c => c.Kind.IsTextual())) multi.AddRange([new PanelAction.PastePlain(), new PanelAction.Copy(), .. TransformActions]);
                 else multi.Add(new PanelAction.Copy());
+                if (CanPreview) multi.Add(new PanelAction.Preview());
                 if (CanShare) multi.Add(new PanelAction.ShareToGroup());
                 multi.AddRange(ContactActions(null));
                 multi.AddRange(SaveActions);
@@ -865,8 +947,9 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                     {
                         actions.AddRange(TransformActions);
                         actions.AddRange(AIActions);
-                        actions.Add(new PanelAction.SaveAsSecret());
                     }
+                    if (CanPreview) actions.Add(new PanelAction.Preview());
+                    if (c.Item.Kind.IsTextual()) actions.Add(new PanelAction.SaveAsSecret());
                     actions.Add(new PanelAction.SetLabel());
                     if (IsPinnedWithoutLabel(c.Item)) actions.Add(new PanelAction.RemoveFromLabelled());
                     actions.AddRange(SaveActions);
@@ -980,6 +1063,10 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             case PanelAction.SendToContact send when item is not null:
                 SendToContact(item, send);
                 break;
+            case PanelAction.Preview:
+                Mode = PanelMode.Browse;
+                OpenPreview();
+                break;
             case PanelAction.Delete:
                 Mode = PanelMode.Browse;
                 DeleteSelection(includingSecrets: true);
@@ -1045,6 +1132,10 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 ResetMode();
                 Refresh();
                 ShowNotice($"Sent {clips.Count} items to {send.ContactName}");
+                break;
+            case PanelAction.Preview:
+                Mode = PanelMode.Browse;
+                OpenPreview();
                 break;
             case PanelAction.Delete:
                 Mode = PanelMode.Browse;
@@ -1224,11 +1315,17 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         switch (key.Key)
         {
             case PanelKey.Escape:
-                // Picked files are let go first; the next Escape closes.
-                if (PickedFiles.Count > 0) ClearPickedFiles(); else host.ClosePanel();
+                // The preview closes first, then picked files are let go; the next Escape closes.
+                if (IsPreviewing) ClosePreview();
+                else if (PickedFiles.Count > 0) ClearPickedFiles();
+                else host.ClosePanel();
                 return true;
             case PanelKey.Up: MoveSelection(-1, key.Shift); return true;
             case PanelKey.Down: MoveSelection(1, key.Shift); return true;
+            // ←/→ page through the preview; otherwise they move the caret in the search box.
+            case PanelKey.Left or PanelKey.Right when IsPreviewing:
+                StepPreview(key.Key == PanelKey.Right ? 1 : -1);
+                return true;
             case PanelKey.PageUp: MoveSelection(-8, key.Shift); return true;
             case PanelKey.PageDown: MoveSelection(8, key.Shift); return true;
             case PanelKey.Enter:
@@ -1248,6 +1345,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 switch (char.ToLowerInvariant(key.Letter))
                 {
                     case 'k': OpenActions(); return true;
+                    case 'y': TogglePreview(); return true;
                     case 'a' when Query.Length == 0: SelectAll(); return true;
                     case ',':
                         host.ClosePanel();
@@ -1319,6 +1417,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             case PanelKey.Enter:
                 if (AIRun?.IsFinished == true) PasteAIOutput();
                 return true;
+            case PanelKey.Left or PanelKey.Right:
+                return false;   // the caret in the output, as before ←/→ were mapped
             case PanelKey.Letter when key.Ctrl:
                 if (char.ToLowerInvariant(key.Letter) == 'c') CopyAIOutput();
                 if (char.ToLowerInvariant(key.Letter) == 'r') ReplaceItemWithAIOutput();

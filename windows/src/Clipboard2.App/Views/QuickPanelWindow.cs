@@ -123,7 +123,7 @@ public sealed class QuickPanelWindow : Window
         Content = new Border { Background = Fluent.PanelBackground, Child = root };
 
         PreviewKeyDown += OnPreviewKeyDown;
-        Deactivated += (_, _) => { if (IsVisible) CloseAfterDeactivation(); };
+        Deactivated += (_, _) => OwnWindowDeactivated();
         Model.Changed += QueueRender;
         _services.StoreChanged += () => Dispatcher.BeginInvoke(() => { if (IsVisible) Model.Refresh(); });
         _services.Sync.Changed += () => Dispatcher.BeginInvoke(_syncStatus.Update);
@@ -171,8 +171,18 @@ public sealed class QuickPanelWindow : Window
 
     public void HidePanel()
     {
+        _preview?.HidePreview();
         if (IsVisible) Hide();
     }
+
+    /// <summary>The panel or its preview lost focus. Focus moving between the two isn't leaving the panel; which
+    /// window got it is only known once the activation is done, so this checks a moment later.</summary>
+    public void OwnWindowDeactivated() => Dispatcher.BeginInvoke(() =>
+    {
+        if (IsVisible && !OwnWindowActive) CloseAfterDeactivation();
+    }, System.Windows.Threading.DispatcherPriority.Input);
+
+    private bool OwnWindowActive => IsActive || _preview?.IsActive == true;
 
     /// <summary>Closes when another window is activated, except while the mouse button is held: the user may be
     /// dragging files in from File Explorer. Then it waits for the release, and stays if something was dropped.</summary>
@@ -203,7 +213,7 @@ public sealed class QuickPanelWindow : Window
         {
             if (Native.IsDown(VK_LBUTTON)) return;
             timer.Stop();
-            if (IsVisible && !IsActive) _services.ClosePanel();
+            if (IsVisible && !OwnWindowActive) _services.ClosePanel();
         };
         timer.Start();
     }
@@ -367,16 +377,27 @@ public sealed class QuickPanelWindow : Window
 
     private void OnPreviewKeyDown(object sender, KeyEventArgs e)
     {
+        var input = ToKeyInput(e);
+        // Tab moves between fields inside forms.
+        if (input.Key == PanelKey.Tab && Model.Mode is PanelMode.SnippetForm) return;
+        if (input.Key != PanelKey.Other && Model.HandleKey(input)) e.Handled = true;
+    }
+
+    /// <summary>A WPF key press as the model sees it (the preview window forwards some through this too).</summary>
+    public static KeyInput ToKeyInput(KeyEventArgs e)
+    {
         var key = e.Key == Key.System ? e.SystemKey : e.Key;
         var mods = KeyMods.None;
         if (Keyboard.Modifiers.HasFlag(ModifierKeys.Control)) mods |= KeyMods.Ctrl;
         if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) mods |= KeyMods.Shift;
         if (Keyboard.Modifiers.HasFlag(ModifierKeys.Alt)) mods |= KeyMods.Alt;
-        KeyInput input = key switch
+        return key switch
         {
             Key.Escape => new(PanelKey.Escape, mods),
             Key.Up => new(PanelKey.Up, mods),
             Key.Down => new(PanelKey.Down, mods),
+            Key.Left => new(PanelKey.Left, mods),
+            Key.Right => new(PanelKey.Right, mods),
             Key.PageUp => new(PanelKey.PageUp, mods),
             Key.PageDown => new(PanelKey.PageDown, mods),
             Key.Enter => new(PanelKey.Enter, mods),
@@ -388,9 +409,6 @@ public sealed class QuickPanelWindow : Window
             Key.OemComma => new(PanelKey.Letter, mods, Letter: ','),
             _ => new(PanelKey.Other, mods),
         };
-        // Tab moves between fields inside forms.
-        if (input.Key == PanelKey.Tab && Model.Mode is PanelMode.SnippetForm) return;
-        if (input.Key != PanelKey.Other && Model.HandleKey(input)) e.Handled = true;
     }
 
     // MARK: Rendering
@@ -423,6 +441,28 @@ public sealed class QuickPanelWindow : Window
         RenderDetail();
         RenderHints();
         if (previousMode != Model.Mode) FocusForMode();
+        SyncPreview();
+    }
+
+    // MARK: Large preview
+
+    private PreviewWindow? _preview;
+
+    /// <summary>Opens, updates or closes the preview window to match the model. Closing it hands focus back here.</summary>
+    private void SyncPreview()
+    {
+        if (Model.IsPreviewing)
+        {
+            _preview ??= new PreviewWindow(_services, this);
+            var opening = !_preview.IsVisible;
+            _preview.Update();
+            if (opening) _preview.ShowOver(this);
+        }
+        else if (_preview is { IsVisible: true })
+        {
+            _preview.HidePreview();
+            ReactivateAfterDrop();
+        }
     }
 
     private void RenderChips()
@@ -734,6 +774,17 @@ public sealed class QuickPanelWindow : Window
             menu.Items.Add(Item("Paste as Plain Text", () => Model.Activate(entry, Transform.PlainText)));
             menu.Items.Add(Item("Copy", () => _services.Copy(Model.ItemForUse(item))));
             menu.Items.Add(new Separator());
+            if (item != Model.SelectionItem)
+            {
+                var preview = Item("Preview", () =>
+                {
+                    // Right-clicking one of several selected items previews them all.
+                    if (!(Model.IsMultiSelecting && Model.IsSelected(entry))) Model.Select(entry.Id);
+                    Model.OpenPreview();
+                });
+                preview.InputGestureText = "Ctrl+Y";
+                menu.Items.Add(preview);
+            }
             menu.Items.Add(Item(item.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
             if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Labelled", () => Model.RemoveFromLabelled([item])));
             if (item != Model.SelectionItem)
@@ -1317,10 +1368,14 @@ public sealed class QuickPanelWindow : Window
         _syncStatus.Update();
         _hints.Text = Model.Mode switch
         {
+            PanelMode.Browse when Model.IsPreviewing => "←→ Previous/Next    ↑↓ Choose Item    Enter Paste    Esc Close Preview",
             PanelMode.Browse when Model.PickedFiles.Count > 0 && Model.PickableItem is { } item =>
                 $"Enter Paste {Model.PickedFiles.Count} of {item.Files.Count} files    Ctrl+K Actions    Esc All Files",
-            PanelMode.Browse when Model.IsMultiSelecting => $"Enter Paste {Model.SelectedClips.Count} items    Shift+Enter Plain Text    Ctrl+K Actions    Del Delete    Esc Close",
-            PanelMode.Browse => "Enter Paste    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Shift+1–9 Assign Slot    Tab Filter    Esc Close",
+            PanelMode.Browse when Model.IsMultiSelecting => $"Enter Paste {Model.SelectedClips.Count} items    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Y Preview    Del Delete    Esc Close",
+            // The compact panel has no room for one more hint.
+            PanelMode.Browse when _services.Settings.PanelSize == PanelSize.Compact =>
+                "Enter Paste    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Shift+1–9 Assign Slot    Tab Filter    Esc Close",
+            PanelMode.Browse => "Enter Paste    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Y Preview    Ctrl+Shift+1–9 Assign Slot    Tab Filter    Esc Close",
             PanelMode.Actions when Model.IsPickingGroup => "↑↓ Choose Group    Enter Share    Esc Back",
             PanelMode.Actions => "↑↓ Choose    Enter Run    Esc Back",
             PanelMode.AI => "Enter Paste    Ctrl+C Copy    Ctrl+R Replace Item    Esc Back",
