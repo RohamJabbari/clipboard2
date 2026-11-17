@@ -80,6 +80,7 @@ enum PanelAction: Identifiable, Hashable {
     case paste
     case pastePlain
     case copy
+    case quickLook
     case transform(Transform)
     case ai(AIAction)
     case saveAsSecret
@@ -99,6 +100,7 @@ enum PanelAction: Identifiable, Hashable {
         case .paste: "paste"
         case .pastePlain: "pastePlain"
         case .copy: "copy"
+        case .quickLook: "quickLook"
         case .transform(let t): "transform-" + t.rawValue
         case .ai(let a): "ai-" + a.id
         case .saveAsSecret: "saveAsSecret"
@@ -117,7 +119,7 @@ enum PanelAction: Identifiable, Hashable {
 
     func section(aiName: String) -> String {
         switch self {
-        case .paste, .pastePlain, .copy: "Paste"
+        case .paste, .pastePlain, .copy, .quickLook: "Paste"
         case .transform: "Transform & Paste"
         case .ai, .setUpAI: "Ask \(aiName)"
         case .sendToDevice, .sendToContact: "Send"
@@ -132,6 +134,7 @@ enum PanelAction: Identifiable, Hashable {
         case .paste: "Paste"
         case .pastePlain: "Paste as Plain Text"
         case .copy: "Copy to Clipboard"
+        case .quickLook: "Quick Look"
         case .transform(let t): t.title
         case .ai(.instruction(let text)): "Ask: “\(text)”"
         case .ai(let a): a.title
@@ -154,6 +157,7 @@ enum PanelAction: Identifiable, Hashable {
         case .paste: "doc.on.clipboard"
         case .pastePlain: "doc.plaintext"
         case .copy: "doc.on.doc"
+        case .quickLook: "eye"
         case .transform(let t): t.symbol
         case .ai(let a): a.symbol
         case .saveAsSecret: "key"
@@ -304,7 +308,9 @@ final class PanelViewModel {
         }
     }
     /// Every selected row; more than one after ⌘-click, ⇧-click, ⇧-arrows or ⌘A.
-    private(set) var selectedIDs: Set<String> = []
+    private(set) var selectedIDs: Set<String> = [] {
+        didSet { if selectedIDs != oldValue { onQuickLookItemsChanged() } }
+    }
     @ObservationIgnored private var anchorID: String?
     @ObservationIgnored private var adjustingSelection = false
     /// Bumped each time the panel opens so the view can refocus the search field.
@@ -334,6 +340,7 @@ final class PanelViewModel {
 
     init(env: AppEnvironment) {
         self.env = env
+        quickLookFiles = QuickLookFiles(blobs: env.blobs, directory: AppPaths.quickLookDirectory)
     }
 
     // MARK: Lifecycle
@@ -389,7 +396,9 @@ final class PanelViewModel {
 
     /// Files chosen in the preview of the selected multi-file item. While some (not all) are
     /// chosen, paste, copy, save and drag use only those; the item itself is unchanged.
-    private(set) var pickedFiles: Set<URL> = []
+    private(set) var pickedFiles: Set<URL> = [] {
+        didSet { if pickedFiles != oldValue { onQuickLookItemsChanged() } }
+    }
     @ObservationIgnored private var pickedFileAnchor: URL?
 
     /// Click toggles a file, ⇧-click adds the range from the last clicked one.
@@ -1047,6 +1056,56 @@ final class PanelViewModel {
         save(items, to: folder)
     }
 
+    // MARK: Quick Look
+
+    /// Writes text items out for Quick Look and finds the files of the rest.
+    @ObservationIgnored var quickLookFiles: QuickLookFiles
+    /// Set by the controller: whether the Quick Look panel is up.
+    @ObservationIgnored var isQuickLookOpen: () -> Bool = { false }
+    /// Set by the controller: shows (true) or closes (false) the Quick Look panel.
+    @ObservationIgnored var onQuickLook: (Bool) -> Void = { _ in }
+    /// Set by the controller: the selection (or the files picked in it) changed, so an open
+    /// Quick Look panel follows it.
+    @ObservationIgnored var onQuickLookItemsChanged: () -> Void = {}
+
+    /// Selected entries in list order; snippets and secrets are never previewed.
+    private var quickLookEntries: [PanelEntry] {
+        if isMultiSelecting { return selectedClips.map(PanelEntry.clip) }
+        return selectedEntry.map { [$0] } ?? []
+    }
+
+    /// Something in the selection can be shown in Quick Look (⌘Y).
+    var canQuickLook: Bool {
+        quickLookEntries.contains { entry in
+            entry.clip.map { !$0.isTransient } == true && quickLookFiles.canPreview(entry)
+        }
+    }
+
+    /// What Quick Look shows for the selection: every selected item, and only the picked files
+    /// of a multi-file item.
+    func quickLookURLs() -> [URL] {
+        let entries = quickLookEntries.filter { $0.clip?.isTransient == false }
+        return quickLookFiles.urls(for: entries) { self.pickedFileURLs(for: $0) ?? $0.fileURLs }
+    }
+
+    /// ⌘Y: opens Quick Look on the selection, or closes it.
+    func toggleQuickLook() {
+        if isQuickLookOpen() {
+            onQuickLook(false)
+        } else if canQuickLook {
+            if mode == .actions { mode = .browse }
+            onQuickLook(true)
+        } else {
+            NSSound.beep()
+        }
+    }
+
+    /// The row menu's Quick Look: previews the row (with the rest of the selection, if it's part of one).
+    func quickLook(_ entry: PanelEntry) {
+        if !isSelected(entry) { selectedID = entry.id }
+        if !isQuickLookOpen() { toggleQuickLook() }
+    }
+
     // MARK: Drag and drop
 
     /// Called after a drop was accepted, so the panel takes keyboard focus back (a drag from
@@ -1132,6 +1191,7 @@ final class PanelViewModel {
             } else {
                 actions.append(.copy)
             }
+            if canQuickLook { actions.append(.quickLook) }
             if canShareToGroup { actions.append(.shareToGroup) }
             actions += sendToContactActions
             return actions + [.saveToFolder, .saveToChosenFolder, .delete]
@@ -1150,6 +1210,7 @@ final class PanelViewModel {
         case .clip(let item):
             if item.kind.isTextual { actions.append(.pastePlain) }
             actions.append(.copy)
+            if canQuickLook { actions.append(.quickLook) }
             if item.kind.isTextual {
                 actions += Transform.allCases.filter { $0 != .plainText }.map(PanelAction.transform)
                 actions += aiActions
@@ -1274,6 +1335,8 @@ final class PanelViewModel {
         case .sendToContact(let contact):
             guard let item = entry.clip else { return }
             send([item], to: contact)
+        case .quickLook:
+            toggleQuickLook()
         case .setUpAI:
             onClose()
             SettingsOpener.open()
@@ -1307,6 +1370,8 @@ final class PanelViewModel {
         case .copy:
             env.paste.write(clips, transform: nil)
             onClose()
+        case .quickLook:
+            toggleQuickLook()
         case .transform(let transform):
             let parts = clips.map { transform.apply($0.text) }
             guard parts.allSatisfy({ $0 != nil }) else {
@@ -1425,7 +1490,8 @@ final class PanelViewModel {
 
         switch event.keyCode {
         case KeyCode.escape:
-            onClose()
+            // Quick Look closes first; the panel on the next press.
+            if isQuickLookOpen() { onQuickLook(false) } else { onClose() }
             return true
         case KeyCode.upArrow:
             moveSelection(by: -1, extending: shift)
@@ -1480,6 +1546,9 @@ final class PanelViewModel {
                 return true
             case "e":
                 beginEditing()
+                return true
+            case "y":
+                toggleQuickLook()
                 return true
             case ",":
                 onClose()

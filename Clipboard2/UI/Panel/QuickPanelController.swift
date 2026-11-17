@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import QuartzCore
+import Quartz
 import os
 
 /// Borderless, non-activating panel: it takes keyboard focus without making Clipboard2 the active
@@ -30,6 +31,24 @@ final class QuickPanel: NSPanel {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    // Quick Look looks for its controller along the key window's responder chain.
+    weak var quickLook: QuickLookPreview?
+
+    // AppKit calls these on the main thread.
+    nonisolated override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
+        MainActor.assumeIsolated { quickLook != nil }
+    }
+
+    nonisolated override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        nonisolated(unsafe) let panel = panel
+        MainActor.assumeIsolated { if let panel { quickLook?.beginControl(panel) } }
+    }
+
+    nonisolated override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        nonisolated(unsafe) let panel = panel
+        MainActor.assumeIsolated { if let panel { quickLook?.endControl(panel) } }
+    }
 }
 
 /// The window's transparent root. Clicks that land on the shadow halo (not on the panel) close it.
@@ -62,6 +81,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
     /// While the mouse is held down in another app after the panel lost focus (a possible drag in).
     private var resignWatch: Timer?
     private var lastDropAt: Date?
+    private let quickLook = QuickLookPreview()
 
     // View tree: root → [shadowView (our own layers), morphView → shell (material) → hosting].
     private var root: PanelRootView?
@@ -117,6 +137,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
             guard let self, let panel = self.panel, self.isVisible else { return }
             panel.makeKey()
         }
+        setUpQuickLook()
         // Touch ID takes key focus; take it back afterwards if the panel is still meant to be up.
         authObserver = NotificationCenter.default.addObserver(forName: SecretStore.authenticationEnded, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
@@ -250,6 +271,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
             return
         }
         removeKeyMonitor()
+        quickLook.close()
         model.didClose()
         env.sync.setPanelOpen(false)
         resignWatch?.invalidate()
@@ -530,6 +552,11 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         // The Touch ID / password sheet steals focus; that isn't the user leaving the panel.
         if env.secrets.isAuthenticating || model.isChoosingFolder { return }
         guard isVisible else { return }
+        // Quick Look taking key isn't the user leaving the panel; leaving both of them is.
+        if quickLook.isVisible {
+            closeIfFocusLeft()
+            return
+        }
         // A mouse button is down in another app: maybe the start of a drag from Finder into the
         // panel. Decide when the button comes up; a drop takes focus back by then.
         if NSEvent.pressedMouseButtons & 1 != 0 {
@@ -538,6 +565,48 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         }
         Log.panel.debug("panel lost key focus; closing")
         close()
+    }
+
+    // MARK: Quick Look
+
+    private func setUpQuickLook() {
+        model.quickLookFiles.removeAll()   // anything left over from a crash
+        quickLook.urlsProvider = { [model] in model.quickLookURLs() }
+        quickLook.handleKey = { [model] event in model.handleKeyDown(event) }
+        quickLook.onEnd = { [weak self] in
+            guard let self else { return }
+            self.model.quickLookFiles.removeAll()
+            // Quick Look may have had the keyboard: hand it back to the panel.
+            if let panel = self.panel, self.isVisible, !panel.isKeyWindow { panel.makeKey() }
+        }
+        quickLook.onResignKey = { [weak self] in self?.closeIfFocusLeft() }
+        model.isQuickLookOpen = { [quickLook] in quickLook.isVisible }
+        model.onQuickLook = { [weak self] open in
+            guard let self else { return }
+            if open {
+                guard let panel = self.panel, self.isVisible else { return }
+                panel.makeKey()   // Quick Look finds its controller through the key window
+                self.quickLook.show(above: panel)
+            } else {
+                self.quickLook.close()
+            }
+        }
+        model.onQuickLookItemsChanged = { [quickLook] in quickLook.selectionChanged() }
+    }
+
+    /// Focus moved between the panel and Quick Look, or away from both: once it settles, close
+    /// everything if neither has it, and take it back if Quick Look just closed.
+    private func closeIfFocusLeft() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self, self.isVisible, let panel = self.panel, !panel.isKeyWindow, !self.quickLook.isKey else { return }
+            if self.env.secrets.isAuthenticating || self.model.isChoosingFolder { return }
+            if self.quickLook.isVisible {
+                Log.panel.debug("panel and Quick Look lost key focus; closing")
+                self.close()
+            } else {
+                panel.makeKey()
+            }
+        }
     }
 
     private func watchForDragEnd() {
@@ -568,6 +637,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
     private func makePanel() -> QuickPanel {
         let panel = QuickPanel()
         panel.delegate = self
+        panel.quickLook = quickLook
 
         let root = PanelRootView(frame: NSRect(origin: .zero, size: panel.frame.size))
         root.wantsLayer = true

@@ -64,6 +64,7 @@ struct QuickPanelView: View {
                     canEditText: model.selectedEntry?.clip.map(model.isEditable) ?? false,
                     selectionCount: model.isMultiSelecting ? model.selectedClips.count : nil,
                     pickedFiles: model.pickedFileCount,
+                    canQuickLook: model.canQuickLook,
                     updateVersion: env.updates.readyVersion,
                     syncIndicator: env.sync.indicator,
                     onUpdate: { env.updates.installNow() },
@@ -239,6 +240,9 @@ struct QuickPanelView: View {
         if let item = entry.clip {
             Button("Paste as Plain Text") { model.activate(entry, transform: .plainText) }
             Button("Copy") { model.copy(item) }
+            if !item.isTransient && model.quickLookFiles.canPreview(entry) {
+                Button("Quick Look") { model.quickLook(entry) }
+            }
             Divider()
             Button(item.label == nil ? "Label…" : "Edit Label…") { model.beginLabel(entry) }
             if item.isPinned && item.label == nil {
@@ -669,6 +673,8 @@ struct HintBar: View {
     var selectionCount: Int?
     /// Some files of a multi-file item are picked in the preview: Return pastes only those.
     var pickedFiles: (picked: Int, total: Int)?
+    /// The selection can be shown in Quick Look (⌘Y).
+    var canQuickLook = false
     /// A downloaded update waiting for a relaunch: shown quietly at the trailing end.
     var updateVersion: String?
     /// Sync state, shown as a dot and a few words at the trailing end while signed in.
@@ -698,6 +704,7 @@ struct HintBar: View {
                 }
                 if entry != nil {
                     hint("⌘K", "Actions")
+                    if canQuickLook { hint("⌘Y", "Preview") }
                     if canEditText { hint("⌘E", "Edit") }
                 }
             case .actions:
