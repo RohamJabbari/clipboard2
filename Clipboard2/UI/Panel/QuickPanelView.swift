@@ -35,16 +35,12 @@ struct QuickPanelView: View {
     var body: some View {
         VStack(spacing: 0) {
             searchBar
-            FilterChips(selection: $model.filter, groupSelection: $model.groupFilter, groups: env.sync.groups,
+            FilterChips(selection: $model.filter, groupSelection: $model.groupFilter,
+                        groupShowsSaved: $model.groupShowsSaved, groups: env.sync.groups,
                         showsInbox: !model.sendableContacts.isEmpty,
                         thisAppName: model.targetRef?.name, dropModel: model)
                 .padding(.horizontal, 14)
                 .padding(.bottom, 10)
-            if model.groupFilter != nil {
-                GroupViewSwitch(showsSaved: $model.groupShowsSaved)
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 8)
-            }
             Hairline()
             HStack(spacing: 0) {
                 VStack(spacing: 0) {
@@ -230,7 +226,7 @@ struct QuickPanelView: View {
                  commandHeld: model.isCommandHeld,
                  sharing: sharing(for: entry),
                  badge: entry.clip.flatMap(env.sync.badge),
-                 folderCaption: entry.clip.flatMap { model.folderCaptions[$0.id] })
+                 folderCaption: model.folderCaptions[entry.id])
             .id(entry.id)
             // One recogniser reading AppKit's click count: SwiftUI's stacked
             // count:2 / count:1 gestures miss double-clicks in a non-activating panel.
@@ -248,15 +244,17 @@ struct QuickPanelView: View {
             .contextMenu { contextMenu(for: entry) }
             .modifier(ClipDragSource(item: entry.clip.flatMap { $0.isTransient ? nil : $0 },
                                      blobs: env.blobs, pickedFiles: model.pickedFileURLs))
+            .modifier(SecretDragSource(ref: entry.secret))
     }
 
     @ViewBuilder
     private func contextMenu(for entry: PanelEntry) -> some View {
         Button("Paste") { model.activate(entry) }
-        if case .secret = entry {
-            Button("Edit…") { if case .secret(let ref) = entry { model.beginEditSecret(ref) } }
+        if let ref = entry.secret {
+            Button("Edit…") { model.beginEditSecret(ref) }
             Button("Rename…") { model.beginLabel(entry) }
-            if case .secret(let ref) = entry, model.canShareToGroup, env.sync.groups.contains(where: { $0.id != ref.spaceID }) {
+            folderMenuItems(for: entry)
+            if model.canShareToGroup, env.sync.groups.contains(where: { $0.id != ref.spaceID }) {
                 Button("Share to Group…") { model.beginShareSecret(ref) }
             }
         }
@@ -319,30 +317,53 @@ struct QuickPanelView: View {
         model.refresh()
     }
 
-    /// Add to / Remove from Saved, Move to Folder ▸ and Remove from Folder, for the row or the
-    /// selection it's part of.
+    /// Add to Saved (or Save a Copy), Remove from Saved, Move to Folder ▸ and Remove from Folder,
+    /// for the row or the selection it's part of.
     @ViewBuilder
     private func savedMenuItems(for entry: PanelEntry, item: ClipItem) -> some View {
         let clips = model.clipsForContextAction(on: entry).filter { !$0.isTransient }
         if !clips.isEmpty {
-            if clips.contains(where: { !$0.isPinned }) {
+            let changeable = clips.allSatisfy(env.sync.canChange)
+            if changeable && clips.contains(where: { !$0.isPinned }) {
                 Button("Add to Saved") { model.addToSaved(clips) }
             }
-            if model.canMoveToFolder(clips) {
-                Menu("Move to Folder") {
-                    ForEach(model.folderTargets(for: clips)) { folder in
-                        Button(folder.name) { model.move(clips, to: folder) }
-                    }
-                    if !model.folderTargets(for: clips).isEmpty { Divider() }
-                    Button("New Folder…") { model.beginNewFolder(moving: clips) }
-                }
+            if !changeable {
+                Button("Save a Copy") { model.saveCopies(clips) }
             }
-            if clips.contains(where: { model.folder(of: $0) != nil }) {
-                Button("Remove from Folder") { model.removeFromFolder(clips) }
-            }
-            if clips.contains(where: { $0.isPinned && $0.label == nil }) {
+            folderMenuItems(for: entry)
+            if changeable && clips.contains(where: { $0.isPinned && $0.label == nil }) {
                 Button("Remove from Saved") { model.removeFromSaved(clips) }
             }
+        }
+    }
+
+    /// Move to Folder ▸ (the group's folders under its name, yours under "Mine") and Remove from
+    /// Folder, for a clip or secret row or the selection it's part of.
+    @ViewBuilder
+    private func folderMenuItems(for entry: PanelEntry) -> some View {
+        let (clips, secrets) = model.itemsForContextAction(on: entry)
+        if let menu = model.folderMenu(for: clips, secrets: secrets) {
+            Menu("Move to Folder") {
+                if let group = menu.group {
+                    Section(group.name) {
+                        ForEach(group.folders) { folder in
+                            Button(folder.name) { model.place(clips, secrets: secrets, in: folder) }
+                        }
+                        Button("New Folder…") { model.beginNewFolder(moving: clips, secrets: secrets) }
+                    }
+                }
+                if menu.copiesToPersonal {
+                    Section("Mine") { personalFolderItems(menu, clips: clips, secrets: secrets) }
+                } else {
+                    personalFolderItems(menu, clips: clips, secrets: secrets)
+                }
+            }
+        }
+        let inFolder = clips.contains { model.folder(of: $0) != nil } || secrets.contains { model.folder(of: $0) != nil }
+        let changeable = clips.allSatisfy(env.sync.canChange)
+            && secrets.allSatisfy { env.sync.canChange(itemID: $0.id, spaceID: $0.spaceID) }
+        if inFolder && changeable {
+            Button("Remove from Folder") { model.removeFromFolder(clips, secrets: secrets) }
         }
     }
 
@@ -356,6 +377,15 @@ struct QuickPanelView: View {
         }
         Divider()
         Button("Delete Folder", role: .destructive) { model.deleteFolder(folder) }
+    }
+
+    @ViewBuilder
+    private func personalFolderItems(_ menu: PanelViewModel.FolderMenu, clips: [ClipItem], secrets: [SecretRef]) -> some View {
+        ForEach(menu.personal) { folder in
+            Button(folder.name) { model.place(clips, secrets: secrets, in: folder) }
+        }
+        if !menu.personal.isEmpty { Divider() }
+        Button("New Folder…") { model.beginNewFolder(moving: clips, secrets: secrets, personal: menu.copiesToPersonal) }
     }
 
     /// "Send to ‹contact›" for the row (or the selection it's part of); a submenu once there are many.
@@ -426,22 +456,37 @@ struct QuickPanelView: View {
 
 // MARK: - Filter chips
 
-/// Every filter in one row, then the sync groups.
+/// Every filter in one row, then the sync groups. The selected group's chip grows into a pill
+/// with its Copies | Saved segments.
 struct FilterChips: View {
     @Binding var selection: PanelFilter
     @Binding var groupSelection: String?
+    /// The selected group's segment: its Saved (true) or its Copies.
+    @Binding var groupShowsSaved: Bool
     var groups: [SyncGroup] = []
     /// The Inbox chip: what contacts sent you. Only once there are contacts.
     var showsInbox = false
     let thisAppName: String?
     /// When set, group chips accept dropped history items and files and share them to the group.
     var dropModel: PanelViewModel?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         if groups.isEmpty && !showsInbox {
             chips
         } else {
-            ScrollView(.horizontal, showsIndicators: false) { chips }
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) { chips }
+                    // A pill that opens near the trailing edge slides into view as it grows.
+                    .onChange(of: groupSelection) { _, id in
+                        guard let id else { return }
+                        if reduceMotion {
+                            proxy.scrollTo(id)
+                        } else {
+                            withAnimation(ChipMotion.morph) { proxy.scrollTo(id) }
+                        }
+                    }
+            }
         }
     }
 
@@ -461,19 +506,19 @@ struct FilterChips: View {
                     .accessibilityHidden(true)
             }
             ForEach(groups) { group in
-                let select = {
+                GroupChip(group: group, selected: groupSelection == group.id, showsSaved: $groupShowsSaved,
+                          dropModel: dropModel) {
                     groupSelection = group.id
                     selection = .all
                 }
-                if let dropModel {
-                    GroupDropChip(group: group, selected: groupSelection == group.id, model: dropModel, action: select)
-                } else {
-                    FilterChip(title: group.name, symbol: "person.2.fill", tint: .purple, selected: groupSelection == group.id,
-                               action: select)
-                }
+                .id(group.id)
             }
             Spacer(minLength: 0)
         }
+        // The morph runs however the selection changes: a click or ⇥ (opening the panel resets it
+        // without animating).
+        .animation(reduceMotion ? nil : ChipMotion.morph, value: groupSelection)
+        .animation(reduceMotion ? nil : ChipMotion.morph, value: groupShowsSaved)
     }
 
     private func title(for filter: PanelFilter) -> String {
@@ -482,21 +527,132 @@ struct FilterChips: View {
     }
 }
 
-/// A group chip that's also a drop target: drag a row (or files from Finder) onto it to share.
-private struct GroupDropChip: View {
+/// The filter row's motion: one spring for the group pill opening, closing and its segment
+/// highlight sliding. Critically damped enough not to overshoot, quick enough to feel direct.
+enum ChipMotion {
+    static let morph = Animation.spring(response: 0.35, dampingFraction: 0.9)
+    /// The segment labels wait for the pill to start widening, then fade in.
+    static let labelsIn = Animation.easeOut(duration: 0.2).delay(0.08)
+    /// On the way back they go first, quickly, so the pill closes on its own name.
+    static let labelsOut = Animation.easeIn(duration: 0.1)
+    static let tint = Color.purple
+}
+
+/// A sync group in the filter row. Unselected it's a compact chip; selected it grows into one
+/// pill — the group, then **Copies · Saved** — with the active segment filled and its highlight
+/// sliding between them. Also a drop target: drop a row or a file on it to share it.
+struct GroupChip: View {
     let group: SyncGroup
     let selected: Bool
-    let model: PanelViewModel
-    let action: () -> Void
-    @State private var targeted = false
+    @Binding var showsSaved: Bool
+    var dropModel: PanelViewModel?
+    let onSelect: () -> Void
+    @State private var dropTargeted = false
+    @Namespace private var segmentSpace
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private let shape = RoundedRectangle(cornerRadius: 8, style: .continuous)
 
     var body: some View {
-        FilterChip(title: group.name, symbol: "person.2.fill", tint: .purple, selected: selected,
-                   dropHighlighted: targeted, action: action)
-            .onDrop(of: [.clipboard2Clip, .fileURL],
-                    delegate: PanelDropDelegate(target: .group(group.id), model: model, isTargeted: $targeted))
-            .help("Click to show \(group.name). Drop an item or a file here to share it.")
-            .accessibilityHint("Drop items here to share them with \(group.name)")
+        let pill = HStack(spacing: 0) {
+            nameButton
+            if selected {
+                segments
+                    .transition(reduceMotion ? .identity
+                                : .asymmetric(insertion: .opacity.animation(ChipMotion.labelsIn),
+                                              removal: .opacity.animation(ChipMotion.labelsOut)))
+            }
+        }
+        .font(.callout.weight(.medium))
+        .lineLimit(1)
+        .fixedSize()
+        .background { background }
+        // The segments are revealed by the growing pill, never drawn outside it.
+        .clipShape(shape)
+        .overlay {
+            if dropTargeted { shape.strokeBorder(ChipMotion.tint.opacity(0.8), lineWidth: 1.5) }
+        }
+        .scaleEffect(dropTargeted && !reduceMotion ? 1.06 : 1)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(group.name) group")
+
+        if let dropModel {
+            pill
+                .onDrop(of: [.clipboard2Clip, .fileURL],
+                        delegate: PanelDropDelegate(target: .group(group.id), model: dropModel, isTargeted: $dropTargeted))
+                .help(selected ? "Drop an item or a file here to share it with \(group.name)."
+                      : "Click to show \(group.name). Drop an item or a file here to share it.")
+                .accessibilityHint("Drop items here to share them with \(group.name)")
+        } else {
+            pill
+        }
+    }
+
+    /// The group's icon and name. Clicking it on an open pill changes nothing.
+    private var nameButton: some View {
+        Button {
+            guard !selected else { return }
+            onSelect()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "person.2.fill").imageScale(.small)
+                Text(group.name)
+            }
+            .padding(.leading, 10)
+            .padding(.trailing, selected ? 4 : 10)
+            .padding(.vertical, 4)
+            .foregroundStyle(ChipMotion.tint)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(group.name) filter")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private var segments: some View {
+        HStack(spacing: 0) {
+            Rectangle()
+                .fill(ChipMotion.tint.opacity(0.3))
+                .frame(width: 1, height: 13)
+                .padding(.trailing, 3)
+                .accessibilityHidden(true)
+            segment("Copies", saved: false)
+            segment("Saved", saved: true)
+        }
+        .padding(.vertical, 2)
+        .padding(.trailing, 2)
+    }
+
+    private func segment(_ title: String, saved: Bool) -> some View {
+        let active = showsSaved == saved
+        return Button {
+            showsSaved = saved
+        } label: {
+            Text(title)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .foregroundStyle(active ? AnyShapeStyle(.white) : AnyShapeStyle(ChipMotion.tint))
+                .background {
+                    if active {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(ChipMotion.tint)
+                            .matchedGeometryEffect(id: "highlight", in: segmentSpace)
+                    }
+                }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(group.name) \(title.lowercased())")
+        .accessibilityAddTraits(active ? [.isButton, .isSelected] : .isButton)
+    }
+
+    @ViewBuilder
+    private var background: some View {
+        if dropTargeted {
+            shape.fill(ChipMotion.tint.opacity(0.16))
+        } else {
+            shape.fill(ChipMotion.tint.opacity(selected ? 0.16 : 0.13))
+        }
     }
 }
 

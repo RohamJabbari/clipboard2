@@ -33,7 +33,7 @@ struct ContentBadge: View {
             case .snippet:
                 symbol("text.badge.star", tint: .pink)
             case .secret:
-                symbol("key.fill", tint: nil)
+                symbol("lock.fill", tint: nil)
             case .folder:
                 symbol("folder.fill", tint: .blue)
             }

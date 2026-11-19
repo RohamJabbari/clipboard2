@@ -9,8 +9,8 @@ protocol SyncSecretSource: AnyObject {
     /// Fresh from the store (not a cached list), with `spaceID` and `updatedAt`.
     var syncSecrets: [SecretRef] { get }
     func syncValue(id: String) -> String?
-    /// Creates the secret with this id, or replaces its name and value.
-    func syncUpsert(id: String, name: String, value: String, spaceID: String?)
+    /// Creates the secret with this id, or replaces its name, value and Saved folder.
+    func syncUpsert(id: String, name: String, value: String, spaceID: String?, folderID: UUID?)
     func syncDelete(id: String)
     /// Called once after a batch of upserts and deletes.
     func syncDidChange()
@@ -802,8 +802,9 @@ final class SyncEngine {
         var received = payload
         received.createdAt = min(received.createdAt, now().syncMillis)
         quietly {
+            // Kept even when that folder isn't here (yet): the secret shows at the root until it is.
             secrets.syncUpsert(id: existing?.id ?? remote.id, name: received.name, value: received.value,
-                               spaceID: localSpaceID(spaceId))
+                               spaceID: localSpaceID(spaceId), folderID: received.folder.flatMap(UUID.init(uuidString:)))
         }
         secretsChanged = true
         let ref = secret(withID: remote.id)
@@ -1047,7 +1048,7 @@ final class SyncEngine {
             // Unchanged since it was last synced: don't read the Keychain to find out.
             if let meta, let stamp, !meta.localStamp.isEmpty, meta.localStamp == stamp { continue }
             guard let value = secrets.syncValue(id: ref.id) else { continue }
-            let payload = SyncPayload.secret(SecretPayload(name: ref.name, value: value, createdAt: (ref.createdAt ?? .now).syncMillis))
+            let payload = SyncPayload.secret(SecretPayload(ref: ref, value: value))
             let updatedAt = max(ref.updatedAt?.syncMillis ?? nowMs, (meta?.updatedAt ?? 0) + 1)
             if let job = makeJob(id: id, payload: payload, meta: meta, sortAt: (ref.createdAt ?? .now).syncMillis,
                                  updatedAt: updatedAt, localStamp: stamp) { jobs.append(job) }
@@ -1394,7 +1395,9 @@ final class SyncEngine {
     /// For secrets with an `updatedAt`: changes whenever the name or value does.
     private static func secretStamp(_ ref: SecretRef) -> String? {
         guard let updated = ref.updatedAt else { return nil }
+        // The folder joins only when set, so secrets outside folders keep the stamps they had.
         let fields = [ref.name, "\(updated.syncMillis)", "\(ref.createdAt?.syncMillis ?? 0)", ref.spaceID ?? ""]
+            + (ref.folderID.map { [$0.uuidString.lowercased()] } ?? [])
         return SyncCrypto.sha256Hex(Data(fields.joined(separator: "\u{1F}").utf8))
     }
 
@@ -1408,7 +1411,7 @@ final class SyncEngine {
 
     private func secretFingerprint(_ ref: SecretRef) -> String? {
         guard let value = secrets.syncValue(id: ref.id) else { return nil }
-        return try? SyncPayload.secret(SecretPayload(name: ref.name, value: value, createdAt: (ref.createdAt ?? .now).syncMillis)).fingerprint()
+        return try? SyncPayload.secret(SecretPayload(ref: ref, value: value)).fingerprint()
     }
 
     // MARK: Local state

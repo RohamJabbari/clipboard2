@@ -81,7 +81,7 @@ as in sync. Older readers ignore both, and those clips import at the root of Sav
 ### `secrets`
 
 Only present when the user ticked "Include secrets" and confirmed with Touch ID or Windows Hello. Each
-entry is a secret payload (`"v":1,"type":"secret","name","value","createdAt"`) plus `"id"`. Personal
+entry is a secret payload (`"v":1,"type":"secret","name","value","createdAt"`, and `"folder"` like a clip's, 1.7+) plus `"id"`. Personal
 secrets only. The values are in the plaintext, protected only by the passphrase.
 
 ## Import

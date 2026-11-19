@@ -154,12 +154,20 @@ nonisolated struct SecretPayload: Codable, Equatable, Sendable {
     var name: String
     var value: String
     var createdAt: Int64
+    /// The id of the Saved folder (a `folder` item) the secret is in, like a clip's.
+    var folder: String?
     var rev: Int64?
 
-    init(name: String, value: String, createdAt: Int64) {
+    init(name: String, value: String, createdAt: Int64, folder: String? = nil) {
         self.name = name
         self.value = value
         self.createdAt = createdAt
+        self.folder = folder
+    }
+
+    init(ref: SecretRef, value: String, now: Date = .now) {
+        self.init(name: ref.name, value: value, createdAt: (ref.createdAt ?? now).syncMillis,
+                  folder: ref.folderID?.uuidString.lowercased())
     }
 
     init(from decoder: any Decoder) throws {
@@ -169,6 +177,7 @@ nonisolated struct SecretPayload: Codable, Equatable, Sendable {
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Untitled"
         value = try c.decodeIfPresent(String.self, forKey: .value) ?? ""
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
+        folder = try c.decodeIfPresent(String.self, forKey: .folder)
         rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
     }
 }

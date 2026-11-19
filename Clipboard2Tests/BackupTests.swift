@@ -26,11 +26,14 @@ func renderTextPNG(_ text: String, width: Int = 520, height: Int = 70) throws ->
 final class FakeSecretSink: BackupSecretSink {
     var stored: [(name: String, value: String)] = []
     var finished = 0
+    /// Folder of each added secret, by name.
+    var folders: [String: UUID] = [:]
 
     init(_ stored: [(name: String, value: String)] = []) { self.stored = stored }
     func existingSecrets() -> [(name: String, value: String)] { stored }
-    func addSecret(name: String, value: String) -> Bool {
+    func addSecret(name: String, value: String, folderID: UUID?) -> Bool {
         stored.append((name, value))
+        folders[name] = folderID
         return true
     }
     func finishImport() { finished += 1 }

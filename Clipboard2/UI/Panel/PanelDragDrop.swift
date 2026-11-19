@@ -7,6 +7,47 @@ extension UTType {
 }
 
 enum PanelDrag {
+    /// What a row drag carries for drops inside the panel: a clip's id, or a secret's (prefixed,
+    /// so it can't be read as a clip). Never the secret's value.
+    enum Reference: Equatable {
+        case clip(UUID)
+        case secret(String)
+
+        static let secretPrefix = "secret:"
+
+        var data: Data {
+            switch self {
+            case .clip(let id): Data(id.uuidString.utf8)
+            case .secret(let id): Data((Self.secretPrefix + id).utf8)
+            }
+        }
+
+        init?(data: Data) {
+            guard let text = String(data: data, encoding: .utf8) else { return nil }
+            if text.hasPrefix(Self.secretPrefix) {
+                let id = String(text.dropFirst(Self.secretPrefix.count))
+                guard !id.isEmpty else { return nil }
+                self = .secret(id)
+            } else if let id = UUID(uuidString: text) {
+                self = .clip(id)
+            } else {
+                return nil
+            }
+        }
+    }
+
+    /// A secret row's drag: only its reference, visible to this process alone.
+    static func provider(for ref: SecretRef) -> NSItemProvider {
+        let provider = NSItemProvider()
+        let data = Reference.secret(ref.id).data
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.clipboard2Clip.identifier, visibility: .ownProcess) { completion in
+            completion(data, nil)
+            return nil
+        }
+        provider.suggestedName = ref.name
+        return provider
+    }
+
     /// What a row carries when dragged: its id for drops inside the panel, plus the content
     /// (text, the file, or the image file) for drops into other apps. A SwiftUI drag carries one
     /// item, so a file item with several files is dragged by `MultiFileDragSource` instead.
@@ -53,6 +94,11 @@ enum PanelDrag {
     }
 
     static func loadClipID(from providers: [NSItemProvider]) async -> UUID? {
+        if case .clip(let id) = await loadReference(from: providers) { return id }
+        return nil
+    }
+
+    static func loadReference(from providers: [NSItemProvider]) async -> Reference? {
         guard let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.clipboard2Clip.identifier) }) else {
             return nil
         }
@@ -61,7 +107,7 @@ enum PanelDrag {
                 continuation.resume(returning: data)
             }
         }
-        return data.flatMap { String(data: $0, encoding: .utf8) }.flatMap(UUID.init(uuidString:))
+        return data.flatMap(Reference.init(data:))
     }
 
     static func loadFileURLs(from providers: [NSItemProvider]) async -> [URL] {
@@ -127,21 +173,24 @@ struct PanelDropDelegate: DropDelegate {
         case .folder(let folderID):
             let providers = info.itemProviders(for: [.clipboard2Clip])
             Task {
-                guard let id = await PanelDrag.loadClipID(from: providers) else { return }
-                model.dropClip(id: id, onFolder: folderID)
+                guard let reference = await PanelDrag.loadReference(from: providers) else { return }
+                model.drop(reference, onFolder: folderID)
             }
         case .savedRoot:
             let providers = info.itemProviders(for: [.clipboard2Clip])
             Task {
-                guard let id = await PanelDrag.loadClipID(from: providers) else { return }
-                model.dropClipOnSavedRoot(id: id)
+                guard let reference = await PanelDrag.loadReference(from: providers) else { return }
+                model.dropOnSavedRoot(reference)
             }
         case .group(let groupID):
             if info.hasItemsConforming(to: [.clipboard2Clip]) {
                 let providers = info.itemProviders(for: [.clipboard2Clip])
                 Task {
-                    guard let id = await PanelDrag.loadClipID(from: providers) else { return }
-                    model.dropClip(id: id, onGroup: groupID)
+                    switch await PanelDrag.loadReference(from: providers) {
+                    case .clip(let id): model.dropClip(id: id, onGroup: groupID)
+                    case .secret(let id): model.dropSecret(id: id, onGroup: groupID)
+                    case nil: break
+                    }
                 }
             } else {
                 let providers = info.itemProviders(for: [.fileURL])
@@ -157,6 +206,20 @@ struct PanelDropDelegate: DropDelegate {
             isTargeted = value
         } else {
             withAnimation(.snappy(duration: 0.15)) { isTargeted = value }
+        }
+    }
+}
+
+/// Makes a secret row draggable onto folder rows, the Saved breadcrumb and group chips (never
+/// out of the panel: it carries no value).
+struct SecretDragSource: ViewModifier {
+    let ref: SecretRef?
+
+    func body(content: Content) -> some View {
+        if let ref {
+            content.onDrag { PanelDrag.provider(for: ref) }
+        } else {
+            content
         }
     }
 }

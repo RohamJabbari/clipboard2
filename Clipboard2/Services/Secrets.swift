@@ -11,11 +11,14 @@ nonisolated struct SecretRef: Identifiable, Hashable, Sendable {
     var spaceID: String? = nil
     /// Keychain modification date (last-write-wins for sync).
     var updatedAt: Date? = nil
+    /// The Saved folder (`ClipFolder.id`) it's in. An id with no folder in its space (deleted, or
+    /// not synced yet) reads as the root of Saved.
+    var folderID: UUID? = nil
 }
 
 /// Secret values live only in the login keychain (one generic-password item each). Names are
 /// stored as the item label so listing never needs to touch the values; a sync group id, if
-/// any, as the generic attribute.
+/// any, as the generic attribute; the Saved folder, if any, as the comment.
 nonisolated enum SecretVault {
     static let service = (Bundle.main.bundleIdentifier ?? "at.softmaze.Clippy") + ".secrets"
 
@@ -38,7 +41,8 @@ nonisolated enum SecretVault {
                 name: attrs[kSecAttrLabel as String] as? String ?? "Untitled",
                 createdAt: attrs[kSecAttrCreationDate as String] as? Date,
                 spaceID: space?.isEmpty == false ? space : nil,
-                updatedAt: attrs[kSecAttrModificationDate as String] as? Date
+                updatedAt: attrs[kSecAttrModificationDate as String] as? Date,
+                folderID: (attrs[kSecAttrComment as String] as? String).flatMap(UUID.init(uuidString:))
             )
         }
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -46,7 +50,8 @@ nonisolated enum SecretVault {
 
     /// `id` is given for secrets that arrive through sync.
     @discardableResult
-    static func add(name: String, value: String, id: String = UUID().uuidString, spaceID: String? = nil) -> SecretRef? {
+    static func add(name: String, value: String, id: String = UUID().uuidString, spaceID: String? = nil,
+                    folderID: UUID? = nil) -> SecretRef? {
         var attributes: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
@@ -56,15 +61,18 @@ nonisolated enum SecretVault {
             kSecValueData: Data(value.utf8),
         ]
         if let spaceID { attributes[kSecAttrGeneric] = Data(spaceID.utf8) }
+        if let folderID { attributes[kSecAttrComment] = folderID.uuidString.lowercased() }
         guard SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess else { return nil }
-        return SecretRef(id: id, name: name, createdAt: .now, spaceID: spaceID, updatedAt: .now)
+        return SecretRef(id: id, name: name, createdAt: .now, spaceID: spaceID, updatedAt: .now, folderID: folderID)
     }
 
+    /// `folder` sets the Saved folder: `.some(nil)` takes the secret out of its folder.
     @discardableResult
-    static func update(id: String, name: String? = nil, value: String? = nil) -> Bool {
+    static func update(id: String, name: String? = nil, value: String? = nil, folder: UUID?? = nil) -> Bool {
         var changes: [CFString: Any] = [:]
         if let name { changes[kSecAttrLabel] = name }
         if let value { changes[kSecValueData] = Data(value.utf8) }
+        if let folder { changes[kSecAttrComment] = folder?.uuidString.lowercased() ?? "" }
         guard !changes.isEmpty else { return true }
         return SecItemUpdate(baseQuery(id) as CFDictionary, changes as CFDictionary) == errSecSuccess
     }
@@ -152,10 +160,24 @@ final class SecretStore {
     }
 
     @discardableResult
-    func add(name: String, value: String, spaceID: String? = nil) -> SecretRef? {
-        let ref = SecretVault.add(name: name, value: value, spaceID: spaceID)
+    func add(name: String, value: String, spaceID: String? = nil, folderID: UUID? = nil) -> SecretRef? {
+        let ref = SecretVault.add(name: name, value: value, spaceID: spaceID, folderID: folderID)
         reload()
         return ref
+    }
+
+    /// Moves secrets into a Saved folder, or (nil) out to the root of Saved. Only the ones whose
+    /// folder actually changes are written, so nothing re-syncs for nothing.
+    func setFolder(_ folderID: UUID?, for refs: [SecretRef]) {
+        let changing = refs.filter { $0.folderID != folderID }
+        guard !changing.isEmpty else { return }
+        for ref in changing { SecretVault.update(id: ref.id, folder: .some(folderID)) }
+        reload()
+    }
+
+    /// Secrets in a folder of their own space.
+    func secrets(inFolder folder: ClipFolder) -> [SecretRef] {
+        secrets.filter { $0.folderID == folder.id && $0.spaceID == folder.spaceID }
     }
 
     func rename(_ ref: SecretRef, to name: String) {

@@ -1040,9 +1040,10 @@ final class FakeSecrets: SyncSecretSource {
 
     var syncSecrets: [SecretRef] { Array(refs.values) }
     func syncValue(id: String) -> String? { values[id] }
-    func syncUpsert(id: String, name: String, value: String, spaceID: String?) {
+    func syncUpsert(id: String, name: String, value: String, spaceID: String?, folderID: UUID?) {
         let created = refs[id]?.createdAt ?? Date(timeIntervalSince1970: 1_000)
-        refs[id] = SecretRef(id: id, name: name, createdAt: created, spaceID: refs[id]?.spaceID ?? spaceID, updatedAt: .now)
+        refs[id] = SecretRef(id: id, name: name, createdAt: created, spaceID: refs[id]?.spaceID ?? spaceID, updatedAt: .now,
+                             folderID: folderID)
         values[id] = value
     }
     func syncDelete(id: String) {
@@ -1051,10 +1052,19 @@ final class FakeSecrets: SyncSecretSource {
     }
     func syncDidChange() {}
 
-    func add(name: String, value: String, spaceID: String? = nil) {
+    @discardableResult
+    func add(name: String, value: String, spaceID: String? = nil, folderID: UUID? = nil) -> String {
         let id = UUID().uuidString
-        refs[id] = SecretRef(id: id, name: name, createdAt: Date(timeIntervalSince1970: 1_000), spaceID: spaceID, updatedAt: .now)
+        refs[id] = SecretRef(id: id, name: name, createdAt: Date(timeIntervalSince1970: 1_000), spaceID: spaceID, updatedAt: .now,
+                             folderID: folderID)
         values[id] = value
+        return id
+    }
+
+    /// Moves a secret into a folder (or out), as the panel does.
+    func setFolder(_ folderID: UUID?, id: String) {
+        refs[id]?.folderID = folderID
+        refs[id]?.updatedAt = .now.addingTimeInterval(1)
     }
 }
 
