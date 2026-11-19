@@ -248,6 +248,19 @@ struct ShareToGroupView: View {
                     .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
                 }
             }
+            if !form.destinations.isEmpty, let group = form.selectedGroup {
+                // The chosen group's folders: the copies can go straight into one.
+                Picker("Into", selection: $form.destinationID) {
+                    Label("\(group.name) · Saved", systemImage: "bookmark").tag(UUID?.none)
+                    Divider()
+                    ForEach(form.destinations) { folder in
+                        Label(folder.name, systemImage: "folder").tag(UUID?.some(folder.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .fixedSize()
+                .help("Where the copies go in \(group.name) (← → to change)")
+            }
             Spacer(minLength: 0)
             HStack {
                 Spacer()

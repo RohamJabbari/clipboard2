@@ -432,7 +432,7 @@ struct FolderPanelTests {
         // Search from the root finds clips in folders, captioned.
         model.query = "inside \(tag)"
         #expect(model.entries.contains { $0.clip?.id == inside.id })
-        #expect(model.folderCaptions[inside.id] == folder.name)
+        #expect(model.folderCaptions[PanelEntry.clip(inside).id] == folder.name)
         model.query = ""
 
         // Return opens the selected folder; esc goes back instead of closing.

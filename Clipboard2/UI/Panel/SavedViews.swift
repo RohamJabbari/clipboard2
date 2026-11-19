@@ -1,24 +1,5 @@
 import SwiftUI
 
-/// All | Saved under the filter row while a group is selected (remembered per group).
-struct GroupViewSwitch: View {
-    @Binding var showsSaved: Bool
-
-    var body: some View {
-        HStack {
-            Picker("Show", selection: $showsSaved) {
-                Text("All").tag(false)
-                Text("Saved").tag(true)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .fixedSize()
-            .accessibilityLabel("Show all of the group's items or only its saved ones")
-            Spacer(minLength: 0)
-        }
-    }
-}
-
 /// "Saved › Folder" and New Folder above the Saved list. Inside a folder, "Saved" goes back and
 /// takes dropped clips out of the folder.
 struct SavedHeader: View {
@@ -115,6 +96,7 @@ struct FolderNameView: View {
                 .font(.headline)
             Text(form.isRename ? "Folders sort by name in Saved."
                  : form.movingCount == 0 ? "A folder in Saved. Drag items onto it, or use Move to Folder."
+                 : form.copies ? "A folder in your Saved. Copies of the selected group items go into it; the group's stay as they are."
                  : form.movingCount == 1 ? "The selected item moves into it and stays saved."
                  : "The \(form.movingCount) selected items move into it and stay saved.")
                 .font(.callout)
