@@ -35,6 +35,8 @@ public sealed class QuickPanelWindow : Window
     private readonly TextBlock _notice = Fluent.Label("", 12);
     private readonly SyncStatusBadge _syncStatus;
     private readonly IncomingDownloadBanner _incoming = new();
+    /// <summary>Above the list: a group's All | Saved switch, and in Saved the breadcrumb and New Folder.</summary>
+    private readonly StackPanel _savedBar = new();
     private readonly Dictionary<string, Border> _rowViews = [];
     private List<string> _renderedIds = [];
     private bool _renderQueued;
@@ -90,6 +92,8 @@ public sealed class QuickPanelWindow : Window
         content.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1) });
         content.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(56, GridUnitType.Star) });
         var list = new DockPanel();
+        DockPanel.SetDock(_savedBar, Dock.Top);
+        list.Children.Add(_savedBar);
         DockPanel.SetDock(_incoming, Dock.Top);
         list.Children.Add(_incoming);
         list.Children.Add(_rowScroll);
@@ -361,6 +365,116 @@ public sealed class QuickPanelWindow : Window
         };
     }
 
+    /// <summary>A folder row (or, with null, the "Saved" breadcrumb inside a folder) takes rows of this panel dragged
+    /// onto it: they move in (or out). Highlighted while it's the drop target.</summary>
+    private void MakeFolderDropTarget(Border target, Guid? folderId)
+    {
+        target.AllowDrop = true;
+        target.DragEnter += (_, e) =>
+        {
+            if (!e.Data.GetDataPresent(EntryFormat)) return;
+            target.BorderBrush = Fluent.Accent;
+            target.BorderThickness = new Thickness(2);
+        };
+        target.DragLeave += (_, _) => target.BorderThickness = new Thickness(0);
+        target.DragOver += (_, e) =>
+        {
+            // Copy: the only effect rows offer (Move would let Explorer move a file clip's real files).
+            e.Effects = e.Data.GetDataPresent(EntryFormat) ? DragDropEffects.Copy : DragDropEffects.None;
+            e.Handled = true;
+        };
+        target.Drop += (_, e) =>
+        {
+            e.Handled = true;
+            target.BorderThickness = new Thickness(0);
+            if (e.Data.GetData(EntryFormat) is string id) Model.DropOnFolder(id, folderId);
+        };
+    }
+
+    // MARK: Saved bar
+
+    private void RenderSavedBar()
+    {
+        _savedBar.Children.Clear();
+        if (Model.GroupFilter is { } group)
+        {
+            // All | Saved, remembered per group.
+            var segments = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(14, 6, 14, 2) };
+            var saved = Model.GroupShowsSaved(group);
+            Border Segment(string title, bool selected, bool showSaved)
+            {
+                var segment = new Border
+                {
+                    Child = Fluent.Label(title, 12, selected ? Fluent.AccentText : null),
+                    Padding = new Thickness(10, 2, 10, 2),
+                    Background = selected ? Fluent.Accent : Fluent.Subtle,
+                    CornerRadius = showSaved ? new CornerRadius(0, 8, 8, 0) : new CornerRadius(8, 0, 0, 8),
+                    Cursor = Cursors.Hand,
+                };
+                AutomationName(segment, $"Show {title.ToLowerInvariant()} items of the group" + (selected ? ", selected" : ""));
+                segment.MouseLeftButtonUp += (_, _) => Model.SetGroupShowsSaved(showSaved);
+                return segment;
+            }
+            segments.Children.Add(Segment("All", !saved, false));
+            segments.Children.Add(Segment("Saved", saved, true));
+            _savedBar.Children.Add(segments);
+        }
+        if (!Model.IsSavedView) return;
+
+        var bar = new DockPanel { Margin = new Thickness(14, 6, 10, 2) };
+        var newFolder = new Border { Padding = new Thickness(6, 2, 6, 2), CornerRadius = new CornerRadius(6), Cursor = Cursors.Hand, Background = Brushes.Transparent, ToolTip = "New Folder" };
+        var newContent = new StackPanel { Orientation = Orientation.Horizontal };
+        var newIcon = Glyphs.Icon(Glyphs.NewFolder, 13, Fluent.Accent);
+        newIcon.Margin = new Thickness(0, 0, 5, 0);
+        newContent.Children.Add(newIcon);
+        newContent.Children.Add(Fluent.Label("New Folder", 12, Fluent.Accent));
+        newFolder.Child = newContent;
+        newFolder.MouseLeftButtonUp += (_, _) => Model.CreateFolder();
+        AutomationName(newFolder, "New Folder");
+        DockPanel.SetDock(newFolder, Dock.Right);
+        bar.Children.Add(newFolder);
+
+        var crumbs = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        var open = Model.OpenFolder;
+        var root = new Border
+        {
+            Child = Fluent.Label("Saved", 13, open is null ? null : Fluent.Accent, FontWeights.SemiBold),
+            Padding = new Thickness(4, 1, 4, 1), CornerRadius = new CornerRadius(4), Background = Brushes.Transparent,
+        };
+        crumbs.Children.Add(root);
+        if (open is not null)
+        {
+            // Back to the root; clips dragged here move out of the folder.
+            root.Cursor = Cursors.Hand;
+            root.ToolTip = "Back to Saved. Drop items here to take them out of the folder.";
+            root.MouseLeftButtonUp += (_, _) => Model.CloseFolder();
+            AutomationName(root, "Back to Saved");
+            MakeFolderDropTarget(root, null);
+            var chevron = Glyphs.Icon(Glyphs.ChevronRight, 10, Fluent.Secondary);
+            chevron.Margin = new Thickness(4, 0, 4, 0);
+            crumbs.Children.Add(chevron);
+            crumbs.Children.Add(Fluent.Label(open.Name, 13, null, FontWeights.SemiBold));
+            if (open.Label is { } label) crumbs.Children.Add(LabelPill(label, false));
+        }
+        bar.Children.Add(crumbs);
+        _savedBar.Children.Add(bar);
+    }
+
+    /// <summary>A folder's label, as a small tag.</summary>
+    private static Border LabelPill(string label, bool selected)
+    {
+        var content = new StackPanel { Orientation = Orientation.Horizontal };
+        var icon = Glyphs.Icon(Glyphs.Tag, 10, selected ? Fluent.AccentText : Fluent.Secondary);
+        icon.Margin = new Thickness(0, 0, 4, 0);
+        content.Children.Add(icon);
+        content.Children.Add(Fluent.Label(label.Length > 18 ? label[..17] + "…" : label, 11, selected ? Fluent.AccentText : Fluent.Secondary));
+        return new Border
+        {
+            Child = content, Padding = new Thickness(6, 1, 6, 1), CornerRadius = new CornerRadius(8), Margin = new Thickness(6, 0, 0, 0),
+            Background = selected ? Brushes.Transparent : Fluent.Subtle, VerticalAlignment = VerticalAlignment.Center,
+        };
+    }
+
     private void FocusForMode()
     {
         Dispatcher.BeginInvoke(() =>
@@ -403,6 +517,7 @@ public sealed class QuickPanelWindow : Window
             Key.Enter => new(PanelKey.Enter, mods),
             Key.Tab => new(PanelKey.Tab, mods),
             Key.Delete => new(PanelKey.Delete, mods),
+            Key.Back => new(PanelKey.Backspace, mods),
             >= Key.D1 and <= Key.D9 => new(PanelKey.Digit, mods, Digit: key - Key.D0),
             >= Key.NumPad1 and <= Key.NumPad9 => new(PanelKey.Digit, mods, Digit: key - Key.NumPad0),
             >= Key.A and <= Key.Z => new(PanelKey.Letter, mods, Letter: (char)('a' + (key - Key.A))),
@@ -435,6 +550,7 @@ public sealed class QuickPanelWindow : Window
         }
         _targetLabel.Text = Model.TargetApp is { } app ? $"Pastes into {app.Name}" : "";
         RenderChips();
+        RenderSavedBar();
         UpdateIncoming();
         RenderRows();
         var previousMode = _detailState.Mode;
@@ -557,10 +673,13 @@ public sealed class QuickPanelWindow : Window
             {
                 var empty = new StackPanel { Margin = new Thickness(20, 60, 20, 0), HorizontalAlignment = HorizontalAlignment.Center };
                 var inbox = Model.Filter == PanelFilter.Inbox && Model.GroupFilter is null;
-                empty.Children.Add(Fluent.Label(Model.Query.Length == 0 ? (inbox ? "Your Inbox is empty" : "Nothing here yet") : "No matches", 16, null, FontWeights.SemiBold));
-                empty.Children.Add(Fluent.Label(Model.Query.Length == 0
-                    ? (inbox ? "What your contacts send you appears here." : "Items appear as you copy them.")
-                    : "Try fewer letters or another filter.", 13, Fluent.Secondary));
+                var (emptyTitle, emptyHint) = Model.Query.Length > 0 ? ("No matches", "Try fewer letters or another filter.")
+                    : Model.OpenFolderId is not null ? ("This folder is empty", "Drag items here, or use Move to Folder in Ctrl+K.")
+                    : Model.IsSavedView ? ("Nothing saved yet", "Label an item or use Add to Saved to keep it.")
+                    : inbox ? ("Your Inbox is empty", "What your contacts send you appears here.")
+                    : ("Nothing here yet", "Items appear as you copy them.");
+                empty.Children.Add(Fluent.Label(emptyTitle, 16, null, FontWeights.SemiBold));
+                empty.Children.Add(Fluent.Label(emptyHint, 13, Fluent.Secondary));
                 _rows.Children.Add(empty);
             }
             for (var index = 0; index < Model.Entries.Count; index++)
@@ -588,6 +707,9 @@ public sealed class QuickPanelWindow : Window
     }
 
     private int _lastOpenToken = -1;
+    private long _folderOpenedAt;
+    /// <summary>Longer than Windows' default double-click time (500 ms).</summary>
+    private const long FolderClickGuardMs = 700;
 
     private Border BuildRow(PanelEntry entry, int index, bool multi)
     {
@@ -599,7 +721,16 @@ public sealed class QuickPanelWindow : Window
             _dragEntry = e.ClickCount >= 2 ? null : entry;
             if (e.ClickCount >= 2)
             {
-                if (Model.IsMultiSelecting && Model.IsSelected(entry)) Model.PasteSelection(); else Model.Activate(entry);
+                // A double-click on a folder: its first click opened it, and the second lands on whatever row is now
+                // under the pointer. It mustn't paste that.
+                if (entry is PanelEntry.FolderEntry || Environment.TickCount64 - _folderOpenedAt < FolderClickGuardMs) { }
+                else if (Model.IsMultiSelecting && Model.IsSelected(entry)) Model.PasteSelection();
+                else Model.Activate(entry);
+            }
+            else if (entry is PanelEntry.FolderEntry && Keyboard.Modifiers == ModifierKeys.None)
+            {
+                _folderOpenedAt = Environment.TickCount64;
+                Model.Activate(entry);   // a click opens a folder
             }
             else
             {
@@ -608,7 +739,9 @@ public sealed class QuickPanelWindow : Window
             e.Handled = true;
         };
         border.ContextMenu = new ContextMenu();
-        border.ContextMenuOpening += (_, _) => FillContextMenu(border.ContextMenu, entry);
+        // The row outlives renames and moves (it's kept while the ids stay the same): use the entry as it is now.
+        border.ContextMenuOpening += (_, _) => FillContextMenu(border.ContextMenu, Model.Entries.FirstOrDefault(e => e.Id == entry.Id) ?? entry);
+        if (entry is PanelEntry.FolderEntry folder) MakeFolderDropTarget(border, folder.Folder.Id);
         StyleRow(border, entry, index, multi);
         return border;
     }
@@ -646,7 +779,21 @@ public sealed class QuickPanelWindow : Window
 
         var trailing = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
         var groupName = Model.GroupName(entry);
-        var author = Model.GroupBadge(entry);
+        var author = entry is PanelEntry.FolderEntry ? null : Model.GroupBadge(entry);
+        if (entry is PanelEntry.FolderEntry { Folder.Label: { } folderLabel }) trailing.Children.Add(LabelPill(folderLabel, selected));
+        if (Model.FolderCaption(entry) is { } folderName)
+        {
+            // A clip shown outside its folder (a search, History) says where it lives.
+            var captionContent = new StackPanel { Orientation = Orientation.Horizontal };
+            var folderIcon = Glyphs.Icon(Glyphs.Folder, 10, sub);
+            folderIcon.Margin = new Thickness(0, 0, 4, 0);
+            captionContent.Children.Add(folderIcon);
+            captionContent.Children.Add(Fluent.Label(folderName.Length > 18 ? folderName[..17] + "…" : folderName, 11, sub));
+            trailing.Children.Add(new Border
+            {
+                Child = captionContent, Padding = new Thickness(6, 1, 6, 1), Margin = new Thickness(6, 0, 0, 0), ToolTip = $"In the folder “{folderName}”",
+            });
+        }
         if (Model.SenderName(entry) is { } sender)
         {
             var badgeContent = new StackPanel { Orientation = Orientation.Horizontal };
@@ -675,11 +822,11 @@ public sealed class QuickPanelWindow : Window
                 ToolTip = author == groupName ? $"Shared in “{groupName}”" : $"Copied by {author} in “{groupName}”",
             });
         }
-        if (entry.ClipItem is { IsPinned: true })
+        if (entry.ClipItem is { IsPinned: true } pinned)
         {
-            var tag = Glyphs.Icon(Glyphs.Tag, 12, sub);
+            var tag = Glyphs.Icon(pinned.Label is null ? Glyphs.Saved : Glyphs.Tag, 12, sub);
             tag.Margin = new Thickness(6, 0, 6, 0);
-            tag.ToolTip = "Labelled: kept until you remove the label";
+            tag.ToolTip = pinned.Label is null ? "Saved: kept until you remove it from Saved" : "Labelled: kept until you remove the label";
             trailing.Children.Add(tag);
         }
         if (Model.ShortcutNumber(entry, index) is { } shortcut)
@@ -718,6 +865,8 @@ public sealed class QuickPanelWindow : Window
                 return Box(Glyphs.Icon(c.Item.Kind switch { ClipKind.File => Glyphs.File, ClipKind.Image => Glyphs.Image, _ => Glyphs.Text }, 18, selected ? Fluent.AccentText : Fluent.Secondary));
             case PanelEntry.SnippetEntry:
                 return Box(Glyphs.Icon(Glyphs.Snippet, 18, selected ? Fluent.AccentText : Fluent.Accent));
+            case PanelEntry.FolderEntry:
+                return Box(Glyphs.Icon(Glyphs.Folder, 18, selected ? Fluent.AccentText : Fluent.Accent));
             default:
                 return Box(Glyphs.Icon(Glyphs.Key, 18, selected ? Fluent.AccentText : Fluent.Accent));
         }
@@ -730,13 +879,26 @@ public sealed class QuickPanelWindow : Window
         PanelEntry.Clip c => (c.Item.DisplayTitle, string.Join(" · ", new[] { c.Item.SourceName, Fluent.Relative(c.Item.LastCopiedAt) }.Where(s => !string.IsNullOrEmpty(s)))),
         PanelEntry.SnippetEntry s => (s.Snippet.Name.Length == 0 ? "Untitled Snippet" : s.Snippet.Name, s.Snippet.Keyword.Length == 0 ? "Snippet" : $"Snippet · {s.Snippet.Keyword}"),
         PanelEntry.SecretEntry k => (k.Secret.Name, "••••••••"),
+        PanelEntry.FolderEntry f => (f.Folder.Name, ItemCount(f.Count)),
         _ => ("", ""),
     };
+
+    private static string ItemCount(int count) => count == 1 ? "1 item" : $"{count} items";
 
     private void FillContextMenu(ContextMenu menu, PanelEntry entry)
     {
         menu.Items.Clear();
         MenuItem Item(string header, Action action) { var i = new MenuItem { Header = header }; i.Click += (_, _) => action(); return i; }
+        if (entry is PanelEntry.FolderEntry f)
+        {
+            menu.Items.Add(Item("Open", () => Model.Activate(entry)));
+            menu.Items.Add(Item("Rename…", () => Model.BeginRenameFolder(f.Folder)));
+            menu.Items.Add(Item(f.Folder.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
+            if (f.Folder.SpaceId is null && ShareMenu(entry) is { } shareFolder) menu.Items.Add(shareFolder);
+            menu.Items.Add(new Separator());
+            menu.Items.Add(Item("Delete Folder", () => Model.DeleteFolder(f.Folder)));
+            return;
+        }
         menu.Items.Add(Item("Paste", () => Model.Activate(entry)));
         if (entry is PanelEntry.SecretEntry k)
         {
@@ -786,17 +948,45 @@ public sealed class QuickPanelWindow : Window
                 menu.Items.Add(preview);
             }
             menu.Items.Add(Item(item.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
-            if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Labelled", () => Model.RemoveFromLabelled([item])));
+            // Right-clicking one of several selected items acts on them all.
+            List<ClipItem> Targets() => Model.IsMultiSelecting && Model.IsSelected(entry) ? Model.SelectedClips : [item];
             if (item != Model.SelectionItem)
             {
-                // Right-clicking one of several selected items saves them all.
-                List<ClipItem> Targets() => Model.IsMultiSelecting && Model.IsSelected(entry) ? Model.SelectedClips : [item];
+                if (!item.IsPinned) menu.Items.Add(Item("Add to Saved", () => Model.AddToSaved(Targets())));
+                if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Saved", () => Model.RemoveFromSaved(Targets())));
+                if (Model.CanUseFolders(item)) menu.Items.Add(MoveToFolderMenu(entry, item, Targets));
+                if (Model.FolderOf(item) is not null) menu.Items.Add(Item("Remove from Folder", () => Model.MoveToFolder(Targets(), null)));
                 menu.Items.Add(Item($"Save to {Model.SaveFolderName}", () => Model.Save(Targets(), _services.SaveFolder)));
                 menu.Items.Add(Item("Save to…", () => { if (_services.ChooseSaveFolder() is { } folder) Model.Save(Targets(), folder); }));
             }
             if (item.Kind.IsTextual()) menu.Items.Add(Item("Save as Secret…", () => Model.BeginSaveSecret(item)));
-            menu.Items.Add(Item("Delete", () => { _services.Store.Delete(item); Model.Refresh(); }));
+            // A group item is deleted for everyone in the group.
+            menu.Items.Add(Item(Model.IsGroupItem(item) ? "Remove from Group" : "Delete", () => { _services.Store.Delete(item); Model.Refresh(); }));
         }
+    }
+
+    /// <summary>Move to Folder ▸ the folders of the item's space, then New Folder… (named inline in the panel).</summary>
+    private MenuItem MoveToFolderMenu(PanelEntry entry, ClipItem item, Func<List<ClipItem>> targets)
+    {
+        var menu = new MenuItem { Header = "Move to Folder" };
+        var current = Model.FolderOf(item)?.Id;
+        foreach (var folder in Model.FoldersIn(item.SpaceId).Where(f => f.Id != current))
+        {
+            var target = folder;
+            var row = new MenuItem { Header = folder.Name, Icon = Glyphs.Icon(Glyphs.Folder, 14) };
+            row.Click += (_, _) => Model.MoveToFolder(targets(), target);
+            menu.Items.Add(row);
+        }
+        if (menu.Items.Count > 0) menu.Items.Add(new Separator());
+        var create = new MenuItem { Header = "New Folder…", Icon = Glyphs.Icon(Glyphs.NewFolder, 14) };
+        create.Click += (_, _) =>
+        {
+            var items = targets();
+            if (!(Model.IsMultiSelecting && Model.IsSelected(entry))) Model.Select(entry.Id);
+            Model.BeginNewFolder(items);
+        };
+        menu.Items.Add(create);
+        return menu;
     }
 
     private MenuItem? ShareMenu(PanelEntry entry)
@@ -830,7 +1020,10 @@ public sealed class QuickPanelWindow : Window
     {
         var key = Model.Mode switch
         {
-            PanelMode.Browse => Model.IsMultiSelecting ? "multi:" + string.Join(",", Model.SelectedIds.Order()) : Model.SelectedId,
+            PanelMode.Browse when Model.IsMultiSelecting => "multi:" + string.Join(",", Model.SelectedIds.Order()),
+            // A folder's details change without the selection changing (renamed, labelled, items dropped in).
+            PanelMode.Browse when Model.SelectedEntry is PanelEntry.FolderEntry f => $"{f.Id}|{f.Folder.Name}|{f.Folder.Label}|{f.Count}",
+            PanelMode.Browse => Model.SelectedId,
             PanelMode.AI => Model.AIRun?.GetHashCode().ToString(),
             _ => Model.SelectedId,
         };
@@ -848,6 +1041,7 @@ public sealed class QuickPanelWindow : Window
                 PanelMode.SaveSecret => BuildSaveSecret(),
                 PanelMode.Label => BuildLabel(),
                 PanelMode.EditSecret => BuildEditSecret(),
+                PanelMode.FolderName => BuildFolderName(),
                 PanelMode.AI => BuildAI(),
                 _ => Model.IsMultiSelecting ? BuildMulti() : (Model.SelectedEntry is { } e ? BuildPreview(e) : new Border()),
             };
@@ -873,6 +1067,7 @@ public sealed class QuickPanelWindow : Window
             PanelEntry.Clip c => TextView(c.Item.Text),
             PanelEntry.SnippetEntry s => TextView(s.Snippet.Body),
             PanelEntry.SecretEntry k => SecretView(k.Secret),
+            PanelEntry.FolderEntry f => FolderView(f),
             _ => new Border(),
         };
         grid.Children.Add(body);
@@ -883,6 +1078,27 @@ public sealed class QuickPanelWindow : Window
         Grid.SetRow(meta, 2);
         grid.Children.Add(meta);
         return grid;
+    }
+
+    private UIElement FolderView(PanelEntry.FolderEntry entry)
+    {
+        var stack = new StackPanel { VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(20) };
+        var icon = Glyphs.Icon(Glyphs.Folder, 36, Fluent.Accent);
+        icon.HorizontalAlignment = HorizontalAlignment.Center;
+        stack.Children.Add(icon);
+        var name = Fluent.Label(entry.Folder.Name, 17, null, FontWeights.SemiBold);
+        name.HorizontalAlignment = HorizontalAlignment.Center;
+        name.Margin = new Thickness(0, 10, 0, 4);
+        stack.Children.Add(name);
+        var count = Fluent.Label(ItemCount(entry.Count), 13, Fluent.Secondary);
+        count.HorizontalAlignment = HorizontalAlignment.Center;
+        stack.Children.Add(count);
+        var hint = Fluent.Label("Press Enter to open it. Drag items onto it to move them in.", 13, Fluent.Secondary, wrap: true);
+        hint.TextAlignment = TextAlignment.Center;
+        hint.MaxWidth = 320;
+        hint.Margin = new Thickness(0, 12, 0, 0);
+        stack.Children.Add(hint);
+        return stack;
     }
 
     /// <summary>The picture, and below it the text read from it (when there is any).</summary>
@@ -1083,8 +1299,14 @@ public sealed class QuickPanelWindow : Window
                     ClipKind.File => item.Files.Count == 1 ? "File" : $"{item.Files.Count} files",
                     _ => $"{item.Kind.DisplayName()} · {item.Text.Length} characters",
                 });
-                Line("Expires", item.IsPinned ? "Never (labelled)"
+                if (Model.FolderOf(item) is { } folder) Line("Folder", folder.Name);
+                Line("Expires", item.IsPinned ? "Never (saved)"
                     : item.ExpiryDate(_services.Settings.MaxAge) is { } expiry ? expiry.ToLocalTime().ToString("g") : "Never");
+                break;
+            case PanelEntry.FolderEntry f:
+                if (f.Folder.Label is not null) Line("Label", f.Folder.Label);
+                if (Model.GroupName(f) is { } group) Line("Group", group);
+                Line("Created", f.Folder.CreatedAt.ToLocalTime().ToString("g"));
                 break;
             case PanelEntry.SnippetEntry s:
                 Line("Snippet", s.Snippet.Name);
@@ -1152,7 +1374,9 @@ public sealed class QuickPanelWindow : Window
         if (_actionList is null) return;
         _actionList.Children.Clear();
         if (_actionFilter is not null && _actionFilter.Text != Model.ActionQuery) _actionFilter.Text = Model.ActionQuery;
-        if (_actionHint is not null) _actionHint.Text = Model.IsPickingGroup ? "Choose a group to share with" : $"Filter actions or ask {Model.AIName}";
+        if (_actionHint is not null)
+            _actionHint.Text = Model.IsPickingGroup ? "Choose a group to share with"
+                : Model.IsPickingFolder ? "Choose a folder to move to" : $"Filter actions or ask {Model.AIName}";
         var actions = Model.FilteredActions;
         string? section = null;
         Border? selectedRow = null;
@@ -1295,8 +1519,9 @@ public sealed class QuickPanelWindow : Window
         var form = Model.LabelForm!;
         var stack = new StackPanel();
         stack.Children.Add(Fluent.Label(form.IsSecret ? "Rename Secret" : "Label", 16, null, FontWeights.SemiBold));
-        stack.Children.Add(Fluent.Label(form.IsSecret ? "The name shown for this secret." :
-            "Shown instead of the content and searchable. Labelled items are kept: they never expire. Leave empty to remove the label, and the item expires like the rest of history.",
+        stack.Children.Add(Fluent.Label(form.IsSecret ? "The name shown for this secret."
+            : form.IsFolder ? "A tag shown next to the folder's name, and searchable. Leave empty to remove it."
+            : "Shown instead of the content and searchable. Labelling an item saves it: it never expires. Leave empty to remove the label, and the item expires like the rest of history unless it's in a folder.",
             13, Fluent.Secondary, wrap: true));
         var box = new TextBox { Text = form.Text, Margin = new Thickness(0, 12, 0, 0) };
         box.TextChanged += (_, _) => form.Text = box.Text;
@@ -1305,6 +1530,26 @@ public sealed class QuickPanelWindow : Window
             stack.Children.Add(Fluent.Label("Value: " + (item.Preview.Length == 0 ? item.Kind.DisplayName() : item.Preview), 12, Fluent.Secondary));
         var save = new Button { Content = "Save", HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 16, 0, 0) };
         save.Click += (_, _) => Model.SubmitLabel();
+        stack.Children.Add(save);
+        Dispatcher.BeginInvoke(() => { box.Focus(); box.SelectAll(); }, System.Windows.Threading.DispatcherPriority.Input);
+        return Padded(stack, 16);
+    }
+
+    /// <summary>The inline name prompt: renaming a folder, or naming a new one the selection moves into.</summary>
+    private UIElement BuildFolderName()
+    {
+        var form = Model.FolderForm!;
+        var stack = new StackPanel();
+        stack.Children.Add(Fluent.Label(form.IsRename ? "Rename Folder" : "New Folder", 16, null, FontWeights.SemiBold));
+        stack.Children.Add(Fluent.Label(form.IsRename ? "Folders are listed by name in Saved."
+            : form.ItemIds.Count == 1 ? "The item moves into the new folder and stays saved." : $"The {form.ItemIds.Count} items move into the new folder and stay saved.",
+            13, Fluent.Secondary, wrap: true));
+        var box = new TextBox { Text = form.Text, Margin = new Thickness(0, 12, 0, 0) };
+        AutomationName(box, "Folder name");
+        box.TextChanged += (_, _) => form.Text = box.Text;
+        stack.Children.Add(box);
+        var save = new Button { Content = form.IsRename ? "Rename" : "Create", HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 16, 0, 0) };
+        save.Click += (_, _) => Model.SubmitFolderName();
         stack.Children.Add(save);
         Dispatcher.BeginInvoke(() => { box.Focus(); box.SelectAll(); }, System.Windows.Threading.DispatcherPriority.Input);
         return Padded(stack, 16);
@@ -1372,11 +1617,14 @@ public sealed class QuickPanelWindow : Window
             PanelMode.Browse when Model.PickedFiles.Count > 0 && Model.PickableItem is { } item =>
                 $"Enter Paste {Model.PickedFiles.Count} of {item.Files.Count} files    Ctrl+K Actions    Esc All Files",
             PanelMode.Browse when Model.IsMultiSelecting => $"Enter Paste {Model.SelectedClips.Count} items    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Y Preview    Del Delete    Esc Close",
+            PanelMode.Browse when Model.SelectedEntry is PanelEntry.FolderEntry => "Enter Open    Ctrl+K Actions    Del Delete Folder    Tab Filter    Esc Close",
+            PanelMode.Browse when Model.OpenFolderId is not null => "Enter Paste    Ctrl+K Actions    Ctrl+Y Preview    Backspace Saved    Esc Back",
             // The compact panel has no room for one more hint.
             PanelMode.Browse when _services.Settings.PanelSize == PanelSize.Compact =>
                 "Enter Paste    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Shift+1–9 Assign Slot    Tab Filter    Esc Close",
             PanelMode.Browse => "Enter Paste    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Y Preview    Ctrl+Shift+1–9 Assign Slot    Tab Filter    Esc Close",
             PanelMode.Actions when Model.IsPickingGroup => "↑↓ Choose Group    Enter Share    Esc Back",
+            PanelMode.Actions when Model.IsPickingFolder => "↑↓ Choose Folder    Enter Move    Esc Back",
             PanelMode.Actions => "↑↓ Choose    Enter Run    Esc Back",
             PanelMode.AI => "Enter Paste    Ctrl+C Copy    Ctrl+R Replace Item    Esc Back",
             _ => "Enter Save    Esc Back",

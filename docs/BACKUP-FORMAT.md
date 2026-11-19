@@ -71,6 +71,12 @@ the group and aren't exported.
 A snippet payload (`"v":1,"type":"snippet","name","keyword","body","createdAt","updatedAt"`) plus `"id"`.
 Personal snippets only.
 
+### `folders`
+
+Added in 1.6, omitted when there are none. A folder payload (`"v":1,"type":"folder","name","label","createdAt",
+"updatedAt"`) plus `"id"`. Personal folders only. A clip in one carries its `id` in the clip's `folder` field,
+as in sync. Older readers ignore both, and those clips import at the root of Saved.
+
 ### `secrets`
 
 Only present when the user ticked "Include secrets" and confirmed with Touch ID or Windows Hello. Each
@@ -85,6 +91,9 @@ Import merges into the personal space and never deletes or overwrites anything:
   entry in the same file had it. Otherwise inserted with a **new** local id (the backup's `id` is informational),
   keeping `createdAt`, `lastCopiedAt`, `copyCount`, pin and label. Images are written from `image`/`thumb`;
   an image entry without a decodable `image` is skipped.
+- **Folders:** read first. One joins the personal folder with the same name (case-insensitive) if there is one;
+  otherwise it's added with a new id. Imported clips go into the folder their `folder` names; an id that isn't
+  among `folders` leaves them at the root of Saved. Clips skipped as duplicates keep their current folder.
 - **Snippets:** skipped when one with the same `(name, body)` exists. Otherwise inserted with a new id.
 - **Secrets:** skipped when one with the same `(name, value)` exists. Otherwise added as a new secret.
 - The usual rules then apply: retention (pinned items exempt), and a history item whose text equals a saved

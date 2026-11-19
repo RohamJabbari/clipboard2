@@ -74,7 +74,7 @@ public sealed class ClipStore : IDisposable
     }
 
     /// <summary>Schema version stored in <c>PRAGMA user_version</c>. v0 is the original, unversioned schema.</summary>
-    public const int SchemaVersion = 4;
+    public const int SchemaVersion = 5;
 
     public int UserVersion => Convert.ToInt32(Scalar("PRAGMA user_version"));
 
@@ -127,6 +127,17 @@ public sealed class ClipStore : IDisposable
                     CREATE TABLE IF NOT EXISTS sync_rejected (
                         space_id TEXT NOT NULL, local_id TEXT NOT NULL, fingerprint TEXT NOT NULL, reason TEXT NOT NULL,
                         PRIMARY KEY (space_id, local_id));
+                    """);
+            }
+            if (version < 5)
+            {
+                // v5: folders in Saved. A clip's folder_id may name a folder this device doesn't have (yet): it reads
+                // as the root of Saved.
+                Exec("""
+                    ALTER TABLE clips ADD COLUMN folder_id TEXT;
+                    CREATE TABLE IF NOT EXISTS folders (
+                        id TEXT PRIMARY KEY, name TEXT NOT NULL, label TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
+                        space_id TEXT);
                     """);
             }
             Exec($"PRAGMA user_version = {SchemaVersion}");
@@ -199,24 +210,34 @@ public sealed class ClipStore : IDisposable
         Commit();
     }
 
+    /// <summary>Saves or unsaves an item. Unsaving takes it out of its folder.</summary>
     public void TogglePin(ClipItem item)
     {
         item.IsPinned = !item.IsPinned;
         item.PinnedAt = item.IsPinned ? DateTime.UtcNow : null;
+        if (!item.IsPinned) item.FolderId = null;
         Save(item);
         Commit();
     }
 
-    /// <summary>"Remove from Labelled" for items pinned without a label (pinned before labels replaced pins).</summary>
+    /// <summary>"Add to Saved": keeps the item without a label.</summary>
+    public void Pin(ClipItem item)
+    {
+        if (item.IsPinned) return;
+        TogglePin(item);
+    }
+
+    /// <summary>"Remove from Saved" (items saved without a label): it expires like the rest of history again, and
+    /// leaves its folder.</summary>
     public void Unpin(ClipItem item)
     {
         if (!item.IsPinned) return;
         TogglePin(item);
     }
 
-    /// <summary>Sets (or clears, for empty text) a label. Labels are how items are kept: labelled items are pinned so
-    /// they never expire, and removing the label unpins the item again, unless <paramref name="keepPinned"/> (a quick
-    /// slot still needs the item).</summary>
+    /// <summary>Sets (or clears, for empty text) a label. Labelling saves an item so it never expires, and removing
+    /// the label unsaves it again, unless <paramref name="keepPinned"/> (a quick slot still needs the item) or it's
+    /// in a folder.</summary>
     public void SetLabel(string? label, ClipItem item, bool keepPinned = false)
     {
         var trimmed = label?.Trim() ?? "";
@@ -227,10 +248,11 @@ public sealed class ClipStore : IDisposable
             item.IsPinned = true;
             item.PinnedAt = DateTime.UtcNow;
         }
-        else if (item.Label is null && hadLabel && !keepPinned)
+        else if (item.Label is null && hadLabel && !keepPinned && FolderOf(item) is null)
         {
             item.IsPinned = false;
             item.PinnedAt = null;
+            item.FolderId = null;
         }
         Save(item);
         Commit();
@@ -301,7 +323,7 @@ public sealed class ClipStore : IDisposable
         return removed;
     }
 
-    /// <summary>Collapses items with the same hash. Pinned items are never deleted.</summary>
+    /// <summary>Collapses items with the same hash. Pinned items (folders' included) are never deleted.</summary>
     public int MergeDuplicates()
     {
         var removed = 0;
@@ -445,6 +467,145 @@ public sealed class ClipStore : IDisposable
         Commit();
     }
 
+    // MARK: Folders
+
+    public List<ClipFolder> AllFolders()
+    {
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = "SELECT id, name, label, created, updated, space_id FROM folders ORDER BY name COLLATE NOCASE";
+        using var r = cmd.ExecuteReader();
+        var list = new List<ClipFolder>();
+        while (r.Read())
+            list.Add(new ClipFolder
+            {
+                Id = Guid.Parse(r.GetString(0)), Name = r.GetString(1), Label = r.IsDBNull(2) ? null : r.GetString(2),
+                CreatedAt = FromUnix(r.GetInt64(3)), UpdatedAt = FromUnix(r.GetInt64(4)), SpaceId = r.IsDBNull(5) ? null : r.GetString(5),
+            });
+        return list;
+    }
+
+    /// <summary>The folders of one space (null = personal), by name.</summary>
+    public List<ClipFolder> FoldersInSpace(string? spaceId) => [.. AllFolders().Where(f => f.SpaceId == spaceId)];
+
+    public ClipFolder? FindFolder(Guid id) => AllFolders().FirstOrDefault(f => f.Id == id);
+
+    /// <summary>The folder an item is in, if this device has it (and it's of the item's space).</summary>
+    public ClipFolder? FolderOf(ClipItem item) =>
+        item.IsPinned && item.FolderId is { } id && FindFolder(id) is { } folder && folder.SpaceId == item.SpaceId ? folder : null;
+
+    public ClipFolder CreateFolder(string name = ClipFolder.DefaultName, string? spaceId = null)
+    {
+        var folder = new ClipFolder { Name = CleanFolderName(name), SpaceId = spaceId };
+        PutFolder(folder);
+        return folder;
+    }
+
+    public void RenameFolder(ClipFolder folder, string name)
+    {
+        if (name.Trim().Length == 0 || name.Trim() == folder.Name) return;
+        folder.Name = CleanFolderName(name);
+        UpdateFolder(folder);
+    }
+
+    /// <summary>Sets or (for empty text) clears a folder's label.</summary>
+    public void SetFolderLabel(ClipFolder folder, string? label)
+    {
+        var trimmed = label?.Trim() ?? "";
+        folder.Label = trimmed.Length == 0 ? null : trimmed;
+        UpdateFolder(folder);
+    }
+
+    private static string CleanFolderName(string name) => name.Trim() is { Length: > 0 } trimmed ? trimmed : ClipFolder.DefaultName;
+
+    private void UpdateFolder(ClipFolder folder)
+    {
+        folder.UpdatedAt = DateTime.UtcNow;
+        PutFolder(folder);
+    }
+
+    /// <summary>Inserts or replaces a folder as given, keeping its timestamps (sync).</summary>
+    public void PutFolder(ClipFolder folder)
+    {
+        Exec("""
+            INSERT INTO folders (id, name, label, created, updated, space_id) VALUES ($id, $n, $l, $c, $u, $s)
+            ON CONFLICT(id) DO UPDATE SET name = $n, label = $l, created = $c, updated = $u
+            """,
+            ("$id", SyncId(folder.Id)), ("$n", folder.Name), ("$l", folder.Label), ("$c", ToUnix(folder.CreatedAt)),
+            ("$u", ToUnix(folder.UpdatedAt)), ("$s", folder.SpaceId));
+        Commit();
+    }
+
+    /// <summary>The user deleted a folder: its clips move to the root of Saved (still saved), so they're pushed again
+    /// without it. Returns how many moved.</summary>
+    public int DeleteFolder(ClipFolder folder)
+    {
+        var moved = 0;
+        using (Batch())
+        {
+            foreach (var item in ItemsInSpace(folder.SpaceId).Where(i => i.FolderId == folder.Id))
+            {
+                item.FolderId = null;
+                Save(item);
+                moved++;
+            }
+            RemoveFolder(folder.Id);
+        }
+        return moved;
+    }
+
+    /// <summary>A folder deleted elsewhere: only the folder goes. Its clips keep the id, which reads as the root of
+    /// Saved, so nothing is pushed again on their behalf.</summary>
+    public void RemoveFolder(Guid id)
+    {
+        Exec("DELETE FROM folders WHERE id = $id", ("$id", SyncId(id)));
+        Commit();
+    }
+
+    /// <summary>Moves items into <paramref name="folder"/>, saving them, or (null) out of their folder to the root of
+    /// Saved, where they stay saved. Items of another space than the folder's are skipped. Returns how many moved.</summary>
+    public int MoveToFolder(IEnumerable<ClipItem> items, ClipFolder? folder)
+    {
+        var moved = 0;
+        using (Batch())
+        {
+            foreach (var item in items)
+            {
+                if (folder is not null && folder.SpaceId != item.SpaceId) continue;
+                if (folder is null && item.FolderId is null) continue;
+                if (folder is not null && item.FolderId == folder.Id && item.IsPinned) continue;
+                if (!item.IsPinned)
+                {
+                    item.IsPinned = true;
+                    item.PinnedAt = DateTime.UtcNow;
+                }
+                item.FolderId = folder?.Id;
+                Save(item);
+                Commit();
+                moved++;
+            }
+        }
+        return moved;
+    }
+
+    /// <summary>Share to Group for a folder: a new folder (same name and label) in <paramref name="spaceId"/>, holding
+    /// saved copies of the folder's clips. Later changes to either don't reach the other.</summary>
+    public ClipFolder CopyFolderToSpace(ClipFolder folder, string? spaceId)
+    {
+        using var _ = Batch();
+        var copy = new ClipFolder { Name = folder.Name, Label = folder.Label, SpaceId = spaceId };
+        PutFolder(copy);
+        foreach (var item in ItemsInSpace(folder.SpaceId).Where(i => i.IsPinned && i.FolderId == folder.Id).Reverse())   // oldest first
+        {
+            var clip = CopyToSpace(item, spaceId);
+            clip.IsPinned = true;
+            clip.PinnedAt ??= DateTime.UtcNow;
+            clip.FolderId = copy.Id;
+            Save(clip);
+            Commit();
+        }
+        return copy;
+    }
+
     // MARK: Spaces (sync)
 
     /// <summary>Inserts or replaces an item exactly as given (sync). Write its blobs first.</summary>
@@ -529,6 +690,7 @@ public sealed class ClipStore : IDisposable
     {
         foreach (var item in ItemsInSpace(spaceId)) Remove(item);
         Exec("DELETE FROM snippets WHERE space_id = $s", ("$s", spaceId));
+        Exec("DELETE FROM folders WHERE space_id = $s", ("$s", spaceId));
         Exec("DELETE FROM sync_meta WHERE space_id = $s", ("$s", spaceId));
         Exec("DELETE FROM sync_cursor WHERE space_id = $s", ("$s", spaceId));
         Exec("DELETE FROM sync_resync_seen WHERE space_id = $s", ("$s", spaceId));
@@ -542,6 +704,7 @@ public sealed class ClipStore : IDisposable
     {
         foreach (var item in Query("SELECT * FROM clips WHERE space_id IS NOT NULL")) Remove(item);
         Exec("DELETE FROM snippets WHERE space_id IS NOT NULL");
+        Exec("DELETE FROM folders WHERE space_id IS NOT NULL");
         Exec("DELETE FROM sync_meta; DELETE FROM sync_cursor; DELETE FROM sync_spaces; DELETE FROM sync_resync_seen; DELETE FROM sync_rejected;");
         Commit();
     }
@@ -563,6 +726,7 @@ public sealed class ClipStore : IDisposable
             {
                 winner.IsPinned = true;
                 winner.PinnedAt = group.Where(i => i.PinnedAt is not null).Select(i => i.PinnedAt).Min() ?? winner.LastCopiedAt;
+                winner.FolderId ??= losers.Where(l => l.IsPinned).Select(l => l.FolderId).FirstOrDefault(f => f is not null);
             }
             Save(winner);
             foreach (var loser in losers)
@@ -768,14 +932,15 @@ public sealed class ClipStore : IDisposable
 
     private void Save(ClipItem i) => Exec("""
         INSERT INTO clips (id, created, last_copied, kind, text, preview, rtf, html, hash, files, image_file, thumb_file,
-                           width, height, bytes, source_id, source_name, pinned, pinned_at, label, copy_count, space_id)
+                           width, height, bytes, source_id, source_name, pinned, pinned_at, label, copy_count, space_id, folder_id)
         VALUES ($id, $created, $last, $kind, $text, $preview, $rtf, $html, $hash, $files, $img, $thumb,
-                $w, $h, $bytes, $sid, $sname, $pinned, $pinnedAt, $label, $count, $space)
+                $w, $h, $bytes, $sid, $sname, $pinned, $pinnedAt, $label, $count, $space, $folder)
         ON CONFLICT(id) DO UPDATE SET last_copied = $last, kind = $kind, text = $text, preview = $preview, rtf = $rtf,
             html = $html, hash = $hash, files = $files, image_file = $img, thumb_file = $thumb, width = $w, height = $h,
             bytes = $bytes, source_id = $sid, source_name = $sname, pinned = $pinned, pinned_at = $pinnedAt,
-            label = $label, copy_count = $count, created = $created
+            label = $label, copy_count = $count, created = $created, folder_id = $folder
         """,
+        ("$folder", i.IsPinned && i.FolderId is { } folder ? SyncId(folder) : null),
         ("$id", i.Id.ToString()), ("$created", ToUnix(i.CreatedAt)), ("$last", ToUnix(i.LastCopiedAt)), ("$kind", (int)i.Kind),
         ("$text", i.Text), ("$preview", i.Preview), ("$rtf", i.Rtf), ("$html", i.Html), ("$hash", i.ContentHash),
         ("$files", JsonSerializer.Serialize(i.Files)), ("$img", i.ImageFile), ("$thumb", i.ThumbnailFile),
@@ -819,6 +984,7 @@ public sealed class ClipStore : IDisposable
                 CopyCount = (int)Num("copy_count"),
                 SpaceId = Str("space_id"),
                 OcrText = Str("ocr_text"),
+                FolderId = Guid.TryParse(Str("folder_id"), out var folder) ? folder : null,
             });
         }
         return list;

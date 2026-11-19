@@ -57,6 +57,10 @@ public sealed class ClipItem
     /// <summary>User-chosen name for pinned items; the content stays in <see cref="Text"/>.</summary>
     public string? Label { get; set; }
     public int CopyCount { get; set; } = 1;
+    /// <summary>The Saved folder this item is in (<see cref="ClipFolder"/>), always one of its own space. Only saved
+    /// (pinned) items are in a folder. An id this device doesn't know (deleted, or not synced yet) reads as the root
+    /// of Saved.</summary>
+    public Guid? FolderId { get; set; }
     /// <summary>The sync group this item belongs to; null is the personal space (and every item when signed out).</summary>
     public string? SpaceId { get; set; }
     /// <summary>Images: text recognised on this PC (local only, never synced). Null until the image has been read;
@@ -106,6 +110,20 @@ public sealed class Snippet
     public string Name { get; set; } = "New Snippet";
     public string Keyword { get; set; } = "";
     public string Body { get; set; } = "";
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+    /// <summary>Sync group id, or null for the personal space.</summary>
+    public string? SpaceId { get; set; }
+}
+
+/// <summary>A folder in Saved: groups saved clips of one space (personal or a group), one level deep. Unrelated to
+/// saving items to disk (<see cref="ItemSaver"/>) and to synced file folders.</summary>
+public sealed class ClipFolder
+{
+    public const string DefaultName = "New Folder";
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public string Name { get; set; } = DefaultName;
+    public string? Label { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
     /// <summary>Sync group id, or null for the personal space.</summary>

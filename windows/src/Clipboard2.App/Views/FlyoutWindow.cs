@@ -13,7 +13,7 @@ using Transform = Clipboard2.Core.Transform;
 
 namespace Clipboard2.App.Views;
 
-/// <summary>Opened from the tray icon: search, labelled + recent history, quick actions.</summary>
+/// <summary>Opened from the tray icon: search, saved + recent history, quick actions.</summary>
 public sealed class FlyoutWindow : Window
 {
     private readonly AppServices _services;
@@ -97,7 +97,7 @@ public sealed class FlyoutWindow : Window
             items = items.Select(i => (Item: i, Score: FuzzyMatcher.Score(query, i.SearchableText)))
                 .Where(x => x.Score is not null).OrderByDescending(x => x.Score).Select(x => x.Item).Take(200).ToList();
         }
-        var labelled = items.Where(i => i.IsPinned).ToList();   // incl. items pinned before labels replaced pins
+        var saved = items.Where(i => i.IsPinned).ToList();   // labelled, added to Saved or in a folder
         var recent = items.Where(i => !i.IsPinned).Take(200).ToList();
         if (items.Count == 0)
         {
@@ -106,7 +106,7 @@ public sealed class FlyoutWindow : Window
             empty.HorizontalAlignment = HorizontalAlignment.Center;
             _list.Children.Add(empty);
         }
-        if (labelled.Count > 0) Section("Labelled", labelled);
+        if (saved.Count > 0) Section("Saved", saved);
         if (recent.Count > 0) Section("Recent", recent);
         RenderFooter();
     }
@@ -185,10 +185,10 @@ public sealed class FlyoutWindow : Window
         menu.Items.Add(new Separator());
         menu.Items.Add(Item(item.Label is null ? "Label…" : "Edit Label…", () =>
         {
-            if (InputDialog.Ask("Label", "Labelled items are kept: they never expire. Leave empty to remove the label.", item.Label ?? "") is { } label)
+            if (InputDialog.Ask("Label", "Labelling an item saves it: it never expires. Leave empty to remove the label.", item.Label ?? "") is { } label)
                 _services.Store.SetLabel(label, item, keepPinned: _services.Slots.SlotFor(SlotTarget.ForClip(item.Id)) is not null);
         }));
-        if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Labelled", () => _services.Store.Unpin(item)));
+        if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Saved", () => _services.Store.Unpin(item)));
         if (item.Kind.IsTextual())
         {
             menu.Items.Add(Item("Save as Secret…", () =>
@@ -247,7 +247,7 @@ public sealed class FlyoutWindow : Window
             DockPanel.SetDock(cancel, Dock.Right);
             bar.Children.Add(clear);
             bar.Children.Add(cancel);
-            bar.Children.Add(Fluent.Label("Clear history? Labelled items are kept.", 13));
+            bar.Children.Add(Fluent.Label("Clear history? Saved items are kept.", 13));
             _footer.Child = bar;
             return;
         }

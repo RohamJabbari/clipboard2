@@ -188,10 +188,10 @@ public sealed class PanelTests : IDisposable
             Assert.DoesNotContain(_model.AvailableActions, a => a.Title is "Pin" or "Unpin");
         }
         _model.Select(new PanelEntry.Clip(plain).Id);
-        Assert.DoesNotContain(new PanelAction.RemoveFromLabelled(), _model.AvailableActions);
+        Assert.DoesNotContain(new PanelAction.RemoveFromSaved(), _model.AvailableActions);
         _model.SelectAll();
         Assert.DoesNotContain(_model.AvailableActions, a => a.Title is "Pin" or "Unpin");
-        Assert.Contains(new PanelAction.RemoveFromLabelled(), _model.AvailableActions);
+        Assert.Contains(new PanelAction.RemoveFromSaved(), _model.AvailableActions);
 
         // Ctrl+P no longer pins.
         _model.Select(new PanelEntry.Clip(plain).Id);
@@ -200,15 +200,15 @@ public sealed class PanelTests : IDisposable
 
         _model.SetFilter(PanelFilter.Labelled);
         Assert.Equal(["Kept", "pinned long ago"], _model.Entries.Select(e => e.ClipItem!.DisplayTitle));
-        Assert.Equal("Labelled", PanelFilter.Labelled.Title());
+        Assert.Equal("Saved", PanelFilter.Labelled.Title());
 
-        // Only an item pinned without a label offers "Remove from Labelled".
+        // Only an item pinned without a label offers "Remove from Saved".
         _model.Select(_model.Entries[0].Id);
-        Assert.DoesNotContain(new PanelAction.RemoveFromLabelled(), _model.AvailableActions);
+        Assert.DoesNotContain(new PanelAction.RemoveFromSaved(), _model.AvailableActions);
         _model.Select(new PanelEntry.Clip(legacy).Id);
-        _model.Perform(Assert.Single(_model.AvailableActions.OfType<PanelAction.RemoveFromLabelled>()));
+        _model.Perform(Assert.Single(_model.AvailableActions.OfType<PanelAction.RemoveFromSaved>()));
         Assert.False(_store.Find(legacy.Id)!.IsPinned);
-        Assert.Equal("Removed from Labelled", _model.Notice);
+        Assert.Equal("Removed from Saved", _model.Notice);
         Assert.Equal("Kept", Assert.Single(_model.Entries).ClipItem!.Label);
     }
 
