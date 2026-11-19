@@ -250,7 +250,7 @@ public sealed class FolderTests : IDisposable
 
         _model.PrepareForOpen(null);
         _model.SetFilter(PanelFilter.Labelled);
-        Assert.Equal(["[Mine 0]", "group saved"], Titles());    // the personal Saved has no group folders
+        Assert.Equal(["[Mine 0]"], Titles());    // the personal Saved has no group folders or clips
 
         _model.SetGroupFilter("g1");
         Assert.False(_model.IsSavedView);

@@ -675,8 +675,9 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             : inbox ? [.. store.AllItems().Where(item => Listed(item.SpaceId, new PanelEntry.Clip(item)))]
             : Filter is PanelFilter.Snippets or PanelFilter.Secrets ? [] : store.AllItems().Where(item => Listed(item.SpaceId, new PanelEntry.Clip(item)) && Filter switch
         {
-            // Saved: labelled items, items added to Saved or moved into a folder, and any pinned before labels.
-            PanelFilter.Labelled => item.IsPinned,
+            // Saved: your own saved clips (labelled, added to Saved, in a folder, or pinned before labels).
+            // A group's saved clips are in that group's Saved view.
+            PanelFilter.Labelled => item.IsPinned && item.SpaceId is null,
             PanelFilter.Text => item.Kind.IsTextual(),
             PanelFilter.Images => item.Kind == ClipKind.Image,
             PanelFilter.Files => item.Kind == ClipKind.File,
