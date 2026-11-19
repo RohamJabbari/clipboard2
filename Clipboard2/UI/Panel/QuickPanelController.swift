@@ -52,10 +52,26 @@ final class QuickPanel: NSPanel {
 }
 
 /// The window's transparent root. Clicks that land on the shadow halo (not on the panel) close it.
-private final class PanelRootView: NSView {
+///
+/// A click on an empty part of the panel (the list below its last row, an empty preview, the gaps
+/// in the header) isn't claimed by any SwiftUI view: the hosting view passes it on, AppKit's
+/// default `mouseDown` forwards it up the responder chain, and it arrives here too. So only a
+/// click outside the panel's own shape counts as outside.
+final class PanelRootView: NSView {
     var onClickOutside: () -> Void = {}
+    /// The panel's shape in this view's coordinates (the window is larger, for the shadow).
+    var panelShape: () -> CGPath? = { nil }
     override var isOpaque: Bool { false }
-    override func mouseDown(with event: NSEvent) { onClickOutside() }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if isOutsidePanel(point) { onClickOutside() }
+    }
+
+    func isOutsidePanel(_ point: CGPoint) -> Bool {
+        guard let shape = panelShape() else { return true }
+        return !shape.contains(point)
+    }
 }
 
 /// Presents the quick panel and drives its open/close motion.
@@ -643,6 +659,15 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         root.wantsLayer = true
         root.autoresizingMask = [.width, .height]
         root.onClickOutside = { [weak self] in self?.close() }
+        root.panelShape = { [weak self] in
+            guard let self, let geometry = self.geometry, self.phase != .hidden else { return nil }
+            // At rest, the panel's frame and corners; mid-animation, wherever its shape is now.
+            let progress = self.motion?.state(at: CACurrentMediaTime()).progress ?? (self.phase == .closing ? 0 : 1)
+            let shape = geometry.shape(at: progress)
+            let offset = geometry.offset(at: progress)
+            let rect = shape.rect.offsetBy(dx: geometry.panelInWindow.minX + offset.dx, dy: geometry.panelInWindow.minY + offset.dy)
+            return Self.path(rect, shape.radius)
+        }
 
         let shadowView = NSView()
         let shadowHost = CALayer()
