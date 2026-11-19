@@ -46,7 +46,8 @@ internal sealed class FakeHost : IPanelHost
     public void CopyText(string text) => Log.Add($"copy-text:{text}");
     public void PasteSecret(SecretRef secret) => Log.Add($"paste-secret:{secret.Name}");
     public void CopySecret(SecretRef secret) => Log.Add($"copy-secret:{secret.Name}");
-    public void ShareSecret(SecretRef secret, string groupId, string groupName) => Log.Add($"share-secret:{secret.Name}:{groupName}");
+    public void CopySecrets(IReadOnlyList<SecretRef> secrets, string? spaceId, Guid? folderId, string reason, string notice) =>
+        Log.Add($"copy-secrets:{string.Join(",", secrets.Select(s => s.Name))}:{spaceId ?? "personal"}:{folderId?.ToString() ?? "root"}");
     public string? CurrentClipboardText() => "CLIP";
     public void OpenSettings() => Log.Add("settings");
     public string SaveFolder { get; set; } = Path.Combine(Path.GetTempPath(), "c2save-" + Guid.NewGuid(), "Downloads");
@@ -115,14 +116,22 @@ public sealed class PanelTests : IDisposable
     }
 
     [Fact]
-    public void ContentTypesAreMenuFiltersNotTabStops()
+    public void RemovedFiltersFallBackToAll()
     {
-        Assert.Equal([PanelFilter.All, PanelFilter.Labelled, PanelFilter.Secrets, PanelFilter.ThisApp], PanelFilters.Chips);
+        Assert.Equal([PanelFilter.All, PanelFilter.Labelled, PanelFilter.ThisApp], PanelFilters.Chips);
         Add("some text");
         _model.PrepareForOpen(null);
-        _model.SetFilter(PanelFilter.Images);
-        Assert.Empty(_model.Entries);
-        _model.HandleKey(K(PanelKey.Tab));                 // from a menu filter, Tab goes on to the chips
+        foreach (var removed in new[] { PanelFilter.Text, PanelFilter.Images, PanelFilter.Files, PanelFilter.Snippets, PanelFilter.Secrets })
+        {
+            Assert.True(removed.IsRemoved());
+            Assert.Equal(PanelFilter.All, removed.Normalized());
+            _model.SetFilter(PanelFilter.Labelled);
+            _model.SetFilter(removed);                     // e.g. a value stored by an older version
+            Assert.Equal(PanelFilter.All, _model.Filter);
+            Assert.Equal("some text", Assert.Single(_model.Entries).ClipItem!.Text);
+        }
+        Assert.Equal(PanelFilter.Inbox, PanelFilter.Inbox.Normalized());
+        _model.HandleKey(K(PanelKey.Tab));
         Assert.Equal(PanelFilter.Labelled, _model.Filter);
     }
 
@@ -487,10 +496,14 @@ public sealed class PanelTests : IDisposable
         Assert.Equal("Team", _model.GroupBadge(new PanelEntry.Clip(copy)));
         Assert.Null(_model.GroupBadge(new PanelEntry.Clip(item)));
 
-        // Tab cycles through the filter chips and then the group.
+        // Tab cycles through the filter chips and then the group's two segments.
         for (var i = 0; i < PanelFilters.Chips.Length; i++) _model.CycleFilter(true);
         Assert.Equal("g1", _model.GroupFilter);
+        Assert.False(_model.IsSavedView);
         Assert.Equal(copy.Id, Assert.Single(_model.Entries).ClipItem!.Id);
+        _model.CycleFilter(true);
+        Assert.Equal("g1", _model.GroupFilter);
+        Assert.True(_model.IsSavedView);
         _model.CycleFilter(true);
         Assert.Null(_model.GroupFilter);
         Assert.Equal(PanelFilter.All, _model.Filter);
@@ -508,9 +521,9 @@ public sealed class PanelTests : IDisposable
         Assert.Equal(PanelMode.Actions, _model.Mode);
         Assert.False(_model.IsPickingGroup);
 
-        _model.SetFilter(PanelFilter.Secrets);
+        _model.SetFilter(PanelFilter.Labelled);
         _model.Select(new PanelEntry.SecretEntry(secret).Id);
         _model.Perform(new PanelAction.ShareTo("g1", "Team"));
-        Assert.Contains("share-secret:PIN:Team", _host.Log);
+        Assert.Contains("copy-secrets:PIN:g1:root", _host.Log);
     }
 }

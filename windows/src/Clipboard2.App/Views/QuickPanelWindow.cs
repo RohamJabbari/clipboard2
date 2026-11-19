@@ -26,7 +26,6 @@ public sealed class QuickPanelWindow : Window
 
     private readonly TextBox _search = new();
     private readonly TextBlock _targetLabel = Fluent.Label("", 12, Fluent.Secondary);
-    private readonly Border _typeFilter = new() { CornerRadius = new CornerRadius(6), Padding = new Thickness(6, 2, 6, 2), Margin = new Thickness(8, 0, 8, 0), Cursor = Cursors.Hand, Background = Brushes.Transparent, VerticalAlignment = VerticalAlignment.Center };
     private readonly StackPanel _chips = new() { Orientation = Orientation.Horizontal };
     private readonly StackPanel _rows = new();
     private readonly ScrollViewer _rowScroll;
@@ -35,7 +34,7 @@ public sealed class QuickPanelWindow : Window
     private readonly TextBlock _notice = Fluent.Label("", 12);
     private readonly SyncStatusBadge _syncStatus;
     private readonly IncomingDownloadBanner _incoming = new();
-    /// <summary>Above the list: a group's All | Saved switch, and in Saved the breadcrumb and New Folder.</summary>
+    /// <summary>Above the list in Saved: the breadcrumb and New Folder.</summary>
     private readonly StackPanel _savedBar = new();
     private readonly Dictionary<string, Border> _rowViews = [];
     private List<string> _renderedIds = [];
@@ -78,14 +77,13 @@ public sealed class QuickPanelWindow : Window
         searchIcon.Margin = new Thickness(0, 0, 10, 0);
         DockPanel.SetDock(searchIcon, Dock.Left);
         DockPanel.SetDock(_targetLabel, Dock.Right);
-        DockPanel.SetDock(_typeFilter, Dock.Right);
-        _typeFilter.MouseLeftButtonUp += (_, _) => ShowTypeFilterMenu();
         searchRow.Children.Add(searchIcon);
         searchRow.Children.Add(_targetLabel);
-        searchRow.Children.Add(_typeFilter);
         searchRow.Children.Add(_search);
 
-        _rowScroll = new ScrollViewer { Content = _rows, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(8, 6, 8, 6) };
+        // Not focusable: a click on the empty space below the rows leaves the keyboard in the search box. (Clicks
+        // anywhere in the panel are inside its window, so they never deactivate it and close it.)
+        _rowScroll = new ScrollViewer { Content = _rows, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(8, 6, 8, 6), Focusable = false };
 
         var content = new Grid();
         content.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(44, GridUnitType.Star) });
@@ -166,6 +164,7 @@ public sealed class QuickPanelWindow : Window
             Native.SetWindowPos(hwnd, IntPtr.Zero, x, y, w, h, Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
         }
         _detailState = default;
+        _snapChips = true;
         Render();
         Show();
         Activate();
@@ -267,12 +266,19 @@ public sealed class QuickPanelWindow : Window
 
     private void BeginRowDrag(Border row, PanelEntry entry, MouseEventArgs e)
     {
-        if (e.LeftButton != MouseButtonState.Pressed || _dragEntry != entry || entry.ClipItem is not { } item || item == Model.SelectionItem) return;
+        if (e.LeftButton != MouseButtonState.Pressed || _dragEntry != entry) return;
+        if (entry is not (PanelEntry.Clip or PanelEntry.SecretEntry) || entry.ClipItem is { } selection && selection == Model.SelectionItem) return;
         var delta = e.GetPosition(this) - _dragStart;
         if (Math.Abs(delta.X) < SystemParameters.MinimumHorizontalDragDistance && Math.Abs(delta.Y) < SystemParameters.MinimumVerticalDragDistance) return;
         _dragEntry = null;
         var data = new DataObject();
         data.SetData(EntryFormat, entry.Id);
+        // A secret drags only within the panel (onto a folder or a group): its value never goes on the drag.
+        if (entry.ClipItem is not { } item)
+        {
+            DragDrop.DoDragDrop(row, data, DragDropEffects.Copy);
+            return;
+        }
         if (item.Kind.IsTextual()) data.SetText(item.Text);
         else if (DraggedFiles(Model.ItemForUse(item)) is { Count: > 0 } files) data.SetFileDropList(files);
         if (item.Kind == ClipKind.Image && item.ImageFile is { } image && File.Exists(_services.Store.Blobs.PathFor(image)))
@@ -322,8 +328,9 @@ public sealed class QuickPanelWindow : Window
     }
 
     /// <summary>Dropping a panel item, files or text on a group chip shares it to that group.</summary>
-    private void MakeGroupDropTarget(Border chip, string groupId, string groupName)
+    private void MakeGroupDropTarget(GroupChip chip)
     {
+        var groupId = chip.GroupId;
         chip.AllowDrop = true;
         bool Accepts(IDataObject data) => data.GetDataPresent(EntryFormat) || DroppedFiles(data).Count > 0 || DroppedText(data) is not null;
         chip.DragEnter += (_, e) =>
@@ -342,11 +349,12 @@ public sealed class QuickPanelWindow : Window
         {
             e.Handled = true;
             chip.BorderThickness = new Thickness(0);
+            var groupName = chip.GroupName;
             if (e.Data.GetData(EntryFormat) is string id)
             {
-                // Dragging one of several selected items shares the whole selection.
+                // Dragging one of several selected items shares the whole selection, to the group's root.
                 if (!(Model.IsMultiSelecting && Model.SelectedIds.Contains(id))) Model.Select(id);
-                Model.Perform(new PanelAction.ShareTo(groupId, groupName));
+                Model.ShareSelection(groupId, groupName, null);
                 return;
             }
             var files = DroppedFiles(e.Data);
@@ -396,29 +404,6 @@ public sealed class QuickPanelWindow : Window
     private void RenderSavedBar()
     {
         _savedBar.Children.Clear();
-        if (Model.GroupFilter is { } group)
-        {
-            // All | Saved, remembered per group.
-            var segments = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(14, 6, 14, 2) };
-            var saved = Model.GroupShowsSaved(group);
-            Border Segment(string title, bool selected, bool showSaved)
-            {
-                var segment = new Border
-                {
-                    Child = Fluent.Label(title, 12, selected ? Fluent.AccentText : null),
-                    Padding = new Thickness(10, 2, 10, 2),
-                    Background = selected ? Fluent.Accent : Fluent.Subtle,
-                    CornerRadius = showSaved ? new CornerRadius(0, 8, 8, 0) : new CornerRadius(8, 0, 0, 8),
-                    Cursor = Cursors.Hand,
-                };
-                AutomationName(segment, $"Show {title.ToLowerInvariant()} items of the group" + (selected ? ", selected" : ""));
-                segment.MouseLeftButtonUp += (_, _) => Model.SetGroupShowsSaved(showSaved);
-                return segment;
-            }
-            segments.Children.Add(Segment("All", !saved, false));
-            segments.Children.Add(Segment("Saved", saved, true));
-            _savedBar.Children.Add(segments);
-        }
         if (!Model.IsSavedView) return;
 
         var bar = new DockPanel { Margin = new Thickness(14, 6, 10, 2) };
@@ -583,22 +568,48 @@ public sealed class QuickPanelWindow : Window
 
     private void RenderChips()
     {
-        _chips.Children.Clear();
-        RenderTypeFilter();
-        foreach (var filter in Model.ChipFilters)
+        // All · Saved · ‹App› · Inbox, a divider, then the groups (Tab cycles through them in this order, a group's
+        // Copies and Saved included). The row is rebuilt only when it changes; group chips are kept, so a selected
+        // one can morph into its Copies | Saved pill.
+        var groups = Model.GroupNames.OrderBy(g => g.Value, StringComparer.CurrentCultureIgnoreCase).ToList();
+        string ChipTitle(PanelFilter filter) => filter == PanelFilter.ThisApp && Model.TargetApp is { } app ? app.Name : filter.Title();
+        var key = string.Join("|", Model.ChipFilters.Select(ChipTitle)) + "#" + (Model.GroupFilter is null ? Model.Filter.ToString() : "")
+            + "#" + string.Join("|", groups.Select(g => g.Key + "=" + g.Value));
+        if (key != _chipRowKey)
         {
-            var title = filter == PanelFilter.ThisApp && Model.TargetApp is { } app ? app.Name : filter.Title();
-            var f = filter;
-            AddChip(title, Glyphs.For(filter), Model.GroupFilter is null && filter == Model.Filter, () => Model.SetFilter(f));
+            _chipRowKey = key;
+            _chips.Children.Clear();
+            foreach (var filter in Model.ChipFilters)
+            {
+                var f = filter;
+                AddChip(ChipTitle(filter), Glyphs.For(filter), Model.GroupFilter is null && filter == Model.Filter, () => Model.SetFilter(f));
+            }
+            if (groups.Count > 0)
+                _chips.Children.Add(new Border { Width = 1, Height = 16, Margin = new Thickness(2, 0, 8, 0), Background = Fluent.Separator, VerticalAlignment = VerticalAlignment.Center });
+            foreach (var (id, name) in groups)
+            {
+                if (!_groupChips.TryGetValue(id, out var chip))
+                {
+                    chip = _groupChips[id] = new GroupChip(id, name);
+                    var groupId = id;
+                    chip.Chosen += () => Model.SetGroupFilter(groupId);   // on the open pill: back to its root, nothing new
+                    chip.SegmentChosen += saved => Model.SetGroupShowsSaved(saved);
+                    MakeGroupDropTarget(chip);
+                }
+                chip.SetName(name);
+                _chips.Children.Add(chip);
+            }
+            foreach (var gone in _groupChips.Keys.Where(id => !Model.GroupNames.ContainsKey(id)).ToList()) _groupChips.Remove(gone);
         }
-        // Sync groups come after the built-in filters (Tab cycles through them too).
-        foreach (var (id, name) in Model.GroupNames.OrderBy(g => g.Value, StringComparer.CurrentCultureIgnoreCase))
-        {
-            var chip = AddChip(name, Glyphs.Group, Model.GroupFilter == id, () => Model.SetGroupFilter(id));
-            chip.ToolTip = $"Drop items or files here to share them to “{name}”";
-            MakeGroupDropTarget(chip, id, name);
-        }
+        foreach (var (id, _) in groups)
+            _groupChips[id].Update(Model.GroupFilter == id, Model.GroupShowsSaved(id), animate: !_snapChips);
+        _snapChips = false;
     }
+
+    private readonly Dictionary<string, GroupChip> _groupChips = [];
+    private string? _chipRowKey;
+    /// <summary>Set when the panel opens: the chips take their state without animating.</summary>
+    private bool _snapChips = true;
 
     /// <summary>Group items still downloading, while that group (or All) is shown, and contacts' while the Inbox is.
     /// Updated in place: no list render.</summary>
@@ -606,38 +617,6 @@ public sealed class QuickPanelWindow : Window
         ? d.SpaceId == group
         : Model.Filter == PanelFilter.Inbox ? Model.ContactNames.ContainsKey(d.SpaceId)
         : Model.Filter == PanelFilter.All && Model.GroupNames.ContainsKey(d.SpaceId))]);
-
-    private PanelFilter? ActiveContentType => Model.GroupFilter is null && Model.Filter.IsContentType() ? Model.Filter : null;
-
-    /// <summary>The search box's filter button: the icon, plus the active type so a filtered list is never a surprise.</summary>
-    private void RenderTypeFilter()
-    {
-        var active = ActiveContentType;
-        var content = new StackPanel { Orientation = Orientation.Horizontal };
-        content.Children.Add(Glyphs.Icon(Glyphs.Filter, 15, active is null ? Fluent.Secondary : Fluent.Accent));
-        if (active is { } type)
-            content.Children.Add(new TextBlock { Text = type.Title(), Margin = new Thickness(6, 0, 0, 0), Foreground = Fluent.Accent, VerticalAlignment = VerticalAlignment.Center });
-        _typeFilter.Child = content;
-        _typeFilter.ToolTip = "Show only text, images, files or snippets";
-        AutomationName(_typeFilter, active is { } a ? $"Filter: {a.Title()}" : "Filter by type");
-    }
-
-    private void ShowTypeFilterMenu()
-    {
-        var active = ActiveContentType;
-        var menu = new ContextMenu { PlacementTarget = _typeFilter, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
-        MenuItem Item(string title, string glyph, bool selected, PanelFilter filter)
-        {
-            var item = new MenuItem { Header = title, Icon = Glyphs.Icon(glyph, 14), IsCheckable = true, IsChecked = selected };
-            item.Click += (_, _) => Model.SetFilter(filter);
-            return item;
-        }
-        menu.Items.Add(Item("Everything", Glyphs.All, active is null, PanelFilter.All));
-        menu.Items.Add(new Separator());
-        foreach (var type in PanelFilters.ContentTypes)
-            menu.Items.Add(Item(type.Title(), Glyphs.For(type), active == type, type));
-        menu.IsOpen = true;
-    }
 
     private Border AddChip(string title, string glyph, bool selected, Action choose)
     {
@@ -652,10 +631,11 @@ public sealed class QuickPanelWindow : Window
             CornerRadius = new CornerRadius(12),
             Padding = new Thickness(10, 4, 10, 4),
             Margin = new Thickness(0, 0, 6, 0),
+            Height = 26,
             Background = selected ? Fluent.Accent : Fluent.Subtle,
             Cursor = Cursors.Hand,
         };
-        AutomationName(chip, $"{title} filter");
+        AutomationName(chip, $"{title} filter" + (selected ? ", selected" : ""));
         chip.MouseLeftButtonUp += (_, _) => choose();
         _chips.Children.Add(chip);
         return chip;
@@ -675,7 +655,7 @@ public sealed class QuickPanelWindow : Window
                 var inbox = Model.Filter == PanelFilter.Inbox && Model.GroupFilter is null;
                 var (emptyTitle, emptyHint) = Model.Query.Length > 0 ? ("No matches", "Try fewer letters or another filter.")
                     : Model.OpenFolderId is not null ? ("This folder is empty", "Drag items here, or use Move to Folder in Ctrl+K.")
-                    : Model.IsSavedView ? ("Nothing saved yet", "Label an item or use Add to Saved to keep it.")
+                    : Model.IsSavedView ? ("Nothing saved yet", "Label an item or use Add to Saved to keep it. Secrets and snippets are kept here too.")
                     : inbox ? ("Your Inbox is empty", "What your contacts send you appears here.")
                     : ("Nothing here yet", "Items appear as you copy them.");
                 empty.Children.Add(Fluent.Label(emptyTitle, 16, null, FontWeights.SemiBold));
@@ -867,8 +847,8 @@ public sealed class QuickPanelWindow : Window
                 return Box(Glyphs.Icon(Glyphs.Snippet, 18, selected ? Fluent.AccentText : Fluent.Accent));
             case PanelEntry.FolderEntry:
                 return Box(Glyphs.Icon(Glyphs.Folder, 18, selected ? Fluent.AccentText : Fluent.Accent));
-            default:
-                return Box(Glyphs.Icon(Glyphs.Key, 18, selected ? Fluent.AccentText : Fluent.Accent));
+            default:   // a secret: the lock, as it sits among clips in Saved
+                return Box(Glyphs.Icon(Glyphs.Lock, 18, selected ? Fluent.AccentText : Fluent.Accent));
         }
         static FrameworkElement Box(TextBlock icon) => new Border { Width = 28, Height = 28, Child = icon, HorizontalAlignment = HorizontalAlignment.Center };
     }
@@ -889,12 +869,14 @@ public sealed class QuickPanelWindow : Window
     {
         menu.Items.Clear();
         MenuItem Item(string header, Action action) { var i = new MenuItem { Header = header }; i.Click += (_, _) => action(); return i; }
+        // Right-clicking one of several selected items acts on them all.
+        void Focus() { if (!(Model.IsMultiSelecting && Model.IsSelected(entry))) Model.Select(entry.Id); }
         if (entry is PanelEntry.FolderEntry f)
         {
             menu.Items.Add(Item("Open", () => Model.Activate(entry)));
             menu.Items.Add(Item("Rename…", () => Model.BeginRenameFolder(f.Folder)));
             menu.Items.Add(Item(f.Folder.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
-            if (f.Folder.SpaceId is null && ShareMenu(entry) is { } shareFolder) menu.Items.Add(shareFolder);
+            if (f.Folder.SpaceId is null && ShareMenu(entry, Focus) is { } shareFolder) menu.Items.Add(shareFolder);
             menu.Items.Add(new Separator());
             menu.Items.Add(Item("Delete Folder", () => Model.DeleteFolder(f.Folder)));
             return;
@@ -912,7 +894,7 @@ public sealed class QuickPanelWindow : Window
             slots.Items.Add(Item($"Ctrl+{slot}", () => { Model.Select(entry.Id); Model.AssignSelection(slot); }));
         }
         menu.Items.Add(slots);
-        if (ShareMenu(entry) is { } share) menu.Items.Add(share);
+        if (ShareMenu(entry, Focus) is { } share) menu.Items.Add(share);
         if (entry.ClipItem is { } forContact && Model.ContactNames.Where(c => c.Key != forContact.SpaceId).ToList() is { Count: > 0 } contacts)
         {
             var send = new MenuItem { Header = "Send to Contact" };
@@ -931,6 +913,12 @@ public sealed class QuickPanelWindow : Window
                 send.Items.Add(Item($"Send to {device.Name}", () => _ = _services.SendToDeviceAsync(sendable, device, fromPanel: true)));
             menu.Items.Add(send);
         }
+        if (entry is PanelEntry.SecretEntry)
+        {
+            menu.Items.Add(new Separator());
+            if (Model.CanUseFolders(entry)) menu.Items.Add(MoveToFolderMenu(entry, Focus));
+            if (Model.FolderOf(entry) is not null) menu.Items.Add(Item("Remove from Folder", () => { Focus(); Model.Perform(new PanelAction.RemoveFromFolder()); }));
+        }
         if (entry.ClipItem is { } item)
         {
             menu.Items.Add(Item("Paste as Plain Text", () => Model.Activate(entry, Transform.PlainText)));
@@ -940,22 +928,21 @@ public sealed class QuickPanelWindow : Window
             {
                 var preview = Item("Preview", () =>
                 {
-                    // Right-clicking one of several selected items previews them all.
-                    if (!(Model.IsMultiSelecting && Model.IsSelected(entry))) Model.Select(entry.Id);
+                    Focus();   // right-clicking one of several selected items previews them all
                     Model.OpenPreview();
                 });
                 preview.InputGestureText = "Ctrl+Y";
                 menu.Items.Add(preview);
             }
             menu.Items.Add(Item(item.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
-            // Right-clicking one of several selected items acts on them all.
             List<ClipItem> Targets() => Model.IsMultiSelecting && Model.IsSelected(entry) ? Model.SelectedClips : [item];
             if (item != Model.SelectionItem)
             {
-                if (!item.IsPinned) menu.Items.Add(Item("Add to Saved", () => Model.AddToSaved(Targets())));
+                // Another member's group item can't be saved in the group (the server refuses): a personal copy is.
+                if (!item.IsPinned) menu.Items.Add(Item(Model.CanChange(item) ? "Add to Saved" : "Save a Copy", () => Model.AddToSaved(Targets())));
                 if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Saved", () => Model.RemoveFromSaved(Targets())));
-                if (Model.CanUseFolders(item)) menu.Items.Add(MoveToFolderMenu(entry, item, Targets));
-                if (Model.FolderOf(item) is not null) menu.Items.Add(Item("Remove from Folder", () => Model.MoveToFolder(Targets(), null)));
+                if (Model.CanUseFolders(item)) menu.Items.Add(MoveToFolderMenu(entry, Focus));
+                if (Model.FolderOf(item) is not null) menu.Items.Add(Item("Remove from Folder", () => { Focus(); Model.Perform(new PanelAction.RemoveFromFolder()); }));
                 menu.Items.Add(Item($"Save to {Model.SaveFolderName}", () => Model.Save(Targets(), _services.SaveFolder)));
                 menu.Items.Add(Item("Save to…", () => { if (_services.ChooseSaveFolder() is { } folder) Model.Save(Targets(), folder); }));
             }
@@ -965,31 +952,42 @@ public sealed class QuickPanelWindow : Window
         }
     }
 
-    /// <summary>Move to Folder ▸ the folders of the item's space, then New Folder… (named inline in the panel).</summary>
-    private MenuItem MoveToFolderMenu(PanelEntry entry, ClipItem item, Func<List<ClipItem>> targets)
+    /// <summary>Move to Folder ▸ the folders the item (or the selection it's in) can go into, then New Folder… (named
+    /// inline in the panel). For group items, the group's folders and then the personal ones under "Mine", which take
+    /// personal copies.</summary>
+    private MenuItem MoveToFolderMenu(PanelEntry entry, Action focus)
     {
         var menu = new MenuItem { Header = "Move to Folder" };
-        var current = Model.FolderOf(item)?.Id;
-        foreach (var folder in Model.FoldersIn(item.SpaceId).Where(f => f.Id != current))
+        var targets = Model.IsMultiSelecting && Model.IsSelected(entry) ? Model.FolderTargets : [entry];
+        string? section = null;
+        foreach (var choice in Model.FolderChoices(targets))
         {
-            var target = folder;
-            var row = new MenuItem { Header = folder.Name, Icon = Glyphs.Icon(Glyphs.Folder, 14) };
-            row.Click += (_, _) => Model.MoveToFolder(targets(), target);
+            var title = choice switch { PanelAction.MoveTo m => m.SectionTitle, PanelAction.MoveToNewFolder n => n.SectionTitle, _ => null };
+            if (title is not null && title != section)
+            {
+                if (section is not null) menu.Items.Add(new Separator());
+                section = title;
+                menu.Items.Add(new MenuItem { Header = title, IsEnabled = false, FontWeight = FontWeights.SemiBold });
+            }
+            else if (choice is PanelAction.MoveToNewFolder && title is null && menu.Items.Count > 0) menu.Items.Add(new Separator());
+            var action = choice;
+            var row = new MenuItem
+            {
+                Header = choice.Title,
+                Icon = Glyphs.Icon(choice is PanelAction.MoveToNewFolder ? Glyphs.NewFolder : Glyphs.Folder, 14),
+            };
+            row.Click += (_, _) =>
+            {
+                focus();
+                Model.Perform(action);
+            };
             menu.Items.Add(row);
         }
-        if (menu.Items.Count > 0) menu.Items.Add(new Separator());
-        var create = new MenuItem { Header = "New Folder…", Icon = Glyphs.Icon(Glyphs.NewFolder, 14) };
-        create.Click += (_, _) =>
-        {
-            var items = targets();
-            if (!(Model.IsMultiSelecting && Model.IsSelected(entry))) Model.Select(entry.Id);
-            Model.BeginNewFolder(items);
-        };
-        menu.Items.Add(create);
         return menu;
     }
 
-    private MenuItem? ShareMenu(PanelEntry entry)
+    /// <summary>Share to Group ▸ the groups; for a group with folders, a clip or secret can go into one of them.</summary>
+    private MenuItem? ShareMenu(PanelEntry entry, Action focus)
     {
         var own = entry switch
         {
@@ -1004,11 +1002,25 @@ public sealed class QuickPanelWindow : Window
         foreach (var (id, name) in groups)
         {
             var item = new MenuItem { Header = name };
-            item.Click += (_, _) =>
+            var folders = entry is PanelEntry.Clip or PanelEntry.SecretEntry ? Model.FoldersIn(id) : [];
+            if (folders.Count == 0)
             {
-                Model.Select(entry.Id);
-                Model.Perform(new PanelAction.ShareTo(id, name));
-            };
+                item.Click += (_, _) => { focus(); Model.ShareSelection(id, name, null); };
+            }
+            else
+            {
+                var root = new MenuItem { Header = "No Folder" };
+                root.Click += (_, _) => { focus(); Model.ShareSelection(id, name, null); };
+                item.Items.Add(root);
+                item.Items.Add(new Separator());
+                foreach (var folder in folders)
+                {
+                    var into = new MenuItem { Header = folder.Name, Icon = Glyphs.Icon(Glyphs.Folder, 14) };
+                    var folderId = folder.Id;
+                    into.Click += (_, _) => { focus(); Model.ShareSelection(id, name, folderId); };
+                    item.Items.Add(into);
+                }
+            }
             menu.Items.Add(item);
         }
         return menu;
@@ -1315,6 +1327,8 @@ public sealed class QuickPanelWindow : Window
             case PanelEntry.SecretEntry k:
                 Line("Stored in", "Credential Manager");
                 if (k.Secret.CreatedAt is { } created) Line("Added", created.ToLocalTime().ToString("g"));
+                if (Model.FolderOf(k.Secret) is { } secretFolder) Line("Folder", secretFolder.Name);
+                if (Model.GroupName(k) is { } secretGroup) Line("Group", secretGroup);
                 break;
         }
         return stack;
@@ -1376,6 +1390,7 @@ public sealed class QuickPanelWindow : Window
         if (_actionFilter is not null && _actionFilter.Text != Model.ActionQuery) _actionFilter.Text = Model.ActionQuery;
         if (_actionHint is not null)
             _actionHint.Text = Model.IsPickingGroup ? "Choose a group to share with"
+                : Model.PickingShareFolder is { } share ? $"Choose where in “{share.GroupName}” it goes"
                 : Model.IsPickingFolder ? "Choose a folder to move to" : $"Filter actions or ask {Model.AIName}";
         var actions = Model.FilteredActions;
         string? section = null;
@@ -1624,6 +1639,7 @@ public sealed class QuickPanelWindow : Window
                 "Enter Paste    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Shift+1–9 Assign Slot    Tab Filter    Esc Close",
             PanelMode.Browse => "Enter Paste    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Y Preview    Ctrl+Shift+1–9 Assign Slot    Tab Filter    Esc Close",
             PanelMode.Actions when Model.IsPickingGroup => "↑↓ Choose Group    Enter Share    Esc Back",
+            PanelMode.Actions when Model.PickingShareFolder is not null => "↑↓ Choose Folder    Enter Share    Esc Back",
             PanelMode.Actions when Model.IsPickingFolder => "↑↓ Choose Folder    Enter Move    Esc Back",
             PanelMode.Actions => "↑↓ Choose    Enter Run    Esc Back",
             PanelMode.AI => "Enter Paste    Ctrl+C Copy    Ctrl+R Replace Item    Esc Back",

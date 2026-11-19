@@ -260,13 +260,15 @@ public sealed class FolderTests : IDisposable
         Assert.Equal(["g1"], _settings.GroupsShowingSaved);
         Assert.Equal(["[Shared 1]", "group saved"], Titles());
 
-        // A new folder in a group's Saved belongs to the group; group clips only move into its folders.
+        // A new folder in a group's Saved belongs to the group; group clips move into its folders, and the personal
+        // ones (under "Mine") take copies.
         _model.CreateFolder();
         _model.SubmitFolderName();
         Assert.Equal("g1", _store.AllFolders().Single(f => f.Name == "New Folder").SpaceId);
         _model.Select(new PanelEntry.Clip(groupRoot).Id);
         _model.Perform(new PanelAction.MoveToFolder());
-        Assert.Equal(["New Folder", "Shared", "New Folder…"], _model.FilteredActions.Select(a => a.Title));
+        Assert.Equal(["New Folder", "Shared", "New Folder…", "Mine", "New Folder…"], _model.FilteredActions.Select(a => a.Title));
+        Assert.Equal(["Team", "Team", "Team", "Mine", "Mine"], _model.FilteredActions.Select(a => a.Section("AI")));
         _model.ResetMode();
 
         // The choice is remembered per group.

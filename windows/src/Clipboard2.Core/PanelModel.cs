@@ -3,17 +3,22 @@ using Clipboard2.Core.Sync;
 
 namespace Clipboard2.Core;
 
-/// <summary><see cref="Labelled"/> is the Saved chip: the raw name stays so stored values keep working.</summary>
+/// <summary><see cref="Labelled"/> is the Saved chip: the raw name stays so stored values keep working. Text, Images,
+/// Files, Snippets and Secrets were filters before 1.7 (Saved holds secrets and snippets now); they stay so old values
+/// still parse, and read as All (<see cref="PanelFilters.Normalized"/>).</summary>
 public enum PanelFilter { All, Labelled, Text, Images, Files, Snippets, Secrets, ThisApp, Inbox }
 
 public static class PanelFilters
 {
     public static readonly PanelFilter[] All = Enum.GetValues<PanelFilter>();
-    /// <summary>Content types live in the search box's filter menu; the other filters are chips.</summary>
-    public static bool IsContentType(this PanelFilter f) => f is PanelFilter.Text or PanelFilter.Images or PanelFilter.Files or PanelFilter.Snippets;
-    /// <summary>The chips always shown. Inbox joins them once there are contacts (<see cref="PanelModel.ChipFilters"/>).</summary>
-    public static readonly PanelFilter[] Chips = [.. All.Where(f => !f.IsContentType() && f != PanelFilter.Inbox)];
-    public static readonly PanelFilter[] ContentTypes = [.. All.Where(f => f.IsContentType())];
+    /// <summary>Filters that are no longer offered.</summary>
+    public static bool IsRemoved(this PanelFilter f) =>
+        f is PanelFilter.Text or PanelFilter.Images or PanelFilter.Files or PanelFilter.Snippets or PanelFilter.Secrets;
+    /// <summary>A removed filter falls back to All.</summary>
+    public static PanelFilter Normalized(this PanelFilter f) => f.IsRemoved() ? PanelFilter.All : f;
+    /// <summary>The chips always shown: All · Saved · This App. Inbox joins them once there are contacts
+    /// (<see cref="PanelModel.ChipFilters"/>), and the groups follow.</summary>
+    public static readonly PanelFilter[] Chips = [PanelFilter.All, PanelFilter.Labelled, PanelFilter.ThisApp];
     public static string Title(this PanelFilter f) => f switch
     {
         PanelFilter.ThisApp => "This App",
@@ -66,13 +71,22 @@ public abstract record PanelAction
     public sealed record ClearSlot(int Slot) : PanelAction;
     /// <summary>Saves an unsaved clip without a label.</summary>
     public sealed record AddToSaved : PanelAction;
+    /// <summary>Add to Saved for another member's group item, which only its author or the group's owner may change:
+    /// a personal copy, saved at the root of the personal Saved.</summary>
+    public sealed record SaveCopy : PanelAction;
     /// <summary>For items saved without a label (a labelled one goes when its label does). Also leaves the folder.</summary>
     public sealed record RemoveFromSaved : PanelAction;
-    /// <summary>Lists the folders of the clips' space to move them into.</summary>
+    /// <summary>Lists the folders the selection can go into: its space's, and for group items the personal ones too.</summary>
     public sealed record MoveToFolder : PanelAction;
-    public sealed record MoveTo(Guid FolderId, string FolderName) : PanelAction;
-    /// <summary>Asks for a name, creates the folder and moves the selection in.</summary>
-    public sealed record MoveToNewFolder : PanelAction;
+    /// <param name="SectionTitle">The space the folder is in ("‹Group›" or "Mine") when the picker lists two; null
+    /// reads "Move to Folder".</param>
+    public sealed record MoveTo(Guid FolderId, string FolderName, string? SectionTitle = null) : PanelAction;
+    /// <summary>Asks for a name, creates the folder and moves the selection in. <paramref name="Mine"/>: a personal
+    /// folder, which group items are copied into.</summary>
+    public sealed record MoveToNewFolder(bool Mine = false, string? SectionTitle = null) : PanelAction;
+    /// <summary>Share to Group's second step when the group has folders: where in the group's Saved the copies go
+    /// (null: the root).</summary>
+    public sealed record ShareInto(string GroupId, string GroupName, Guid? FolderId, string FolderTitle) : PanelAction;
     /// <summary>Back to the root of Saved; the clip stays saved.</summary>
     public sealed record RemoveFromFolder : PanelAction;
     public sealed record OpenFolder : PanelAction;
@@ -100,9 +114,11 @@ public abstract record PanelAction
         ApplyTransform => "Transform & Paste",
         Ask or SetUpAI => $"Ask {aiName}",
         ShareTo => "Share to Group",
+        ShareInto s => $"Share to “{s.GroupName}”",
         SendTo => "Send to Device",
         SendToContact => "Send to Contact",
-        MoveTo or MoveToNewFolder => "Move to Folder",
+        MoveTo m => m.SectionTitle ?? "Move to Folder",
+        MoveToNewFolder m => m.SectionTitle ?? "Move to Folder",
         OpenFolder or RenameFolder or DeleteFolder => "Folder",
         _ => "Item",
     };
@@ -120,6 +136,8 @@ public abstract record PanelAction
         SetUpAI => "Set Up AI…",
         ClearSlot c => $"Remove from Quick Slot Ctrl+{c.Slot}",
         AddToSaved => "Add to Saved",
+        SaveCopy => "Save a Copy",
+        ShareInto s => s.FolderTitle,
         RemoveFromSaved => "Remove from Saved",
         MoveToFolder => "Move to Folder…",
         MoveTo m => m.FolderName,
@@ -155,8 +173,11 @@ public interface IPanelHost
     void CopyText(string text);
     void PasteSecret(SecretRef secret);
     void CopySecret(SecretRef secret);
-    /// <summary>Copies a secret into a sync group (after confirming with Windows Hello).</summary>
-    void ShareSecret(SecretRef secret, string groupId, string groupName);
+    /// <summary>Copies secrets (new ids) into a space: a group (Share to Group) or, with null, the personal one (a
+    /// group's secret saved to a personal folder). One Windows Hello confirmation for all of them, asking to
+    /// <paramref name="reason"/>. Each copy goes into <paramref name="folderId"/> when given. Shows
+    /// <paramref name="notice"/> when done.</summary>
+    void CopySecrets(IReadOnlyList<SecretRef> secrets, string? spaceId, Guid? folderId, string reason, string notice);
     string? CurrentClipboardText();
     void OpenSettings();
     /// <summary>The folder "Save to ‹folder›" writes to (Settings, or the user's Downloads folder).</summary>
@@ -212,7 +233,9 @@ public sealed class FolderForm
 {
     public ClipFolder? Folder { get; init; }
     public IReadOnlyList<Guid> ItemIds { get; init; } = [];
+    public IReadOnlyList<string> SecretIds { get; init; } = [];
     public string? SpaceId { get; init; }
+    public int Count => ItemIds.Count + SecretIds.Count;
     public string Text { get; set; } = ClipFolder.DefaultName;
     public bool IsRename => Folder is not null;
 }
@@ -290,6 +313,10 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     /// <summary>The folder open in Saved (personal or a group's), or null at Saved's root.</summary>
     public Guid? OpenFolderId { get; private set; }
     private Dictionary<Guid, ClipFolder> _folders = [];
+    /// <summary>Secret key → the folder it names (<see cref="ClipStore.SecretFolders"/>).</summary>
+    private Dictionary<string, Guid> _secretFolders = [];
+    /// <summary>In the action menu: Share to Group's second step, picking where in this group's Saved the copies go.</summary>
+    public PanelAction.ShareTo? PickingShareFolder { get; private set; }
     public ClipFolder? OpenFolder => OpenFolderId is { } id ? _folders.GetValueOrDefault(id) : null;
     public List<PanelEntry> Entries { get; private set; } = [];
     public string? SelectedId { get; private set; }
@@ -364,6 +391,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         ActionSelection = 0;
         IsPickingGroup = false;
         IsPickingFolder = false;
+        PickingShareFolder = null;
         Mode = PanelMode.Browse;
         Notify();
     }
@@ -378,6 +406,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     /// <summary>Picking the chip that's already selected goes back to the root of Saved.</summary>
     public void SetFilter(PanelFilter filter)
     {
+        filter = filter.Normalized();
         if (filter == Filter && GroupFilter is null)
         {
             CloseFolder();
@@ -412,16 +441,34 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     /// <summary>Whose Saved is shown: a group's id, or null for the personal Saved.</summary>
     public string? SavedSpace => GroupFilter;
 
-    /// <summary>The group's All | Saved switch, remembered per group.</summary>
+    /// <summary>The selected group chip's Copies | Saved segments: true for Saved. Remembered per group.</summary>
     public bool GroupShowsSaved(string groupId) => settings.GroupsShowingSaved.Contains(groupId);
 
     public void SetGroupShowsSaved(bool saved)
     {
         if (GroupFilter is not { } group || GroupShowsSaved(group) == saved) return;
-        if (saved) settings.GroupsShowingSaved.Add(group); else settings.GroupsShowingSaved.Remove(group);
-        settings.Save();
+        RememberGroupSegment(group, saved);
         OpenFolderId = null;
         Refresh(resetSelection: true);
+    }
+
+    private void RememberGroupSegment(string group, bool saved)
+    {
+        if (GroupShowsSaved(group) == saved) return;
+        if (saved) settings.GroupsShowingSaved.Add(group); else settings.GroupsShowingSaved.Remove(group);
+        settings.Save();
+    }
+
+    /// <summary>Shows a group on one of its segments (Tab cycling).</summary>
+    private void ShowGroup(string group, bool saved)
+    {
+        if (GroupFilter == group)
+        {
+            SetGroupShowsSaved(saved);
+            return;
+        }
+        RememberGroupSegment(group, saved);
+        SetGroupFilter(group);
     }
 
     public void OpenFolderById(Guid id)
@@ -445,13 +492,34 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     public ClipFolder? FolderOf(ClipItem item) =>
         item.IsPinned && item.FolderId is { } id && _folders.TryGetValue(id, out var folder) && folder.SpaceId == item.SpaceId ? folder : null;
 
-    /// <summary>The small caption on a clip shown outside its folder (a search from Saved's root, or History).</summary>
+    /// <summary>The folder a secret is in, if this device has it (and it's of the secret's space).</summary>
+    public ClipFolder? FolderOf(SecretRef secret) =>
+        _secretFolders.TryGetValue(ClipStore.SecretKey(secret.Id), out var id) && _folders.TryGetValue(id, out var folder)
+        && folder.SpaceId == secret.SpaceId ? folder : null;
+
+    /// <summary>The folder a clip or secret is in.</summary>
+    public ClipFolder? FolderOf(PanelEntry entry) => entry switch
+    {
+        PanelEntry.Clip c => FolderOf(c.Item),
+        PanelEntry.SecretEntry k => FolderOf(k.Secret),
+        _ => null,
+    };
+
+    /// <summary>The small caption on an item shown outside its folder (a search from Saved's root, or History).</summary>
     public string? FolderCaption(PanelEntry entry) =>
-        entry.ClipItem is { } item && FolderOf(item) is { } folder && folder.Id != OpenFolderId ? folder.Name : null;
+        FolderOf(entry) is { } folder && folder.Id != OpenFolderId ? folder.Name : null;
 
     /// <summary>Folders can hold clips of the personal space and of groups: not contacts' (edits to what they send
     /// stay on this device) nor the selection from another app.</summary>
     public bool CanUseFolders(ClipItem item) => item != SelectionItem && (item.SpaceId is null || _groups.ContainsKey(item.SpaceId));
+
+    /// <summary>Clips and secrets go into folders; snippets stay at the root of Saved.</summary>
+    public bool CanUseFolders(PanelEntry entry) => entry switch
+    {
+        PanelEntry.Clip c => CanUseFolders(c.Item),
+        PanelEntry.SecretEntry k => k.Secret.SpaceId is null || _groups.ContainsKey(k.Secret.SpaceId),
+        _ => false,
+    };
 
     /// <summary>The folders of a space (null = personal), by name.</summary>
     public List<ClipFolder> FoldersIn(string? space) =>
@@ -460,13 +528,30 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     /// <summary>An item of a sync group: deleting it is "Remove from Group".</summary>
     public bool IsGroupItem(ClipItem item) => item.SpaceId is { } space && _groups.ContainsKey(space);
 
-    /// <summary>The one space all <paramref name="items"/> share, when they can go into its folders.</summary>
-    private bool CommonFolderSpace(IReadOnlyList<ClipItem> items, out string? space)
+    /// <summary>Whether the server takes this user's changes to the item: anything personal, and in a group what they
+    /// copied themselves (or haven't pushed yet), or anything when they own the group.</summary>
+    public bool CanChange(ClipItem item)
     {
-        space = items.Count > 0 ? items[0].SpaceId : null;
-        var first = space;
-        return items.Count > 0 && items.All(i => i.SpaceId == first && CanUseFolders(i));
+        if (item.SpaceId is not { } space || !_groups.TryGetValue(space, out var group) || group.IsOwner) return true;
+        if (!_authors.TryGetValue((space, ClipStore.SyncId(item.Id)), out var author) || author is null) return true;
+        return Self?.Invoke() is not { } self || author == self.Uid;
     }
+
+    /// <summary>The one space all <paramref name="items"/> share, when they can go into its folders.</summary>
+    private bool CommonFolderSpace(IReadOnlyList<ClipItem> items, out string? space) =>
+        CommonFolderSpace([.. items.Select(i => (PanelEntry)new PanelEntry.Clip(i))], out space);
+
+    private bool CommonFolderSpace(IReadOnlyList<PanelEntry> entries, out string? space)
+    {
+        space = entries.Count > 0 ? SpaceOf(entries[0]) : null;
+        var first = space;
+        return entries.Count > 0 && entries.All(e => SpaceOf(e) == first && CanUseFolders(e));
+    }
+
+    /// <summary>The selected clips and secrets: what Move to Folder, Remove from Folder and drags act on.</summary>
+    public List<PanelEntry> FolderTargets =>
+        IsMultiSelecting ? [.. Entries.Where(e => SelectedIds.Contains(e.Id) && e is PanelEntry.Clip or PanelEntry.SecretEntry)]
+        : SelectedEntry is PanelEntry.Clip or PanelEntry.SecretEntry ? [SelectedEntry] : [];
 
     /// <summary>The New Folder button: a folder named "New Folder" in the Saved shown, selected and being renamed.</summary>
     public void CreateFolder()
@@ -488,14 +573,24 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     }
 
     /// <summary>Move to Folder ▸ New Folder…: asks for the name inline, then creates it and moves the clips in.</summary>
-    public void BeginNewFolder(IReadOnlyList<ClipItem> items)
+    public void BeginNewFolder(IReadOnlyList<ClipItem> items) => BeginNewFolder([.. items.Select(i => (PanelEntry)new PanelEntry.Clip(i))]);
+
+    /// <summary>Move to Folder ▸ New Folder…: asks for the name inline, then creates it and moves the clips and
+    /// secrets in. <paramref name="mine"/>: a personal folder, which group items are copied into.</summary>
+    public void BeginNewFolder(IReadOnlyList<PanelEntry> entries, bool mine = false)
     {
-        if (!CommonFolderSpace(items, out var space))
+        string? space = null;
+        if (mine ? entries.Count == 0 || !entries.All(CanUseFolders) : !CommonFolderSpace(entries, out space))
         {
             ShowNotice("Items can only move into folders of their own space");
             return;
         }
-        FolderForm = new FolderForm { ItemIds = [.. items.Select(i => i.Id)], SpaceId = space };
+        FolderForm = new FolderForm
+        {
+            ItemIds = [.. entries.OfType<PanelEntry.Clip>().Select(c => c.Item.Id)],
+            SecretIds = [.. entries.OfType<PanelEntry.SecretEntry>().Select(k => k.Secret.Id)],
+            SpaceId = mine ? null : space,
+        };
         ActionQuery = "";
         IsPickingFolder = false;
         Mode = PanelMode.FolderName;
@@ -514,45 +609,94 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             return;
         }
         var created = store.CreateFolder(form.Text, form.SpaceId);
-        var items = form.ItemIds.Select(store.Find).OfType<ClipItem>().ToList();
-        var moved = store.MoveToFolder(items, created);
-        ResetMode();
-        Refresh();
-        ShowNotice(MovedNotice(moved, created.Name));
+        _folders[created.Id] = created;
+        List<PanelEntry> entries = [.. form.ItemIds.Select(store.Find).OfType<ClipItem>().Select(i => new PanelEntry.Clip(i)),
+            .. form.SecretIds.Select(id => secrets.Secrets.FirstOrDefault(s => s.Id == id)).OfType<SecretRef>().Select(s => new PanelEntry.SecretEntry(s))];
+        MoveToFolder(entries, created);
     }
 
     private static string MovedNotice(int count, string folder) =>
         count == 1 ? $"Moved to “{folder}”" : $"Moved {count} items to “{folder}”";
 
+    private static string CopiedNotice(int count, string folder) =>
+        count == 1 ? $"Saved a copy to “{folder}”" : $"Saved {count} copies to “{folder}”";
+
     /// <summary>Moves clips into a folder of their space (null: out of their folder, to the root of Saved).</summary>
-    public void MoveToFolder(IReadOnlyList<ClipItem> items, ClipFolder? folder)
+    public void MoveToFolder(IReadOnlyList<ClipItem> items, ClipFolder? folder) =>
+        MoveToFolder([.. items.Select(i => (PanelEntry)new PanelEntry.Clip(i))], folder);
+
+    /// <summary>Moves clips and secrets into a folder of their space (null: out of their folder, to the root of Saved).
+    /// A personal folder chosen for group items saves personal copies into it; the group items don't change.</summary>
+    public void MoveToFolder(IReadOnlyList<PanelEntry> entries, ClipFolder? folder)
     {
-        var usable = items.Where(CanUseFolders).ToList();
-        var moved = store.MoveToFolder(usable, folder);
+        var usable = entries.Where(CanUseFolders).ToList();
+        List<PanelEntry> copies = folder is { SpaceId: null } ? [.. usable.Where(e => SpaceOf(e) is not null)] : [];
+        var moving = usable.Except(copies).ToList();
+        var moved = store.MoveToFolder([.. moving.OfType<PanelEntry.Clip>().Select(c => c.Item)], folder);
+        foreach (var secret in moving.OfType<PanelEntry.SecretEntry>().Select(k => k.Secret))
+        {
+            if (folder is not null && folder.SpaceId != secret.SpaceId) continue;
+            // An id this device doesn't know reads as the root already: leave it.
+            if (folder is null && FolderOf(secret) is null) continue;
+            if (store.SetSecretFolder(secret.Id, folder?.Id)) moved++;
+        }
+        var copied = 0;
+        if (folder is not null)
+        {
+            foreach (var clip in copies.OfType<PanelEntry.Clip>())
+            {
+                SavePersonalCopy(clip.Item, folder);
+                copied++;
+            }
+            // Secrets need Windows Hello to be read; the host copies them and says so.
+            if (copies.OfType<PanelEntry.SecretEntry>().Select(k => k.Secret).ToList() is { Count: > 0 } groupSecrets)
+            {
+                var total = copied + groupSecrets.Count;
+                host.CopySecrets(groupSecrets, null, folder.Id,
+                    groupSecrets.Count == 1 ? $"save a copy of “{groupSecrets[0].Name}”" : $"save copies of {groupSecrets.Count} secrets",
+                    CopiedNotice(total, folder.Name));
+            }
+        }
         ResetMode();
         Refresh();
         if (folder is null) ShowNotice(moved == 1 ? "Moved to Saved" : $"Moved {moved} items to Saved");
-        else if (moved == 0 && usable.Any(i => i.SpaceId != folder.SpaceId)) ShowNotice("Items can only move into folders of their own space");
-        else ShowNotice(MovedNotice(moved, folder.Name));
+        else if (copies.Count > 0 && moved == 0) { if (copied > 0) ShowNotice(CopiedNotice(copies.Count, folder.Name)); }
+        else if (moved == 0 && copies.Count == 0 && usable.Any(e => SpaceOf(e) != folder.SpaceId)) ShowNotice("Items can only move into folders of their own space");
+        else ShowNotice(MovedNotice(moved + copied, folder.Name));
+    }
+
+    /// <summary>A personal copy of a group item (a new id), saved, in <paramref name="folder"/> or (null) wherever an
+    /// existing personal copy already is. The group item doesn't change.</summary>
+    private ClipItem SavePersonalCopy(ClipItem item, ClipFolder? folder)
+    {
+        var copy = store.CopyToSpace(item, null);
+        if (!copy.IsPinned)
+        {
+            copy.IsPinned = true;
+            copy.PinnedAt = DateTime.UtcNow;
+        }
+        if (folder is not null) copy.FolderId = folder.Id;
+        store.Put(copy);
+        return copy;
     }
 
     /// <summary>A row of this panel dropped on a folder row (or, with null, on the "Saved" breadcrumb): it moves in or
     /// out. Dragging one of several selected rows moves the whole selection.</summary>
     public void DropOnFolder(string entryId, Guid? folderId)
     {
-        var items = IsMultiSelecting && SelectedIds.Contains(entryId)
-            ? SelectedClips
-            : Entries.FirstOrDefault(e => e.Id == entryId)?.ClipItem is { } item ? [item] : [];
-        if (items.Count == 0) return;
+        List<PanelEntry> entries = IsMultiSelecting && SelectedIds.Contains(entryId)
+            ? FolderTargets
+            : Entries.FirstOrDefault(e => e.Id == entryId) is { } entry && entry is PanelEntry.Clip or PanelEntry.SecretEntry ? [entry] : [];
+        if (entries.Count == 0) return;
         if (folderId is { } id)
         {
             if (_folders.GetValueOrDefault(id) is not { } folder) return;
-            MoveToFolder(items, folder);
+            MoveToFolder(entries, folder);
         }
-        else MoveToFolder(items, null);
+        else MoveToFolder(entries, null);
     }
 
-    /// <summary>Delete Folder: its clips move to the root of Saved. No confirmation: nothing is lost.</summary>
+    /// <summary>Delete Folder: its clips and secrets move to the root of Saved. No confirmation: nothing is lost.</summary>
     public void DeleteFolder(ClipFolder folder)
     {
         var moved = store.DeleteFolder(folder);
@@ -562,24 +706,40 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         ShowNotice($"Folder deleted · {(moved == 1 ? "1 item" : $"{moved} items")} moved to Saved");
     }
 
-    /// <summary>Saves clips without a label.</summary>
+    /// <summary>Saves clips without a label. Another member's group item, which the server wouldn't let this user
+    /// change, is saved as a personal copy instead (Save a Copy).</summary>
     public void AddToSaved(IReadOnlyList<ClipItem> items)
     {
         var added = items.Where(i => !i.IsPinned && i != SelectionItem).ToList();
-        foreach (var item in added) store.Pin(item);
+        var own = added.Where(CanChange).ToList();
+        var others = added.Except(own).ToList();
+        foreach (var item in own) store.Pin(item);
+        foreach (var item in others) SavePersonalCopy(item, null);
         ResetMode();
         Refresh();
-        ShowNotice(added.Count == 1 ? "Added to Saved" : $"Added {added.Count} items to Saved");
+        ShowNotice(own.Count == 0 && others.Count > 0
+            ? others.Count == 1 ? "Saved a copy to Saved" : $"Saved {others.Count} copies to Saved"
+            : added.Count == 1 ? "Added to Saved" : $"Added {added.Count} items to Saved");
     }
 
-    private List<PanelAction> FolderPickActions()
+    /// <summary>The Move to Folder picker. One space: its folders (and New Folder…). A group's items also list the
+    /// personal folders under "Mine", which save personal copies; items of several spaces list only "Mine".</summary>
+    private List<PanelAction> FolderPickActions() => FolderChoices(FolderTargets);
+
+    /// <summary>The Move to Folder choices for <paramref name="targets"/> (see <see cref="FolderPickActions"/>); the
+    /// right-click menu lists them too.</summary>
+    public List<PanelAction> FolderChoices(IReadOnlyList<PanelEntry> targets)
     {
-        var clips = IsMultiSelecting ? SelectedClips : SelectedEntry?.ClipItem is { } item ? [item] : [];
-        if (!CommonFolderSpace(clips, out var space)) return [];
-        var current = clips.Select(c => FolderOf(c)?.Id).Distinct().ToList() is [{ } only] ? only : (Guid?)null;
-        return [.. _folders.Values.Where(f => f.SpaceId == space && f.Id != current)
-                    .OrderBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase).Select(f => new PanelAction.MoveTo(f.Id, f.Name)),
-                new PanelAction.MoveToNewFolder()];
+        if (targets.Count == 0 || !targets.All(CanUseFolders)) return [];
+        var current = targets.Select(e => FolderOf(e)?.Id).Distinct().ToList() is [{ } only] ? only : (Guid?)null;
+        var spaces = targets.Select(SpaceOf).Distinct().ToList();
+        IEnumerable<PanelAction> In(string? space, string? section, bool mine) =>
+            [.. FoldersIn(space).Where(f => f.Id != current).Select(f => new PanelAction.MoveTo(f.Id, f.Name, section)),
+             new PanelAction.MoveToNewFolder(mine, section)];
+        if (spaces is [null]) return [.. In(null, null, false)];
+        if (spaces is [{ } group])
+            return [.. In(group, GroupNames.GetValueOrDefault(group, "Group"), false), .. In(null, "Mine", true)];
+        return [.. In(null, "Mine", true)];
     }
 
     public void BeginMoveToFolder()
@@ -589,6 +749,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         ActionSelection = 0;
         IsPickingGroup = false;
         IsPickingFolder = true;
+        PickingShareFolder = null;
         Mode = PanelMode.Actions;
         Notify();
     }
@@ -645,6 +806,9 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     public static TimeSpan NoticeDuration { get; set; } = TimeSpan.FromSeconds(3);
 
+    /// <summary>When a clip was kept, for Saved's newest-first order: when it was saved, else its last copy.</summary>
+    private static DateTime SavedDate(ClipItem item) => item.PinnedAt ?? item.LastCopiedAt;
+
     public void Refresh(bool resetSelection = false)
     {
         if (SelectionItem is not null)
@@ -663,6 +827,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         if (GroupFilter is not null && !GroupNames.ContainsKey(GroupFilter)) GroupFilter = null;
         var group = GroupFilter;
         _folders = store.AllFolders().ToDictionary(f => f.Id);
+        _secretFolders = store.SecretFolders();
         var saved = IsSavedView;
         // A folder deleted (here or elsewhere) while open: back to the root.
         if (OpenFolderId is { } openId && (!saved || !_folders.TryGetValue(openId, out var openFolder) || openFolder.SpaceId != SavedSpace))
@@ -671,47 +836,63 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         var inbox = Filter == PanelFilter.Inbox && group is null;
         bool Listed(string? space, PanelEntry entry) =>
             space is null || !_contacts.ContainsKey(space) ? !inbox : inbox && IsFromContact(space, entry);
-        var clips = group is not null ? store.ItemsInSpace(group)
-            : inbox ? [.. store.AllItems().Where(item => Listed(item.SpaceId, new PanelEntry.Clip(item)))]
-            : Filter is PanelFilter.Snippets or PanelFilter.Secrets ? [] : store.AllItems().Where(item => Listed(item.SpaceId, new PanelEntry.Clip(item)) && Filter switch
-        {
-            // Saved: your own saved clips (labelled, added to Saved, in a folder, or pinned before labels).
-            // A group's saved clips are in that group's Saved view.
-            PanelFilter.Labelled => item.IsPinned && item.SpaceId is null,
-            PanelFilter.Text => item.Kind.IsTextual(),
-            PanelFilter.Images => item.Kind == ClipKind.Image,
-            PanelFilter.Files => item.Kind == ClipKind.File,
-            PanelFilter.ThisApp => target is not null && string.Equals(item.SourceId, target, StringComparison.OrdinalIgnoreCase),
-            _ => true,
-        }).ToList();
-        // Saved: folders of the space shown first (not a group's in the personal Saved), then the clips outside one.
-        // Inside a folder, only its clips. A search from the root finds clips in folders too.
+
         List<PanelEntry.FolderEntry> folderRows = [];
+        List<ClipItem> clips;
+        List<Snippet> snippets;
+        List<SecretRef> secretList;
         if (saved)
         {
-            clips = [.. clips.Where(c => c.IsPinned)];
-            var counts = clips.Where(c => FolderOf(c) is not null).GroupBy(c => c.FolderId!.Value).ToDictionary(g => g.Key, g => g.Count());
-            if (OpenFolderId is { } open) clips = [.. clips.Where(c => FolderOf(c)?.Id == open)];
+            // Saved holds everything kept in one space (personal, or the group's): its saved clips, secrets and
+            // snippets, with the space's folders first. Inside a folder, only its clips and secrets. A search from the
+            // root finds what's in folders too.
+            var space = SavedSpace;
+            clips = [.. store.ItemsInSpace(space).Where(c => c.IsPinned)];
+            secretList = [.. secrets.Secrets.Where(s => s.SpaceId == space)];
+            snippets = [.. store.AllSnippets().Where(s => s.SpaceId == space)];
+            var counts = clips.Select(c => FolderOf(c)?.Id).Concat(secretList.Select(s => FolderOf(s)?.Id)).OfType<Guid>()
+                .GroupBy(id => id).ToDictionary(g => g.Key, g => g.Count());
+            if (OpenFolderId is { } open)
+            {
+                clips = [.. clips.Where(c => FolderOf(c)?.Id == open)];
+                secretList = [.. secretList.Where(s => FolderOf(s)?.Id == open)];
+                snippets = [];   // snippets aren't in folders
+            }
             else
             {
-                folderRows = [.. _folders.Values.Where(f => f.SpaceId == SavedSpace).OrderBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase)
-                    .Select(f => new PanelEntry.FolderEntry(f, counts.GetValueOrDefault(f.Id)))];
-                if (q.Length == 0) clips = [.. clips.Where(c => FolderOf(c) is null)];
+                folderRows = [.. FoldersIn(space).Select(f => new PanelEntry.FolderEntry(f, counts.GetValueOrDefault(f.Id)))];
+                if (q.Length == 0)
+                {
+                    clips = [.. clips.Where(c => FolderOf(c) is null)];
+                    secretList = [.. secretList.Where(s => FolderOf(s) is null)];
+                }
             }
         }
-        // Snippets and secrets join "All" only while searching, so history stays uncluttered.
-        var searchingAll = Filter == PanelFilter.All && q.Length > 0;
-        var snippets = saved ? [] : group is not null ? store.AllSnippets().Where(s => s.SpaceId == group).ToList()
-            : Filter == PanelFilter.Snippets || searchingAll || inbox
-                ? [.. store.AllSnippets().Where(s => Listed(s.SpaceId, new PanelEntry.SnippetEntry(s)))] : [];
-        var secretList = saved ? [] : group is not null ? secrets.Secrets.Where(s => s.SpaceId == group).ToList()
-            : Filter == PanelFilter.Secrets || searchingAll || inbox
-                ? [.. secrets.Secrets.Where(s => Listed(s.SpaceId, new PanelEntry.SecretEntry(s)))] : [];
+        else
+        {
+            clips = group is not null ? store.ItemsInSpace(group)
+                : store.AllItems().Where(item => Listed(item.SpaceId, new PanelEntry.Clip(item)) && (Filter != PanelFilter.ThisApp
+                    || target is not null && string.Equals(item.SourceId, target, StringComparison.OrdinalIgnoreCase))).ToList();
+            // Snippets and secrets join "All" only while searching, so history stays uncluttered. They live in Saved.
+            var searchingAll = Filter == PanelFilter.All && q.Length > 0;
+            snippets = group is not null ? [.. store.AllSnippets().Where(s => s.SpaceId == group)]
+                : searchingAll || inbox ? [.. store.AllSnippets().Where(s => Listed(s.SpaceId, new PanelEntry.SnippetEntry(s)))] : [];
+            secretList = group is not null ? [.. secrets.Secrets.Where(s => s.SpaceId == group)]
+                : searchingAll || inbox ? [.. secrets.Secrets.Where(s => Listed(s.SpaceId, new PanelEntry.SecretEntry(s)))] : [];
+        }
 
         List<PanelEntry> result;
-        if (q.Length == 0)
+        if (q.Length == 0 && saved)
         {
-            result = [.. folderRows, .. clips.Select(c => new PanelEntry.Clip(c)), .. snippets.Select(s => new PanelEntry.SnippetEntry(s)),
+            // Folders by name, then clips, secrets and snippets mixed, newest first.
+            List<(PanelEntry Entry, DateTime Date)> kept = [.. clips.Select(c => ((PanelEntry)new PanelEntry.Clip(c), SavedDate(c))),
+                .. secretList.Select(s => ((PanelEntry)new PanelEntry.SecretEntry(s), s.CreatedAt ?? DateTime.MinValue)),
+                .. snippets.Select(s => ((PanelEntry)new PanelEntry.SnippetEntry(s), s.UpdatedAt))];
+            result = [.. folderRows, .. kept.OrderByDescending(x => x.Date).Select(x => x.Entry)];
+        }
+        else if (q.Length == 0)
+        {
+            result = [.. clips.Select(c => new PanelEntry.Clip(c)), .. snippets.Select(s => new PanelEntry.SnippetEntry(s)),
                       .. secretList.Select(s => new PanelEntry.SecretEntry(s))];
         }
         else
@@ -823,14 +1004,16 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         Notify();
     }
 
-    /// <summary>Tab: the filter chips, then one per sync group (content types are in the filter menu).</summary>
+    /// <summary>Tab: the filter chips, then each sync group's two segments, Copies then Saved, in the chip row's order.</summary>
     public void CycleFilter(bool forward)
     {
-        List<(PanelFilter Filter, string? Group)> all = [.. ChipFilters.Select(f => (f, (string?)null)),
-            .. store.Groups().Select(g => (PanelFilter.All, (string?)g.Id))];
-        var index = all.FindIndex(x => GroupFilter is not null ? x.Group == GroupFilter : x.Group is null && x.Filter == Filter);
+        List<(PanelFilter Filter, string? Group, bool Saved)> all = [.. ChipFilters.Select(f => (f, (string?)null, false))];
+        foreach (var g in store.Groups().OrderBy(g => g.DisplayName, StringComparer.CurrentCultureIgnoreCase))
+            all.AddRange([(PanelFilter.All, g.Id, false), (PanelFilter.All, g.Id, true)]);
+        var index = all.FindIndex(x => GroupFilter is { } group ? x.Group == group && x.Saved == GroupShowsSaved(group)
+            : x.Group is null && x.Filter == Filter);
         var next = all[(Math.Max(index, 0) + (forward ? 1 : all.Count - 1)) % all.Count];
-        if (next.Group is { } g) SetGroupFilter(g); else SetFilter(next.Filter);
+        if (next.Group is { } g2) ShowGroup(g2, next.Saved); else SetFilter(next.Filter);
     }
 
     // MARK: Picking files of a multi-file item
@@ -1145,6 +1328,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         ActionSelection = 0;
         IsPickingGroup = false;
         IsPickingFolder = false;
+        PickingShareFolder = null;
         Mode = PanelMode.Actions;
         Notify();
     }
@@ -1156,6 +1340,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         ActionQuery = "";
         ActionSelection = 0;
         IsPickingFolder = false;
+        PickingShareFolder = null;
         IsPickingGroup = true;
         Mode = PanelMode.Actions;
         Notify();
@@ -1163,6 +1348,17 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     private List<PanelAction> ShareActions(string? exceptGroup) =>
         [.. store.Groups().Where(g => g.Id != exceptGroup).Select(g => new PanelAction.ShareTo(g.Id, g.DisplayName))];
+
+    /// <summary>Share to Group's second step: the group's root, then its folders.</summary>
+    private List<PanelAction> ShareFolderActions(PanelAction.ShareTo share) =>
+        [new PanelAction.ShareInto(share.GroupId, share.GroupName, null, "No Folder"),
+         .. FoldersIn(share.GroupId).Select(f => new PanelAction.ShareInto(share.GroupId, share.GroupName, f.Id, f.Name))];
+
+    /// <summary>Whether sharing the selection to <paramref name="groupId"/> can pick one of its folders: the group has
+    /// some, and something selected can go in one (clips and secrets; folders and snippets go to the root).</summary>
+    public bool CanShareIntoFolder(string groupId) =>
+        FoldersIn(groupId).Count > 0 && (IsMultiSelecting ? Entries.Where(e => SelectedIds.Contains(e.Id)) : SelectedEntry is { } e ? [e] : [])
+            .Any(e => e is PanelEntry.Clip or PanelEntry.SecretEntry);
 
     private bool CanShare => store.Groups().Count > 0;
 
@@ -1211,7 +1407,13 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             if (IsMultiSelecting)
             {
                 var clips = SelectedClips;
-                if (clips.Count == 0) return [];
+                // Only secrets selected: they can move between folders and be shared; nothing else acts on several.
+                if (clips.Count == 0)
+                {
+                    var targets = FolderTargets;
+                    if (targets.Count == 0) return [];
+                    return [.. CanShare ? [new PanelAction.ShareToGroup()] : Array.Empty<PanelAction>(), .. SavedActions(targets)];
+                }
                 List<PanelAction> multi = [new PanelAction.Paste()];
                 if (clips.All(c => c.Kind.IsTextual())) multi.AddRange([new PanelAction.PastePlain(), new PanelAction.Copy(), .. TransformActions]);
                 else multi.Add(new PanelAction.Copy());
@@ -1219,7 +1421,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 if (CanShare) multi.Add(new PanelAction.ShareToGroup());
                 multi.AddRange(ContactActions(null));
                 multi.AddRange(SaveActions);
-                multi.AddRange(SavedActions(clips));
+                multi.AddRange(SavedActions(FolderTargets));
                 return [.. multi, DeleteAction(clips)];
             }
             if (SelectedEntry is not { } entry) return [];
@@ -1247,12 +1449,13 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                     if (CanPreview) actions.Add(new PanelAction.Preview());
                     if (c.Item.Kind.IsTextual()) actions.Add(new PanelAction.SaveAsSecret());
                     actions.Add(new PanelAction.SetLabel());
-                    actions.AddRange(SavedActions([c.Item]));
+                    actions.AddRange(SavedActions([entry]));
                     actions.AddRange(SaveActions);
                     break;
                 case PanelEntry.SecretEntry:
                     actions.Add(new PanelAction.Copy());
                     actions.Add(new PanelAction.SetLabel());
+                    actions.AddRange(SavedActions([entry]));
                     break;
             }
             if (CanShare) actions.Add(new PanelAction.ShareToGroup());
@@ -1268,14 +1471,18 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         }
     }
 
-    /// <summary>Add to Saved, Remove from Saved, Move to Folder… and Remove from Folder, as they apply to the clips.</summary>
-    private List<PanelAction> SavedActions(IReadOnlyList<ClipItem> clips)
+    /// <summary>Add to Saved (Save a Copy for another member's group item), Remove from Saved, Move to Folder… and
+    /// Remove from Folder, as they apply to the clips and secrets.</summary>
+    private List<PanelAction> SavedActions(IReadOnlyList<PanelEntry> entries)
     {
+        var clips = entries.OfType<PanelEntry.Clip>().Select(c => c.Item).ToList();
+        var unsaved = clips.Where(c => !c.IsPinned).ToList();
         List<PanelAction> list = [];
-        if (clips.Any(c => !c.IsPinned)) list.Add(new PanelAction.AddToSaved());
+        if (unsaved.Any(CanChange)) list.Add(new PanelAction.AddToSaved());
+        else if (unsaved.Count > 0) list.Add(new PanelAction.SaveCopy());
         if (clips.Any(IsPinnedWithoutLabel)) list.Add(new PanelAction.RemoveFromSaved());
-        if (CommonFolderSpace(clips, out _)) list.Add(new PanelAction.MoveToFolder());
-        if (clips.Any(c => FolderOf(c) is not null)) list.Add(new PanelAction.RemoveFromFolder());
+        if (entries.Count > 0 && entries.All(CanUseFolders)) list.Add(new PanelAction.MoveToFolder());
+        if (entries.Any(e => FolderOf(e) is not null)) list.Add(new PanelAction.RemoveFromFolder());
         return list;
     }
 
@@ -1288,11 +1495,12 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         get
         {
             var q = ActionQuery.Trim();
-            if (IsPickingGroup || IsPickingFolder)
+            if (IsPickingGroup || IsPickingFolder || PickingShareFolder is not null)
             {
-                var groups = IsPickingFolder ? FolderPickActions() : ShareActions(!IsMultiSelecting && SelectedEntry is { } e ? SpaceOf(e) : null);
-                return q.Length == 0 ? groups
-                    : [.. groups.Select(a => (Action: a, Score: FuzzyMatcher.Score(q, a.Title))).Where(x => x.Score is not null)
+                var choices = PickingShareFolder is { } share ? ShareFolderActions(share)
+                    : IsPickingFolder ? FolderPickActions() : ShareActions(!IsMultiSelecting && SelectedEntry is { } e ? SpaceOf(e) : null);
+                return q.Length == 0 ? choices
+                    : [.. choices.Select(a => (Action: a, Score: FuzzyMatcher.Score(q, a.Title))).Where(x => x.Score is not null)
                         .OrderByDescending(x => x.Score).Select(x => x.Action)];
             }
             if (q.Length == 0) return AvailableActions;
@@ -1311,6 +1519,38 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     public void Perform(PanelAction action)
     {
+        // Folder moves and sharing act on clips and secrets alike, one or several.
+        switch (action)
+        {
+            case PanelAction.MoveToFolder:
+                BeginMoveToFolder();
+                return;
+            case PanelAction.MoveTo move:
+                if (_folders.GetValueOrDefault(move.FolderId) is { } target) MoveToFolder(FolderTargets, target);
+                return;
+            case PanelAction.MoveToNewFolder newFolder:
+                BeginNewFolder(FolderTargets, newFolder.Mine);
+                return;
+            case PanelAction.RemoveFromFolder:
+                MoveToFolder(FolderTargets, null);
+                return;
+            case PanelAction.ShareTo share when PickingShareFolder is null && CanShareIntoFolder(share.GroupId):
+                // The group has folders: pick where the copies go (the root by default).
+                ActionQuery = "";
+                ActionSelection = 0;
+                IsPickingGroup = false;
+                IsPickingFolder = false;
+                PickingShareFolder = share;
+                Mode = PanelMode.Actions;
+                Notify();
+                return;
+            case PanelAction.ShareTo share:
+                ShareSelection(share.GroupId, share.GroupName, null);
+                return;
+            case PanelAction.ShareInto into:
+                ShareSelection(into.GroupId, into.GroupName, into.FolderId);
+                return;
+        }
         if (IsMultiSelecting) { PerformOnSelection(action); return; }
         if (SelectedEntry is not { } entry) return;
         var item = entry.ClipItem;
@@ -1355,20 +1595,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             case PanelAction.RemoveFromSaved when item is not null:
                 RemoveFromSaved([item]);
                 break;
-            case PanelAction.AddToSaved when item is not null:
+            case PanelAction.AddToSaved or PanelAction.SaveCopy when item is not null:
                 AddToSaved([item]);
-                break;
-            case PanelAction.MoveToFolder:
-                BeginMoveToFolder();
-                break;
-            case PanelAction.MoveTo move when item is not null && _folders.GetValueOrDefault(move.FolderId) is { } target:
-                MoveToFolder([item], target);
-                break;
-            case PanelAction.MoveToNewFolder when item is not null:
-                BeginNewFolder([item]);
-                break;
-            case PanelAction.RemoveFromFolder when item is not null:
-                MoveToFolder([item], null);
                 break;
             case PanelAction.OpenFolder when entry is PanelEntry.FolderEntry f:
                 ResetMode();
@@ -1392,9 +1620,6 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 break;
             case PanelAction.ShareToGroup:
                 BeginShareToGroup();
-                break;
-            case PanelAction.ShareTo share:
-                Share(entry, share);
                 break;
             case PanelAction.SendTo send when item is not null:
                 SendToDevice?.Invoke(item, new DeviceTarget(send.DeviceId, send.DeviceName));
@@ -1439,20 +1664,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             case PanelAction.RemoveFromSaved:
                 RemoveFromSaved(clips);
                 break;
-            case PanelAction.AddToSaved:
+            case PanelAction.AddToSaved or PanelAction.SaveCopy:
                 AddToSaved(clips);
-                break;
-            case PanelAction.MoveToFolder:
-                BeginMoveToFolder();
-                break;
-            case PanelAction.MoveTo move when _folders.GetValueOrDefault(move.FolderId) is { } target:
-                MoveToFolder(clips, target);
-                break;
-            case PanelAction.MoveToNewFolder:
-                BeginNewFolder(clips);
-                break;
-            case PanelAction.RemoveFromFolder:
-                MoveToFolder(clips, null);
                 break;
             case PanelAction.SaveToFolder:
                 Save(clips, host.SaveFolder);
@@ -1462,19 +1675,6 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 break;
             case PanelAction.ShareToGroup:
                 BeginShareToGroup();
-                break;
-            case PanelAction.ShareTo share:
-                // All or nothing: one item that can't sync keeps the whole selection out of the group.
-                if (clips.Where(c => c.SpaceId != share.GroupId).Select(SyncEngine.GroupShareProblem).FirstOrDefault(p => p is not null) is { } problem)
-                {
-                    ResetMode();
-                    ShowNotice(problem);
-                    break;
-                }
-                foreach (var c in clips.Where(c => c.SpaceId != share.GroupId)) store.CopyToSpace(c, share.GroupId);
-                ResetMode();
-                Refresh();
-                ShowNotice($"Shared {clips.Count} items to “{share.GroupName}”");
                 break;
             case PanelAction.SendToContact send:
                 // All or nothing, like sharing to a group.
@@ -1509,13 +1709,56 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         _ => null,
     };
 
-    /// <summary>Copies the entry into the group with a new id; the original stays where it is.</summary>
-    private void Share(PanelEntry entry, PanelAction.ShareTo share)
+    /// <summary>Share to Group for the selection (one entry or several): copies into the group with new ids; the
+    /// originals stay where they are. Clips and secrets go into <paramref name="folderId"/>, one of the group's
+    /// folders, when given (saved, as being in a folder implies); snippets and folders go to the root.</summary>
+    public void ShareSelection(string groupId, string groupName, Guid? folderId)
+    {
+        var folder = folderId is { } id && _folders.GetValueOrDefault(id) is { } f && f.SpaceId == groupId ? f : null;
+        var where = folder is null ? $"“{groupName}”" : $"“{groupName} › {folder.Name}”";
+        if (!IsMultiSelecting)
+        {
+            if (SelectedEntry is { } entry) Share(entry, groupId, groupName, folder, where);
+            return;
+        }
+        var clips = SelectedClips.Where(c => c.SpaceId != groupId).ToList();
+        var groupSecrets = Entries.Where(e => SelectedIds.Contains(e.Id)).OfType<PanelEntry.SecretEntry>()
+            .Select(k => k.Secret).Where(s => s.SpaceId != groupId).ToList();
+        // All or nothing: one item that can't sync keeps the whole selection out of the group.
+        if (clips.Select(SyncEngine.GroupShareProblem).FirstOrDefault(p => p is not null) is { } problem)
+        {
+            ResetMode();
+            ShowNotice(problem);
+            return;
+        }
+        foreach (var c in clips) CopyIntoGroup(c, groupId, folder);
+        var notice = $"Shared {clips.Count + groupSecrets.Count} items to {where}";
+        if (groupSecrets.Count > 0) host.CopySecrets(groupSecrets, groupId, folder?.Id, $"share {groupSecrets.Count} secrets with {groupName}", notice);
+        ResetMode();
+        Refresh();
+        if (clips.Count > 0 || groupSecrets.Count == 0) ShowNotice(notice);
+    }
+
+    private void CopyIntoGroup(ClipItem item, string groupId, ClipFolder? folder)
+    {
+        var copy = store.CopyToSpace(item, groupId);
+        if (folder is null) return;
+        if (!copy.IsPinned)
+        {
+            copy.IsPinned = true;
+            copy.PinnedAt = DateTime.UtcNow;
+        }
+        copy.FolderId = folder.Id;
+        store.Put(copy);
+    }
+
+    private void Share(PanelEntry entry, string groupId, string groupName, ClipFolder? folder, string where)
     {
         switch (entry)
         {
             case PanelEntry.Clip c when c.Item == SelectionItem:
-                store.Ingest(ProcessedCapture.ForText(c.Item.Text, source: c.Item.Source), spaceId: share.GroupId);
+                var ingested = store.Ingest(ProcessedCapture.ForText(c.Item.Text, source: c.Item.Source), spaceId: groupId);
+                if (folder is not null) store.MoveToFolder([ingested], folder);
                 host.ClosePanel();
                 return;
             case PanelEntry.Clip c when SyncEngine.GroupShareProblem(c.Item) is { } problem:
@@ -1523,10 +1766,10 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 ShowNotice(problem);
                 return;
             case PanelEntry.Clip c:
-                store.CopyToSpace(c.Item, share.GroupId);
+                CopyIntoGroup(c.Item, groupId, folder);
                 break;
             case PanelEntry.SnippetEntry s:
-                store.CopySnippetToSpace(s.Snippet, share.GroupId);
+                store.CopySnippetToSpace(s.Snippet, groupId);
                 break;
             case PanelEntry.FolderEntry f:
                 // All or nothing, like sharing several items.
@@ -1537,16 +1780,25 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                     ShowNotice(folderProblem);
                     return;
                 }
-                store.CopyFolderToSpace(f.Folder, share.GroupId);
+                var copy = store.CopyFolderToSpace(f.Folder, groupId);
+                // Its secrets are copied too, after Windows Hello, into the new folder.
+                var folderSecrets = secrets.Secrets.Where(s => s.SpaceId == f.Folder.SpaceId && FolderOf(s)?.Id == f.Folder.Id).ToList();
+                if (folderSecrets.Count > 0)
+                {
+                    host.CopySecrets(folderSecrets, groupId, copy.Id, $"share the secrets in “{f.Folder.Name}” with {groupName}", $"Shared to “{groupName}”");
+                    ResetMode();
+                    Refresh();
+                    return;
+                }
                 break;
             case PanelEntry.SecretEntry k:
-                host.ShareSecret(k.Secret, share.GroupId, share.GroupName);
+                host.CopySecrets([k.Secret], groupId, folder?.Id, $"share “{k.Secret.Name}” with {groupName}", $"Shared “{k.Secret.Name}” to {where}");
                 ResetMode();
                 return;
         }
         ResetMode();
         Refresh();
-        ShowNotice($"Shared to “{share.GroupName}”");
+        ShowNotice($"Shared to {where}");
     }
 
     /// <summary>Copies a clip into the contact's space (without this user's label): it arrives in their Inbox.
@@ -1644,6 +1896,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             case PanelEntry.SecretEntry k when includingSecrets:
                 slots.Remove(entry.SlotTarget);
                 secrets.Delete(k.Secret);
+                store.SetSecretFolder(k.Secret.Id, null);
                 break;
             case PanelEntry.FolderEntry f:
                 DeleteFolder(f.Folder);
@@ -1741,7 +1994,9 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         switch (key.Key)
         {
             case PanelKey.Escape:
-                if (IsPickingGroup || IsPickingFolder) { IsPickingGroup = false; IsPickingFolder = false; ActionQuery = ""; ActionSelection = 0; Notify(); }
+                // Picking a group's folder goes back to the groups; picking a group or a folder, to the actions.
+                if (PickingShareFolder is not null) { PickingShareFolder = null; IsPickingGroup = true; ActionQuery = ""; ActionSelection = 0; Notify(); }
+                else if (IsPickingGroup || IsPickingFolder) { IsPickingGroup = false; IsPickingFolder = false; ActionQuery = ""; ActionSelection = 0; Notify(); }
                 else if (IsSelectionMode) host.ClosePanel();
                 else { Mode = PanelMode.Browse; Notify(); }
                 return true;

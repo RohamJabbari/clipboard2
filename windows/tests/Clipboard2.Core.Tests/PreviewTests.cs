@@ -135,13 +135,14 @@ public sealed class PreviewTests : IDisposable
         _vault.Add("Bank", "hunter2");
         _store.CreateSnippet("greet", ";hi", "Hello");
         _model.PrepareForOpen(null);
-        _model.SetFilter(PanelFilter.Secrets);
+        _model.SetFilter(PanelFilter.Labelled);   // Saved holds both
+        _model.Select(_model.Entries.Single(e => e is PanelEntry.SecretEntry).Id);
         Assert.False(_model.CanPreview);
         Assert.DoesNotContain(_model.AvailableActions, a => a is PanelAction.Preview);
         _model.HandleKey(CtrlY);
         Assert.False(_model.IsPreviewing);
         Assert.Equal("Secrets aren't previewed", _model.Notice);
-        _model.SetFilter(PanelFilter.Snippets);
+        _model.Select(_model.Entries.Single(e => e is PanelEntry.SnippetEntry).Id);
         _model.HandleKey(CtrlY);
         Assert.False(_model.IsPreviewing);
         Assert.Equal("Snippets aren't previewed", _model.Notice);

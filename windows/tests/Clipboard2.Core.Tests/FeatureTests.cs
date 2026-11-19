@@ -401,10 +401,13 @@ public sealed class SendToDeviceTests : IDisposable
         _store.CreateSnippet("S", "", "body");
         _vault.Add("Secret", "v");
         _model.PrepareForOpen(null);
-        _model.SetFilter(PanelFilter.Snippets);
-        Assert.DoesNotContain(_model.AvailableActions, a => a is PanelAction.SendTo);
-        _model.SetFilter(PanelFilter.Secrets);
-        Assert.DoesNotContain(_model.AvailableActions, a => a is PanelAction.SendTo);
+        _model.SetFilter(PanelFilter.Labelled);   // Saved holds the snippet and the secret
+        Assert.Equal(2, _model.Entries.Count);
+        foreach (var entry in _model.Entries.ToList())
+        {
+            _model.Select(entry.Id);
+            Assert.DoesNotContain(_model.AvailableActions, a => a is PanelAction.SendTo);
+        }
 
         _devices = [];
         _store.Ingest(ProcessedCapture.ForText("x"));

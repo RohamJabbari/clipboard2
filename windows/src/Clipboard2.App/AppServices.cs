@@ -437,16 +437,23 @@ public sealed class AppServices : IPanelHost
         if (value is not null) Dispatcher.Invoke(() => WriteSecretWithAutoClear(value));
     });
 
-    public void ShareSecret(SecretRef secret, string groupId, string groupName) => _ = ShareSecretAsync(secret, groupId, groupName);
+    public void CopySecrets(IReadOnlyList<SecretRef> secrets, string? spaceId, Guid? folderId, string reason, string notice) =>
+        _ = CopySecretsAsync(secrets, spaceId, folderId, reason, notice);
 
-    private async Task ShareSecretAsync(SecretRef secret, string groupId, string groupName)
+    /// <summary>One Windows Hello confirmation, then each value is read and written again as a new secret.</summary>
+    private async Task CopySecretsAsync(IReadOnlyList<SecretRef> secrets, string? spaceId, Guid? folderId, string reason, string notice)
     {
-        var value = await Secrets.RevealAsync(secret, $"share “{secret.Name}” with {groupName}");
-        if (value is null) return;
+        if (secrets.Count == 0 || !await Secrets.AuthenticateAsync(reason)) return;
         Dispatcher.Invoke(() =>
         {
-            if (Secrets.Add(secret.Name, value, groupId) is null) return;
-            Panel.ShowNotice($"Shared “{secret.Name}” to “{groupName}”");
+            var copied = 0;
+            foreach (var secret in secrets)
+            {
+                if (Secrets.ReadValue(secret) is not { } value || Secrets.Add(secret.Name, value, spaceId) is not { } copy) continue;
+                if (folderId is { } folder) Store.SetSecretFolder(copy.Id, folder);
+                copied++;
+            }
+            Panel.ShowNotice(copied == secrets.Count ? notice : "Couldn't save to Credential Manager");
         });
     }
 
