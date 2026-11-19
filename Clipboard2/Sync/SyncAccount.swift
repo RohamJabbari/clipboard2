@@ -335,14 +335,54 @@ final class SyncAccount {
     /// Whoever last wrote a synced item. Items never synced are yours; nil when synced but the
     /// author isn't known yet. Looks up what arrived since the last `loadGroups()`.
     private func author(of item: ClipItem) -> String? {
-        let key = item.id.uuidString.lowercased()
+        author(ofItemID: item.id.uuidString)
+    }
+
+    private func author(ofItemID id: String) -> String? {
+        let key = id.lowercased()
         if let known = authors[key] { return known }
         if let meta = engine?.meta(for: key) {
             authors[key] = meta.authorUid
             return meta.authorUid
         }
+        return myUID
+    }
+
+    private var myUID: String? {
+        #if DEBUG
+        if let testUID { return testUID }
+        #endif
         return session?.uid
     }
+
+    /// Whether the server lets this account change (save, move, label, delete) a group item:
+    /// only its author or the group's owner can (PROTOCOL.md → Write checks). True outside
+    /// groups, and when the author isn't known yet (the server still decides).
+    func canChange(itemID: String, spaceID: String?) -> Bool {
+        guard let spaceID, let group = groups.first(where: { $0.id == spaceID }) else { return true }
+        if group.isOwner { return true }
+        guard let author = author(ofItemID: itemID) else { return true }
+        return author == myUID
+    }
+
+    func canChange(_ item: ClipItem) -> Bool { canChange(itemID: item.id.uuidString, spaceID: item.spaceID) }
+
+    #if DEBUG
+    @ObservationIgnored private var testUID: String?
+
+    /// Tests: pretend to be `uid` in these groups, with these item authors (id → uid).
+    func setUpForTesting(groups: [SyncGroup], uid: String?, authors: [String: String]) {
+        self.groups = groups
+        testUID = uid
+        for (id, author) in authors { self.authors[id.lowercased()] = .some(author) }
+    }
+
+    func tearDownTesting() {
+        groups = []
+        testUID = nil
+        authors = [:]
+    }
+    #endif
 
     func contact(for spaceID: String?) -> SyncContact? {
         guard let spaceID else { return nil }
@@ -1405,11 +1445,12 @@ extension SecretStore: SyncSecretSource {
 
     func syncValue(id: String) -> String? { SecretVault.value(id: id) }
 
-    func syncUpsert(id: String, name: String, value: String, spaceID: String?) {
+    func syncUpsert(id: String, name: String, value: String, spaceID: String?, folderID: UUID?) {
         if let existing = SecretVault.list().first(where: { $0.id.lowercased() == id.lowercased() }) {
-            SecretVault.update(id: existing.id, name: name, value: value)
+            SecretVault.update(id: existing.id, name: name, value: value,
+                               folder: existing.folderID == folderID ? nil : .some(folderID))
         } else {
-            SecretVault.add(name: name, value: value, id: id, spaceID: spaceID)
+            SecretVault.add(name: name, value: value, id: id, spaceID: spaceID, folderID: folderID)
         }
     }
 

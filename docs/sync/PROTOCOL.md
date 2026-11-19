@@ -128,7 +128,7 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
 // type "snippet"
 {"v":1,"type":"snippet","name":"…","keyword":"…","body":"…","createdAt":0,"updatedAt":0}
 // type "secret"
-{"v":1,"type":"secret","name":"…","value":"…","createdAt":0}
+{"v":1,"type":"secret","name":"…","value":"…","createdAt":0,"folder":"<folder item id>"}
 ```
 
 - **Images:** the PNG and its thumbnail are uploaded as two encrypted blobs. Their ids are listed in the payload and in `blobIds`.

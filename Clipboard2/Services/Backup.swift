@@ -302,12 +302,15 @@ nonisolated struct BackupSecret: Codable, Equatable, Sendable {
     var name: String
     var value: String
     var createdAt: Int64
+    /// The id of the backup folder it's in (1.7+), like a clip's `folder`.
+    var folder: String?
 
-    init(id: String, name: String, value: String, createdAt: Int64) {
+    init(id: String, name: String, value: String, createdAt: Int64, folder: String? = nil) {
         self.id = id
         self.name = name
         self.value = value
         self.createdAt = createdAt
+        self.folder = folder
     }
 
     init(from decoder: any Decoder) throws {
@@ -318,6 +321,7 @@ nonisolated struct BackupSecret: Codable, Equatable, Sendable {
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Untitled"
         value = try c.decodeIfPresent(String.self, forKey: .value) ?? ""
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
+        folder = try c.decodeIfPresent(String.self, forKey: .folder)
     }
 }
 
@@ -388,7 +392,8 @@ enum BackupExporter {
         }
         let secretList = secrets?.map {
             BackupSecret(id: $0.ref.id.lowercased(), name: $0.ref.name, value: $0.value,
-                         createdAt: ($0.ref.createdAt ?? .now).backupMillis)
+                         createdAt: ($0.ref.createdAt ?? .now).backupMillis,
+                         folder: $0.ref.folderID?.uuidString.lowercased())
         }
         let folderList = store.folders(inSpace: nil).map {
             BackupFolder(id: $0.id.uuidString.lowercased(), name: $0.name, label: $0.label,
@@ -397,7 +402,15 @@ enum BackupExporter {
         // A clip pointing at a folder that isn't here goes to the root.
         let known = Set(folderList.map(\.id))
         for index in clips.indices where clips[index].folder.map(known.contains) == false { clips[index].folder = nil }
-        return BackupContents(clips: clips, imageFiles: files, snippets: snippetList, folders: folderList, secrets: secretList)
+        var secretEntries = secretList
+        if let entries = secretEntries {
+            secretEntries = entries.map { entry in
+                var entry = entry
+                if entry.folder.map(known.contains) == false { entry.folder = nil }
+                return entry
+            }
+        }
+        return BackupContents(clips: clips, imageFiles: files, snippets: snippetList, folders: folderList, secrets: secretEntries)
     }
 
     /// Reads the images, encrypts and writes the file atomically. Images that can't be read are
@@ -432,7 +445,8 @@ enum BackupExporter {
 protocol BackupSecretSink {
     /// Personal secrets already saved, for skipping duplicates.
     func existingSecrets() -> [(name: String, value: String)]
-    func addSecret(name: String, value: String) -> Bool
+    /// `folderID`: the personal Saved folder it goes in, if any.
+    func addSecret(name: String, value: String, folderID: UUID?) -> Bool
     func finishImport()
 }
 
@@ -441,8 +455,8 @@ extension SecretStore: BackupSecretSink {
         secrets.filter { $0.spaceID == nil }.compactMap { ref in SecretVault.value(id: ref.id).map { (ref.name, $0) } }
     }
 
-    func addSecret(name: String, value: String) -> Bool {
-        SecretVault.add(name: name, value: value) != nil
+    func addSecret(name: String, value: String, folderID: UUID?) -> Bool {
+        SecretVault.add(name: name, value: value, folderID: folderID) != nil
     }
 
     func finishImport() {
@@ -514,7 +528,7 @@ enum BackupImporter {
         mergeClips(document.clips, into: store, folders: folders, maxAge: maxAge, now: now, summary: &summary)
         mergeSnippets(document.snippets, into: snippets, summary: &summary)
         if let secrets, let incoming = document.secrets {
-            mergeSecrets(incoming, into: secrets, summary: &summary)
+            mergeSecrets(incoming, into: secrets, folders: folders, summary: &summary)
         }
         return summary
     }
@@ -671,14 +685,15 @@ enum BackupImporter {
         if inserted { snippets.commitSynced() }
     }
 
-    private static func mergeSecrets(_ incoming: [BackupSecret], into sink: any BackupSecretSink, summary: inout BackupImportSummary) {
+    private static func mergeSecrets(_ incoming: [BackupSecret], into sink: any BackupSecretSink, folders: [String: UUID] = [:],
+                                     summary: inout BackupImportSummary) {
         var known = Set(sink.existingSecrets().map { SecretKey(name: $0.name, value: $0.value) })
         for secret in incoming where !secret.value.isEmpty {
             guard known.insert(SecretKey(name: secret.name, value: secret.value)).inserted else {
                 summary.secretsSkipped += 1
                 continue
             }
-            if sink.addSecret(name: secret.name, value: secret.value) {
+            if sink.addSecret(name: secret.name, value: secret.value, folderID: secret.folder.flatMap { folders[$0] }) {
                 summary.secretsAdded += 1
             } else {
                 summary.secretsFailed += 1

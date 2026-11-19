@@ -486,6 +486,27 @@ final class ClipStore {
         try? FileManager.default.removeItem(at: AppPaths.syncedFilesFolder(for: id))
     }
 
+    /// Saves personal copies of (group) items: new ids in the personal space, saved, in `folder`
+    /// (a personal folder) or at the root of Saved. The originals don't change. A personal item
+    /// with the same content is reused rather than duplicated. Returns the copies.
+    @discardableResult
+    func savePersonalCopies(of items: [ClipItem], into folder: ClipFolder? = nil, now: Date = .now) -> [ClipItem] {
+        guard folder?.spaceID == nil else { return [] }
+        var copies: [ClipItem] = []
+        for item in items where !item.isTransient {
+            let copy = item.spaceID == nil ? item : shareCopy(of: item, toSpace: nil, now: now)
+            if !copy.isPinned {
+                copy.isPinned = true
+                copy.pinnedAt = now
+            }
+            // A personal item reused for the copy keeps the folder it's in, unless one was chosen.
+            if let folder { copy.folderID = folder.id }
+            copies.append(copy)
+        }
+        if !copies.isEmpty { commit() }
+        return copies
+    }
+
     // MARK: Sync
 
     /// Copies an item into a sync group (or, for nil, the personal space) with a new id. Images
