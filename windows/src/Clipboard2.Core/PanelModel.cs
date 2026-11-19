@@ -807,7 +807,9 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     public static TimeSpan NoticeDuration { get; set; } = TimeSpan.FromSeconds(3);
 
     /// <summary>When a clip was kept, for Saved's newest-first order: when it was saved, else its last copy.</summary>
-    private static DateTime SavedDate(ClipItem item) => item.PinnedAt ?? item.LastCopiedAt;
+    // The later of saved and last copied, like the Mac: a saved clip copied again moves up.
+    private static DateTime SavedDate(ClipItem item) =>
+        item.PinnedAt is { } pinned && pinned > item.LastCopiedAt ? pinned : item.LastCopiedAt;
 
     public void Refresh(bool resetSelection = false)
     {
