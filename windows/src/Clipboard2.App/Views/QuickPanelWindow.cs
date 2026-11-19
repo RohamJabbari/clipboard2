@@ -786,7 +786,7 @@ public sealed class QuickPanelWindow : Window
                 menu.Items.Add(preview);
             }
             menu.Items.Add(Item(item.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
-            if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Labelled", () => Model.RemoveFromLabelled([item])));
+            if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Saved", () => Model.RemoveFromSaved([item])));
             if (item != Model.SelectionItem)
             {
                 // Right-clicking one of several selected items saves them all.

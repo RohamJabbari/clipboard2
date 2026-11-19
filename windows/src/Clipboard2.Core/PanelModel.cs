@@ -3,6 +3,7 @@ using Clipboard2.Core.Sync;
 
 namespace Clipboard2.Core;
 
+/// <summary><see cref="Labelled"/> is the Saved chip: the raw name stays so stored values keep working.</summary>
 public enum PanelFilter { All, Labelled, Text, Images, Files, Snippets, Secrets, ThisApp, Inbox }
 
 public static class PanelFilters
@@ -16,6 +17,7 @@ public static class PanelFilters
     public static string Title(this PanelFilter f) => f switch
     {
         PanelFilter.ThisApp => "This App",
+        PanelFilter.Labelled => "Saved",
         _ => f.ToString(),
     };
 }
@@ -25,27 +27,31 @@ public abstract record PanelEntry
     public sealed record Clip(ClipItem Item) : PanelEntry;
     public sealed record SnippetEntry(Snippet Snippet) : PanelEntry;
     public sealed record SecretEntry(SecretRef Secret) : PanelEntry;
+    /// <summary>A folder row in Saved, with the number of saved clips in it.</summary>
+    public sealed record FolderEntry(ClipFolder Folder, int Count) : PanelEntry;
 
     public string Id => this switch
     {
         Clip c => "c-" + c.Item.Id,
         SnippetEntry s => "s-" + s.Snippet.Id,
         SecretEntry k => "k-" + k.Secret.Id,
+        FolderEntry f => "f-" + f.Folder.Id,
         _ => "",
     };
 
     public ClipItem? ClipItem => (this as Clip)?.Item;
 
+    /// <summary>Folders can't go in a quick slot: theirs never matches one.</summary>
     public SlotTarget SlotTarget => this switch
     {
         Clip c => SlotTarget.ForClip(c.Item.Id),
         SnippetEntry s => SlotTarget.ForSnippet(s.Snippet.Id),
         SecretEntry k => SlotTarget.ForSecret(k.Secret.Id),
-        _ => throw new InvalidOperationException(),
+        _ => new SlotTarget(SlotKind.Clip, "folder:" + Id),
     };
 }
 
-public enum PanelMode { Browse, Actions, SnippetForm, SaveSecret, Label, EditSecret, AI }
+public enum PanelMode { Browse, Actions, SnippetForm, SaveSecret, Label, EditSecret, AI, FolderName }
 
 public abstract record PanelAction
 {
@@ -58,8 +64,23 @@ public abstract record PanelAction
     public sealed record SetLabel : PanelAction;
     public sealed record SetUpAI : PanelAction;
     public sealed record ClearSlot(int Slot) : PanelAction;
-    /// <summary>For items pinned without a label: labels are the only way to keep items now.</summary>
-    public sealed record RemoveFromLabelled : PanelAction;
+    /// <summary>Saves an unsaved clip without a label.</summary>
+    public sealed record AddToSaved : PanelAction;
+    /// <summary>For items saved without a label (a labelled one goes when its label does). Also leaves the folder.</summary>
+    public sealed record RemoveFromSaved : PanelAction;
+    /// <summary>Lists the folders of the clips' space to move them into.</summary>
+    public sealed record MoveToFolder : PanelAction;
+    public sealed record MoveTo(Guid FolderId, string FolderName) : PanelAction;
+    /// <summary>Asks for a name, creates the folder and moves the selection in.</summary>
+    public sealed record MoveToNewFolder : PanelAction;
+    /// <summary>Back to the root of Saved; the clip stays saved.</summary>
+    public sealed record RemoveFromFolder : PanelAction;
+    public sealed record OpenFolder : PanelAction;
+    public sealed record RenameFolder : PanelAction;
+    /// <summary>Its clips move to the root of Saved.</summary>
+    public sealed record DeleteFolder : PanelAction;
+    /// <summary>Delete, worded for group items: it deletes the item for everyone in the group.</summary>
+    public sealed record RemoveFromGroup : PanelAction;
     /// <summary>Saves into the folder chosen in Settings (Downloads unless changed), named after it.</summary>
     public sealed record SaveToFolder(string FolderName) : PanelAction;
     /// <summary>Asks for a folder, then saves there.</summary>
@@ -81,6 +102,8 @@ public abstract record PanelAction
         ShareTo => "Share to Group",
         SendTo => "Send to Device",
         SendToContact => "Send to Contact",
+        MoveTo or MoveToNewFolder => "Move to Folder",
+        OpenFolder or RenameFolder or DeleteFolder => "Folder",
         _ => "Item",
     };
 
@@ -96,7 +119,16 @@ public abstract record PanelAction
         SetLabel => "Label…",
         SetUpAI => "Set Up AI…",
         ClearSlot c => $"Remove from Quick Slot Ctrl+{c.Slot}",
-        RemoveFromLabelled => "Remove from Labelled",
+        AddToSaved => "Add to Saved",
+        RemoveFromSaved => "Remove from Saved",
+        MoveToFolder => "Move to Folder…",
+        MoveTo m => m.FolderName,
+        MoveToNewFolder => "New Folder…",
+        RemoveFromFolder => "Remove from Folder",
+        OpenFolder => "Open",
+        RenameFolder => "Rename…",
+        DeleteFolder => "Delete Folder",
+        RemoveFromGroup => "Remove from Group",
         SaveToFolder f => $"Save to {f.FolderName}",
         SaveToChosenFolder => "Save to…",
         ShareToGroup => "Share to Group…",
@@ -167,9 +199,22 @@ public sealed class LabelForm(PanelEntry entry)
     {
         PanelEntry.Clip c => c.Item.Label ?? "",
         PanelEntry.SecretEntry s => s.Secret.Name,
+        PanelEntry.FolderEntry f => f.Folder.Label ?? "",
         _ => "",
     };
     public bool IsSecret => Entry is PanelEntry.SecretEntry;
+    public bool IsFolder => Entry is PanelEntry.FolderEntry;
+}
+
+/// <summary>The inline name prompt for a folder: renaming one (<see cref="Folder"/>), or naming a new one that
+/// <see cref="ItemIds"/> then move into (Move to Folder ▸ New Folder…).</summary>
+public sealed class FolderForm
+{
+    public ClipFolder? Folder { get; init; }
+    public IReadOnlyList<Guid> ItemIds { get; init; } = [];
+    public string? SpaceId { get; init; }
+    public string Text { get; set; } = ClipFolder.DefaultName;
+    public bool IsRename => Folder is not null;
 }
 
 /// <summary>Name and value of a secret, filled in after Windows Hello. The value lives only as long as the form.</summary>
@@ -188,7 +233,7 @@ public sealed class SaveSecretForm(ClipItem item)
 }
 
 [Flags] public enum KeyMods { None = 0, Ctrl = 1, Shift = 2, Alt = 4 }
-public enum PanelKey { Other, Escape, Up, Down, Left, Right, PageUp, PageDown, Enter, Tab, Delete, Digit, Letter }
+public enum PanelKey { Other, Escape, Up, Down, Left, Right, PageUp, PageDown, Enter, Tab, Delete, Digit, Letter, Backspace }
 
 /// <summary>A key press, mapped from the UI framework so the logic is testable anywhere.</summary>
 public readonly record struct KeyInput(PanelKey Key, KeyMods Mods = KeyMods.None, int Digit = 0, char Letter = '\0')
@@ -239,6 +284,13 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     public IReadOnlyList<PanelFilter> ChipFilters => _contacts.Count > 0 || Filter == PanelFilter.Inbox ? [.. PanelFilters.Chips, PanelFilter.Inbox] : PanelFilters.Chips;
     /// <summary>In the action menu: picking the group to share with.</summary>
     public bool IsPickingGroup { get; private set; }
+    /// <summary>In the action menu: picking the folder to move the selection into.</summary>
+    public bool IsPickingFolder { get; private set; }
+    public FolderForm? FolderForm { get; private set; }
+    /// <summary>The folder open in Saved (personal or a group's), or null at Saved's root.</summary>
+    public Guid? OpenFolderId { get; private set; }
+    private Dictionary<Guid, ClipFolder> _folders = [];
+    public ClipFolder? OpenFolder => OpenFolderId is { } id ? _folders.GetValueOrDefault(id) : null;
     public List<PanelEntry> Entries { get; private set; } = [];
     public string? SelectedId { get; private set; }
     public HashSet<string> SelectedIds { get; private set; } = [];
@@ -273,6 +325,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         Query = "";
         Filter = PanelFilter.All;
         GroupFilter = null;
+        OpenFolderId = null;
         _userMovedSelection = false;
         ClearPickedFiles();
         Refresh(resetSelection: true);
@@ -306,9 +359,11 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         SaveSecretForm = null;
         LabelForm = null;
         EditSecretForm = null;
+        FolderForm = null;
         ActionQuery = "";
         ActionSelection = 0;
         IsPickingGroup = false;
+        IsPickingFolder = false;
         Mode = PanelMode.Browse;
         Notify();
     }
@@ -320,22 +375,211 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         Refresh(resetSelection: true);
     }
 
+    /// <summary>Picking the chip that's already selected goes back to the root of Saved.</summary>
     public void SetFilter(PanelFilter filter)
     {
-        if (filter == Filter && GroupFilter is null) return;
+        if (filter == Filter && GroupFilter is null)
+        {
+            CloseFolder();
+            return;
+        }
         Filter = filter;
         GroupFilter = null;
+        OpenFolderId = null;
         Refresh(resetSelection: true);
         if (filter == PanelFilter.Inbox) GroupFilterSelected?.Invoke();   // fetch what contacts just sent
     }
 
     public void SetGroupFilter(string groupId)
     {
-        if (GroupFilter == groupId) return;
+        if (GroupFilter == groupId)
+        {
+            CloseFolder();
+            return;
+        }
         GroupFilter = groupId;
         Filter = PanelFilter.All;
+        OpenFolderId = null;
         Refresh(resetSelection: true);
         GroupFilterSelected?.Invoke();
+    }
+
+    // MARK: Saved and folders
+
+    /// <summary>The list shows Saved: the Saved chip, or a group switched to Saved.</summary>
+    public bool IsSavedView => GroupFilter is { } group ? GroupShowsSaved(group) : Filter == PanelFilter.Labelled;
+
+    /// <summary>Whose Saved is shown: a group's id, or null for the personal Saved.</summary>
+    public string? SavedSpace => GroupFilter;
+
+    /// <summary>The group's All | Saved switch, remembered per group.</summary>
+    public bool GroupShowsSaved(string groupId) => settings.GroupsShowingSaved.Contains(groupId);
+
+    public void SetGroupShowsSaved(bool saved)
+    {
+        if (GroupFilter is not { } group || GroupShowsSaved(group) == saved) return;
+        if (saved) settings.GroupsShowingSaved.Add(group); else settings.GroupsShowingSaved.Remove(group);
+        settings.Save();
+        OpenFolderId = null;
+        Refresh(resetSelection: true);
+    }
+
+    public void OpenFolderById(Guid id)
+    {
+        if (!IsSavedView || !_folders.ContainsKey(id)) return;
+        OpenFolderId = id;
+        Query = "";
+        Refresh(resetSelection: true);
+    }
+
+    /// <summary>Back to the root of Saved, with the folder selected.</summary>
+    public void CloseFolder()
+    {
+        if (OpenFolderId is not { } id) return;
+        OpenFolderId = null;
+        Refresh(resetSelection: true);
+        if (Entries.Any(e => e.Id == "f-" + id)) Select("f-" + id);
+    }
+
+    /// <summary>The folder a clip is in, if this device has it.</summary>
+    public ClipFolder? FolderOf(ClipItem item) =>
+        item.IsPinned && item.FolderId is { } id && _folders.TryGetValue(id, out var folder) && folder.SpaceId == item.SpaceId ? folder : null;
+
+    /// <summary>The small caption on a clip shown outside its folder (a search from Saved's root, or History).</summary>
+    public string? FolderCaption(PanelEntry entry) =>
+        entry.ClipItem is { } item && FolderOf(item) is { } folder && folder.Id != OpenFolderId ? folder.Name : null;
+
+    /// <summary>Folders can hold clips of the personal space and of groups: not contacts' (edits to what they send
+    /// stay on this device) nor the selection from another app.</summary>
+    private bool CanUseFolders(ClipItem item) => item != SelectionItem && (item.SpaceId is null || _groups.ContainsKey(item.SpaceId));
+
+    /// <summary>The one space all <paramref name="items"/> share, when they can go into its folders.</summary>
+    private bool CommonFolderSpace(IReadOnlyList<ClipItem> items, out string? space)
+    {
+        space = items.Count > 0 ? items[0].SpaceId : null;
+        var first = space;
+        return items.Count > 0 && items.All(i => i.SpaceId == first && CanUseFolders(i));
+    }
+
+    /// <summary>The New Folder button: a folder named "New Folder" in the Saved shown, selected and being renamed.</summary>
+    public void CreateFolder()
+    {
+        if (!IsSavedView) return;
+        var folder = store.CreateFolder(ClipFolder.DefaultName, SavedSpace);
+        OpenFolderId = null;
+        Query = "";
+        Refresh();
+        BeginRenameFolder(folder);
+    }
+
+    public void BeginRenameFolder(ClipFolder folder)
+    {
+        Select("f-" + folder.Id);
+        FolderForm = new FolderForm { Folder = folder, SpaceId = folder.SpaceId, Text = folder.Name };
+        Mode = PanelMode.FolderName;
+        Notify();
+    }
+
+    /// <summary>Move to Folder ▸ New Folder…: asks for the name inline, then creates it and moves the clips in.</summary>
+    public void BeginNewFolder(IReadOnlyList<ClipItem> items)
+    {
+        if (!CommonFolderSpace(items, out var space)) return;
+        FolderForm = new FolderForm { ItemIds = [.. items.Select(i => i.Id)], SpaceId = space };
+        ActionQuery = "";
+        IsPickingFolder = false;
+        Mode = PanelMode.FolderName;
+        Notify();
+    }
+
+    public void SubmitFolderName()
+    {
+        if (FolderForm is not { } form) return;
+        if (form.Folder is { } folder)
+        {
+            store.RenameFolder(folder, form.Text);
+            ResetMode();
+            Refresh();
+            Select("f-" + folder.Id);
+            return;
+        }
+        var created = store.CreateFolder(form.Text, form.SpaceId);
+        var items = form.ItemIds.Select(store.Find).OfType<ClipItem>().ToList();
+        var moved = store.MoveToFolder(items, created);
+        ResetMode();
+        Refresh();
+        ShowNotice(MovedNotice(moved, created.Name));
+    }
+
+    private static string MovedNotice(int count, string folder) =>
+        count == 1 ? $"Moved to “{folder}”" : $"Moved {count} items to “{folder}”";
+
+    /// <summary>Moves clips into a folder of their space (null: out of their folder, to the root of Saved).</summary>
+    public void MoveToFolder(IReadOnlyList<ClipItem> items, ClipFolder? folder)
+    {
+        var usable = items.Where(CanUseFolders).ToList();
+        var moved = store.MoveToFolder(usable, folder);
+        ResetMode();
+        Refresh();
+        if (folder is null) ShowNotice(moved == 1 ? "Moved to Saved" : $"Moved {moved} items to Saved");
+        else if (moved == 0 && usable.Any(i => i.SpaceId != folder.SpaceId)) ShowNotice("Items can only move into folders of their own space");
+        else ShowNotice(MovedNotice(moved, folder.Name));
+    }
+
+    /// <summary>A row of this panel dropped on a folder row (or, with null, on the "Saved" breadcrumb): it moves in or
+    /// out. Dragging one of several selected rows moves the whole selection.</summary>
+    public void DropOnFolder(string entryId, Guid? folderId)
+    {
+        var items = IsMultiSelecting && SelectedIds.Contains(entryId)
+            ? SelectedClips
+            : Entries.FirstOrDefault(e => e.Id == entryId)?.ClipItem is { } item ? [item] : [];
+        if (items.Count == 0) return;
+        if (folderId is { } id)
+        {
+            if (_folders.GetValueOrDefault(id) is not { } folder) return;
+            MoveToFolder(items, folder);
+        }
+        else MoveToFolder(items, null);
+    }
+
+    /// <summary>Delete Folder: its clips move to the root of Saved. No confirmation: nothing is lost.</summary>
+    public void DeleteFolder(ClipFolder folder)
+    {
+        var moved = store.DeleteFolder(folder);
+        if (OpenFolderId == folder.Id) OpenFolderId = null;
+        ResetMode();
+        Refresh(resetSelection: true);
+        ShowNotice($"Folder deleted · {(moved == 1 ? "1 item" : $"{moved} items")} moved to Saved");
+    }
+
+    /// <summary>Saves clips without a label.</summary>
+    public void AddToSaved(IReadOnlyList<ClipItem> items)
+    {
+        var added = items.Where(i => !i.IsPinned && i != SelectionItem).ToList();
+        foreach (var item in added) store.Pin(item);
+        ResetMode();
+        Refresh();
+        ShowNotice(added.Count == 1 ? "Added to Saved" : $"Added {added.Count} items to Saved");
+    }
+
+    private List<PanelAction> FolderPickActions()
+    {
+        var clips = IsMultiSelecting ? SelectedClips : SelectedEntry?.ClipItem is { } item ? [item] : [];
+        if (!CommonFolderSpace(clips, out var space)) return [];
+        var current = clips.Select(c => FolderOf(c)?.Id).Distinct().ToList() is [{ } only] ? only : (Guid?)null;
+        return [.. _folders.Values.Where(f => f.SpaceId == space && f.Id != current)
+                    .OrderBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase).Select(f => new PanelAction.MoveTo(f.Id, f.Name)),
+                new PanelAction.MoveToNewFolder()];
+    }
+
+    public void BeginMoveToFolder()
+    {
+        if (SelectedEntry is null && !IsMultiSelecting) return;
+        ActionQuery = "";
+        ActionSelection = 0;
+        IsPickingGroup = false;
+        IsPickingFolder = true;
+        Mode = PanelMode.Actions;
+        Notify();
     }
 
     /// <summary>The badge for a group entry: the username of whoever copied it, or the group's name when that isn't
@@ -407,6 +651,11 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         _authors = _groups.Count == 0 && _contacts.Count == 0 ? [] : store.GroupAuthors();
         if (GroupFilter is not null && !GroupNames.ContainsKey(GroupFilter)) GroupFilter = null;
         var group = GroupFilter;
+        _folders = store.AllFolders().ToDictionary(f => f.Id);
+        var saved = IsSavedView;
+        // A folder deleted (here or elsewhere) while open: back to the root.
+        if (OpenFolderId is { } openId && (!saved || !_folders.TryGetValue(openId, out var openFolder) || openFolder.SpaceId != SavedSpace))
+            OpenFolderId = null;
         // What contacts send lives in the Inbox only; what this user sent them isn't listed again.
         var inbox = Filter == PanelFilter.Inbox && group is null;
         bool Listed(string? space, PanelEntry entry) =>
@@ -415,7 +664,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             : inbox ? [.. store.AllItems().Where(item => Listed(item.SpaceId, new PanelEntry.Clip(item)))]
             : Filter is PanelFilter.Snippets or PanelFilter.Secrets ? [] : store.AllItems().Where(item => Listed(item.SpaceId, new PanelEntry.Clip(item)) && Filter switch
         {
-            // Labelled items, plus any pinned before labels replaced pins: both are kept forever.
+            // Saved: labelled items, items added to Saved or moved into a folder, and any pinned before labels.
             PanelFilter.Labelled => item.IsPinned,
             PanelFilter.Text => item.Kind.IsTextual(),
             PanelFilter.Images => item.Kind == ClipKind.Image,
@@ -423,24 +672,42 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             PanelFilter.ThisApp => target is not null && string.Equals(item.SourceId, target, StringComparison.OrdinalIgnoreCase),
             _ => true,
         }).ToList();
+        // Saved: folders of the space shown first (not a group's in the personal Saved), then the clips outside one.
+        // Inside a folder, only its clips. A search from the root finds clips in folders too.
+        List<PanelEntry.FolderEntry> folderRows = [];
+        if (saved)
+        {
+            clips = [.. clips.Where(c => c.IsPinned)];
+            var counts = clips.Where(c => FolderOf(c) is not null).GroupBy(c => c.FolderId!.Value).ToDictionary(g => g.Key, g => g.Count());
+            if (OpenFolderId is { } open) clips = [.. clips.Where(c => FolderOf(c)?.Id == open)];
+            else
+            {
+                folderRows = [.. _folders.Values.Where(f => f.SpaceId == SavedSpace).OrderBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase)
+                    .Select(f => new PanelEntry.FolderEntry(f, counts.GetValueOrDefault(f.Id)))];
+                if (q.Length == 0) clips = [.. clips.Where(c => FolderOf(c) is null)];
+            }
+        }
         // Snippets and secrets join "All" only while searching, so history stays uncluttered.
         var searchingAll = Filter == PanelFilter.All && q.Length > 0;
-        var snippets = group is not null ? store.AllSnippets().Where(s => s.SpaceId == group).ToList()
+        var snippets = saved ? [] : group is not null ? store.AllSnippets().Where(s => s.SpaceId == group).ToList()
             : Filter == PanelFilter.Snippets || searchingAll || inbox
                 ? [.. store.AllSnippets().Where(s => Listed(s.SpaceId, new PanelEntry.SnippetEntry(s)))] : [];
-        var secretList = group is not null ? secrets.Secrets.Where(s => s.SpaceId == group).ToList()
+        var secretList = saved ? [] : group is not null ? secrets.Secrets.Where(s => s.SpaceId == group).ToList()
             : Filter == PanelFilter.Secrets || searchingAll || inbox
                 ? [.. secrets.Secrets.Where(s => Listed(s.SpaceId, new PanelEntry.SecretEntry(s)))] : [];
 
         List<PanelEntry> result;
         if (q.Length == 0)
         {
-            result = [.. clips.Select(c => new PanelEntry.Clip(c)), .. snippets.Select(s => new PanelEntry.SnippetEntry(s)),
+            result = [.. folderRows, .. clips.Select(c => new PanelEntry.Clip(c)), .. snippets.Select(s => new PanelEntry.SnippetEntry(s)),
                       .. secretList.Select(s => new PanelEntry.SecretEntry(s))];
         }
         else
         {
             var scored = new List<(PanelEntry Entry, int Score, DateTime Date)>();
+            foreach (var folder in folderRows)
+                if (FuzzyMatcher.Score(q, folder.Folder.Name + (folder.Folder.Label is { } l ? " " + l : "")) is { } s)
+                    scored.Add((folder, s + 500, folder.Folder.UpdatedAt));
             foreach (var item in clips)
                 if (FuzzyMatcher.Score(q, item.SearchableText) is { } s) scored.Add((new PanelEntry.Clip(item), s, item.LastCopiedAt));
             var lowered = q.ToLowerInvariant();
@@ -680,6 +947,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     /// <summary>The Ctrl+number shown on a row: its slot, or its position if that number is free.</summary>
     public (int Number, bool IsSlot)? ShortcutNumber(PanelEntry entry, int index)
     {
+        if (entry is PanelEntry.FolderEntry) return null;
         if (slots.SlotFor(entry.SlotTarget) is { } slot) return (slot, true);
         var position = index + 1;
         return position <= 9 && slots.Target(position) is null ? (position, false) : null;
@@ -707,7 +975,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     public void AssignSelection(int slot)
     {
-        if (SelectedEntry is not { } entry) return;
+        if (SelectedEntry is not { } entry || entry is PanelEntry.FolderEntry) return;
         if (entry is PanelEntry.Clip { Item.IsPinned: false } clip) store.TogglePin(clip.Item);
         slots.Assign(entry.SlotTarget, slot);
         Refresh();
@@ -746,6 +1014,9 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             case PanelEntry.SecretEntry k:
                 host.ClosePanel();
                 host.PasteSecret(k.Secret);
+                break;
+            case PanelEntry.FolderEntry f:
+                OpenFolderById(f.Folder.Id);
                 break;
         }
     }
@@ -790,6 +1061,10 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 // An item in a quick slot stays kept without its label, so the slot can't lose it.
                 store.SetLabel(form.Text, c.Item, keepPinned: slots.SlotFor(form.Entry.SlotTarget) is not null);
                 ShowNotice(c.Item.Label is null ? "Label removed" : "Labelled");
+                break;
+            case PanelEntry.FolderEntry f:
+                store.SetFolderLabel(f.Folder, form.Text);
+                ShowNotice(f.Folder.Label is null ? "Label removed" : "Labelled");
                 break;
             case PanelEntry.SecretEntry s when form.Text.Trim().Length > 0:
                 secrets.Rename(s.Secret, form.Text.Trim());
@@ -857,6 +1132,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         ActionQuery = "";
         ActionSelection = 0;
         IsPickingGroup = false;
+        IsPickingFolder = false;
         Mode = PanelMode.Actions;
         Notify();
     }
@@ -867,6 +1143,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         if (SelectedEntry is null && !IsMultiSelecting) return;
         ActionQuery = "";
         ActionSelection = 0;
+        IsPickingFolder = false;
         IsPickingGroup = true;
         Mode = PanelMode.Actions;
         Notify();
@@ -930,10 +1207,17 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 if (CanShare) multi.Add(new PanelAction.ShareToGroup());
                 multi.AddRange(ContactActions(null));
                 multi.AddRange(SaveActions);
-                if (clips.Any(IsPinnedWithoutLabel)) multi.Add(new PanelAction.RemoveFromLabelled());
-                return [.. multi, new PanelAction.Delete()];
+                multi.AddRange(SavedActions(clips));
+                return [.. multi, DeleteAction(clips)];
             }
             if (SelectedEntry is not { } entry) return [];
+            if (entry is PanelEntry.FolderEntry folderEntry)
+            {
+                List<PanelAction> folderActions = [new PanelAction.OpenFolder(), new PanelAction.RenameFolder(), new PanelAction.SetLabel()];
+                // A group's folder isn't shared on: its clips are already the group's.
+                if (folderEntry.Folder.SpaceId is null && CanShare) folderActions.Add(new PanelAction.ShareToGroup());
+                return [.. folderActions, new PanelAction.DeleteFolder()];
+            }
             List<PanelAction> actions = [new PanelAction.Paste()];
             switch (entry)
             {
@@ -951,7 +1235,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                     if (CanPreview) actions.Add(new PanelAction.Preview());
                     if (c.Item.Kind.IsTextual()) actions.Add(new PanelAction.SaveAsSecret());
                     actions.Add(new PanelAction.SetLabel());
-                    if (IsPinnedWithoutLabel(c.Item)) actions.Add(new PanelAction.RemoveFromLabelled());
+                    actions.AddRange(SavedActions([c.Item]));
                     actions.AddRange(SaveActions);
                     break;
                 case PanelEntry.SecretEntry:
@@ -966,19 +1250,35 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 actions.AddRange(SendActions);
             }
             if (slots.SlotFor(entry.SlotTarget) is { } slot) actions.Add(new PanelAction.ClearSlot(slot));
-            if (entry is PanelEntry.Clip or PanelEntry.SecretEntry) actions.Add(new PanelAction.Delete());
+            if (entry is PanelEntry.Clip c3) actions.Add(DeleteAction([c3.Item]));
+            else if (entry is PanelEntry.SecretEntry) actions.Add(new PanelAction.Delete());
             return actions;
         }
     }
+
+    /// <summary>Add to Saved, Remove from Saved, Move to Folder… and Remove from Folder, as they apply to the clips.</summary>
+    private List<PanelAction> SavedActions(IReadOnlyList<ClipItem> clips)
+    {
+        List<PanelAction> list = [];
+        if (clips.Any(c => !c.IsPinned)) list.Add(new PanelAction.AddToSaved());
+        if (clips.Any(IsPinnedWithoutLabel)) list.Add(new PanelAction.RemoveFromSaved());
+        if (CommonFolderSpace(clips, out _)) list.Add(new PanelAction.MoveToFolder());
+        if (clips.Any(c => FolderOf(c) is not null)) list.Add(new PanelAction.RemoveFromFolder());
+        return list;
+    }
+
+    /// <summary>Group items read "Remove from Group": deleting one deletes it for everyone.</summary>
+    private PanelAction DeleteAction(IReadOnlyList<ClipItem> clips) =>
+        clips.Count > 0 && clips.All(c => c.SpaceId is { } s && _groups.ContainsKey(s)) ? new PanelAction.RemoveFromGroup() : new PanelAction.Delete();
 
     public List<PanelAction> FilteredActions
     {
         get
         {
             var q = ActionQuery.Trim();
-            if (IsPickingGroup)
+            if (IsPickingGroup || IsPickingFolder)
             {
-                var groups = ShareActions(!IsMultiSelecting && SelectedEntry is { } e ? SpaceOf(e) : null);
+                var groups = IsPickingFolder ? FolderPickActions() : ShareActions(!IsMultiSelecting && SelectedEntry is { } e ? SpaceOf(e) : null);
                 return q.Length == 0 ? groups
                     : [.. groups.Select(a => (Action: a, Score: FuzzyMatcher.Score(q, a.Title))).Where(x => x.Score is not null)
                         .OrderByDescending(x => x.Score).Select(x => x.Action)];
@@ -1040,8 +1340,37 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 Mode = PanelMode.Browse;
                 Refresh();
                 break;
-            case PanelAction.RemoveFromLabelled when item is not null:
-                RemoveFromLabelled([item]);
+            case PanelAction.RemoveFromSaved when item is not null:
+                RemoveFromSaved([item]);
+                break;
+            case PanelAction.AddToSaved when item is not null:
+                AddToSaved([item]);
+                break;
+            case PanelAction.MoveToFolder:
+                BeginMoveToFolder();
+                break;
+            case PanelAction.MoveTo move when item is not null && _folders.GetValueOrDefault(move.FolderId) is { } target:
+                MoveToFolder([item], target);
+                break;
+            case PanelAction.MoveToNewFolder when item is not null:
+                BeginNewFolder([item]);
+                break;
+            case PanelAction.RemoveFromFolder when item is not null:
+                MoveToFolder([item], null);
+                break;
+            case PanelAction.OpenFolder when entry is PanelEntry.FolderEntry f:
+                ResetMode();
+                OpenFolderById(f.Folder.Id);
+                break;
+            case PanelAction.RenameFolder when entry is PanelEntry.FolderEntry f:
+                BeginRenameFolder(f.Folder);
+                break;
+            case PanelAction.DeleteFolder when entry is PanelEntry.FolderEntry f:
+                DeleteFolder(f.Folder);
+                break;
+            case PanelAction.RemoveFromGroup:
+                Mode = PanelMode.Browse;
+                DeleteSelection();
                 break;
             case PanelAction.SaveToFolder when item is not null:
                 Save([item], host.SaveFolder);
@@ -1095,8 +1424,23 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 host.ClosePanel();
                 host.PasteText(string.Join("\n", parts));
                 break;
-            case PanelAction.RemoveFromLabelled:
-                RemoveFromLabelled(clips);
+            case PanelAction.RemoveFromSaved:
+                RemoveFromSaved(clips);
+                break;
+            case PanelAction.AddToSaved:
+                AddToSaved(clips);
+                break;
+            case PanelAction.MoveToFolder:
+                BeginMoveToFolder();
+                break;
+            case PanelAction.MoveTo move when _folders.GetValueOrDefault(move.FolderId) is { } target:
+                MoveToFolder(clips, target);
+                break;
+            case PanelAction.MoveToNewFolder:
+                BeginNewFolder(clips);
+                break;
+            case PanelAction.RemoveFromFolder:
+                MoveToFolder(clips, null);
                 break;
             case PanelAction.SaveToFolder:
                 Save(clips, host.SaveFolder);
@@ -1137,7 +1481,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 Mode = PanelMode.Browse;
                 OpenPreview();
                 break;
-            case PanelAction.Delete:
+            case PanelAction.Delete or PanelAction.RemoveFromGroup:
                 Mode = PanelMode.Browse;
                 DeleteSelectedClips();
                 break;
@@ -1149,6 +1493,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         PanelEntry.Clip c => c.Item.SpaceId,
         PanelEntry.SnippetEntry s => s.Snippet.SpaceId,
         PanelEntry.SecretEntry k => k.Secret.SpaceId,
+        PanelEntry.FolderEntry f => f.Folder.SpaceId,
         _ => null,
     };
 
@@ -1170,6 +1515,17 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 break;
             case PanelEntry.SnippetEntry s:
                 store.CopySnippetToSpace(s.Snippet, share.GroupId);
+                break;
+            case PanelEntry.FolderEntry f:
+                // All or nothing, like sharing several items.
+                var inFolder = store.ItemsInSpace(f.Folder.SpaceId).Where(i => i.IsPinned && i.FolderId == f.Folder.Id).ToList();
+                if (inFolder.Select(SyncEngine.GroupShareProblem).FirstOrDefault(p => p is not null) is { } folderProblem)
+                {
+                    ResetMode();
+                    ShowNotice(folderProblem);
+                    return;
+                }
+                store.CopyFolderToSpace(f.Folder, share.GroupId);
                 break;
             case PanelEntry.SecretEntry k:
                 host.ShareSecret(k.Secret, share.GroupId, share.GroupName);
@@ -1242,15 +1598,15 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     // MARK: Item actions
 
-    /// <summary>Unpins items pinned without a label, so they expire like the rest of history. Labelled items keep
-    /// their pin: removing the label is what lets them go.</summary>
-    public void RemoveFromLabelled(IReadOnlyList<ClipItem> items)
+    /// <summary>Unsaves items saved without a label, so they expire like the rest of history, and takes them out of
+    /// their folder. Labelled items stay saved: removing the label is what lets them go.</summary>
+    public void RemoveFromSaved(IReadOnlyList<ClipItem> items)
     {
         var unpinned = items.Where(IsPinnedWithoutLabel).ToList();
         foreach (var item in unpinned) store.Unpin(item);
         ResetMode();
         Refresh();
-        ShowNotice(unpinned.Count == 1 ? "Removed from Labelled" : $"Removed {unpinned.Count} items from Labelled");
+        ShowNotice(unpinned.Count == 1 ? "Removed from Saved" : $"Removed {unpinned.Count} items from Saved");
     }
 
     /// <summary>Writes each item into <paramref name="folder"/> (text as .txt, images as .png, files as copies) and
@@ -1277,6 +1633,10 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 slots.Remove(entry.SlotTarget);
                 secrets.Delete(k.Secret);
                 break;
+            case PanelEntry.FolderEntry f:
+                DeleteFolder(f.Folder);
+                if (Entries.Count > 0) Select(Entries[Math.Min(index, Entries.Count - 1)].Id);
+                return;
             default:
                 return;
         }
@@ -1306,7 +1666,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     {
         PanelMode.Browse => HandleBrowseKey(key),
         PanelMode.Actions => HandleActionKey(key),
-        PanelMode.SnippetForm or PanelMode.SaveSecret or PanelMode.Label or PanelMode.EditSecret => HandleFormKey(key),
+        PanelMode.SnippetForm or PanelMode.SaveSecret or PanelMode.Label or PanelMode.EditSecret or PanelMode.FolderName => HandleFormKey(key),
         _ => HandleAIKey(key),
     };
 
@@ -1316,9 +1676,14 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         {
             case PanelKey.Escape:
                 // The preview closes first, then picked files are let go; the next Escape closes.
+                // In a folder, Escape goes back to Saved's root rather than closing.
                 if (IsPreviewing) ClosePreview();
                 else if (PickedFiles.Count > 0) ClearPickedFiles();
+                else if (OpenFolderId is not null) CloseFolder();
                 else host.ClosePanel();
+                return true;
+            case PanelKey.Backspace when Query.Length == 0 && OpenFolderId is not null:
+                CloseFolder();
                 return true;
             case PanelKey.Up: MoveSelection(-1, key.Shift); return true;
             case PanelKey.Down: MoveSelection(1, key.Shift); return true;
@@ -1364,7 +1729,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         switch (key.Key)
         {
             case PanelKey.Escape:
-                if (IsPickingGroup) { IsPickingGroup = false; ActionQuery = ""; ActionSelection = 0; Notify(); }
+                if (IsPickingGroup || IsPickingFolder) { IsPickingGroup = false; IsPickingFolder = false; ActionQuery = ""; ActionSelection = 0; Notify(); }
                 else if (IsSelectionMode) host.ClosePanel();
                 else { Mode = PanelMode.Browse; Notify(); }
                 return true;
@@ -1393,6 +1758,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                     case PanelMode.SaveSecret: SubmitSaveSecret(); break;
                     case PanelMode.Label: SubmitLabel(); break;
                     case PanelMode.EditSecret: SubmitEditSecret(); break;
+                    case PanelMode.FolderName: SubmitFolderName(); break;
                     default: SubmitSnippetForm(); break;
                 }
                 return true;
@@ -1417,8 +1783,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             case PanelKey.Enter:
                 if (AIRun?.IsFinished == true) PasteAIOutput();
                 return true;
-            case PanelKey.Left or PanelKey.Right:
-                return false;   // the caret in the output, as before ←/→ were mapped
+            case PanelKey.Left or PanelKey.Right or PanelKey.Backspace:
+                return false;   // the caret in the output, as before these were mapped
             case PanelKey.Letter when key.Ctrl:
                 if (char.ToLowerInvariant(key.Letter) == 'c') CopyAIOutput();
                 if (char.ToLowerInvariant(key.Letter) == 'r') ReplaceItemWithAIOutput();

@@ -543,6 +543,9 @@ public sealed partial class SyncEngine
             case ItemPayload.SnippetPayload { Snippet: var s }:
                 if (s.CreatedAt > now) s.CreatedAt = now;
                 break;
+            case ItemPayload.FolderPayload { Folder: var f }:
+                if (f.CreatedAt > now) f.CreatedAt = now;
+                break;
         }
     }
 
@@ -551,6 +554,7 @@ public sealed partial class SyncEngine
     private static DateTime? LocalEditTime(LocalItem local) => local switch
     {
         LocalItem.SnippetItem s => s.Snippet.UpdatedAt,
+        LocalItem.FolderItem f => f.Folder.UpdatedAt,
         LocalItem.Secret k => k.Ref.CreatedAt,
         LocalItem.Clip c => c.Item.PinnedAt is { } pinned && pinned > c.Item.LastCopiedAt ? pinned : c.Item.LastCopiedAt,
         _ => null,
@@ -759,6 +763,9 @@ public sealed partial class SyncEngine
             case ItemPayload.SnippetPayload s:
                 store.PutSnippet(s.Snippet);
                 break;
+            case ItemPayload.FolderPayload f:
+                store.PutFolder(f.Folder);   // clips that already name it move into it
+                break;
             case ItemPayload.Secret secret:
                 vault.Put(id, secret.Name, secret.Value, space.LocalId);
                 break;
@@ -778,6 +785,8 @@ public sealed partial class SyncEngine
         if (!Guid.TryParse(itemId, out var id)) return;
         if (store.Find(id) is { } clip && clip.SpaceId == space.LocalId) store.Delete(clip);
         if (category is SyncCategory.History or SyncCategory.Pinned) return;
+        // Only the folder: its clips keep naming it and read as the root of Saved, without being pushed again.
+        if (store.FindFolder(id) is { } folder && folder.SpaceId == space.LocalId) store.RemoveFolder(folder.Id);
         if (store.AllSnippets().FirstOrDefault(s => s.Id == id && s.SpaceId == space.LocalId) is { } snippet) store.DeleteSnippet(snippet);
         if (vault.Secrets.FirstOrDefault(s => SecretGuid(s) == id && s.SpaceId == space.LocalId) is { } secret) vault.Delete(secret);
     }
@@ -788,6 +797,7 @@ public sealed partial class SyncEngine
     {
         public sealed record Clip(string Id, ClipItem Item) : LocalItem(Id);
         public sealed record SnippetItem(string Id, Snippet Snippet) : LocalItem(Id);
+        public sealed record FolderItem(string Id, ClipFolder Folder) : LocalItem(Id);
         public sealed record Secret(string Id, SecretRef Ref, string Value) : LocalItem(Id);
     }
 
@@ -799,6 +809,7 @@ public sealed partial class SyncEngine
             SyncPayload.ForClip(c.Item, Lookup(blobs, c.Item.ImageFile), Lookup(blobs, c.Item.ThumbnailFile), includeRichText, FileBlobs(c.Item, blobs)),
             SyncCategory.ForClip(c.Item), SyncPayload.Millis(c.Item.LastCopiedAt)),
         LocalItem.SnippetItem s => new(SyncPayload.ForSnippet(s.Snippet), SyncCategory.Snippet, SyncPayload.Millis(s.Snippet.UpdatedAt)),
+        LocalItem.FolderItem f => new(SyncPayload.ForFolder(f.Folder), SyncCategory.Folder, SyncPayload.Millis(f.Folder.CreatedAt)),
         LocalItem.Secret k => new(SyncPayload.ForSecret(k.Ref.Name, k.Value, k.Ref.CreatedAt), SyncCategory.Secret,
             SyncPayload.Millis(k.Ref.CreatedAt ?? _now())),
         _ => throw new InvalidOperationException(),
@@ -846,6 +857,7 @@ public sealed partial class SyncEngine
         if (store.Find(id) is { } clip && clip.SpaceId == space.LocalId) return new LocalItem.Clip(itemId, clip);
         if (store.AllSnippets().FirstOrDefault(s => s.Id == id && s.SpaceId == space.LocalId) is { } snippet)
             return new LocalItem.SnippetItem(itemId, snippet);
+        if (store.FindFolder(id) is { } folder && folder.SpaceId == space.LocalId) return new LocalItem.FolderItem(itemId, folder);
         if (vault.Secrets.FirstOrDefault(s => SecretGuid(s) == id && s.SpaceId == space.LocalId) is { } secret
             && vault.ReadValue(secret) is { } value)
             return new LocalItem.Secret(itemId, secret, value);
@@ -872,6 +884,12 @@ public sealed partial class SyncEngine
             var id = ClipStore.SyncId(snippet.Id);
             live.Add(id);
             push.Add(new LocalItem.SnippetItem(id, snippet));
+        }
+        foreach (var folder in store.FoldersInSpace(space.LocalId))
+        {
+            var id = ClipStore.SyncId(folder.Id);
+            live.Add(id);
+            push.Add(new LocalItem.FolderItem(id, folder));
         }
         foreach (var secret in vault.Secrets.Where(s => s.SpaceId == space.LocalId))
         {

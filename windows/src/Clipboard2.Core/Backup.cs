@@ -83,8 +83,11 @@ public static class BackupCrypto
 /// <summary>A secret to export, read after Windows Hello.</summary>
 public sealed record BackupSecret(string Id, string Name, string Value, DateTime? CreatedAt);
 
-/// <summary>Personal items and snippets to back up, and where their images are.</summary>
-public sealed record BackupSource(IReadOnlyList<ClipItem> Items, IReadOnlyList<Snippet> Snippets, BlobStore Blobs);
+/// <summary>Personal items, snippets and Saved folders to back up, and where their images are.</summary>
+public sealed record BackupSource(IReadOnlyList<ClipItem> Items, IReadOnlyList<Snippet> Snippets, BlobStore Blobs)
+{
+    public IReadOnlyList<ClipFolder> Folders { get; init; } = [];
+}
 
 public sealed record BackupSummary(int Clips, int Snippets, int Secrets);
 
@@ -124,7 +127,7 @@ public static class Backup
 
     /// <summary>What goes into a backup, read from the store on its own thread.</summary>
     public static BackupSource Snapshot(ClipStore store) =>
-        new(store.ItemsInSpace(null), [.. store.AllSnippets().Where(s => s.SpaceId is null)], store.Blobs);
+        new(store.ItemsInSpace(null), [.. store.AllSnippets().Where(s => s.SpaceId is null)], store.Blobs) { Folders = store.FoldersInSpace(null) };
 
     public static JsonObject Create(ClipStore store, IReadOnlyList<BackupSecret>? secrets, string app = "windows", DateTime? now = null) =>
         Create(Snapshot(store), secrets, app, now);
@@ -153,6 +156,13 @@ public static class Backup
             payload["id"] = ClipStore.SyncId(snippet.Id);
             snippets.Add(payload);
         }
+        var folders = new JsonArray();
+        foreach (var folder in source.Folders)
+        {
+            var payload = SyncPayload.ForFolder(folder);
+            payload["id"] = ClipStore.SyncId(folder.Id);
+            folders.Add(payload);
+        }
         var root = new JsonObject
         {
             ["format"] = Format,
@@ -162,6 +172,8 @@ public static class Backup
             ["clips"] = clips,
             ["snippets"] = snippets,
         };
+        // Added in 1.6; older readers ignore it, and the clips' "folder" ids with it (they import at Saved's root).
+        if (folders.Count > 0) root["folders"] = folders;
         if (secrets is not null)
         {
             var list = new JsonArray();
@@ -207,11 +219,28 @@ public static class Backup
         int clips = 0, snippets = 0, secrets = 0, duplicates = 0, unreadable = 0;
         using (store.Batch())
         {
+            // Folders first: a backup's folder joins a personal one with the same name, or is added (with a new id).
+            var folderIds = new Dictionary<Guid, Guid>();
+            var byName = store.FoldersInSpace(null).GroupBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().Id, StringComparer.CurrentCultureIgnoreCase);
+            foreach (var entry in Entries(root, "folders").OfType<JsonObject>())
+            {
+                if (!Guid.TryParse(Str(entry, "id"), out var oldId)) continue;
+                if (SyncPayload.Parse(Encoding.UTF8.GetBytes(entry.ToJsonString()), Guid.NewGuid(), null) is not ItemPayload.FolderPayload { Folder: var folder })
+                    continue;
+                if (!byName.TryGetValue(folder.Name, out var id))
+                {
+                    store.PutFolder(folder);
+                    byName[folder.Name] = id = folder.Id;
+                }
+                folderIds[oldId] = id;
+            }
             var hashes = store.ItemsInSpace(null).Select(i => i.ContentHash).ToHashSet();
             foreach (var entry in Entries(root, "clips").OfType<JsonObject>())
             {
                 if (ClipFrom(entry) is not { } item) { unreadable++; continue; }
                 if (!hashes.Add(item.ContentHash)) { duplicates++; continue; }
+                item.FolderId = item.FolderId is { } old && folderIds.TryGetValue(old, out var folderId) ? folderId : null;
                 if (item.Kind == ClipKind.Image)
                 {
                     var image = Bytes(entry, "image");

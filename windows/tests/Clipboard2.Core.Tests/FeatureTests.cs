@@ -303,7 +303,7 @@ public sealed class ImageTextTests : IDisposable
         {
             db.Open();
             using var cmd = db.CreateCommand();
-            cmd.CommandText = "ALTER TABLE clips DROP COLUMN ocr_text; ALTER TABLE sync_cursor DROP COLUMN resync; "
+            cmd.CommandText = "ALTER TABLE clips DROP COLUMN ocr_text; ALTER TABLE clips DROP COLUMN folder_id; DROP TABLE folders; ALTER TABLE sync_cursor DROP COLUMN resync; "
                 + "DROP TABLE sync_resync_seen; DROP TABLE sync_rejected; PRAGMA user_version = 2;";
             cmd.ExecuteNonQuery();
         }

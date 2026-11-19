@@ -72,6 +72,8 @@ public sealed class Settings
     public string? DefaultGroupId { get; set; }
     /// <summary>Where "Save to ‹folder›" writes items; null is the user's Downloads folder.</summary>
     public string? SaveFolder { get; set; }
+    /// <summary>Groups whose chip shows their Saved items rather than All (the panel's All | Saved switch).</summary>
+    public List<string> GroupsShowingSaved { get; set; } = [];
 
     [JsonIgnore] public TimeSpan? MaxAge => MaxAgeMinutes > 0 ? TimeSpan.FromMinutes(MaxAgeMinutes) : null;
     [JsonIgnore] public HashSet<string> IgnoredIds => IgnoredApps.Select(a => a.Id.ToLowerInvariant()).ToHashSet();

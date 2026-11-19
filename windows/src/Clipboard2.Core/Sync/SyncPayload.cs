@@ -7,7 +7,7 @@ namespace Clipboard2.Core.Sync;
 
 public static class SyncCategory
 {
-    public const string History = "history", Pinned = "pinned", Snippet = "snippet", Secret = "secret";
+    public const string History = "history", Pinned = "pinned", Snippet = "snippet", Secret = "secret", Folder = "folder";
     public static string ForClip(ClipItem item) => item.IsPinned ? Pinned : History;
 }
 
@@ -26,6 +26,7 @@ public abstract record ItemPayload
         public string? FromDevice { get; init; }
     }
     public sealed record SnippetPayload(Snippet Snippet) : ItemPayload;
+    public sealed record FolderPayload(ClipFolder Folder) : ItemPayload;
     public sealed record Secret(string Name, string Value, DateTime? CreatedAt) : ItemPayload;
 }
 
@@ -82,6 +83,17 @@ public static partial class SyncPayload
         json["createdAt"] = Millis(item.CreatedAt);
         json["lastCopiedAt"] = Millis(item.LastCopiedAt);
         json["contentHash"] = item.ContentHash;
+        // Only saved clips are in a folder; left out otherwise, so fingerprints of other clips stay as they were.
+        if (item.IsPinned && item.FolderId is { } folder) json["folder"] = ClipStore.SyncId(folder);
+        return json;
+    }
+
+    public static JsonObject ForFolder(ClipFolder folder)
+    {
+        var json = new JsonObject { ["v"] = Version, ["type"] = "folder", ["name"] = folder.Name };
+        if (folder.Label is { } label) json["label"] = label;
+        json["createdAt"] = Millis(folder.CreatedAt);
+        json["updatedAt"] = Millis(folder.UpdatedAt);
         return json;
     }
 
@@ -193,6 +205,8 @@ public static partial class SyncPayload
                     CreatedAt = created,
                     LastCopiedAt = Time(json, "lastCopiedAt") ?? created,
                 };
+                // A clip in a folder is saved: clearing isPinned clears the folder.
+                if (item.IsPinned && Guid.TryParse(Str(json, "folder"), out var folder)) item.FolderId = folder;
                 return new ItemPayload.Clip(item, Str(json, "imageBlob"), Str(json, "thumbBlob"), FileBlobs(json))
                 {
                     ToDevice = Str(json, "toDevice"),
@@ -206,6 +220,16 @@ public static partial class SyncPayload
                     Name = Str(json, "name") ?? "Untitled Snippet",
                     Keyword = Str(json, "keyword") ?? "",
                     Body = Str(json, "body") ?? "",
+                    CreatedAt = Time(json, "createdAt") ?? DateTime.UtcNow,
+                    UpdatedAt = Time(json, "updatedAt") ?? Time(json, "createdAt") ?? DateTime.UtcNow,
+                });
+            case "folder":
+                return new ItemPayload.FolderPayload(new ClipFolder
+                {
+                    Id = id,
+                    SpaceId = spaceId,
+                    Name = Str(json, "name") is { Length: > 0 } name ? name : ClipFolder.DefaultName,
+                    Label = Str(json, "label") is { Length: > 0 } label ? label : null,
                     CreatedAt = Time(json, "createdAt") ?? DateTime.UtcNow,
                     UpdatedAt = Time(json, "updatedAt") ?? Time(json, "createdAt") ?? DateTime.UtcNow,
                 });
