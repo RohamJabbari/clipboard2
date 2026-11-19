@@ -513,6 +513,8 @@ final class SyncEngine {
             applySnippet(snippet, remote: remote, spaceId: spaceId, force: force)
         case .secret(let secret):
             applySecret(secret, remote: remote, spaceId: spaceId, force: force)
+        case .folder(let folder):
+            applyFolder(folder, remote: remote, spaceId: spaceId, force: force)
         }
     }
 
@@ -762,6 +764,30 @@ final class SyncEngine {
                    seq: remote.seq, updatedAt: remote.updatedAt, authorUid: remote.authorUid)
     }
 
+    /// Like a snippet. Clips that point at a folder before it arrives show at the root until now.
+    private func applyFolder(_ payload: FolderPayload, remote: RemoteItem, spaceId: String, force: Bool) {
+        guard let uuid = UUID(uuidString: remote.id) else { return }
+        let existing = store.folder(withID: uuid)
+        if !force, let existing, let known = meta(for: remote.id),
+           folderFingerprint(existing) != known.fingerprint,
+           existing.updatedAt.syncMillis > remote.updatedAt {
+            // Renamed or labelled here after the server's version: keep ours, the push sends it.
+            known.fingerprint = (try? SyncPayload.folder(payload).fingerprint()) ?? ""
+            known.remoteSeq = remote.seq
+            known.updatedAt = remote.updatedAt
+            return
+        }
+        let folder = existing ?? ClipFolder(syncID: uuid, spaceID: localSpaceID(spaceId))
+        payload.apply(to: folder, arrivedAt: now())
+        folder.spaceID = localSpaceID(spaceId)
+        quietly {
+            if existing == nil { store.insertSynced(folder) }
+            commitStore()
+        }
+        recordMeta(id: remote.id, spaceId: spaceId, category: .folder, fingerprint: folderFingerprint(folder),
+                   seq: remote.seq, updatedAt: remote.updatedAt, authorUid: remote.authorUid)
+    }
+
     private func applySecret(_ payload: SecretPayload, remote: RemoteItem, spaceId: String, force: Bool) {
         let existing = secret(withID: remote.id)
         if !force, let existing, let known = meta(for: remote.id),
@@ -982,6 +1008,18 @@ final class SyncEngine {
         }
 
         var jobs: [PushJob] = []
+        // Folders before their clips, so a member who pulls mid-push finds the folder first.
+        // Never in a contact's space (not in v1).
+        if !isDirect {
+            for folder in store.folders(inSpace: localSpace) {
+                let id = folder.id.uuidString.lowercased()
+                let meta = metaByID[id]
+                let payload = SyncPayload.folder(FolderPayload(folder: folder))
+                let updatedAt = max(folder.updatedAt.syncMillis, (meta?.updatedAt ?? 0) + 1)
+                if let job = makeJob(id: id, payload: payload, meta: meta, sortAt: folder.createdAt.syncMillis,
+                                     updatedAt: updatedAt) { jobs.append(job) }
+            }
+        }
         var history = 0
         for item in store.items(inSpace: localSpace) {
             if !item.isPinned {
@@ -1348,6 +1386,7 @@ final class SyncEngine {
             item.sourceBundleID ?? "", item.sourceAppName ?? "", item.isPinned ? "pinned" : "",
             "\(item.pinnedAt?.syncMillis ?? 0)", item.label ?? "", "\(item.copyCount)",
             "\(item.createdAt.syncMillis)", "\(item.lastCopiedAt.syncMillis)", item.spaceID ?? "",
+            item.folderID?.uuidString ?? "",
         ]
         return SyncCrypto.sha256Hex(Data(fields.joined(separator: "\u{1F}").utf8))
     }
@@ -1361,6 +1400,10 @@ final class SyncEngine {
 
     private func snippetFingerprint(_ snippet: Snippet) -> String {
         (try? SyncPayload.snippet(SnippetPayload(snippet: snippet)).fingerprint()) ?? ""
+    }
+
+    private func folderFingerprint(_ folder: ClipFolder) -> String {
+        (try? SyncPayload.folder(FolderPayload(folder: folder)).fingerprint()) ?? ""
     }
 
     private func secretFingerprint(_ ref: SecretRef) -> String? {
@@ -1385,6 +1428,9 @@ final class SyncEngine {
             return snippets.snippet(withID: uuid) != nil
         case .secret:
             return secret(withID: meta.localId) != nil
+        case .folder:
+            guard let uuid = UUID(uuidString: meta.localId) else { return false }
+            return store.folder(withID: uuid) != nil
         case nil:
             return false
         }
@@ -1396,6 +1442,7 @@ final class SyncEngine {
         var ids = Set(store.items(inSpace: space).map { $0.id.uuidString.lowercased() })
         let allSnippets = (try? context.fetch(FetchDescriptor<Snippet>())) ?? []
         ids.formUnion(allSnippets.map { $0.id.uuidString.lowercased() })
+        ids.formUnion(store.allFolders().map { $0.id.uuidString.lowercased() })
         ids.formUnion(secrets.syncSecrets.map { $0.id.lowercased() })
         return ids
     }
@@ -1405,6 +1452,8 @@ final class SyncEngine {
         if let uuid = UUID(uuidString: id) {
             if let item = store.item(withID: uuid) { store.removeSynced(item) }
             if let snippet = snippets.snippet(withID: uuid) { snippets.removeSynced(snippet) }
+            // Its clips keep pointing at it and read as the root of Saved (PROTOCOL.md → Folders).
+            if let folder = store.folder(withID: uuid) { store.removeSynced(folder) }
         }
         if let ref = secret(withID: id) {
             secrets.syncDelete(id: ref.id)
@@ -1502,6 +1551,7 @@ final class SyncEngine {
         var groupIDs = Set(spaces.filter { !$0.isPersonal }.map(\.id))
         groupIDs.formUnion(store.allItems().compactMap(\.spaceID))
         groupIDs.formUnion(((try? context.fetch(FetchDescriptor<Snippet>())) ?? []).compactMap(\.spaceID))
+        groupIDs.formUnion(store.allFolders().compactMap(\.spaceID))
         for id in groupIDs {
             store.removeAll(inSpace: id)
             snippets.removeAll(inSpace: id)

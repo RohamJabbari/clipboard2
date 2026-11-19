@@ -911,6 +911,9 @@ actor FakeSyncServer {
     }
 
     func item(space: String, id: String) -> RemoteItem? { items[space]?[id] }
+
+    /// Forgets an item entirely (no tombstone), as if it had never been uploaded.
+    func dropItem(space: String, id: String) { items[space]?[id] = nil }
 }
 
 /// One signed-in client of the fake server; the token decides who the caller is.

@@ -1,7 +1,7 @@
 import Foundation
 
 nonisolated enum SyncCategory: String, Codable, Sendable, CaseIterable {
-    case history, pinned, snippet, secret
+    case history, pinned, snippet, secret, folder
 
     var isClip: Bool { self == .history || self == .pinned }
 }
@@ -43,6 +43,8 @@ nonisolated struct ClipPayload: Codable, Equatable, Sendable {
     var createdAt: Int64
     var lastCopiedAt: Int64
     var contentHash: String
+    /// The id of the Saved folder (a `folder` item) the clip is in; only with `isPinned`.
+    var folder: String?
     /// The `updatedAt` the writer sent with this version (rollback protection); nil from older apps.
     var rev: Int64?
     /// A session id from `/v1/sessions`: that device shows "Sent from ‹fromDevice›" and puts the
@@ -88,6 +90,7 @@ nonisolated struct ClipPayload: Codable, Equatable, Sendable {
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
         lastCopiedAt = try c.decodeIfPresent(Int64.self, forKey: .lastCopiedAt) ?? createdAt
         contentHash = try c.decodeIfPresent(String.self, forKey: .contentHash) ?? ""
+        folder = try c.decodeIfPresent(String.self, forKey: .folder)
         rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
         toDevice = try c.decodeIfPresent(String.self, forKey: .toDevice)
         fromDevice = try c.decodeIfPresent(String.self, forKey: .fromDevice)
@@ -170,6 +173,35 @@ nonisolated struct SecretPayload: Codable, Equatable, Sendable {
     }
 }
 
+/// `type: "folder"`: a Saved folder. Its clips point at it with their `folder` field.
+nonisolated struct FolderPayload: Codable, Equatable, Sendable {
+    var v = 1
+    var type = "folder"
+    var name: String
+    var label: String?
+    var createdAt: Int64
+    var updatedAt: Int64
+    var rev: Int64?
+
+    init(name: String, label: String? = nil, createdAt: Int64, updatedAt: Int64) {
+        self.name = name
+        self.label = label
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        v = try c.decodeIfPresent(Int.self, forKey: .v) ?? 1
+        type = try c.decodeIfPresent(String.self, forKey: .type) ?? "folder"
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Folder"
+        label = try c.decodeIfPresent(String.self, forKey: .label)
+        createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
+        updatedAt = try c.decodeIfPresent(Int64.self, forKey: .updatedAt) ?? createdAt
+        rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
+    }
+}
+
 nonisolated enum SyncPayloadError: Error, Equatable {
     case unknownType(String)
 }
@@ -178,6 +210,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
     case clip(ClipPayload)
     case snippet(SnippetPayload)
     case secret(SecretPayload)
+    case folder(FolderPayload)
 
     nonisolated private struct TypeProbe: Decodable { var type: String? }
 
@@ -187,6 +220,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case "clip": return .clip(try decoder.decode(ClipPayload.self, from: data))
         case "snippet": return .snippet(try decoder.decode(SnippetPayload.self, from: data))
         case "secret": return .secret(try decoder.decode(SecretPayload.self, from: data))
+        case "folder": return .folder(try decoder.decode(FolderPayload.self, from: data))
         case let other: throw SyncPayloadError.unknownType(other ?? "nil")
         }
     }
@@ -200,6 +234,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .clip(let p): return try encoder.encode(p)
         case .snippet(let p): return try encoder.encode(p)
         case .secret(let p): return try encoder.encode(p)
+        case .folder(let p): return try encoder.encode(p)
         }
     }
 
@@ -223,6 +258,9 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .secret(var p):
             p.rev = nil
             return .secret(p)
+        case .folder(var p):
+            p.rev = nil
+            return .folder(p)
         }
     }
 
@@ -231,6 +269,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .clip(let p): p.rev
         case .snippet(let p): p.rev
         case .secret(let p): p.rev
+        case .folder(let p): p.rev
         }
     }
 
@@ -246,6 +285,9 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .secret(var p):
             p.rev = rev
             return .secret(p)
+        case .folder(var p):
+            p.rev = rev
+            return .folder(p)
         }
     }
 
@@ -254,6 +296,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .clip(let p): p.category
         case .snippet: .snippet
         case .secret: .secret
+        case .folder: .folder
         }
     }
 }
@@ -281,6 +324,7 @@ extension ClipPayload {
         sourceName = item.sourceAppName
         pinnedAt = item.isPinned ? item.pinnedAt?.syncMillis : nil
         label = item.label
+        folder = item.isPinned ? item.folderID?.uuidString.lowercased() : nil
     }
 
     /// Without rich text, for items whose RTF/HTML would push the ciphertext past the limit.
@@ -323,6 +367,8 @@ extension ClipPayload {
         item.isPinned = isPinned
         item.pinnedAt = isPinned ? pinnedAt.map(Date.init(syncMillis:)) ?? item.pinnedAt ?? .now : nil
         item.label = label
+        // Kept even when that folder isn't here (yet): the clip shows at the root until it is.
+        item.folderID = isPinned ? folder.flatMap(UUID.init(uuidString:)) : nil
         item.copyCount = max(1, copyCount)
         let arrived = arrivedAt.syncMillis
         item.createdAt = Date(syncMillis: min(createdAt, arrived))
@@ -343,6 +389,30 @@ extension SnippetPayload {
         snippet.body = body
         snippet.createdAt = Date(syncMillis: min(createdAt, arrived))
         snippet.updatedAt = Date(syncMillis: min(updatedAt, arrived))
+    }
+}
+
+extension FolderPayload {
+    init(folder: ClipFolder) {
+        self.init(name: folder.name, label: folder.label, createdAt: folder.createdAt.syncMillis,
+                  updatedAt: folder.updatedAt.syncMillis)
+    }
+
+    func apply(to folder: ClipFolder, arrivedAt: Date = .now) {
+        let arrived = arrivedAt.syncMillis
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        folder.name = trimmed.isEmpty ? "Folder" : trimmed
+        folder.label = label?.isEmpty == true ? nil : label
+        folder.createdAt = Date(syncMillis: min(createdAt, arrived))
+        folder.updatedAt = Date(syncMillis: min(updatedAt, arrived))
+    }
+}
+
+extension ClipFolder {
+    convenience init(syncID: UUID, spaceID: String?) {
+        self.init(name: "")
+        id = syncID
+        self.spaceID = spaceID
     }
 }
 
