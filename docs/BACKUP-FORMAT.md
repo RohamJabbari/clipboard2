@@ -74,9 +74,9 @@ Personal snippets only.
 
 ### `folders`
 
-Saved folders of the personal space: a folder payload (`"v":1,"type":"folder","name","label","createdAt",
-"updatedAt"`) plus `"id"`. A clip's `folder` field holds the `id` of its folder in this list. Written since 1.6;
-readers that don't know it ignore both, and the clips import at the root of Saved.
+Added in 1.6, omitted when there are none. A folder payload (`"v":1,"type":"folder","name","label","createdAt","updatedAt"`)
+plus `"id"`. Personal folders only. A clip in one carries its id in the clip's `folder` field, as in sync. Older readers
+ignore both, and those clips import at the root of Saved.
 
 ### `secrets`
 
@@ -93,8 +93,9 @@ Import merges into the personal space and never deletes or overwrites anything:
   keeping `createdAt`, `lastCopiedAt`, `copyCount`, pin and label. Images are written from `image`/`thumb`;
   an image entry without a decodable `image` is skipped.
 - **Snippets:** skipped when one with the same `(name, body)` exists. Otherwise inserted with a new id.
-- **Folders:** a personal folder with the same name (ignoring case) is reused; otherwise one is created. Saved
-  clips that are inserted go into their folder; clips skipped as duplicates stay where they are.
+- **Folders:** read first. One joins the personal folder with the same name (case-insensitive) if there is one;
+  otherwise added with a new id. Imported clips go into the folder their `folder` names; an id not among `folders`
+  leaves them at the root of Saved. Clips skipped as duplicates keep their current folder.
 - **Secrets:** skipped when one with the same `(name, value)` exists. Otherwise added as a new secret.
 - The usual rules then apply: retention (pinned items exempt), and a history item whose text equals a saved
   secret is removed.

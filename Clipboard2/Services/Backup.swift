@@ -510,7 +510,7 @@ enum BackupImporter {
     static func merge(_ document: BackupDocument, store: ClipStore, snippets: SnippetStore,
                       secrets: (any BackupSecretSink)?, maxAge: TimeInterval?, now: Date = .now) -> BackupImportSummary {
         var summary = BackupImportSummary()
-        let folders = mergeFolders(document.folders ?? [], into: store, clips: document.clips)
+        let folders = mergeFolders(document.folders ?? [], into: store)
         mergeClips(document.clips, into: store, folders: folders, maxAge: maxAge, now: now, summary: &summary)
         mergeSnippets(document.snippets, into: snippets, summary: &summary)
         if let secrets, let incoming = document.secrets {
@@ -519,14 +519,13 @@ enum BackupImporter {
         return summary
     }
 
-    /// Personal folders for the backup's folders that saved clips are in: one with the same name
-    /// (ignoring case) is reused, otherwise one is created. Returns backup folder id → local id.
-    private static func mergeFolders(_ incoming: [BackupFolder], into store: ClipStore, clips: [BackupClip]) -> [String: UUID] {
-        let used = Set(clips.filter(\.isPinned).compactMap(\.folder))
+    /// The backup's folders, read first: each joins the personal folder with the same name
+    /// (ignoring case), otherwise it's added with a new id. Returns backup folder id → local id.
+    private static func mergeFolders(_ incoming: [BackupFolder], into store: ClipStore) -> [String: UUID] {
         var byName = Dictionary(store.folders(inSpace: nil).map { ($0.name.lowercased(), $0) }, uniquingKeysWith: { first, _ in first })
         var map: [String: UUID] = [:]
         var inserted = false
-        for backup in incoming where used.contains(backup.id) && map[backup.id] == nil {
+        for backup in incoming where map[backup.id] == nil {
             let name = backup.name.trimmingCharacters(in: .whitespacesAndNewlines)
             let key = (name.isEmpty ? "Folder" : name).lowercased()
             if let existing = byName[key] {
@@ -534,7 +533,6 @@ enum BackupImporter {
                 continue
             }
             let folder = ClipFolder(name: name.isEmpty ? "Folder" : name, spaceID: nil)
-            if let id = UUID(uuidString: backup.id), store.folder(withID: id) == nil { folder.id = id }
             folder.label = backup.label?.isEmpty == true ? nil : backup.label
             folder.createdAt = Date(backupMillis: backup.createdAt)
             folder.updatedAt = Date(backupMillis: backup.updatedAt)
