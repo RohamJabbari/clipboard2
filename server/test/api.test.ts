@@ -50,7 +50,7 @@ beforeAll(async () => {
   await embedded.start();
   await embedded.createDatabase("c2test");
   pool = new pg.Pool({ connectionString: `postgres://postgres:postgres@localhost:${port}/c2test`, max: 4 });
-  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql", "003_hardening.sql", "004_contacts.sql"]);
+  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql", "003_hardening.sql", "004_contacts.sql", "005_folders.sql"]);
   expect(await migrate(pool)).toEqual([]);
 }, 120_000);
 
@@ -695,6 +695,25 @@ describe("items", () => {
     const changes = (await call(alice, "GET", `/v1/spaces/${space}/changes`)).body.items;
     expect(changes).toHaveLength(1);
     expect(changes[0]).toMatchObject({ category: "pinned", authorUid: alice.uid });
+  });
+
+  it("keeps folders in a group as their own category", async () => {
+    const alice = await signUp("alice");
+    const group = await createGroup(alice);
+    const folder = await putItem(alice, group.id, group.sk, {
+      category: "folder",
+      payload: { v: 1, type: "folder", name: "Trip", createdAt: 1, updatedAt: 1 },
+    });
+    expect(folder.status).toBe(200);
+    const inside = await putItem(alice, group.id, group.sk, {
+      category: "pinned",
+      payload: { v: 1, type: "clip", kind: "text", text: "hi", isPinned: true, folder: folder.id },
+    });
+    expect(inside.status).toBe(200);
+    const changes = (await call(alice, "GET", `/v1/spaces/${group.id}/changes`)).body.items;
+    expect(changes.map((i: { category: string }) => i.category).sort()).toEqual(["folder", "pinned"]);
+    const bogus = await putItem(alice, group.id, group.sk, { category: "album" });
+    expect(bogus.status).toBe(400);
   });
 
   it("writes tombstones, refuses stale deletes and is idempotent", async () => {

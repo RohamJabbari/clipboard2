@@ -75,7 +75,7 @@ const b64 = (maxBytes: number) =>
     .transform((s) => Buffer.from(s, "base64"))
     .refine((b) => b.length <= maxBytes, `at most ${maxBytes} bytes`);
 const millis = z.number().int().nonnegative().max(8.64e15);
-const category = z.enum(["history", "pinned", "snippet", "secret"]);
+const category = z.enum(["history", "pinned", "snippet", "secret", "folder"]);
 const kdf = z.object({ salt: b64(64).refine((b) => b.length >= 16, "salt too short"), iterations: z.number().int().min(100_000).max(10_000_000) });
 const sealed = b64(4096);
 const publicKey = b64(65).refine((b) => b.length === 65 && b[0] === 0x04, "X9.63 uncompressed P-256 key");
@@ -1212,7 +1212,7 @@ export function buildApp(deps: Deps): FastifyInstance {
           [spaceId],
         );
         if ((count.rows[0]?.n ?? 0) >= limits.nonHistoryPerSpace) {
-          throw new ApiError(403, "quota_exceeded", `A space can hold at most ${limits.nonHistoryPerSpace} pinned items, snippets and secrets`);
+          throw new ApiError(403, "quota_exceeded", `A space can hold at most ${limits.nonHistoryPerSpace} saved items, folders, snippets and secrets`);
         }
       }
 
