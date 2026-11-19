@@ -189,7 +189,7 @@ struct PanelKeyboardTests {
         defer { env.store.delete(item) }
         model.query = "label-release"
         model.refresh(resetSelection: true)
-        #expect(PanelFilter.labelled.title == "Labelled")
+        #expect(PanelFilter.labelled.title == "Saved")
 
         model.beginLabel(.clip(item))
         model.labelForm?.text = "Release me"

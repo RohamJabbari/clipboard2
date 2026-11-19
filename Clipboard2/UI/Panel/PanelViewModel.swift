@@ -9,7 +9,7 @@ nonisolated enum PanelFilter: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .all: "All"
         case .inbox: "Inbox"
-        case .labelled: "Labelled"
+        case .labelled: "Saved"
         case .text: "Text"
         case .images: "Images"
         case .files: "Files"
@@ -22,7 +22,7 @@ nonisolated enum PanelFilter: String, CaseIterable, Identifiable, Sendable {
     var symbol: String {
         switch self {
         case .all: "tray.full"
-        case .labelled: "tag"
+        case .labelled: "bookmark"
         case .text: "text.alignleft"
         case .images: "photo"
         case .files: "doc"
@@ -42,12 +42,15 @@ enum PanelEntry: Identifiable {
     case clip(ClipItem)
     case snippet(Snippet)
     case secret(SecretRef)
+    /// A Saved folder row (Saved tab only).
+    case folder(ClipFolder)
 
     var id: String {
         switch self {
         case .clip(let item): "c-" + item.id.uuidString
         case .snippet(let snippet): "s-" + snippet.id.uuidString
         case .secret(let ref): "k-" + ref.id
+        case .folder(let folder): "f-" + folder.id.uuidString
         }
     }
 
@@ -56,11 +59,18 @@ enum PanelEntry: Identifiable {
         return nil
     }
 
-    var slotTarget: SlotTarget {
+    var folder: ClipFolder? {
+        if case .folder(let folder) = self { return folder }
+        return nil
+    }
+
+    /// Nil for folders, which can't be put on a quick slot.
+    var slotTarget: SlotTarget? {
         switch self {
         case .clip(let item): .clip(item.id)
         case .snippet(let snippet): .snippet(snippet.id)
         case .secret(let ref): .secret(ref.id)
+        case .folder: nil
         }
     }
 }
@@ -74,6 +84,8 @@ enum PanelMode: Equatable {
     case editSecret
     case shareToGroup
     case ai
+    /// Naming a folder: renaming one, or a new one (which may take the selection with it).
+    case folderName
 }
 
 enum PanelAction: Identifiable, Hashable {
@@ -91,6 +103,13 @@ enum PanelAction: Identifiable, Hashable {
     case setUpAI
     case clearSlot(Int)
     case removeFromLabelled
+    case addToSaved
+    case moveToFolder(ClipFolder)
+    case moveToNewFolder
+    case removeFromFolder
+    case openFolder
+    case renameFolder
+    case deleteFolder
     case saveToFolder
     case saveToChosenFolder
     case delete
@@ -111,6 +130,13 @@ enum PanelAction: Identifiable, Hashable {
         case .setUpAI: "setUpAI"
         case .clearSlot(let n): "clearSlot-\(n)"
         case .removeFromLabelled: "removeFromLabelled"
+        case .addToSaved: "addToSaved"
+        case .moveToFolder(let folder): "moveToFolder-" + folder.id.uuidString
+        case .moveToNewFolder: "moveToNewFolder"
+        case .removeFromFolder: "removeFromFolder"
+        case .openFolder: "openFolder"
+        case .renameFolder: "renameFolder"
+        case .deleteFolder: "deleteFolder"
         case .saveToFolder: "saveToFolder"
         case .saveToChosenFolder: "saveToChosenFolder"
         case .delete: "delete"
@@ -124,7 +150,9 @@ enum PanelAction: Identifiable, Hashable {
         case .ai, .setUpAI: "Ask \(aiName)"
         case .sendToDevice, .sendToContact: "Send"
         case .saveToFolder, .saveToChosenFolder: "Save"
-        case .saveAsSecret, .setLabel, .shareToGroup, .clearSlot, .removeFromLabelled, .delete: "Item"
+        case .addToSaved, .moveToFolder, .moveToNewFolder, .removeFromFolder, .removeFromLabelled: "Saved"
+        case .openFolder, .renameFolder, .deleteFolder: "Folder"
+        case .saveAsSecret, .setLabel, .shareToGroup, .clearSlot, .delete: "Item"
         }
     }
 
@@ -145,7 +173,14 @@ enum PanelAction: Identifiable, Hashable {
         case .sendToContact(let contact): "Send to \(contact.name)"
         case .setUpAI: "Set Up AI…"
         case .clearSlot(let n): "Remove from Quick Slot ⌘\(n)"
-        case .removeFromLabelled: "Remove from Labelled"
+        case .removeFromLabelled: "Remove from Saved"
+        case .addToSaved: "Add to Saved"
+        case .moveToFolder(let folder): "Move to “\(folder.name)”"
+        case .moveToNewFolder: "Move to New Folder…"
+        case .removeFromFolder: "Remove from Folder"
+        case .openFolder: "Open"
+        case .renameFolder: "Rename…"
+        case .deleteFolder: "Delete Folder"
         case .saveToFolder: "Save to \(folderName)"
         case .saveToChosenFolder: "Save to…"
         case .delete: "Delete"
@@ -167,7 +202,14 @@ enum PanelAction: Identifiable, Hashable {
         case .sendToContact: "paperplane"
         case .setUpAI: "sparkles"
         case .clearSlot: "number.square"
-        case .removeFromLabelled: "tag.slash"
+        case .removeFromLabelled: "bookmark.slash"
+        case .addToSaved: "bookmark"
+        case .moveToFolder: "folder"
+        case .moveToNewFolder: "folder.badge.plus"
+        case .removeFromFolder: "folder.badge.minus"
+        case .openFolder: "folder"
+        case .renameFolder: "pencil"
+        case .deleteFolder: "trash"
         case .saveToFolder: "square.and.arrow.down"
         case .saveToChosenFolder: "folder"
         case .delete: "trash"
@@ -221,14 +263,18 @@ final class ShareGroupState {
     let items: [ClipItem]
     /// Set when sharing a secret instead of clips; its value is read (after Touch ID) only on submit.
     let secret: SecretRef?
+    /// Set when sharing a Saved folder: it's copied with its clips (`items`).
+    let folder: ClipFolder?
     let groups: [SyncGroup]
     var selection: Int
     /// Set when a text item looks like a password or key, so the form warns before it's shared.
     let sensitiveKind: SensitiveText.Kind?
 
-    init(items: [ClipItem] = [], secret: SecretRef? = nil, groups: [SyncGroup], defaultGroupID: String?) {
+    init(items: [ClipItem] = [], secret: SecretRef? = nil, folder: ClipFolder? = nil, groups: [SyncGroup],
+         defaultGroupID: String?) {
         self.items = items
         self.secret = secret
+        self.folder = folder
         self.groups = groups
         self.selection = groups.firstIndex { $0.id == defaultGroupID } ?? 0
         self.sensitiveKind = items.lazy.filter(\.kind.isTextual).compactMap { SensitiveText.detect($0.text) }.first
@@ -242,6 +288,7 @@ final class LabelFormState {
     enum Target {
         case clip(ClipItem)
         case secret(SecretRef)
+        case folder(ClipFolder)
     }
 
     let target: Target
@@ -252,6 +299,7 @@ final class LabelFormState {
         switch target {
         case .clip(let item): text = item.label ?? ""
         case .secret(let ref): text = ref.name
+        case .folder(let folder): text = folder.label ?? ""
         }
     }
 
@@ -259,12 +307,49 @@ final class LabelFormState {
         switch target {
         case .clip(let item): item.preview.isEmpty ? item.kind.displayName : item.preview
         case .secret: "••••••••"
+        case .folder(let folder): folder.name
         }
     }
 
     var isSecret: Bool {
         if case .secret = target { return true }
         return false
+    }
+
+    var isFolder: Bool {
+        if case .folder = target { return true }
+        return false
+    }
+}
+
+/// The name of a folder being renamed or created, typed in the panel (never a dialog).
+@Observable
+final class FolderNameState {
+    enum Purpose {
+        case rename(ClipFolder)
+        /// A new folder in `spaceID`; `moving` clips go into it.
+        case create(spaceID: String?, moving: [ClipItem])
+    }
+
+    let purpose: Purpose
+    var name: String
+
+    init(purpose: Purpose) {
+        self.purpose = purpose
+        switch purpose {
+        case .rename(let folder): name = folder.name
+        case .create: name = "New Folder"
+        }
+    }
+
+    var isRename: Bool {
+        if case .rename = purpose { return true }
+        return false
+    }
+
+    var movingCount: Int {
+        if case .create(_, let moving) = purpose { return moving.count }
+        return 0
     }
 }
 
@@ -277,6 +362,7 @@ final class PanelViewModel {
     var filter: PanelFilter = .all {
         didSet {
             guard filter != oldValue else { return }
+            openFolderID = nil
             refresh(resetSelection: true)
             // Fetch what contacts sent since the last sync; the list refreshes when it lands.
             if filter == .inbox { env.sync.syncNow() }
@@ -286,10 +372,64 @@ final class PanelViewModel {
     var groupFilter: String? {
         didSet {
             guard groupFilter != oldValue else { return }
+            openFolderID = nil
             refresh(resetSelection: true)
             // Fetch what group members sent since the last sync; the list refreshes when it lands.
             if groupFilter != nil { env.sync.syncNow() }
         }
+    }
+
+    // MARK: Saved and folders
+
+    /// The folder open in the Saved list (nil: its root).
+    private(set) var openFolderID: UUID?
+    /// Number of saved clips in each folder of the Saved list being shown.
+    private(set) var folderCounts: [UUID: Int] = [:]
+    /// Search results inside a folder, from the Saved root: the folder's name, shown under them.
+    private(set) var folderCaptions: [UUID: String] = [:]
+    /// Groups showing their Saved items instead of All (remembered per group).
+    private(set) var groupsShowingSaved: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "panelGroupsShowingSaved") ?? [])
+
+    /// The selected group's All | Saved switch.
+    var groupShowsSaved: Bool {
+        get { groupFilter.map(groupsShowingSaved.contains) ?? false }
+        set {
+            guard let groupFilter, newValue != groupShowsSaved else { return }
+            if newValue { groupsShowingSaved.insert(groupFilter) } else { groupsShowingSaved.remove(groupFilter) }
+            UserDefaults.standard.set(Array(groupsShowingSaved).sorted(), forKey: "panelGroupsShowingSaved")
+            openFolderID = nil
+            refresh(resetSelection: true)
+        }
+    }
+
+    /// The list shows Saved: the Saved chip, or a group switched to Saved.
+    var isSavedView: Bool {
+        groupFilter == nil ? filter == .labelled && selectionItem == nil : groupShowsSaved
+    }
+
+    /// The space whose Saved items are shown (nil: personal).
+    var savedSpaceID: String? { groupFilter }
+
+    var openFolder: ClipFolder? {
+        guard isSavedView, let openFolderID, let folder = env.store.folder(withID: openFolderID),
+              folder.spaceID == savedSpaceID else { return nil }
+        return folder
+    }
+
+    func openFolder(_ folder: ClipFolder) {
+        guard isSavedView, folder.spaceID == savedSpaceID else { return }
+        openFolderID = folder.id
+        query = ""
+        refresh(resetSelection: true)
+        userMovedSelection = false
+    }
+
+    /// Back to the root of Saved, with the folder selected.
+    func closeFolder() {
+        guard let id = openFolderID else { return }
+        openFolderID = nil
+        refresh(resetSelection: true)
+        if entries.contains(where: { $0.id == "f-" + id.uuidString }) { selectedID = "f-" + id.uuidString }
     }
     private(set) var entries: [PanelEntry] = []
     /// Date headings ("Today", "Yesterday"…) keyed by the first row under each; empty while searching.
@@ -327,6 +467,7 @@ final class PanelViewModel {
     private(set) var labelForm: LabelFormState?
     private(set) var editSecretForm: EditSecretState?
     private(set) var shareForm: ShareGroupState?
+    private(set) var folderNameForm: FolderNameState?
     private(set) var aiRun: AIRun?
     /// Transient status line ("Copied", "Not valid JSON", …).
     private(set) var notice: String?
@@ -369,6 +510,7 @@ final class PanelViewModel {
         query = ""
         filter = .all
         groupFilter = nil
+        openFolderID = nil
         userMovedSelection = false
         isCommandHeld = false
         tipIndex &+= 1
@@ -512,6 +654,7 @@ final class PanelViewModel {
         labelForm = nil
         editSecretForm = nil
         shareForm = nil
+        folderNameForm = nil
         actionQuery = ""
         actionSelection = 0
         mode = .browse
@@ -538,7 +681,33 @@ final class PanelViewModel {
         let targetBundle = targetApp?.bundleIdentifier
 
         var clips: [ClipItem] = []
-        if let groupFilter {
+        var folders: [ClipFolder] = []
+        folderCaptions = [:]
+        if isSavedView {
+            // Saved: one space's saved clips and folders. Folder rows first (by name), then the
+            // clips at the root; inside a folder only its clips. Searching from the root finds
+            // clips in folders too, captioned with the folder's name.
+            let all = env.store.folders(inSpace: savedSpaceID)
+            let byID = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let saved = env.store.items(inSpace: savedSpaceID).filter(\.isPinned)
+            if let open = openFolderID, byID[open] == nil { openFolderID = nil }   // deleted meanwhile
+            var counts: [UUID: Int] = [:]
+            for item in saved { if let id = item.folderID, byID[id] != nil { counts[id, default: 0] += 1 } }
+            folderCounts = counts
+            if let open = openFolderID {
+                clips = saved.filter { $0.folderID == open }
+            } else {
+                folders = all
+                if q.isEmpty {
+                    clips = saved.filter { $0.folderID.flatMap { byID[$0] } == nil }
+                } else {
+                    clips = saved
+                    for item in saved {
+                        if let id = item.folderID, let folder = byID[id] { folderCaptions[item.id] = folder.name }
+                    }
+                }
+            }
+        } else if let groupFilter {
             clips = env.store.allItems().filter { $0.spaceID == groupFilter }
         } else if filter != .snippets && filter != .secrets {
             // What contacts send lives in the Inbox only; what you sent them isn't listed again.
@@ -563,9 +732,16 @@ final class PanelViewModel {
 
         var result: [PanelEntry]
         if q.isEmpty {
-            result = clips.map(PanelEntry.clip) + snippets.map(PanelEntry.snippet) + secrets.map(PanelEntry.secret)
+            result = folders.map(PanelEntry.folder) + clips.map(PanelEntry.clip) + snippets.map(PanelEntry.snippet)
+                + secrets.map(PanelEntry.secret)
         } else {
             var scored: [(PanelEntry, Int, Date)] = []
+            for folder in folders {
+                // Folders whose name matches come first.
+                if let s = FuzzyMatcher.score(query: q, in: folder.name + (folder.label.map { " " + $0 } ?? "")) {
+                    scored.append((.folder(folder), s + 1_000, folder.createdAt))
+                }
+            }
             for item in clips {
                 if let s = FuzzyMatcher.score(query: q, in: item.searchableText) {
                     scored.append((.clip(item), s, item.lastCopiedAt))
@@ -741,7 +917,8 @@ final class PanelViewModel {
 
     /// The ⌘-number shown on a row: its assigned slot, or its position if that number is unassigned.
     func shortcutNumber(for entry: PanelEntry, at index: Int) -> (number: Int, isSlot: Bool)? {
-        if let slot = env.slots.slot(for: entry.slotTarget) { return (slot, true) }
+        guard let target = entry.slotTarget else { return nil }
+        if let slot = env.slots.slot(for: target) { return (slot, true) }
         let position = index + 1
         guard position <= 9, env.slots.target(for: position) == nil else { return nil }
         return (position, false)
@@ -799,6 +976,8 @@ final class PanelViewModel {
             let target = targetApp
             onClose()
             env.pasteSecret(ref, into: target)
+        case .folder(let folder):
+            openFolder(folder)
         }
     }
 
@@ -814,6 +993,7 @@ final class PanelViewModel {
         switch entry {
         case .clip(let item): labelForm = LabelFormState(target: .clip(item))
         case .secret(let ref): labelForm = LabelFormState(target: .secret(ref))
+        case .folder(let folder): labelForm = LabelFormState(target: .folder(folder))
         case .snippet: return
         }
         mode = .label
@@ -826,6 +1006,9 @@ final class PanelViewModel {
             // A quick slot keeps its item even without a label.
             env.store.setLabel(form.text, for: item, keepPinned: env.slots.slot(for: .clip(item.id)) != nil)
             showNotice(item.label == nil ? "Label removed" : "Labelled")
+        case .folder(let folder):
+            env.store.setLabel(form.text, for: folder)
+            showNotice(folder.label == nil ? "Label removed" : "Labelled")
         case .secret(let ref):
             let name = form.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty else { return }
@@ -901,9 +1084,34 @@ final class PanelViewModel {
                 guard let value = await env.secrets.reveal(ref, reason: "share “\(ref.name)” with \(group.name)") else { return }
                 shareSecret(ref, value: value, to: group)
             }
+        } else if let folder = form.folder {
+            share(folder, to: group)
         } else {
             share(form.items, to: group)
         }
+    }
+
+    /// Share to Group… on a personal folder: picks the group, then copies the folder and its clips.
+    func beginShareFolder(_ folder: ClipFolder) {
+        guard canShareToGroup, folder.spaceID == nil else { return }
+        selectedID = PanelEntry.folder(folder).id
+        shareForm = ShareGroupState(items: env.store.items(inFolder: folder), folder: folder, groups: env.sync.groups,
+                                    defaultGroupID: env.prefs.syncDefaultGroupID)
+        mode = .shareToGroup
+    }
+
+    /// Copies a personal folder (new id, same name and label) and copies of its clips into the
+    /// group. Yours stays as it is; later changes don't follow.
+    func share(_ folder: ClipFolder, to group: SyncGroup) {
+        let items = env.store.items(inFolder: folder)
+        if let problem = items.lazy.compactMap(SyncEngine.groupShareProblem).first {
+            refuseGroupShare(problem)
+            return
+        }
+        env.store.shareCopy(of: folder, toSpace: group.id)
+        env.sync.syncNow()
+        refresh()
+        showNotice("Shared “\(folder.name)” to \(group.name)")
     }
 
     func beginShareSecret(_ ref: SecretRef) {
@@ -1131,6 +1339,31 @@ final class PanelViewModel {
         return true
     }
 
+    /// The dragged item, with the rest of the selection if it was part of one.
+    private func draggedClips(id: UUID) -> [ClipItem] {
+        guard let item = env.store.item(withID: id) else { return [] }
+        return isMultiSelecting && selectedIDs.contains(PanelEntry.clip(item).id) ? selectedClips : [item]
+    }
+
+    /// Clips dragged onto a folder row: they move in (only clips of the folder's own space).
+    @discardableResult
+    func dropClip(id: UUID, onFolder folderID: UUID) -> Bool {
+        guard let folder = env.store.folder(withID: folderID) else { return false }
+        onDropFinished()
+        move(draggedClips(id: id), to: folder)
+        return true
+    }
+
+    /// Clips dragged onto the "Saved" breadcrumb from inside a folder: out to the root.
+    @discardableResult
+    func dropClipOnSavedRoot(id: UUID) -> Bool {
+        let clips = draggedClips(id: id).filter { $0.folderID != nil }
+        onDropFinished()
+        guard !clips.isEmpty else { return false }
+        removeFromFolder(clips)
+        return true
+    }
+
     /// Files dragged in from Finder. On a group chip they're shared to that group; on the list
     /// they're added to history (or to the group being shown).
     func dropFiles(_ urls: [URL], onGroup groupID: String? = nil) {
@@ -1192,11 +1425,17 @@ final class PanelViewModel {
                 actions.append(.copy)
             }
             if canQuickLook { actions.append(.quickLook) }
+            actions += savedActions(for: clips)
             if canShareToGroup { actions.append(.shareToGroup) }
             actions += sendToContactActions
             return actions + [.saveToFolder, .saveToChosenFolder, .delete]
         }
         guard let entry = selectedEntry else { return [] }
+        if case .folder(let folder) = entry {
+            var actions: [PanelAction] = [.openFolder, .renameFolder, .setLabel]
+            if folder.spaceID == nil && canShareToGroup { actions.append(.shareToGroup) }
+            return actions + [.deleteFolder]
+        }
         var actions: [PanelAction] = [.paste]
         switch entry {
         case .clip(let item) where item.isTransient:
@@ -1219,25 +1458,40 @@ final class PanelViewModel {
                 actions += aiActions.filter { if case .ai(let ai) = $0 { ai.worksOnImages } else { true } }
             }
             actions.append(.setLabel)
+            actions += savedActions(for: [item])
             if canShareToGroup { actions.append(.shareToGroup) }
             actions += PanelAction.sendToDeviceActions(for: item, multiSelecting: false, targets: DeviceTarget.others(in: env.sync))
             actions += sendableContacts.filter { $0.id != item.spaceID }.map(PanelAction.sendToContact)
             actions += [.saveToFolder, .saveToChosenFolder]
-            // Kept from before labels replaced pins: the only way to let it expire again.
-            if item.isPinned && item.label == nil { actions.append(.removeFromLabelled) }
-        case .snippet:
+        case .snippet, .folder:
             break
         case .secret(let ref):
             actions.append(.copy)
             actions.append(.setLabel)
             if canShareToGroup && env.sync.groups.contains(where: { $0.id != ref.spaceID }) { actions.append(.shareToGroup) }
         }
-        if let slot = env.slots.slot(for: entry.slotTarget) {
+        if let target = entry.slotTarget, let slot = env.slots.slot(for: target) {
             actions.append(.clearSlot(slot))
         }
         if entry.clip != nil || { if case .secret = entry { return true } else { return false } }() {
             actions.append(.delete)
         }
+        return actions
+    }
+
+    /// Add to Saved, Remove from Saved, Move to ‹folder›, New Folder… and Remove from Folder for
+    /// the clips, as they apply.
+    private func savedActions(for clips: [ClipItem]) -> [PanelAction] {
+        guard !clips.isEmpty, clips.allSatisfy({ !$0.isTransient }) else { return [] }
+        var actions: [PanelAction] = []
+        if clips.contains(where: { !$0.isPinned }) { actions.append(.addToSaved) }
+        if canMoveToFolder(clips) {
+            actions += folderTargets(for: clips).map(PanelAction.moveToFolder)
+            actions.append(.moveToNewFolder)
+        }
+        if clips.contains(where: { env.store.folder(of: $0) != nil }) { actions.append(.removeFromFolder) }
+        // A label keeps an item saved; it's released by removing the label.
+        if clips.contains(where: { $0.isPinned && $0.label == nil }) { actions.append(.removeFromLabelled) }
         return actions
     }
 
@@ -1250,7 +1504,14 @@ final class PanelViewModel {
             default: break
             }
         }
+        if action == .delete, isRemovingFromGroup { return "Remove from Group" }
         return action.title(folderName: env.prefs.saveFolderName)
+    }
+
+    /// Delete on group items removes them for everyone in the group.
+    var isRemovingFromGroup: Bool {
+        let clips = isMultiSelecting ? selectedClips : selectedEntry?.clip.map { [$0] } ?? []
+        return !clips.isEmpty && clips.allSatisfy { isGroupSpace($0.spaceID) }
     }
 
     var filteredActions: [PanelAction] {
@@ -1292,7 +1553,7 @@ final class PanelViewModel {
             case .clip(let item) where item.isTransient: env.paste.write(text: item.text)
             case .clip(let item): copy(item)
             case .secret(let ref): env.copySecret(ref)
-            case .snippet: break
+            case .snippet, .folder: break
             }
             onClose()
         case .transform(let transform):
@@ -1328,7 +1589,28 @@ final class PanelViewModel {
                 beginShare([item])
             } else if case .secret(let ref) = entry {
                 beginShareSecret(ref)
+            } else if let folder = entry.folder {
+                beginShareFolder(folder)
             }
+        case .addToSaved:
+            guard let item = entry.clip else { return }
+            addToSaved([item])
+        case .moveToFolder(let folder):
+            guard let item = entry.clip else { return }
+            move([item], to: folder)
+        case .moveToNewFolder:
+            guard let item = entry.clip else { return }
+            beginNewFolder(moving: [item])
+        case .removeFromFolder:
+            guard let item = entry.clip else { return }
+            removeFromFolder([item])
+        case .openFolder:
+            mode = .browse
+            if let folder = entry.folder { openFolder(folder) }
+        case .renameFolder:
+            if let folder = entry.folder { beginRename(folder) }
+        case .deleteFolder:
+            if let folder = entry.folder { deleteFolder(folder) }
         case .sendToDevice(let device):
             guard let item = entry.clip else { return }
             send(item, to: device)
@@ -1385,6 +1667,16 @@ final class PanelViewModel {
             beginShare(clips)
         case .sendToContact(let contact):
             send(clips, to: contact)
+        case .addToSaved:
+            addToSaved(clips)
+        case .moveToFolder(let folder):
+            move(clips, to: folder)
+        case .moveToNewFolder:
+            beginNewFolder(moving: clips)
+        case .removeFromFolder:
+            removeFromFolder(clips)
+        case .removeFromLabelled:
+            removeFromSaved(clips)
         case .saveToFolder:
             save(clips, to: env.prefs.saveFolder)
         case .saveToChosenFolder:
@@ -1443,9 +1735,123 @@ final class PanelViewModel {
 
     /// Lets an item kept without a label expire like the rest of history.
     func removeFromLabelled(_ item: ClipItem) {
-        env.store.removeFromLabelled(item)
+        removeFromSaved([item])
+    }
+
+    // MARK: Saved and folder actions
+
+    /// Whether a clip can go into a folder: saved to history, and yours or a group's. A contact's
+    /// items stay as they arrived (edits to them never sync).
+    func canUseFolders(_ item: ClipItem) -> Bool {
+        guard !item.isTransient else { return false }
+        guard let space = item.spaceID else { return true }
+        return isGroupSpace(space)
+    }
+
+    func isGroupSpace(_ spaceID: String?) -> Bool {
+        guard let spaceID else { return false }
+        return env.sync.groups.contains { $0.id == spaceID }
+    }
+
+    /// Clips that may move into a folder together: all of one space, folders allowed there.
+    func canMoveToFolder(_ clips: [ClipItem]) -> Bool {
+        guard let first = clips.first else { return false }
+        return clips.allSatisfy { canUseFolders($0) && $0.spaceID == first.spaceID }
+    }
+
+    /// The folders the clips can move into (their space's, except the one they're all in already).
+    func folderTargets(for clips: [ClipItem]) -> [ClipFolder] {
+        guard canMoveToFolder(clips), let first = clips.first else { return [] }
+        return env.store.folders(inSpace: first.spaceID).filter { folder in !clips.allSatisfy { $0.folderID == folder.id } }
+    }
+
+    /// The folder an item shows in, if any.
+    func folder(of item: ClipItem) -> ClipFolder? { env.store.folder(of: item) }
+
+    func move(_ clips: [ClipItem], to folder: ClipFolder) {
+        if mode == .actions { mode = .browse }
+        let movable = clips.filter { $0.spaceID == folder.spaceID && canUseFolders($0) }
+        guard !movable.isEmpty else {
+            NSSound.beep()
+            showNotice("Only items from the same place can go in “\(folder.name)”")
+            return
+        }
+        env.store.move(movable, to: folder)
         refresh()
-        showNotice("Removed from Labelled")
+        showNotice(movable.count == 1 ? "Moved to “\(folder.name)”" : "Moved \(movable.count) items to “\(folder.name)”")
+    }
+
+    func removeFromFolder(_ clips: [ClipItem]) {
+        if mode == .actions { mode = .browse }
+        env.store.removeFromFolder(clips)
+        refresh()
+        showNotice("Moved to Saved")
+    }
+
+    func addToSaved(_ clips: [ClipItem]) {
+        if mode == .actions { mode = .browse }
+        env.store.addToSaved(clips)
+        refresh()
+        showNotice(clips.count == 1 ? "Added to Saved" : "Added \(clips.count) items to Saved")
+    }
+
+    /// Lets saved items without a label expire again (out of their folder too).
+    func removeFromSaved(_ clips: [ClipItem]) {
+        if mode == .actions { mode = .browse }
+        env.store.removeFromSaved(clips)
+        refresh()
+        showNotice("Removed from Saved")
+    }
+
+    /// Names a new folder in the panel; `moving` clips go into it (Move to Folder ▸ New Folder…).
+    func beginNewFolder(moving clips: [ClipItem] = []) {
+        let space = clips.first?.spaceID ?? savedSpaceID
+        guard clips.isEmpty ? (space == nil || isGroupSpace(space)) : canMoveToFolder(clips) else { return }
+        folderNameForm = FolderNameState(purpose: .create(spaceID: space, moving: clips))
+        mode = .folderName
+    }
+
+    func beginRename(_ folder: ClipFolder) {
+        selectedID = PanelEntry.folder(folder).id
+        folderNameForm = FolderNameState(purpose: .rename(folder))
+        mode = .folderName
+    }
+
+    func submitFolderName() {
+        guard let form = folderNameForm else { return }
+        let name = form.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        switch form.purpose {
+        case .rename(let folder):
+            env.store.rename(folder, to: name)
+            resetMode()
+            refresh()
+            selectedID = PanelEntry.folder(folder).id
+            showNotice("Renamed to “\(folder.name)”")
+        case .create(let space, let moving):
+            let folder = env.store.createFolder(named: name, inSpace: space)
+            if !moving.isEmpty { env.store.move(moving, to: folder) }
+            resetMode()
+            refresh()
+            let id = PanelEntry.folder(folder).id
+            if entries.contains(where: { $0.id == id }) { selectedID = id }
+            showNotice(moving.isEmpty ? "Created “\(folder.name)”"
+                       : moving.count == 1 ? "Moved to “\(folder.name)”" : "Moved \(moving.count) items to “\(folder.name)”")
+        }
+    }
+
+    /// Its clips stay saved, at the root; nothing to confirm.
+    func deleteFolder(_ folder: ClipFolder) {
+        if mode == .actions { mode = .browse }
+        let index = selectedIndex
+        if openFolderID == folder.id { openFolderID = nil }
+        let moved = env.store.deleteFolder(folder)
+        refresh()
+        if let index, !entries.isEmpty { selectedID = entries[min(index, entries.count - 1)].id }
+        showNotice("Folder deleted · \(moved) \(moved == 1 ? "item" : "items") moved to Saved")
     }
 
     /// ⌫ never deletes secrets (too easy to hit by accident); ⌘K → Delete does.
@@ -1453,12 +1859,15 @@ final class PanelViewModel {
         guard let entry = selectedEntry, let index = selectedIndex else { return }
         switch entry {
         case .clip(let item):
-            env.slots.remove(target: entry.slotTarget)
+            env.slots.remove(target: .clip(item.id))
             env.store.delete(item)
         case .secret(let ref):
             guard includingSecrets else { return }
-            env.slots.remove(target: entry.slotTarget)
+            env.slots.remove(target: .secret(ref.id))
             env.secrets.delete(ref)
+        case .folder(let folder):
+            deleteFolder(folder)   // nothing is lost: its clips move to the root
+            return
         case .snippet:
             return   // snippets are edited in Settings
         }
@@ -1475,7 +1884,7 @@ final class PanelViewModel {
         switch mode {
         case .browse: handleBrowseKey(event)
         case .actions: handleActionKey(event)
-        case .snippetForm, .saveSecret, .label, .editSecret: handleFormKey(event)
+        case .snippetForm, .saveSecret, .label, .editSecret, .folderName: handleFormKey(event)
         case .shareToGroup: handleShareKey(event)
         case .ai: handleAIKey(event)
         }
@@ -1490,8 +1899,20 @@ final class PanelViewModel {
 
         switch event.keyCode {
         case KeyCode.escape:
-            // Quick Look closes first; the panel on the next press.
-            if isQuickLookOpen() { onQuickLook(false) } else { onClose() }
+            // Quick Look closes first, then an open folder; the panel on the next press.
+            if isQuickLookOpen() {
+                onQuickLook(false)
+            } else if openFolderID != nil {
+                closeFolder()
+            } else {
+                onClose()
+            }
+            return true
+        case KeyCode.leftArrow where openFolderID != nil && query.isEmpty && !command && !shift:
+            closeFolder()
+            return true
+        case KeyCode.rightArrow where query.isEmpty && !command && !shift && selectedEntry?.folder != nil && !isMultiSelecting:
+            activate(selectedEntry)
             return true
         case KeyCode.upArrow:
             moveSelection(by: -1, extending: shift)
@@ -1591,6 +2012,7 @@ final class PanelViewModel {
             switch mode {
             case .saveSecret: submitSaveSecret()
             case .label: submitLabel()
+            case .folderName: submitFolderName()
             case .editSecret: submitEditSecret()
             default: submitSnippetForm()
             }

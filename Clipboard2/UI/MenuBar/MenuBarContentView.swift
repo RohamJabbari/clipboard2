@@ -18,7 +18,7 @@ struct MenuBarLabel: View {
     }
 }
 
-/// The menu bar popover: recent history, search, labelled items and quick actions.
+/// The menu bar popover: recent history, search, saved items and quick actions.
 struct MenuBarContentView: View {
     @Environment(AppEnvironment.self) private var env
     @Environment(\.dismiss) private var dismiss
@@ -63,12 +63,12 @@ struct MenuBarContentView: View {
         return items.filter { filter.includes($0) && env.sync.isListed($0, inInbox: false) }
     }
 
-    /// Labelled first, then Today / Yesterday / This Week / Earlier; one plain list while searching.
+    /// Saved first, then Today / Yesterday / This Week / Earlier; one plain list while searching.
     private func sections(_ results: [ClipItem]) -> [(title: String?, items: [ClipItem])] {
         guard search.trimmingCharacters(in: .whitespaces).isEmpty else { return [(nil, results)] }
         var sections: [(title: String?, items: [ClipItem])] = []
         let pinned = results.filter(\.isPinned)
-        if !pinned.isEmpty { sections.append(("Labelled", pinned)) }
+        if !pinned.isEmpty { sections.append(("Saved", pinned)) }
         let calendar = Calendar.current
         let weekAgo = calendar.date(byAdding: .day, value: -7, to: calendar.startOfDay(for: .now)) ?? .now
         for item in results.filter({ !$0.isPinned }).prefix(100) {
@@ -204,8 +204,10 @@ struct MenuBarContentView: View {
                 Button("Copy") { env.paste.copy(item) }
                 Divider()
                 Button(item.label == nil ? "Label…" : "Edit Label…") { beginLabel(item) }
-                if item.isPinned && item.label == nil {
-                    Button("Remove from Labelled") { env.store.removeFromLabelled(item) }
+                if !item.isPinned {
+                    Button("Add to Saved") { env.store.addToSaved([item]) }
+                } else if item.label == nil {
+                    Button("Remove from Saved") { env.store.removeFromLabelled(item) }
                 }
                 if item.kind.isTextual {
                     Button("Save as Secret…") {
@@ -245,7 +247,7 @@ struct MenuBarContentView: View {
 
     private func labelBar(_ item: ClipItem) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Label — labelled items never expire")
+            Text("Label — labelled items are saved and never expire")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             HStack(spacing: 8) {
@@ -312,7 +314,7 @@ struct MenuBarContentView: View {
     /// which closes the popover before the click lands.
     private var clearConfirmation: some View {
         HStack(spacing: 8) {
-            Text("Clear history? Labelled items are kept.")
+            Text("Clear history? Saved items are kept.")
                 .font(.callout)
                 .lineLimit(1)
             Spacer()
@@ -403,7 +405,7 @@ struct MenuBarContentView: View {
 private enum MenuBarFilter: String, CaseIterable, Identifiable {
     case all, labelled, text, images, links
     var id: String { rawValue }
-    var title: String { rawValue.capitalized }
+    var title: String { self == .labelled ? "Saved" : rawValue.capitalized }
 
     func includes(_ item: ClipItem) -> Bool {
         switch self {

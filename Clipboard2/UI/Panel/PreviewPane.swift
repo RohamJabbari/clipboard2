@@ -65,6 +65,8 @@ struct PreviewPane: View {
             TextPreviewView(text: snippet.body, placeholders: true)
         case .secret(let ref):
             SecretPreviewView(ref: ref, onEdit: onEditSecret.map { edit in { edit(ref) } })
+        case .folder:
+            EmptyView()   // folders have their own preview (FolderPreview)
         }
     }
 
@@ -105,6 +107,9 @@ struct PreviewPane: View {
                 if let label = item.label {
                     row("Label", label)
                 }
+                if let folder = model?.folder(of: item) {
+                    row("Folder", folder.name)
+                }
                 if let source = item.source {
                     GridRow {
                         Text("From").foregroundStyle(.secondary)
@@ -142,6 +147,8 @@ struct PreviewPane: View {
                 if let created = ref.createdAt {
                     row("Added", created.formatted(date: .abbreviated, time: .shortened))
                 }
+            case .folder(let folder):
+                row("Folder", folder.name)
             }
         }
         .font(.caption)
@@ -155,7 +162,7 @@ struct PreviewPane: View {
     }
 
     private func expiryText(_ item: ClipItem) -> String {
-        if item.isPinned { return item.label == nil ? "Never (kept)" : "Never (labelled)" }
+        if item.isPinned { return item.label == nil ? "Never (saved)" : "Never (labelled)" }
         guard let date = item.expiryDate(maxAge: AppEnvironment.shared.prefs.maxAge) else { return "Never" }
         if date <= .now { return "Now" }
         return date.formatted(.relative(presentation: .named))

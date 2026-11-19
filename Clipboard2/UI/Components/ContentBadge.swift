@@ -7,6 +7,7 @@ struct ContentBadge: View {
         case clip(ClipItem)
         case snippet
         case secret
+        case folder
     }
 
     let kind: Kind
@@ -33,6 +34,8 @@ struct ContentBadge: View {
                 symbol("text.badge.star", tint: .pink)
             case .secret:
                 symbol("key.fill", tint: nil)
+            case .folder:
+                symbol("folder.fill", tint: .blue)
             }
         }
         .frame(width: size, height: size)

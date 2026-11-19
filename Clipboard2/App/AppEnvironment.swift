@@ -673,6 +673,8 @@ final class AppEnvironment {
             }
         case .secret(let ref):
             pasteSecret(ref, into: target)
+        case .folder:
+            NSSound.beep()   // slots never hold folders
         }
     }
 

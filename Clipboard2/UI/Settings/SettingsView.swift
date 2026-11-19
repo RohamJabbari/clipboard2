@@ -223,7 +223,7 @@ struct HistorySettingsView: View {
                     }
                 } label: {
                     Text("Forget items after")
-                    Text("Counted from the last time you copied an item. Labelled items never expire.")
+                    Text("Counted from the last time you copied an item. Saved items never expire.")
                 }
                 LabeledContent {
                     Button("Clear History…", role: .destructive) { confirmClear = true }
@@ -291,7 +291,7 @@ struct HistorySettingsView: View {
         .onChange(of: prefs.maxAgeMinutes) { env.runMaintenance() }
         .confirmationDialog("Clear clipboard history?", isPresented: $confirmClear) {
             Button("Clear History", role: .destructive) { env.store.clearHistory() }
-            Button("Clear Including Labelled", role: .destructive) { env.store.clearHistory(includingPinned: true) }
+            Button("Clear Including Saved", role: .destructive) { env.store.clearHistory(includingPinned: true) }
         } message: {
             Text("Snippets and secrets are kept. This can't be undone.")
         }

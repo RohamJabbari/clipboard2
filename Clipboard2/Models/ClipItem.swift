@@ -127,7 +127,7 @@ final class ClipItem {
 
     var accessibilityDescription: String {
         let app = sourceAppName.map { ", from \($0)" } ?? ""
-        let pin = isPinned && label == nil ? ", kept" : ""
+        let pin = isPinned && label == nil ? ", saved" : ""
         let name = label.map { "\($0), " } ?? ""
         return "\(name)\(kind.displayName): \(preview)\(app)\(pin)"
     }

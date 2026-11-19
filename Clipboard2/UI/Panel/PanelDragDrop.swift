@@ -84,6 +84,10 @@ struct PanelDropDelegate: DropDelegate {
     enum Target: Equatable {
         case list
         case group(String)
+        /// A Saved folder row: clips move in.
+        case folder(UUID)
+        /// The "Saved" breadcrumb inside a folder: clips move out to the root.
+        case savedRoot
     }
 
     let target: Target
@@ -95,6 +99,7 @@ struct PanelDropDelegate: DropDelegate {
         switch target {
         case .list: return !isClip && info.hasItemsConforming(to: [.fileURL])
         case .group: return isClip || info.hasItemsConforming(to: [.fileURL])
+        case .folder, .savedRoot: return isClip
         }
     }
 
@@ -119,6 +124,18 @@ struct PanelDropDelegate: DropDelegate {
         case .list:
             let providers = info.itemProviders(for: [.fileURL])
             Task { model.dropFiles(await PanelDrag.loadFileURLs(from: providers)) }
+        case .folder(let folderID):
+            let providers = info.itemProviders(for: [.clipboard2Clip])
+            Task {
+                guard let id = await PanelDrag.loadClipID(from: providers) else { return }
+                model.dropClip(id: id, onFolder: folderID)
+            }
+        case .savedRoot:
+            let providers = info.itemProviders(for: [.clipboard2Clip])
+            Task {
+                guard let id = await PanelDrag.loadClipID(from: providers) else { return }
+                model.dropClipOnSavedRoot(id: id)
+            }
         case .group(let groupID):
             if info.hasItemsConforming(to: [.clipboard2Clip]) {
                 let providers = info.itemProviders(for: [.clipboard2Clip])

@@ -137,7 +137,7 @@ private struct SyncSignInSection: View {
             Text("Sync")
         } footer: {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Keeps recent history (newest 200 items), labelled items, snippets and secrets in step across your Macs and PCs, and shares items with groups. Everything is encrypted on this Mac before upload — the server can't read it. New accounts need an invite code: a sign-up code, or a group's invite code (you join that group right away).")
+                Text("Keeps recent history (newest 200 items), saved items, snippets and secrets in step across your Macs and PCs, and shares items with groups. Everything is encrypted on this Mac before upload — the server can't read it. New accounts need an invite code: a sign-up code, or a group's invite code (you join that group right away).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if creating {
@@ -1059,7 +1059,7 @@ private struct DeleteAccountSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Delete Sync Account").font(.headline)
-            Text("Permanently deletes your account, your synced history, labelled items, snippets and secrets, the groups you own (for all their members) and everything you and your contacts sent each other. Items on this Mac stay. This can't be undone.")
+            Text("Permanently deletes your account, your synced history, saved items, snippets and secrets, the groups you own (for all their members) and everything you and your contacts sent each other. Items on this Mac stay. This can't be undone.")
                 .fixedSize(horizontal: false, vertical: true)
             SecureField("Password", text: $password).textContentType(.password)
             if let error {

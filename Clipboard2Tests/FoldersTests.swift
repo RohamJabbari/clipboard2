@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import SwiftData
+import AppKit
 @testable import Clipboard2
 
 // MARK: - Store
@@ -387,6 +388,111 @@ struct FolderSyncTests {
     }
 }
 
+// MARK: - Panel
+
+@MainActor
+struct FolderPanelTests {
+    let env = AppEnvironment.shared
+    let model: PanelViewModel
+
+    init() {
+        model = PanelViewModel(env: env)
+    }
+
+    private func key(_ code: UInt16, _ chars: String = "") -> NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
+                         characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code)!
+    }
+
+    @Test func savedListsFoldersFirstAndOpensAndClosesThem() {
+        let tag = UUID().uuidString
+        let folder = env.store.createFolder(named: "AAA \(tag)", inSpace: nil)
+        let inside = env.store.ingest(.text("inside \(tag)"))
+        let root = env.store.ingest(.text("root \(tag)"))
+        let group = env.store.createFolder(named: "Group \(tag)", inSpace: "group-\(tag)")
+        defer {
+            [inside, root].forEach(env.store.delete)
+            env.store.deleteFolder(folder)
+            env.store.deleteFolder(group)
+        }
+        env.store.move([inside], to: folder)
+        env.store.addToSaved([root])
+
+        model.filter = .labelled
+        #expect(PanelFilter.labelled.title == "Saved" && PanelFilter.labelled.symbol == "bookmark")
+        let folderRow = PanelEntry.folder(folder).id
+        #expect(model.entries.contains { $0.id == folderRow })
+        #expect(!model.entries.contains { $0.folder?.id == group.id })        // group folders stay in their group
+        #expect(!model.entries.contains { $0.clip?.id == inside.id })        // in a folder: not at the root
+        #expect(model.entries.contains { $0.clip?.id == root.id })
+        let firstClip = model.entries.firstIndex { $0.clip != nil } ?? 0
+        #expect(model.entries.prefix(firstClip).allSatisfy { $0.folder != nil })
+        #expect(model.folderCounts[folder.id] == 1)
+
+        // Search from the root finds clips in folders, captioned.
+        model.query = "inside \(tag)"
+        #expect(model.entries.contains { $0.clip?.id == inside.id })
+        #expect(model.folderCaptions[inside.id] == folder.name)
+        model.query = ""
+
+        // Return opens the selected folder; esc goes back instead of closing.
+        model.selectedID = folderRow
+        #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
+        #expect(model.openFolder?.id == folder.id)
+        #expect(model.entries.map(\.clip?.id) == [inside.id])
+        var closed = false
+        model.onClose = { closed = true }
+        #expect(model.handleKeyDown(key(KeyCode.escape, "\u{1b}")))
+        #expect(model.openFolder == nil && !closed && model.selectedID == folderRow)
+
+        // ← goes back too.
+        model.openFolder(folder)
+        #expect(model.handleKeyDown(key(KeyCode.leftArrow)))
+        #expect(model.openFolder == nil)
+    }
+
+    @Test func moveToNewFolderAndDeleteFolderFromThePanel() {
+        let tag = UUID().uuidString
+        let a = env.store.ingest(.text("newfolder-a \(tag)"))
+        let b = env.store.ingest(.text("newfolder-b \(tag)"))
+        defer { [a, b].forEach(env.store.delete) }
+        model.query = tag
+        model.selectAll()
+        #expect(model.availableActions.contains(.addToSaved))
+        #expect(model.availableActions.contains(.moveToNewFolder))
+
+        model.perform(.moveToNewFolder)
+        #expect(model.mode == .folderName)
+        model.folderNameForm?.name = "Batch \(tag)"
+        #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
+        let folder = try? #require(env.store.folders(inSpace: nil).first { $0.name == "Batch \(tag)" })
+        #expect(a.isPinned && a.folderID == folder?.id && b.folderID == folder?.id)
+
+        model.query = ""
+        model.filter = .labelled
+        guard let folder else { return }
+        model.selectedID = PanelEntry.folder(folder).id
+        #expect(model.availableActions == [.openFolder, .renameFolder, .setLabel, .deleteFolder]
+                || model.availableActions.contains(.shareToGroup))
+        model.perform(.deleteFolder)
+        #expect(model.notice == "Folder deleted · 2 items moved to Saved")
+        #expect(a.isPinned && a.folderID == nil && env.store.folder(withID: folder.id) == nil)
+    }
+
+    @Test func groupSavedSwitchIsRememberedPerGroup() {
+        let group = "group-\(UUID().uuidString)"
+        model.groupFilter = group
+        #expect(!model.isSavedView)
+        model.groupShowsSaved = true
+        #expect(model.isSavedView && model.savedSpaceID == group)
+        model.groupFilter = nil
+        #expect(!model.isSavedView)
+        model.groupFilter = group
+        #expect(model.groupShowsSaved)
+        model.groupShowsSaved = false
+    }
+}
+
 // MARK: - Backup and migration
 
 @MainActor
@@ -416,7 +522,7 @@ struct FolderBackupTests {
         let fresh = try TestStores()
         _ = BackupImporter.merge(document, store: fresh.store, snippets: fresh.snippets, secrets: nil, maxAge: nil)
         let created = try #require(fresh.store.folders(inSpace: nil).first)
-        #expect(created.name == "Deploy" && created.label == "ops")
+        #expect(created.name == "Deploy" && created.label == "ops" && created.id != folder.id)
         #expect(fresh.store.items(inFolder: created).map(\.text) == ["in folder"])
     }
 
