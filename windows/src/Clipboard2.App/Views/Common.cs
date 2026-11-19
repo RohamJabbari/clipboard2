@@ -22,7 +22,7 @@ public static class Glyphs
         Panel = "", Clock = "", Cut = "", SelectAll = "", Undo = "", Redo = "",
         OpenWith = "", Info = "", Rename = "", Menu = "", Eye = "", Book = "",
         Group = "\uE716", Cloud = "\uE753", Filter = "\uE71C", Cancel = "\uE711", Warning = "\uE7BA",
-        Inbox = "\uE715", Contact = "\uE77B";
+        Inbox = "\uE715", Contact = "\uE77B", Folder = "\uE8B7", NewFolder = "\uE8F4", Saved = "\uE8A4", ChevronRight = "\uE76C";
 
     public static TextBlock Icon(string glyph, double size = 16, Brush? brush = null) => new()
     {
@@ -36,7 +36,7 @@ public static class Glyphs
     public static string For(PanelFilter filter) => filter switch
     {
         PanelFilter.All => All,
-        PanelFilter.Labelled => Tag,
+        PanelFilter.Labelled => Saved,
         PanelFilter.Text => Text,
         PanelFilter.Images => Image,
         PanelFilter.Files => File,

@@ -451,7 +451,14 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     /// <summary>Folders can hold clips of the personal space and of groups: not contacts' (edits to what they send
     /// stay on this device) nor the selection from another app.</summary>
-    private bool CanUseFolders(ClipItem item) => item != SelectionItem && (item.SpaceId is null || _groups.ContainsKey(item.SpaceId));
+    public bool CanUseFolders(ClipItem item) => item != SelectionItem && (item.SpaceId is null || _groups.ContainsKey(item.SpaceId));
+
+    /// <summary>The folders of a space (null = personal), by name.</summary>
+    public List<ClipFolder> FoldersIn(string? space) =>
+        [.. _folders.Values.Where(f => f.SpaceId == space).OrderBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase)];
+
+    /// <summary>An item of a sync group: deleting it is "Remove from Group".</summary>
+    public bool IsGroupItem(ClipItem item) => item.SpaceId is { } space && _groups.ContainsKey(space);
 
     /// <summary>The one space all <paramref name="items"/> share, when they can go into its folders.</summary>
     private bool CommonFolderSpace(IReadOnlyList<ClipItem> items, out string? space)
@@ -483,7 +490,11 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     /// <summary>Move to Folder ▸ New Folder…: asks for the name inline, then creates it and moves the clips in.</summary>
     public void BeginNewFolder(IReadOnlyList<ClipItem> items)
     {
-        if (!CommonFolderSpace(items, out var space)) return;
+        if (!CommonFolderSpace(items, out var space))
+        {
+            ShowNotice("Items can only move into folders of their own space");
+            return;
+        }
         FolderForm = new FolderForm { ItemIds = [.. items.Select(i => i.Id)], SpaceId = space };
         ActionQuery = "";
         IsPickingFolder = false;
@@ -1269,7 +1280,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     /// <summary>Group items read "Remove from Group": deleting one deletes it for everyone.</summary>
     private PanelAction DeleteAction(IReadOnlyList<ClipItem> clips) =>
-        clips.Count > 0 && clips.All(c => c.SpaceId is { } s && _groups.ContainsKey(s)) ? new PanelAction.RemoveFromGroup() : new PanelAction.Delete();
+        clips.Count > 0 && clips.All(IsGroupItem) ? new PanelAction.RemoveFromGroup() : new PanelAction.Delete();
 
     public List<PanelAction> FilteredActions
     {
