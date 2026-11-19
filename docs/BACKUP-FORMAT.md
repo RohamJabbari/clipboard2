@@ -43,6 +43,7 @@ UTF-8 JSON, one object:
   "app": "mac",                        // "mac" or "windows": who wrote it
   "clips":    [ /* ClipPayload + extras, below */ ],
   "snippets": [ /* SnippetPayload + "id" */ ],
+  "folders":  [ /* FolderPayload + "id" (1.6+; older readers ignore it) */ ],
   "secrets":  [ /* SecretPayload + "id" */ ]   // omitted unless the user opted in
 }
 ```
@@ -71,6 +72,12 @@ the group and aren't exported.
 A snippet payload (`"v":1,"type":"snippet","name","keyword","body","createdAt","updatedAt"`) plus `"id"`.
 Personal snippets only.
 
+### `folders`
+
+Saved folders of the personal space: a folder payload (`"v":1,"type":"folder","name","label","createdAt",
+"updatedAt"`) plus `"id"`. A clip's `folder` field holds the `id` of its folder in this list. Written since 1.6;
+readers that don't know it ignore both, and the clips import at the root of Saved.
+
 ### `secrets`
 
 Only present when the user ticked "Include secrets" and confirmed with Touch ID or Windows Hello. Each
@@ -86,6 +93,8 @@ Import merges into the personal space and never deletes or overwrites anything:
   keeping `createdAt`, `lastCopiedAt`, `copyCount`, pin and label. Images are written from `image`/`thumb`;
   an image entry without a decodable `image` is skipped.
 - **Snippets:** skipped when one with the same `(name, body)` exists. Otherwise inserted with a new id.
+- **Folders:** a personal folder with the same name (ignoring case) is reused; otherwise one is created. Saved
+  clips that are inserted go into their folder; clips skipped as duplicates stay where they are.
 - **Secrets:** skipped when one with the same `(name, value)` exists. Otherwise added as a new secret.
 - The usual rules then apply: retention (pinned items exempt), and a history item whose text equals a saved
   secret is removed.

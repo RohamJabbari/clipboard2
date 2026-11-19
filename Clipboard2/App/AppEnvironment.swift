@@ -77,7 +77,7 @@ final class AppEnvironment {
     }
 
     /// Every persisted model (the newest store version); tests build in-memory containers from it.
-    static let schema = Schema(versionedSchema: StoreSchemaV2.self)
+    static let schema = Schema(versionedSchema: StoreSchemaV3.self)
 
     /// Opens the store with the migration plan. Stores from before the versioned schema (older
     /// than 1.3.0) match no version, so they get the automatic lightweight migration they always

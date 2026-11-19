@@ -120,13 +120,17 @@ nonisolated struct BackupDocument: Codable, Equatable, Sendable {
     var app = "mac"
     var clips: [BackupClip] = []
     var snippets: [BackupSnippet] = []
+    /// Saved folders (1.6+); omitted when there are none.
+    var folders: [BackupFolder]?
     /// Omitted unless the user chose to include secrets.
     var secrets: [BackupSecret]?
 
-    init(createdAt: Int64, clips: [BackupClip], snippets: [BackupSnippet], secrets: [BackupSecret]?) {
+    init(createdAt: Int64, clips: [BackupClip], snippets: [BackupSnippet], folders: [BackupFolder]? = nil,
+         secrets: [BackupSecret]?) {
         self.createdAt = createdAt
         self.clips = clips
         self.snippets = snippets
+        self.folders = folders?.isEmpty == true ? nil : folders
         self.secrets = secrets
     }
 
@@ -138,6 +142,7 @@ nonisolated struct BackupDocument: Codable, Equatable, Sendable {
         app = try c.decodeIfPresent(String.self, forKey: .app) ?? ""
         clips = try c.decodeIfPresent([BackupClip].self, forKey: .clips) ?? []
         snippets = try c.decodeIfPresent([BackupSnippet].self, forKey: .snippets) ?? []
+        folders = try c.decodeIfPresent([BackupFolder].self, forKey: .folders)
         secrets = try c.decodeIfPresent([BackupSecret].self, forKey: .secrets)
     }
 
@@ -186,6 +191,8 @@ nonisolated struct BackupClip: Codable, Equatable, Sendable {
     var createdAt: Int64
     var lastCopiedAt: Int64
     var contentHash: String
+    /// The `id` of its entry in `folders`; saved clips only.
+    var folder: String?
 
     init(id: String, kind: String, isPinned: Bool = false, copyCount: Int = 1, createdAt: Int64,
          lastCopiedAt: Int64, contentHash: String) {
@@ -223,6 +230,36 @@ nonisolated struct BackupClip: Codable, Equatable, Sendable {
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
         lastCopiedAt = try c.decodeIfPresent(Int64.self, forKey: .lastCopiedAt) ?? createdAt
         contentHash = try c.decodeIfPresent(String.self, forKey: .contentHash) ?? ""
+        folder = try c.decodeIfPresent(String.self, forKey: .folder)
+    }
+}
+
+nonisolated struct BackupFolder: Codable, Equatable, Sendable {
+    var v = 1
+    var type = "folder"
+    var id: String
+    var name: String
+    var label: String?
+    var createdAt: Int64
+    var updatedAt: Int64
+
+    init(id: String, name: String, label: String?, createdAt: Int64, updatedAt: Int64) {
+        self.id = id
+        self.name = name
+        self.label = label
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        v = try c.decodeIfPresent(Int.self, forKey: .v) ?? 1
+        type = try c.decodeIfPresent(String.self, forKey: .type) ?? "folder"
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        label = try c.decodeIfPresent(String.self, forKey: .label)
+        createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
+        updatedAt = try c.decodeIfPresent(Int64.self, forKey: .updatedAt) ?? createdAt
     }
 }
 
@@ -312,6 +349,7 @@ extension BackupClip {
         sourceName = item.sourceAppName
         pinnedAt = item.isPinned ? item.pinnedAt?.backupMillis : nil
         label = item.label
+        folder = item.isPinned ? item.folderID?.uuidString.lowercased() : nil
     }
 }
 
@@ -321,6 +359,7 @@ nonisolated struct BackupContents: Sendable {
     /// Image and thumbnail files of each clip, by index.
     var imageFiles: [Int: (image: URL?, thumb: URL?)]
     var snippets: [BackupSnippet]
+    var folders: [BackupFolder] = []
     var secrets: [BackupSecret]?
 
     var summary: String {
@@ -351,7 +390,14 @@ enum BackupExporter {
             BackupSecret(id: $0.ref.id.lowercased(), name: $0.ref.name, value: $0.value,
                          createdAt: ($0.ref.createdAt ?? .now).backupMillis)
         }
-        return BackupContents(clips: clips, imageFiles: files, snippets: snippetList, secrets: secretList)
+        let folderList = store.folders(inSpace: nil).map {
+            BackupFolder(id: $0.id.uuidString.lowercased(), name: $0.name, label: $0.label,
+                         createdAt: $0.createdAt.backupMillis, updatedAt: $0.updatedAt.backupMillis)
+        }
+        // A clip pointing at a folder that isn't here goes to the root.
+        let known = Set(folderList.map(\.id))
+        for index in clips.indices where clips[index].folder.map(known.contains) == false { clips[index].folder = nil }
+        return BackupContents(clips: clips, imageFiles: files, snippets: snippetList, folders: folderList, secrets: secretList)
     }
 
     /// Reads the images, encrypts and writes the file atomically. Images that can't be read are
@@ -375,7 +421,7 @@ enum BackupExporter {
             clips.append(clip)
         }
         let document = BackupDocument(createdAt: now.backupMillis, clips: clips, snippets: contents.snippets,
-                                      secrets: contents.secrets)
+                                      folders: contents.folders, secrets: contents.secrets)
         return try BackupCrypto.seal(try document.encoded(), passphrase: passphrase)
     }
 }
@@ -464,7 +510,8 @@ enum BackupImporter {
     static func merge(_ document: BackupDocument, store: ClipStore, snippets: SnippetStore,
                       secrets: (any BackupSecretSink)?, maxAge: TimeInterval?, now: Date = .now) -> BackupImportSummary {
         var summary = BackupImportSummary()
-        mergeClips(document.clips, into: store, maxAge: maxAge, now: now, summary: &summary)
+        let folders = mergeFolders(document.folders ?? [], into: store, clips: document.clips)
+        mergeClips(document.clips, into: store, folders: folders, maxAge: maxAge, now: now, summary: &summary)
         mergeSnippets(document.snippets, into: snippets, summary: &summary)
         if let secrets, let incoming = document.secrets {
             mergeSecrets(incoming, into: secrets, summary: &summary)
@@ -472,8 +519,36 @@ enum BackupImporter {
         return summary
     }
 
-    private static func mergeClips(_ clips: [BackupClip], into store: ClipStore, maxAge: TimeInterval?, now: Date,
-                                   summary: inout BackupImportSummary) {
+    /// Personal folders for the backup's folders that saved clips are in: one with the same name
+    /// (ignoring case) is reused, otherwise one is created. Returns backup folder id → local id.
+    private static func mergeFolders(_ incoming: [BackupFolder], into store: ClipStore, clips: [BackupClip]) -> [String: UUID] {
+        let used = Set(clips.filter(\.isPinned).compactMap(\.folder))
+        var byName = Dictionary(store.folders(inSpace: nil).map { ($0.name.lowercased(), $0) }, uniquingKeysWith: { first, _ in first })
+        var map: [String: UUID] = [:]
+        var inserted = false
+        for backup in incoming where used.contains(backup.id) && map[backup.id] == nil {
+            let name = backup.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let key = (name.isEmpty ? "Folder" : name).lowercased()
+            if let existing = byName[key] {
+                map[backup.id] = existing.id
+                continue
+            }
+            let folder = ClipFolder(name: name.isEmpty ? "Folder" : name, spaceID: nil)
+            if let id = UUID(uuidString: backup.id), store.folder(withID: id) == nil { folder.id = id }
+            folder.label = backup.label?.isEmpty == true ? nil : backup.label
+            folder.createdAt = Date(backupMillis: backup.createdAt)
+            folder.updatedAt = Date(backupMillis: backup.updatedAt)
+            store.insertSynced(folder)
+            byName[key] = folder
+            map[backup.id] = folder.id
+            inserted = true
+        }
+        if inserted { store.commitSynced() }
+        return map
+    }
+
+    private static func mergeClips(_ clips: [BackupClip], into store: ClipStore, folders: [String: UUID] = [:],
+                                   maxAge: TimeInterval?, now: Date, summary: inout BackupImportSummary) {
         var known = Set(store.items(inSpace: nil).map(\.contentHash).filter { !$0.isEmpty })
         var inserted = false
         for clip in clips {
@@ -496,6 +571,7 @@ enum BackupImporter {
                 continue
             }
             known.insert(item.contentHash)
+            if item.isPinned, let folder = clip.folder { item.folderID = folders[folder] }
             store.insertSynced(item)
             inserted = true
             summary.clipsAdded += 1

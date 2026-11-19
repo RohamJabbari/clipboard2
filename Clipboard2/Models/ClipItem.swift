@@ -61,6 +61,9 @@ final class ClipItem {
     /// Text recognised on this Mac in an image item, for search. nil = not looked at yet;
     /// "" = looked at, no text. Never synced; each device recognises its own copy.
     var imageText: String?
+    /// The Saved folder (`ClipFolder.id`) this item is in; only set while `isPinned`. An id with
+    /// no folder in the item's space (deleted, or not synced yet) reads as the root of Saved.
+    var folderID: UUID?
 
     init(capture: ProcessedCapture, now: Date = .now) {
         id = UUID()
@@ -127,6 +130,28 @@ final class ClipItem {
         let pin = isPinned && label == nil ? ", kept" : ""
         let name = label.map { "\($0), " } ?? ""
         return "\(name)\(kind.displayName): \(preview)\(app)\(pin)"
+    }
+}
+
+/// A folder in Saved: groups saved clips of one space, one level deep. Not `FolderSaver` or
+/// `FolderArchive`, which are about folders on disk.
+@Model
+final class ClipFolder {
+    var id: UUID = UUID()
+    var name: String = ""
+    /// Optional tag, like an item's label.
+    var label: String?
+    var createdAt: Date = Date.now
+    var updatedAt: Date = Date.now
+    /// The sync group this folder belongs to; nil is the personal space.
+    var spaceID: String?
+
+    init(name: String, spaceID: String? = nil, now: Date = .now) {
+        self.id = UUID()
+        self.name = name
+        self.spaceID = spaceID
+        self.createdAt = now
+        self.updatedAt = now
     }
 }
 
