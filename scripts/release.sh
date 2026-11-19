@@ -41,4 +41,6 @@ git push -q origin HEAD "v$VERSION"
 # because appcast.xml on main was just pushed (raw.githubusercontent.com may cache ~5 min).
 gh release create "v$VERSION" "dist/$APP_NAME-$VERSION.pkg" "$ZIP" -R "$REPO" \
     --title "$APP_NAME $VERSION" --generate-notes --verify-tag
+# Every version's installer and update zip live on its GitHub release; keep only this one locally.
+find dist -name "$APP_NAME-*" ! -name "$APP_NAME-$VERSION.*" -delete
 echo "✓ Released $VERSION — installs update themselves within the hour."
