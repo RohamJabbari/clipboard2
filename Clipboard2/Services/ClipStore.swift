@@ -91,7 +91,7 @@ final class ClipStore {
 
     /// Sets (or clears, for empty text) a label. Labels are how items are kept: a labelled item is
     /// pinned so it never expires, and removing the label releases it again — unless `keepPinned`
-    /// (a quick slot still needs the item).
+    /// (a quick slot still needs the item) or it's in a folder.
     func setLabel(_ label: String?, for item: ClipItem, keepPinned: Bool = false) {
         let trimmed = label?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let hadLabel = item.label != nil
@@ -99,24 +99,189 @@ final class ClipStore {
         if item.label != nil && !item.isPinned {
             item.isPinned = true
             item.pinnedAt = .now
-        } else if item.label == nil && hadLabel && item.isPinned && !keepPinned {
+        } else if item.label == nil && hadLabel && item.isPinned && !keepPinned && item.folderID == nil {
             item.isPinned = false
             item.pinnedAt = nil
         }
         commit()
     }
 
-    /// Pinning is internal ("kept forever"): labels and quick slots set it; users only see labels.
+    /// Pinning is internal ("kept forever", shown as Saved): labels, folders and quick slots set
+    /// it. Unpinning takes the item out of its folder.
     func togglePin(_ item: ClipItem) {
         item.isPinned.toggle()
         item.pinnedAt = item.isPinned ? .now : nil
+        if !item.isPinned { item.folderID = nil }
         commit()
     }
 
-    /// Releases an item kept without a label (pinned before labels replaced pins), so it expires normally.
+    /// Remove from Saved: releases an item kept without a label (a labelled one is released by
+    /// removing its label), out of its folder too, so it expires normally.
     func removeFromLabelled(_ item: ClipItem) {
-        guard item.isPinned, item.label == nil else { return }
-        togglePin(item)
+        removeFromSaved([item])
+    }
+
+    func removeFromSaved(_ items: [ClipItem]) {
+        var changed = false
+        for item in items where item.isPinned && item.label == nil {
+            item.isPinned = false
+            item.pinnedAt = nil
+            item.folderID = nil
+            changed = true
+        }
+        if changed { commit() }
+    }
+
+    /// Add to Saved: keeps the items forever without a label.
+    func addToSaved(_ items: [ClipItem], now: Date = .now) {
+        var changed = false
+        for item in items where !item.isPinned && !item.isTransient {
+            item.isPinned = true
+            item.pinnedAt = now
+            changed = true
+        }
+        if changed { commit() }
+    }
+
+    // MARK: Folders
+
+    /// Folders of one space (nil = personal), by name.
+    func folders(inSpace spaceID: String?) -> [ClipFolder] {
+        let descriptor = FetchDescriptor<ClipFolder>(predicate: #Predicate { $0.spaceID == spaceID })
+        return ((try? context.fetch(descriptor)) ?? []).sorted {
+            let order = $0.name.localizedStandardCompare($1.name)
+            return order == .orderedSame ? $0.createdAt < $1.createdAt : order == .orderedAscending
+        }
+    }
+
+    func allFolders() -> [ClipFolder] {
+        (try? context.fetch(FetchDescriptor<ClipFolder>())) ?? []
+    }
+
+    func folder(withID id: UUID) -> ClipFolder? {
+        var descriptor = FetchDescriptor<ClipFolder>(predicate: #Predicate { $0.id == id })
+        descriptor.fetchLimit = 1
+        return (try? context.fetch(descriptor))?.first
+    }
+
+    /// The folder an item shows in: nil when it has none, or one that isn't here (deleted, or
+    /// not synced yet), or one in another space.
+    func folder(of item: ClipItem) -> ClipFolder? {
+        guard item.isPinned, let id = item.folderID, let folder = folder(withID: id), folder.spaceID == item.spaceID else {
+            return nil
+        }
+        return folder
+    }
+
+    /// Saved items in a folder.
+    func items(inFolder folder: ClipFolder) -> [ClipItem] {
+        let id: UUID? = folder.id
+        let spaceID = folder.spaceID
+        let descriptor = FetchDescriptor<ClipItem>(
+            predicate: #Predicate { $0.folderID == id && $0.spaceID == spaceID && $0.isPinned == true },
+            sortBy: [SortDescriptor(\.lastCopiedAt, order: .reverse)]
+        )
+        return (try? context.fetch(descriptor)) ?? []
+    }
+
+    @discardableResult
+    func createFolder(named name: String = "New Folder", inSpace spaceID: String?, now: Date = .now) -> ClipFolder {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let folder = ClipFolder(name: trimmed.isEmpty ? "New Folder" : trimmed, spaceID: spaceID, now: now)
+        context.insert(folder)
+        commit()
+        return folder
+    }
+
+    /// An empty name is ignored.
+    func rename(_ folder: ClipFolder, to name: String, now: Date = .now) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != folder.name else { return }
+        folder.name = trimmed
+        folder.updatedAt = now
+        commit()
+    }
+
+    /// Sets (or clears, for empty text) a folder's label.
+    func setLabel(_ label: String?, for folder: ClipFolder, now: Date = .now) {
+        let trimmed = label?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let new = trimmed.isEmpty ? nil : trimmed
+        guard new != folder.label else { return }
+        folder.label = new
+        folder.updatedAt = now
+        commit()
+    }
+
+    /// Deletes the folder; its clips stay saved, at the root of Saved (their `folderID` is
+    /// cleared, so sync pushes them without it). Returns how many moved.
+    @discardableResult
+    func deleteFolder(_ folder: ClipFolder) -> Int {
+        let id: UUID? = folder.id
+        let spaceID = folder.spaceID
+        let descriptor = FetchDescriptor<ClipItem>(predicate: #Predicate { $0.folderID == id && $0.spaceID == spaceID })
+        let items = (try? context.fetch(descriptor)) ?? []
+        for item in items { item.folderID = nil }
+        context.delete(folder)
+        commit()
+        return items.filter(\.isPinned).count
+    }
+
+    /// Moves items into a folder of their own space (which saves them). Items of another space,
+    /// and transient ones, are left alone. Returns how many moved.
+    @discardableResult
+    func move(_ items: [ClipItem], to folder: ClipFolder, now: Date = .now) -> Int {
+        var moved = 0
+        for item in items where !item.isTransient && item.spaceID == folder.spaceID {
+            if !item.isPinned {
+                item.isPinned = true
+                item.pinnedAt = now
+            }
+            if item.folderID != folder.id { item.folderID = folder.id }
+            moved += 1
+        }
+        if moved > 0 { commit() }
+        return moved
+    }
+
+    /// Takes items out of their folder; they stay saved, at the root of Saved.
+    func removeFromFolder(_ items: [ClipItem]) {
+        var changed = false
+        for item in items where item.folderID != nil {
+            item.folderID = nil
+            changed = true
+        }
+        if changed { commit() }
+    }
+
+    /// Copies a folder and its clips into a group with new ids (Share to Group). The original
+    /// stays as it is; later changes don't follow. Returns the copy.
+    @discardableResult
+    func shareCopy(of folder: ClipFolder, toSpace spaceID: String?, now: Date = .now) -> ClipFolder {
+        let items = items(inFolder: folder)
+        let copy = ClipFolder(name: folder.name, spaceID: spaceID, now: now)
+        copy.label = folder.label
+        context.insert(copy)
+        for item in items {
+            let shared = shareCopy(of: item, toSpace: spaceID, now: now)
+            if !shared.isPinned {
+                shared.isPinned = true
+                shared.pinnedAt = now
+            }
+            shared.folderID = copy.id
+        }
+        commit()
+        return copy
+    }
+
+    /// Inserts a folder received from sync (without committing).
+    func insertSynced(_ folder: ClipFolder) {
+        context.insert(folder)
+    }
+
+    /// Deletes a folder received as deleted, without committing. Its clips keep their
+    /// `folderID` and read as the root of Saved.
+    func removeSynced(_ folder: ClipFolder) {
+        context.delete(folder)
     }
 
     func delete(_ item: ClipItem) {
@@ -412,6 +577,7 @@ final class ClipStore {
                 winner.isPinned = true
                 winner.pinnedAt = pinned.pinnedAt
             }
+            if winner.folderID == nil { winner.folderID = sorted.lazy.filter(\.isPinned).compactMap(\.folderID).first }
             for loser in sorted.dropFirst() {
                 remove(loser)
                 removed += 1
@@ -434,8 +600,10 @@ final class ClipStore {
     /// Drops every item of a space, e.g. after leaving a group or signing out.
     func removeAll(inSpace spaceID: String) {
         let items = items(inSpace: spaceID)
-        guard !items.isEmpty else { return }
+        let folders = folders(inSpace: spaceID)
+        guard !items.isEmpty || !folders.isEmpty else { return }
         for item in items { remove(item) }
+        for folder in folders { context.delete(folder) }
         commit()
     }
 

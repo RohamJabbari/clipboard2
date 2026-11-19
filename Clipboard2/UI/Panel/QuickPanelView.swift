@@ -40,9 +40,17 @@ struct QuickPanelView: View {
                         thisAppName: model.targetRef?.name, dropModel: model)
                 .padding(.horizontal, 14)
                 .padding(.bottom, 10)
+            if model.groupFilter != nil {
+                GroupViewSwitch(showsSaved: $model.groupShowsSaved)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 8)
+            }
             Hairline()
             HStack(spacing: 0) {
                 VStack(spacing: 0) {
+                    if model.isSavedView {
+                        SavedHeader(model: model)
+                    }
                     IncomingDownloadsBanner(downloads: env.sync.downloads.filter { download in
                         model.groupFilter.map { $0 == download.spaceId } ?? true
                     })
@@ -62,6 +70,7 @@ struct QuickPanelView: View {
             HintBar(entry: model.selectedEntry, mode: model.mode, notice: model.notice,
                     isEditingText: model.isEditingText,
                     canEditText: model.selectedEntry?.clip.map(model.isEditable) ?? false,
+                    inFolder: model.openFolder != nil,
                     selectionCount: model.isMultiSelecting ? model.selectedClips.count : nil,
                     pickedFiles: model.pickedFileCount,
                     canQuickLook: model.canQuickLook,
@@ -73,7 +82,9 @@ struct QuickPanelView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear { searchFocused = true }
-        .onChange(of: model.focusToken) { searchFocused = ![.actions, .snippetForm, .saveSecret, .label, .editSecret, .shareToGroup].contains(model.mode) }
+        .onChange(of: model.focusToken) {
+            searchFocused = ![.actions, .snippetForm, .saveSecret, .label, .editSecret, .shareToGroup, .folderName].contains(model.mode)
+        }
         .onChange(of: env.store.revision) { model.refresh() }
         .onChange(of: env.snippets.revision) { model.refresh() }
         .onChange(of: env.secrets.revision) { model.refresh() }
@@ -154,7 +165,16 @@ struct QuickPanelView: View {
 
     private var resultsList: some View {
         Group {
-            if model.entries.isEmpty {
+            if model.entries.isEmpty && model.isSavedView && model.query.isEmpty {
+                ContentUnavailableView {
+                    Label(model.openFolder != nil ? "This Folder Is Empty" : "Nothing Saved Yet",
+                          systemImage: model.openFolder != nil ? "folder" : "bookmark")
+                } description: {
+                    Text(model.openFolder != nil
+                         ? "Drag items here, or use Move to Folder in an item's actions."
+                         : "Use Add to Saved or a label to keep an item forever.")
+                }
+            } else if model.entries.isEmpty {
                 let inbox = model.filter == .inbox && model.groupFilter == nil
                 ContentUnavailableView {
                     Label(model.query.isEmpty ? (inbox ? "Your Inbox Is Empty" : "Nothing Here Yet") : "No Matches",
@@ -172,30 +192,13 @@ struct QuickPanelView: View {
                                 if let title = model.sectionStarts[entry.id] {
                                     SectionHeading(title: title, isFirst: index == 0)
                                 }
-                                PanelRow(entry: entry, shortcut: model.shortcutNumber(for: entry, at: index),
-                                         isSelected: model.isSelected(entry),
-                                         showsCheckmark: model.isMultiSelecting,
-                                         query: model.query,
-                                         commandHeld: model.isCommandHeld,
-                                         sharing: sharing(for: entry),
-                                         badge: entry.clip.flatMap(env.sync.badge))
-                                    .id(entry.id)
-                                    // One recogniser reading AppKit's click count: SwiftUI's stacked
-                                    // count:2 / count:1 gestures miss double-clicks in a non-activating panel.
-                                    .onTapGesture {
-                                        if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
-                                            if model.isMultiSelecting && model.isSelected(entry) {
-                                                model.pasteSelection()
-                                            } else {
-                                                model.activate(entry)
-                                            }
-                                        } else {
-                                            model.click(entry)
-                                        }
-                                    }
-                                    .contextMenu { contextMenu(for: entry) }
-                                    .modifier(ClipDragSource(item: entry.clip.flatMap { $0.isTransient ? nil : $0 },
-                                                             blobs: env.blobs, pickedFiles: model.pickedFileURLs))
+                                if let folder = entry.folder {
+                                    FolderDropRow(entry: entry, folder: folder, model: model)
+                                        .id(entry.id)
+                                        .contextMenu { folderContextMenu(folder) }
+                                } else {
+                                    row(for: entry, at: index)
+                                }
                             }
                         }
                         .padding(.horizontal, 8)
@@ -217,6 +220,34 @@ struct QuickPanelView: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Results")
+    }
+
+    private func row(for entry: PanelEntry, at index: Int) -> some View {
+        PanelRow(entry: entry, shortcut: model.shortcutNumber(for: entry, at: index),
+                 isSelected: model.isSelected(entry),
+                 showsCheckmark: model.isMultiSelecting,
+                 query: model.query,
+                 commandHeld: model.isCommandHeld,
+                 sharing: sharing(for: entry),
+                 badge: entry.clip.flatMap(env.sync.badge),
+                 folderCaption: entry.clip.flatMap { model.folderCaptions[$0.id] })
+            .id(entry.id)
+            // One recogniser reading AppKit's click count: SwiftUI's stacked
+            // count:2 / count:1 gestures miss double-clicks in a non-activating panel.
+            .onTapGesture {
+                if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
+                    if model.isMultiSelecting && model.isSelected(entry) {
+                        model.pasteSelection()
+                    } else {
+                        model.activate(entry)
+                    }
+                } else {
+                    model.click(entry)
+                }
+            }
+            .contextMenu { contextMenu(for: entry) }
+            .modifier(ClipDragSource(item: entry.clip.flatMap { $0.isTransient ? nil : $0 },
+                                     blobs: env.blobs, pickedFiles: model.pickedFileURLs))
     }
 
     @ViewBuilder
@@ -245,9 +276,7 @@ struct QuickPanelView: View {
             }
             Divider()
             Button(item.label == nil ? "Label…" : "Edit Label…") { model.beginLabel(entry) }
-            if item.isPinned && item.label == nil {
-                Button("Remove from Labelled") { model.removeFromLabelled(item) }
-            }
+            savedMenuItems(for: entry, item: item)
             if item.kind.isTextual {
                 Button("Save as Secret…") { model.beginSaveSecret(item) }
             }
@@ -273,8 +302,60 @@ struct QuickPanelView: View {
             }
             Button("Save to…") { model.saveChoosingFolder(model.clipsForContextAction(on: entry)) }
             Divider()
-            Button("Delete", role: .destructive) { env.store.delete(item); model.refresh() }
+            if model.isGroupSpace(item.spaceID) {
+                // Gone for everyone in the group, like Delete always was there.
+                Button("Remove from Group", role: .destructive) { removeFromGroup(model.clipsForContextAction(on: entry)) }
+            } else {
+                Button("Delete", role: .destructive) { env.store.delete(item); model.refresh() }
+            }
         }
+    }
+
+    private func removeFromGroup(_ clips: [ClipItem]) {
+        for clip in clips where model.isGroupSpace(clip.spaceID) {
+            env.slots.remove(target: .clip(clip.id))
+            env.store.delete(clip)
+        }
+        model.refresh()
+    }
+
+    /// Add to / Remove from Saved, Move to Folder ▸ and Remove from Folder, for the row or the
+    /// selection it's part of.
+    @ViewBuilder
+    private func savedMenuItems(for entry: PanelEntry, item: ClipItem) -> some View {
+        let clips = model.clipsForContextAction(on: entry).filter { !$0.isTransient }
+        if !clips.isEmpty {
+            if clips.contains(where: { !$0.isPinned }) {
+                Button("Add to Saved") { model.addToSaved(clips) }
+            }
+            if model.canMoveToFolder(clips) {
+                Menu("Move to Folder") {
+                    ForEach(model.folderTargets(for: clips)) { folder in
+                        Button(folder.name) { model.move(clips, to: folder) }
+                    }
+                    if !model.folderTargets(for: clips).isEmpty { Divider() }
+                    Button("New Folder…") { model.beginNewFolder(moving: clips) }
+                }
+            }
+            if clips.contains(where: { model.folder(of: $0) != nil }) {
+                Button("Remove from Folder") { model.removeFromFolder(clips) }
+            }
+            if clips.contains(where: { $0.isPinned && $0.label == nil }) {
+                Button("Remove from Saved") { model.removeFromSaved(clips) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func folderContextMenu(_ folder: ClipFolder) -> some View {
+        Button("Open") { model.openFolder(folder) }
+        Button("Rename…") { model.beginRename(folder) }
+        Button(folder.label == nil ? "Label…" : "Edit Label…") { model.beginLabel(.folder(folder)) }
+        if folder.spaceID == nil && model.canShareToGroup {
+            Button("Share to Group…") { model.beginShareFolder(folder) }
+        }
+        Divider()
+        Button("Delete Folder", role: .destructive) { model.deleteFolder(folder) }
     }
 
     /// "Send to ‹contact›" for the row (or the selection it's part of); a submenu once there are many.
@@ -318,6 +399,10 @@ struct QuickPanelView: View {
             if let form = model.saveSecretForm {
                 SaveSecretView(form: form) { model.submitSaveSecret() }
             }
+        case .folderName:
+            if let form = model.folderNameForm {
+                FolderNameView(form: form) { model.submitFolderName() }
+            }
         case .ai:
             if let run = model.aiRun {
                 AIResultView(run: run, model: model)
@@ -325,6 +410,9 @@ struct QuickPanelView: View {
         case .browse:
             if model.isMultiSelecting {
                 MultiSelectionPreview(clips: model.selectedClips, totalSelected: model.selectedIDs.count)
+            } else if let folder = model.selectedEntry?.folder {
+                FolderPreview(folder: folder, count: model.folderCounts[folder.id] ?? 0, model: model)
+                    .id(folder.id)
             } else if let entry = model.selectedEntry {
                 PreviewPane(entry: entry, sharing: sharing(for: entry), onEditSecret: model.beginEditSecret,
                             onPasteText: model.pasteText, onSaveAsSecret: model.beginSaveSecret, model: model)
@@ -504,6 +592,12 @@ struct PanelRow: View {
     var sharing: PreviewSharing?
     /// For a contact's item: who it's from or to (group items show `sharing` instead).
     var badge: SyncBadge?
+    /// A search result inside a folder (from the Saved root): the folder's name.
+    var folderCaption: String?
+    /// A folder row: how many saved items it holds.
+    var folderCount = 0
+    /// Something droppable hovers over this folder row.
+    var dropHighlighted = false
     @State private var hovering = false
 
     var body: some View {
@@ -538,10 +632,13 @@ struct PanelRow: View {
                     .accessibilityHidden(true)
             }
             if case .clip(let item) = entry, item.isPinned {
-                Image(systemName: "tag.fill")
+                Image(systemName: item.label == nil ? "bookmark.fill" : "tag.fill")
                     .font(.caption)
                     .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
                     .accessibilityHidden(true)
+            }
+            if case .folder(let folder) = entry {
+                folderTrailing(folder)
             }
             if let shortcut, shortcut.isSlot || isSelected || hovering || commandHeld {
                 Text("⌘\(shortcut.number)")
@@ -561,18 +658,53 @@ struct PanelRow: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
-        .background {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isSelected ? AnyShapeStyle(Color.accentColor)
-                      : hovering ? AnyShapeStyle(Color.primary.opacity(0.05)) : AnyShapeStyle(.clear))
-        }
+        .background { rowBackground }
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityText + (sharing.map { ", shared in \($0.group)" } ?? badge.map { ", \($0.help)" } ?? "")
-                            + (shortcut?.isSlot == true ? ", quick slot \(shortcut?.number ?? 0)" : ""))
+        .accessibilityLabel(fullAccessibilityLabel)
         .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : .isButton)
-        .accessibilityHint("Double-click or press Return to paste")
+        .accessibilityHint(entry.folder == nil ? "Double-click or press Return to paste" : "Click or press Return to open")
+    }
+
+    @ViewBuilder
+    private var rowBackground: some View {
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+        if dropHighlighted {
+            shape.fill(Color.accentColor.opacity(0.16))
+                .overlay(shape.strokeBorder(Color.accentColor.opacity(0.8), lineWidth: 1.5))
+        } else {
+            shape.fill(isSelected ? AnyShapeStyle(Color.accentColor)
+                       : hovering ? AnyShapeStyle(Color.primary.opacity(0.05)) : AnyShapeStyle(.clear))
+        }
+    }
+
+    private var fullAccessibilityLabel: String {
+        var text = accessibilityText
+        if let sharing { text += ", shared in \(sharing.group)" } else if let badge { text += ", \(badge.help)" }
+        if let folderCaption { text += ", in folder \(folderCaption)" }
+        if let shortcut, shortcut.isSlot { text += ", quick slot \(shortcut.number)" }
+        return text
+    }
+
+    /// A folder row's label tag and disclosure chevron.
+    @ViewBuilder
+    private func folderTrailing(_ folder: ClipFolder) -> some View {
+        if let label = folder.label {
+            Label(label, systemImage: "tag.fill")
+                .labelStyle(.titleAndIcon)
+                .font(.caption2)
+                .lineLimit(1)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
+                .background(Capsule().strokeBorder(isSelected ? AnyShapeStyle(.white.opacity(0.6)) : AnyShapeStyle(.quaternary)))
+                .accessibilityHidden(true)
+        }
+        Image(systemName: "chevron.right")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(isSelected ? AnyShapeStyle(.white.opacity(0.85)) : AnyShapeStyle(.tertiary))
+            .accessibilityHidden(true)
     }
 
     private var badgeKind: ContentBadge.Kind {
@@ -580,6 +712,7 @@ struct PanelRow: View {
         case .clip(let item): .clip(item)
         case .snippet: .snippet
         case .secret: .secret
+        case .folder: .folder
         }
     }
 
@@ -597,11 +730,20 @@ struct PanelRow: View {
             return item.displayTitle
         case .snippet(let snippet): return snippet.name.isEmpty ? "Untitled Snippet" : snippet.name
         case .secret(let ref): return ref.name
+        case .folder(let folder): return folder.name
         }
     }
 
     private var subtitleLine: some View {
         HStack(spacing: 4) {
+            if let folderCaption {
+                Image(systemName: "folder.fill")
+                    .imageScale(.small)
+                    .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.blue))
+                Text(folderCaption)
+                    .fontWeight(.semibold)
+                Text("·")
+            }
             if let sharing {
                 Image(systemName: "person.2.fill")
                     .imageScale(.small)
@@ -646,6 +788,8 @@ struct PanelRow: View {
             return snippet.keyword.isEmpty ? "Snippet" : "Snippet · \(snippet.keyword)"
         case .secret:
             return "Secret · ••••••••"
+        case .folder:
+            return folderCount == 1 ? "Folder · 1 item" : "Folder · \(folderCount) items"
         }
     }
 
@@ -658,6 +802,9 @@ struct PanelRow: View {
             return item.accessibilityDescription
         case .snippet(let snippet): return "Snippet \(snippet.name)"
         case .secret(let ref): return "Secret \(ref.name)"
+        case .folder(let folder):
+            return "Folder \(folder.name)" + (folder.label.map { ", label \($0)" } ?? "")
+                + ", \(folderCount) \(folderCount == 1 ? "item" : "items")"
         }
     }
 }
@@ -670,6 +817,8 @@ struct HintBar: View {
     let notice: String?
     var isEditingText = false
     var canEditText = false
+    /// A Saved folder is open: esc goes back to the root.
+    var inFolder = false
     var selectionCount: Int?
     /// Some files of a multi-file item are picked in the preview: Return pastes only those.
     var pickedFiles: (picked: Int, total: Int)?
@@ -697,6 +846,9 @@ struct HintBar: View {
                 hint("⌥⏎", "Plain Text")
                 hint("⌘K", "Actions")
                 hint("⌫", "Delete")
+            case .browse where entry?.folder != nil:
+                hint("⏎", "Open")
+                hint("⌘K", "Actions")
             case .browse:
                 hint("⏎", pickedFiles.map { "Paste \($0.picked) of \($0.total) Files" } ?? "Paste")
                 if entry?.clip != nil {
@@ -713,7 +865,7 @@ struct HintBar: View {
             case .snippetForm:
                 hint("⇥", "Next Field")
                 hint("⏎", "Paste")
-            case .saveSecret, .label, .editSecret:
+            case .saveSecret, .label, .editSecret, .folderName:
                 hint("⏎", "Save")
             case .shareToGroup:
                 hint("↑↓", "Choose")
@@ -760,7 +912,7 @@ struct HintBar: View {
                     .layoutPriority(-1)
                     .help(syncIndicator.offersSyncNow ? "\(syncIndicator.title()) — use Sync Now in the menu bar menu" : syncIndicator.title())
             }
-            if !isEditingText { hint("esc", mode == .browse ? "Close" : "Back") }
+            if !isEditingText { hint("esc", mode == .browse && !inFolder ? "Close" : "Back") }
         }
         .font(.caption)
         .foregroundStyle(.secondary)

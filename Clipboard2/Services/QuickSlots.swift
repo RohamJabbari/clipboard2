@@ -50,8 +50,7 @@ final class QuickSlots {
 
     /// Assigns an entry; clips get pinned so retention never deletes a slotted item.
     func assign(_ entry: PanelEntry, to slot: Int) {
-        guard Self.range.contains(slot) else { return }
-        let target = entry.slotTarget
+        guard Self.range.contains(slot), let target = entry.slotTarget else { return }
         if let existing = self.slot(for: target) { assignments[existing] = nil }
         if case .clip(let item) = entry, !item.isPinned { store.togglePin(item) }
         assignments[slot] = target
@@ -88,6 +87,7 @@ final class QuickSlots {
         case .clip(let item): item.preview.isEmpty ? item.kind.displayName : item.preview
         case .snippet(let snippet): snippet.name
         case .secret(let ref): ref.name
+        case .folder(let folder): folder.name
         case nil: nil
         }
     }

@@ -43,6 +43,7 @@ UTF-8 JSON, one object:
   "app": "mac",                        // "mac" or "windows": who wrote it
   "clips":    [ /* ClipPayload + extras, below */ ],
   "snippets": [ /* SnippetPayload + "id" */ ],
+  "folders":  [ /* FolderPayload + "id" (1.6+; older readers ignore it) */ ],
   "secrets":  [ /* SecretPayload + "id" */ ]   // omitted unless the user opted in
 }
 ```

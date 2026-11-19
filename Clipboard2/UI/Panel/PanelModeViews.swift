@@ -202,7 +202,9 @@ struct ShareToGroupView: View {
         VStack(alignment: .leading, spacing: 14) {
             Label("Share to Group", systemImage: "person.2.fill")
                 .font(.headline)
-            Text(form.secret != nil
+            Text(form.folder != nil
+                 ? "Copies this folder and its \(form.items.count == 1 ? "item" : "\(form.items.count) items") into the group. Every member sees them, end-to-end encrypted. Your folder stays as it is."
+                 : form.secret != nil
                  ? "Sends a copy of this secret to the group, end-to-end encrypted. Members paste it after their own Touch ID or password. Changing yours later won't change theirs."
                  : form.items.count == 1
                  ? "Copies this item into the group. Every member sees it, end-to-end encrypted."
@@ -270,7 +272,9 @@ struct LabelFormView: View {
                 .font(.headline)
             Text(form.isSecret
                  ? "The name shown for this secret in the panel and in search."
-                 : "Shown instead of the content in lists and searchable. Labelled items never expire and are listed under Labelled. Leave empty to remove the label and let it expire again.")
+                 : form.isFolder
+                 ? "A tag shown on the folder in Saved and searchable. Leave empty to remove it."
+                 : "Shown instead of the content in lists and searchable. Labelled items never expire and are listed under Saved. Leave empty to remove the label and let it expire again.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
