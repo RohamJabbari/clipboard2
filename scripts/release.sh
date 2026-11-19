@@ -43,4 +43,7 @@ gh release create "v$VERSION" "dist/$APP_NAME-$VERSION.pkg" "$ZIP" -R "$REPO" \
     --title "$APP_NAME $VERSION" --generate-notes --verify-tag
 # Every version's installer and update zip live on its GitHub release; keep only this one locally.
 find dist -name "$APP_NAME-*" ! -name "$APP_NAME-$VERSION.*" -delete
+# Clean build: keep Sparkle's tools (sign-windows-feed.sh needs them), drop the rest (rebuilt next time).
+rm -rf .tools/sparkle-bin && mkdir -p .tools && cp -R "$(dirname "$SIGN_UPDATE")" .tools/sparkle-bin
+rm -rf build build-dev
 echo "✓ Released $VERSION — installs update themselves within the hour."

@@ -7,3 +7,4 @@ build-dev/
 windows/**/bin/
 windows/**/obj/
 .claude/worktrees/
+.tools/

@@ -64,6 +64,7 @@ windows-release:
 	git tag "windows-v$(VERSION)"
 	git push origin "windows-v$(VERSION)"
 	scripts/sign-windows-feed.sh --wait $(VERSION)
+	rm -rf windows/src/*/bin windows/src/*/obj windows/tests/*/bin windows/tests/*/obj
 
 # Sync API (server/): integration tests run against an embedded Postgres; deploy goes to Cloud Run.
 server-test:

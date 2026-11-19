@@ -26,7 +26,7 @@ WAIT=0
 ARG="${1:?usage: scripts/sign-windows-feed.sh --key | [--wait] <version>}"
 
 BIN=""
-for dir in build/SourcePackages/artifacts/sparkle/Sparkle/bin build-dev/SourcePackages/artifacts/sparkle/Sparkle/bin; do
+for dir in .tools/sparkle-bin build/SourcePackages/artifacts/sparkle/Sparkle/bin build-dev/SourcePackages/artifacts/sparkle/Sparkle/bin; do
   [[ -x "$dir/sign_update" ]] && { BIN="$dir"; break; }
 done
 [[ -n "$BIN" ]] || { echo "Sparkle's tools aren't there yet: run 'make build' once."; exit 1; }
