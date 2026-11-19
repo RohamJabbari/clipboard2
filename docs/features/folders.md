@@ -53,8 +53,8 @@ These are on a folder row's actions and right-click menu:
   - **All** is what the group shows today.
   - **Saved** is the same Saved layout as above, scoped to that group's saved clips and folders.
 - **Add to Saved**, folders, moving, labels and Delete Folder all work on group items and sync to every member. That's already true for pins in group spaces; check it, don't assume it.
-- Any member can create, rename, label or delete a group folder, the same as any member can delete a group item today.
-- **Remove from Group**: on a group item, the delete action reads "Remove from Group". It deletes the item for everyone, as group delete does today. Multi-select works.
+- Any member can create a group folder. Changing an existing group clip or folder (saving it, moving it, labelling, renaming, deleting, Remove from Group) is limited by the server to the item's author or the group's owner. Anyone else's change stays on their device, with the existing warning.
+- **Remove from Group**: on a group item, the delete action reads "Remove from Group". For the author or the owner it deletes the item for everyone. Multi-select works.
 - The personal Saved tab doesn't show group folders.
 
 ## Contacts / Inbox
