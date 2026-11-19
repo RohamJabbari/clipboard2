@@ -27,7 +27,8 @@ public abstract record ItemPayload
     }
     public sealed record SnippetPayload(Snippet Snippet) : ItemPayload;
     public sealed record FolderPayload(ClipFolder Folder) : ItemPayload;
-    public sealed record Secret(string Name, string Value, DateTime? CreatedAt) : ItemPayload;
+    /// <param name="Folder">The Saved folder it's in (1.7+), like a clip's; an id this device doesn't have reads as the root.</param>
+    public sealed record Secret(string Name, string Value, DateTime? CreatedAt, Guid? Folder = null) : ItemPayload;
 }
 
 /// <summary>One file of a file item, uploaded as an encrypted blob. <see cref="Size"/> is the plaintext byte count.
@@ -116,10 +117,12 @@ public static partial class SyncPayload
         ["updatedAt"] = Millis(snippet.UpdatedAt),
     };
 
-    public static JsonObject ForSecret(string name, string value, DateTime? createdAt)
+    /// <summary>"folder" only when the secret is in one, so the fingerprints of other secrets stay as they were.</summary>
+    public static JsonObject ForSecret(string name, string value, DateTime? createdAt, Guid? folder = null)
     {
         var json = new JsonObject { ["v"] = Version, ["type"] = "secret", ["name"] = name, ["value"] = value };
         json["createdAt"] = Millis(createdAt ?? DateTime.UtcNow);
+        if (folder is { } f) json["folder"] = ClipStore.SyncId(f);
         return json;
     }
 
@@ -234,7 +237,8 @@ public static partial class SyncPayload
                     UpdatedAt = Time(json, "updatedAt") ?? Time(json, "createdAt") ?? DateTime.UtcNow,
                 });
             case "secret":
-                return new ItemPayload.Secret(Str(json, "name") ?? "Untitled", Str(json, "value") ?? "", Time(json, "createdAt"));
+                return new ItemPayload.Secret(Str(json, "name") ?? "Untitled", Str(json, "value") ?? "", Time(json, "createdAt"),
+                    Guid.TryParse(Str(json, "folder"), out var secretFolder) ? secretFolder : null);
             default:
                 return null;
         }

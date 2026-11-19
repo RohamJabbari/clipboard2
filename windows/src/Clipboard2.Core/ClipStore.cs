@@ -74,7 +74,7 @@ public sealed class ClipStore : IDisposable
     }
 
     /// <summary>Schema version stored in <c>PRAGMA user_version</c>. v0 is the original, unversioned schema.</summary>
-    public const int SchemaVersion = 5;
+    public const int SchemaVersion = 6;
 
     public int UserVersion => Convert.ToInt32(Scalar("PRAGMA user_version"));
 
@@ -139,6 +139,12 @@ public sealed class ClipStore : IDisposable
                         id TEXT PRIMARY KEY, name TEXT NOT NULL, label TEXT, created INTEGER NOT NULL, updated INTEGER NOT NULL,
                         space_id TEXT);
                     """);
+            }
+            if (version < 6)
+            {
+                // v6: secrets in folders. Secrets live in the vault, so the folder each one is in is kept here, by the
+                // secret's id (lowercase hyphenated when it's a UUID).
+                Exec("CREATE TABLE IF NOT EXISTS secret_folders (secret_id TEXT PRIMARY KEY, folder_id TEXT NOT NULL);");
             }
             Exec($"PRAGMA user_version = {SchemaVersion}");
             Exec("COMMIT");
@@ -548,6 +554,8 @@ public sealed class ClipStore : IDisposable
                 Save(item);
                 moved++;
             }
+            moved += Convert.ToInt32(Scalar("SELECT COUNT(*) FROM secret_folders WHERE folder_id = $f", ("$f", SyncId(folder.Id))));
+            Exec("DELETE FROM secret_folders WHERE folder_id = $f", ("$f", SyncId(folder.Id)));
             RemoveFolder(folder.Id);
         }
         return moved;
@@ -585,6 +593,42 @@ public sealed class ClipStore : IDisposable
             }
         }
         return moved;
+    }
+
+    // MARK: Secrets in folders
+
+    /// <summary>The key a secret's folder is kept under: its id lowercase hyphenated when it's a UUID (the vault
+    /// spells ids either way), else as is.</summary>
+    public static string SecretKey(string secretId) => Guid.TryParse(secretId, out var g) ? SyncId(g) : secretId;
+
+    /// <summary>Every secret that names a folder: secret key → folder id. The folder may not be here (yet): such a
+    /// secret reads as the root of Saved, like a clip.</summary>
+    public Dictionary<string, Guid> SecretFolders()
+    {
+        using var cmd = _db.CreateCommand();
+        cmd.CommandText = "SELECT secret_id, folder_id FROM secret_folders";
+        using var r = cmd.ExecuteReader();
+        var map = new Dictionary<string, Guid>();
+        while (r.Read())
+            if (Guid.TryParse(r.GetString(1), out var folder)) map[r.GetString(0)] = folder;
+        return map;
+    }
+
+    public Guid? SecretFolderId(string secretId) =>
+        Scalar("SELECT folder_id FROM secret_folders WHERE secret_id = $s", ("$s", SecretKey(secretId))) is string id && Guid.TryParse(id, out var g) ? g : null;
+
+    /// <summary>Puts a secret in a folder, or (null) at the root of Saved; secrets are always saved. Returns whether
+    /// anything changed.</summary>
+    public bool SetSecretFolder(string secretId, Guid? folderId)
+    {
+        if (SecretFolderId(secretId) == folderId) return false;
+        if (folderId is { } id)
+            Exec("INSERT INTO secret_folders (secret_id, folder_id) VALUES ($s, $f) ON CONFLICT(secret_id) DO UPDATE SET folder_id = $f",
+                ("$s", SecretKey(secretId)), ("$f", SyncId(id)));
+        else
+            Exec("DELETE FROM secret_folders WHERE secret_id = $s", ("$s", SecretKey(secretId)));
+        Commit();
+        return true;
     }
 
     /// <summary>Share to Group for a folder: a new folder (same name and label) in <paramref name="spaceId"/>, holding

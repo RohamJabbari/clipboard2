@@ -81,7 +81,8 @@ public static class BackupCrypto
 }
 
 /// <summary>A secret to export, read after Windows Hello.</summary>
-public sealed record BackupSecret(string Id, string Name, string Value, DateTime? CreatedAt);
+/// <param name="Folder">The personal Saved folder it's in (1.7+), written as the entry's "folder".</param>
+public sealed record BackupSecret(string Id, string Name, string Value, DateTime? CreatedAt, Guid? Folder = null);
 
 /// <summary>Personal items, snippets and Saved folders to back up, and where their images are.</summary>
 public sealed record BackupSource(IReadOnlyList<ClipItem> Items, IReadOnlyList<Snippet> Snippets, BlobStore Blobs)
@@ -179,7 +180,7 @@ public static class Backup
             var list = new JsonArray();
             foreach (var secret in secrets)
             {
-                var payload = SyncPayload.ForSecret(secret.Name, secret.Value, secret.CreatedAt);
+                var payload = SyncPayload.ForSecret(secret.Name, secret.Value, secret.CreatedAt, secret.Folder);
                 payload.Remove("rev");
                 payload["id"] = secret.Id;
                 list.Add(payload);
@@ -217,10 +218,11 @@ public static class Backup
     public static BackupImportResult Merge(JsonObject root, ClipStore store, ISecretVault? vault)
     {
         int clips = 0, snippets = 0, secrets = 0, duplicates = 0, unreadable = 0;
+        // Backup folder id → the personal folder it joined or became; clips and secrets in it go there.
+        var folderIds = new Dictionary<Guid, Guid>();
         using (store.Batch())
         {
             // Folders first: a backup's folder joins a personal one with the same name, or is added (with a new id).
-            var folderIds = new Dictionary<Guid, Guid>();
             var byName = store.FoldersInSpace(null).GroupBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase)
                 .ToDictionary(g => g.Key, g => g.First().Id, StringComparer.CurrentCultureIgnoreCase);
             foreach (var entry in Entries(root, "folders").OfType<JsonObject>())
@@ -281,7 +283,9 @@ public static class Backup
                     continue;
                 }
                 if (!existing.Add((name, value))) { duplicates++; continue; }
-                if (vault.Add(name, value) is null) { unreadable++; continue; }
+                if (vault.Add(name, value) is not { } added) { unreadable++; continue; }
+                if (Guid.TryParse(Str(entry, "folder"), out var old) && folderIds.TryGetValue(old, out var folderId))
+                    store.SetSecretFolder(added.Id, folderId);
                 secrets++;
             }
         }

@@ -94,7 +94,7 @@ public sealed partial class SettingsWindow
             secrets = [.. _services.Secrets.All.Where(s => s.SpaceId is null)
                 .Select(s => (Secret: s, Value: _services.Secrets.ReadValue(s)))
                 .Where(x => x.Value is not null)
-                .Select(x => new BackupSecret(x.Secret.Id, x.Secret.Name, x.Value!, x.Secret.CreatedAt))];
+                .Select(x => new BackupSecret(x.Secret.Id, x.Secret.Name, x.Value!, x.Secret.CreatedAt, _services.Store.SecretFolderId(x.Secret.Id)))];
         }
         if (AskNewBackupPassphrase() is not { } passphrase) return;
         var dialog = new Microsoft.Win32.SaveFileDialog

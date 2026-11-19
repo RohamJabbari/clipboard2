@@ -768,6 +768,7 @@ public sealed partial class SyncEngine
                 break;
             case ItemPayload.Secret secret:
                 vault.Put(id, secret.Name, secret.Value, space.LocalId);
+                store.SetSecretFolder(ClipStore.SyncId(id), secret.Folder);   // an unknown id reads as the root
                 break;
         }
         // Remember the local rendering, so a payload written by another platform doesn't bounce back. After merging
@@ -788,7 +789,11 @@ public sealed partial class SyncEngine
         // Only the folder: its clips keep naming it and read as the root of Saved, without being pushed again.
         if (store.FindFolder(id) is { } folder && folder.SpaceId == space.LocalId) store.RemoveFolder(folder.Id);
         if (store.AllSnippets().FirstOrDefault(s => s.Id == id && s.SpaceId == space.LocalId) is { } snippet) store.DeleteSnippet(snippet);
-        if (vault.Secrets.FirstOrDefault(s => SecretGuid(s) == id && s.SpaceId == space.LocalId) is { } secret) vault.Delete(secret);
+        if (vault.Secrets.FirstOrDefault(s => SecretGuid(s) == id && s.SpaceId == space.LocalId) is { } secret)
+        {
+            vault.Delete(secret);
+            store.SetSecretFolder(secret.Id, null);
+        }
     }
 
     // MARK: Local items
@@ -810,7 +815,7 @@ public sealed partial class SyncEngine
             SyncCategory.ForClip(c.Item), SyncPayload.Millis(c.Item.LastCopiedAt)),
         LocalItem.SnippetItem s => new(SyncPayload.ForSnippet(s.Snippet), SyncCategory.Snippet, SyncPayload.Millis(s.Snippet.UpdatedAt)),
         LocalItem.FolderItem f => new(SyncPayload.ForFolder(f.Folder), SyncCategory.Folder, SyncPayload.Millis(f.Folder.CreatedAt)),
-        LocalItem.Secret k => new(SyncPayload.ForSecret(k.Ref.Name, k.Value, k.Ref.CreatedAt), SyncCategory.Secret,
+        LocalItem.Secret k => new(SyncPayload.ForSecret(k.Ref.Name, k.Value, k.Ref.CreatedAt, store.SecretFolderId(k.Ref.Id)), SyncCategory.Secret,
             SyncPayload.Millis(k.Ref.CreatedAt ?? _now())),
         _ => throw new InvalidOperationException(),
     };
