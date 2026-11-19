@@ -122,7 +122,9 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
  "imageBlob":"<blob uuid>","thumbBlob":"<blob uuid>","imageWidth":0,"imageHeight":0,"byteCount":0,
  "sourceId":"com.apple.Safari","sourceName":"Safari",
  "isPinned":false,"pinnedAt":null,"label":null,"copyCount":1,
- "createdAt":0,"lastCopiedAt":0,"contentHash":"text:…"}
+ "createdAt":0,"lastCopiedAt":0,"contentHash":"text:…","folder":"<folder item id>"}
+// type "folder"
+{"v":1,"type":"folder","name":"…","label":null,"createdAt":0,"updatedAt":0}
 // type "snippet"
 {"v":1,"type":"snippet","name":"…","keyword":"…","body":"…","createdAt":0,"updatedAt":0}
 // type "secret"
@@ -139,8 +141,15 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
 | `pinned` | clip with `isPinned: true` | `lastCopiedAt` |
 | `snippet` | snippet | `updatedAt` |
 | `secret` | secret | `createdAt` |
+| `folder` | folder | `createdAt` |
 
 Pinning or unpinning changes the category, and the category is part of the AAD, so the client re-encrypts and `PUT`s again.
+
+**Folders** group saved clips within one space (personal or group; not contacts in v1), one level deep.
+- A clip in a folder has `isPinned: true` and `folder` set to the folder item's id; it travels as `pinned`. Clearing `isPinned` clears `folder`.
+- A `folder` id the reader doesn't have (deleted, or not pulled yet) means the clip sits at the root of Saved.
+- Deleting a folder deletes only the folder: each member's client moves its clips to the root lazily (they already read as root, above), and the device that deleted it re-pushes its clips without `folder`.
+- Clients before 1.6 skip the `folder` category and drop the unknown `folder` field when they re-push a clip, which moves it to the root.
 
 ## API
 
@@ -335,12 +344,12 @@ Deleting an account deletes all its direct spaces.
 - The writer becomes the item's `authorUid`.
 
 ```jsonc
-Item = {"id","category":"history|pinned|snippet|secret","seq","sortAt","updatedAt",
+Item = {"id","category":"history|pinned|snippet|secret|folder","seq","sortAt","updatedAt",
         "deleted":null|"user"|"trimmed","ciphertext":null|"<b64>","blobIds":[],"authorUid"}
 ```
 
 **Retention:**
-- `pinned`, `snippet` and `secret` items stay until deleted.
+- `pinned`, `snippet`, `secret` and `folder` items stay until deleted.
 - After any `history` upsert, the server keeps the newest **200** `history` items in that space by `sortAt`, ties broken by `id`. All others become `trimmed` tombstones, their blobs are deleted, and the `PUT` response lists them.
 - Tombstones are kept for **90 days**. A `since` older than the space's purge horizon returns `{resetRequired: true}`, and the client re-syncs from `since=0`. While re-walking from 0, the client sends `full=1` so pages below the horizon don't ask for another reset.
 
