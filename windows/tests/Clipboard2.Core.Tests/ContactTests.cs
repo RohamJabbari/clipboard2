@@ -42,7 +42,7 @@ public sealed partial class SyncEngineTests
     {
         var a = await SignedUp();
         Assert.NotEmpty(_cloud.SpacesQueries);
-        Assert.All(_cloud.SpacesQueries, q => Assert.Equal("?include=direct", q));
+        Assert.All(_cloud.SpacesQueries, q => Assert.Equal("?include=direct,authenticator", q));
         Assert.Empty(a.Account.Contacts);
     }
 

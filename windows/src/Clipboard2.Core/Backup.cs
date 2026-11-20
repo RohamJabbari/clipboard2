@@ -88,13 +88,15 @@ public sealed record BackupSecret(string Id, string Name, string Value, DateTime
 public sealed record BackupSource(IReadOnlyList<ClipItem> Items, IReadOnlyList<Snippet> Snippets, BlobStore Blobs)
 {
     public IReadOnlyList<ClipFolder> Folders { get; init; } = [];
+    /// <summary>The user's own authenticators; written only with secrets (codes shared with them never are).</summary>
+    public IReadOnlyList<Authenticator> Authenticators { get; init; } = [];
 }
 
-public sealed record BackupSummary(int Clips, int Snippets, int Secrets);
+public sealed record BackupSummary(int Clips, int Snippets, int Secrets, int Authenticators = 0);
 
 /// <param name="Duplicates">Entries skipped because the same content was already here.</param>
 /// <param name="Unreadable">Entries skipped because they were incomplete (e.g. an image without its picture).</param>
-public sealed record BackupImportResult(int Clips, int Snippets, int Secrets, int Duplicates, int Unreadable)
+public sealed record BackupImportResult(int Clips, int Snippets, int Secrets, int Duplicates, int Unreadable, int Authenticators = 0)
 {
     public string Describe()
     {
@@ -102,6 +104,7 @@ public sealed record BackupImportResult(int Clips, int Snippets, int Secrets, in
         if (Clips > 0) parts.Add(Clips == 1 ? "1 item" : $"{Clips} items");
         if (Snippets > 0) parts.Add(Snippets == 1 ? "1 snippet" : $"{Snippets} snippets");
         if (Secrets > 0) parts.Add(Secrets == 1 ? "1 secret" : $"{Secrets} secrets");
+        if (Authenticators > 0) parts.Add(Authenticators == 1 ? "1 authenticator" : $"{Authenticators} authenticators");
         var text = parts.Count == 0 ? "Nothing new to import." : "Imported " + string.Join(", ", parts) + ".";
         if (Duplicates > 0) text += Duplicates == 1 ? " Skipped 1 duplicate." : $" Skipped {Duplicates} duplicates.";
         if (Unreadable > 0) text += Unreadable == 1 ? " 1 entry couldn't be read." : $" {Unreadable} entries couldn't be read.";
@@ -186,6 +189,14 @@ public static class Backup
                 list.Add(payload);
             }
             root["secrets"] = list;
+            // Added in 1.8: the otp payload plus "id". Only with secrets, like them.
+            if (source.Authenticators.Count > 0)
+                root["authenticators"] = new JsonArray([.. source.Authenticators.Select(a =>
+                {
+                    var payload = SyncPayload.ForOtp(a);
+                    payload["id"] = a.Id;
+                    return (JsonNode?)payload;
+                })]);
         }
         return root;
     }
@@ -211,31 +222,62 @@ public static class Backup
     }
 
     public static BackupSummary Summarize(JsonObject root) =>
-        new(Entries(root, "clips").Count, Entries(root, "snippets").Count, Entries(root, "secrets").Count);
+        new(Entries(root, "clips").Count, Entries(root, "snippets").Count, Entries(root, "secrets").Count, Entries(root, "authenticators").Count);
 
     /// <summary>Adds what isn't here yet to the personal space: clips by content hash, snippets by (name, body),
     /// secrets by (name, value) when a vault is given. Nothing is overwritten or deleted.</summary>
-    public static BackupImportResult Merge(JsonObject root, ClipStore store, ISecretVault? vault)
+    /// <param name="authenticators">With secrets only: each new authenticator is added as the user's own, skipping
+    /// one with the same issuer, account and secret.</param>
+    public static BackupImportResult Merge(JsonObject root, ClipStore store, ISecretVault? vault, AuthenticatorStore? authenticators = null)
+    {
+        var result = MergeContent(root, store, vault);
+        if (authenticators is null || vault is null) return result;
+        int added = 0, duplicates = 0, unreadable = 0;
+        foreach (var entry in Entries(root, "authenticators").OfType<JsonObject>())
+        {
+            var copy = entry.DeepClone().AsObject();
+            copy.Remove("id");
+            if (SyncPayload.Parse(Encoding.UTF8.GetBytes(copy.ToJsonString()), Guid.NewGuid(), null) is not ItemPayload.Otp { Authenticator: var a }) { unreadable++; continue; }
+            if (authenticators.All.Any(x => x.SameAs(a))) { duplicates++; continue; }
+            if (authenticators.Put(a with { SpaceId = null, Shares = null })) added++; else unreadable++;
+        }
+        return result with { Authenticators = added, Duplicates = result.Duplicates + duplicates, Unreadable = result.Unreadable + unreadable };
+    }
+
+    private static BackupImportResult MergeContent(JsonObject root, ClipStore store, ISecretVault? vault)
     {
         int clips = 0, snippets = 0, secrets = 0, duplicates = 0, unreadable = 0;
         // Backup folder id → the personal folder it joined or became; clips and secrets in it go there.
         var folderIds = new Dictionary<Guid, Guid>();
         using (store.Batch())
         {
-            // Folders first: a backup's folder joins a personal one with the same name, or is added (with a new id).
-            var byName = store.FoldersInSpace(null).GroupBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase)
-                .ToDictionary(g => g.Key, g => g.First().Id, StringComparer.CurrentCultureIgnoreCase);
+            // Folders first, parents before their subfolders: a backup's folder joins a personal one with the same name
+            // in the same parent, or is added (with a new id) there.
+            var tree = store.FolderTree(null);
+            var existing = new Dictionary<(Guid? Parent, string Name), Guid>();
+            foreach (var f in tree.All) existing.TryAdd((tree.ParentOf(f.Id), f.Name.ToLowerInvariant()), f.Id);
+            var backupFolders = new Dictionary<Guid, ClipFolder>();
             foreach (var entry in Entries(root, "folders").OfType<JsonObject>())
             {
                 if (!Guid.TryParse(Str(entry, "id"), out var oldId)) continue;
-                if (SyncPayload.Parse(Encoding.UTF8.GetBytes(entry.ToJsonString()), Guid.NewGuid(), null) is not ItemPayload.FolderPayload { Folder: var folder })
-                    continue;
-                if (!byName.TryGetValue(folder.Name, out var id))
+                if (SyncPayload.Parse(Encoding.UTF8.GetBytes(entry.ToJsonString()), oldId, null) is ItemPayload.FolderPayload { Folder: var folder })
+                    backupFolders[oldId] = folder;
+            }
+            var backupTree = new FolderTree(backupFolders.Values);
+            foreach (var folder in backupFolders.Values.OrderBy(f => backupTree.Depth(f.Id)))
+            {
+                Guid? parent = backupTree.ParentOf(folder.Id) is { } oldParent && folderIds.TryGetValue(oldParent, out var newParent) ? newParent : null;
+                var key = (parent, folder.Name.ToLowerInvariant());
+                if (!existing.TryGetValue(key, out var id))
                 {
-                    store.PutFolder(folder);
-                    byName[folder.Name] = id = folder.Id;
+                    var added = new ClipFolder
+                    {
+                        Name = folder.Name, Label = folder.Label, CreatedAt = folder.CreatedAt, UpdatedAt = folder.UpdatedAt, ParentId = parent,
+                    };
+                    store.PutFolder(added);
+                    existing[key] = id = added.Id;
                 }
-                folderIds[oldId] = id;
+                folderIds[folder.Id] = id;
             }
             var hashes = store.ItemsInSpace(null).Select(i => i.ContentHash).ToHashSet();
             foreach (var entry in Entries(root, "clips").OfType<JsonObject>())

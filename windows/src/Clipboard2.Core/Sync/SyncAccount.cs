@@ -704,6 +704,78 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
         }
     }
 
+    // MARK: Authenticators
+
+    /// <summary>This user's authenticators and what others share with them (Credential Manager in the app).</summary>
+    public AuthenticatorStore Authenticators { get; set; } = new(new MemoryProtectedStore());
+
+    /// <summary>Whom an authenticator can be shared with: contacts and members of this user's groups, each once,
+    /// minus whoever has it already. By name.</summary>
+    public List<(string Uid, string Name)> ShareCandidates(Authenticator a)
+    {
+        var taken = a.People.Select(p => p.Uid).Append(Uid ?? "").ToHashSet();
+        var people = new Dictionary<string, string>();
+        foreach (var space in _store.SyncSpaces().Where(s => s.IsDirect || s.IsGroup))
+            foreach (var (uid, name) in space.Members ?? new Dictionary<string, string>())
+                if (!taken.Contains(uid) && name.Length > 0) people.TryAdd(uid, name);
+        return [.. people.Select(p => (p.Key, p.Value)).OrderBy(p => p.Value, StringComparer.CurrentCultureIgnoreCase)];
+    }
+
+    public Task<bool> ShareAuthenticatorAsync(Authenticator a, string uid, string name) => Run($"Sharing with {name}…", async ct =>
+    {
+        await WithEngineIdleAsync();
+        await RequireEngine().ShareAuthenticatorAsync(a, uid, ct);
+        Status = $"Shared with {name}. They get codes, never the secret.";
+    }, keepStatus: true);
+
+    /// <summary>Until when the removed person's codes keep working, or null when it failed.</summary>
+    public async Task<DateTime?> RemoveAuthenticatorShareAsync(Authenticator a, string uid)
+    {
+        DateTime? until = null;
+        var ok = await Run("Removing…", async ct =>
+        {
+            await WithEngineIdleAsync();
+            until = await RequireEngine().RemoveShareAsync(a, uid, ct) ?? _now();
+        });
+        return ok ? until : null;
+    }
+
+    public Task<bool> TransferAuthenticatorAsync(Authenticator a, string uid, string name) => Run($"Transferring to {name}…", async ct =>
+    {
+        await WithEngineIdleAsync();
+        await RequireEngine().TransferAuthenticatorAsync(a, uid, ct);
+    });
+
+    public Task<bool> LeaveAuthenticatorAsync(SharedAuthenticator shared) => Run("Leaving…", async ct =>
+    {
+        await WithEngineIdleAsync();
+        await RequireEngine().LeaveSharedAsync(shared, ct);
+    });
+
+    /// <summary>Deletes it for everyone; signed out (or never synced), only here.</summary>
+    public async Task<bool> DeleteAuthenticatorAsync(Authenticator a)
+    {
+        if (_engine is null || a.SpaceId is null)
+        {
+            Authenticators.Delete(a.Id);
+            return true;
+        }
+        return await Run("Deleting…", async ct =>
+        {
+            await WithEngineIdleAsync();
+            await RequireEngine().DeleteAuthenticatorAsync(a, ct);
+        });
+    }
+
+    /// <summary>One writer at a time: a tick in progress finishes first.</summary>
+    private async Task WithEngineIdleAsync()
+    {
+        if (_running is { IsCompleted: false } running)
+        {
+            try { await running; } catch { }
+        }
+    }
+
     // MARK: Contacts
 
     /// <summary>The server's contact limits (PROTOCOL.md → Contacts), for the messages.</summary>
@@ -1123,7 +1195,7 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
         CurrentDeviceId = null;
         Devices = [];
         _engine?.ClearDownloads();
-        _engine = new SyncEngine(_store, _vault, _api, identity, _now, _pins) { Logger = m => Logger?.Invoke(m) };
+        _engine = new SyncEngine(_store, _vault, _api, identity, _now, _pins, Authenticators) { Logger = m => Logger?.Invoke(m) };
         _engine.ReceivedFromDevice += (item, from) => ReceivedFromDevice?.Invoke(item, from);
         _engine.ReceivedFromContact += (item, from) => ReceivedFromContact?.Invoke(item, from);
         _contactsFetched = null;
@@ -1166,6 +1238,10 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
     /// <summary>Group data, sync meta and cursors go; personal history and secrets stay.</summary>
     private void ResetLocalSync()
     {
+        // Own authenticators stay (they're personal tools) and get a new space at the next sign-in; codes shared
+        // with this account go.
+        foreach (var shared in Authenticators.Shared.ToList()) Authenticators.DeleteShared(shared.SpaceId);
+        foreach (var own in Authenticators.All.Where(a => a.SpaceId is not null).ToList()) Authenticators.Put(own with { SpaceId = null, Shares = null });
         foreach (var secret in _vault.Secrets.Where(s => s.SpaceId is not null).ToList()) _vault.Delete(secret);
         _store.ResetSync();
     }

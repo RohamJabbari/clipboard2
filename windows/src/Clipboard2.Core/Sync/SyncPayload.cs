@@ -7,7 +7,7 @@ namespace Clipboard2.Core.Sync;
 
 public static class SyncCategory
 {
-    public const string History = "history", Pinned = "pinned", Snippet = "snippet", Secret = "secret", Folder = "folder";
+    public const string History = "history", Pinned = "pinned", Snippet = "snippet", Secret = "secret", Folder = "folder", Otp = "otp";
     public static string ForClip(ClipItem item) => item.IsPinned ? Pinned : History;
 }
 
@@ -29,6 +29,8 @@ public abstract record ItemPayload
     public sealed record FolderPayload(ClipFolder Folder) : ItemPayload;
     /// <param name="Folder">The Saved folder it's in (1.7+), like a clip's; an id this device doesn't have reads as the root.</param>
     public sealed record Secret(string Name, string Value, DateTime? CreatedAt, Guid? Folder = null) : ItemPayload;
+    /// <summary>An authenticator (only in its own authenticator space, only ever read by its owner).</summary>
+    public sealed record Otp(Authenticator Authenticator) : ItemPayload;
 }
 
 /// <summary>One file of a file item, uploaded as an encrypted blob. <see cref="Size"/> is the plaintext byte count.
@@ -95,6 +97,7 @@ public static partial class SyncPayload
         if (folder.Label is { } label) json["label"] = label;
         json["createdAt"] = Millis(folder.CreatedAt);
         json["updatedAt"] = Millis(folder.UpdatedAt);
+        if (folder.ParentId is { } parent) json["parent"] = ClipStore.SyncId(parent);   // 1.8; left out at the top level
         return json;
     }
 
@@ -105,6 +108,20 @@ public static partial class SyncPayload
         if (f.Folder) json["folder"] = true;
         return json;
     }
+
+    public static JsonObject ForOtp(Authenticator a) => new()
+    {
+        ["v"] = Version,
+        ["type"] = "otp",
+        ["issuer"] = a.Issuer,
+        ["account"] = a.Account,
+        ["secret"] = Base32.Normalize(a.Secret),
+        ["algorithm"] = a.Algorithm.ToString(),
+        ["digits"] = a.Digits,
+        ["period"] = a.Period,
+        ["createdAt"] = Millis(a.CreatedAt),
+        ["updatedAt"] = Millis(a.UpdatedAt),
+    };
 
     public static JsonObject ForSnippet(Snippet snippet) => new()
     {
@@ -235,10 +252,21 @@ public static partial class SyncPayload
                     Label = Str(json, "label") is { Length: > 0 } label ? label : null,
                     CreatedAt = Time(json, "createdAt") ?? DateTime.UtcNow,
                     UpdatedAt = Time(json, "updatedAt") ?? Time(json, "createdAt") ?? DateTime.UtcNow,
+                    ParentId = Guid.TryParse(Str(json, "parent"), out var parentFolder) && parentFolder != id ? parentFolder : null,
                 });
             case "secret":
                 return new ItemPayload.Secret(Str(json, "name") ?? "Untitled", Str(json, "value") ?? "", Time(json, "createdAt"),
                     Guid.TryParse(Str(json, "folder"), out var secretFolder) ? secretFolder : null);
+            case "otp":
+                var otpSecret = Base32.Normalize(Str(json, "secret") ?? "");
+                if (Base32.Decode(otpSecret) is null) return null;
+                var algorithm = OtpAuthUri.TryAlgorithm(Str(json, "algorithm") ?? "SHA1", out var alg) ? alg : OtpAlgorithm.SHA1;
+                var otpCreated = Time(json, "createdAt") ?? DateTime.UtcNow;
+                var digits = Int(json, "digits");
+                var period = Int(json, "period");
+                return new ItemPayload.Otp(new Authenticator(ClipStore.SyncId(id), Str(json, "issuer") ?? "", Str(json, "account") ?? "", otpSecret,
+                    algorithm, digits is >= 6 and <= 8 ? digits : Authenticator.DefaultDigits, period > 0 ? period : Authenticator.DefaultPeriod,
+                    otpCreated, Time(json, "updatedAt") ?? otpCreated, spaceId));
             default:
                 return null;
         }

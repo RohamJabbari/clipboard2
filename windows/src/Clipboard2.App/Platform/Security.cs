@@ -128,6 +128,24 @@ public sealed class CredentialKeyStore : IKeyStore
     public void Delete(string account) => CredentialManager.Delete(Target(account));
 }
 
+/// <summary>Authenticators (and codes shared with this user) in Credential Manager under "Clipboard2/otp/&lt;key&gt;",
+/// DPAPI-protected like secrets. A batch of shared codes is split into parts by <see cref="CredentialManager"/>.</summary>
+public sealed class CredentialProtectedStore : IProtectedStore
+{
+    private const string Prefix = "Clipboard2/otp/";
+
+    public IEnumerable<KeyValuePair<string, string>> All() =>
+        CredentialManager.Enumerate(Prefix + "*")
+            .Select(e => e.Target[Prefix.Length..])
+            .Select(key => KeyValuePair.Create(key, CredentialManager.Read(Prefix + key)))
+            .Where(p => p.Value is { Length: > 0 })
+            .Select(p => KeyValuePair.Create(p.Key, p.Value!))
+            .ToList();
+
+    public bool Write(string key, string value) => CredentialManager.Write(Prefix + key, value, comment: "Clipboard2 authenticator");
+    public void Delete(string key) => CredentialManager.Delete(Prefix + key);
+}
+
 /// <summary>Secrets: values only in Credential Manager; pasting asks Windows Hello unless unlocked.
 /// A synced group secret keeps its group id in the credential's UserName (personal ones have the Windows user name).</summary>
 public sealed class SecretVault : ISecretVault
@@ -286,6 +304,9 @@ public sealed class SecretVault : ISecretVault
         _lastAuthentication = DateTime.Now;
         return true;
     }
+
+    /// <summary>Always asks Windows Hello, even while secrets are unlocked (showing an authenticator's seed).</summary>
+    public Task<bool> VerifyFreshAsync(string reason) => VerifyAsync(reason);
 
     public async Task<bool> UnlockForAsync(TimeSpan duration, string label)
     {

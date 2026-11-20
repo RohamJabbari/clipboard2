@@ -13,6 +13,9 @@ public sealed class FolderTests : IDisposable
     private readonly FakeHost _host = new();
     private readonly PanelModel _model;
 
+    /// <summary>The folder picker without its "New Folder in ‹folder›…" rows (nested-folders.md).</summary>
+    private List<PanelAction> Picks() => [.. _model.FilteredActions.Where(a => a is not PanelAction.MoveToNewFolder { ParentId: not null })];
+
     public FolderTests()
     {
         _model = new PanelModel(_store, _settings, new QuickSlots(_settings), _vault, _host);
@@ -51,7 +54,7 @@ public sealed class FolderTests : IDisposable
 
         _model.Perform(new PanelAction.MoveToFolder());
         Assert.True(_model.IsPickingFolder);
-        Assert.Equal([new PanelAction.MoveTo(folder.Id, "Work"), new PanelAction.MoveToNewFolder()], _model.FilteredActions);
+        Assert.Equal([new PanelAction.MoveTo(folder.Id, "Work"), new PanelAction.MoveToNewFolder()], Picks());
         _model.Perform(new PanelAction.MoveTo(folder.Id, "Work"));
         Assert.Equal((true, folder.Id), (Fresh(item).IsPinned, Fresh(item).FolderId));
         Assert.Equal("Moved to “Work”", _model.Notice);
@@ -94,11 +97,11 @@ public sealed class FolderTests : IDisposable
         _model.SetFilter(PanelFilter.Labelled);
         Assert.Equal(["[Trip 2]"], Titles());
         _model.Select(_model.Entries[0].Id);
-        Assert.Equal([new PanelAction.OpenFolder(), new PanelAction.RenameFolder(), new PanelAction.SetLabel(), new PanelAction.DeleteFolder()],
+        Assert.Equal([new PanelAction.OpenFolder(), new PanelAction.RenameFolder(), new PanelAction.SetLabel(), new PanelAction.NewFolderInside(), new PanelAction.DeleteFolder()],
             _model.AvailableActions);
         _model.Perform(new PanelAction.DeleteFolder());
 
-        Assert.Equal("Folder deleted · 2 items moved to Saved", _model.Notice);
+        Assert.Equal("Folder deleted · moved 2 items to Saved", _model.Notice);
         Assert.Empty(_store.AllFolders());
         Assert.All(new[] { a, b }, i => Assert.Equal((true, (Guid?)null), (Fresh(i).IsPinned, Fresh(i).FolderId)));
         Assert.Equal(["b", "a"], Titles());
@@ -267,8 +270,8 @@ public sealed class FolderTests : IDisposable
         Assert.Equal("g1", _store.AllFolders().Single(f => f.Name == "New Folder").SpaceId);
         _model.Select(new PanelEntry.Clip(groupRoot).Id);
         _model.Perform(new PanelAction.MoveToFolder());
-        Assert.Equal(["New Folder", "Shared", "New Folder…", "Mine", "New Folder…"], _model.FilteredActions.Select(a => a.Title));
-        Assert.Equal(["Team", "Team", "Team", "Mine", "Mine"], _model.FilteredActions.Select(a => a.Section("AI")));
+        Assert.Equal(["New Folder", "Shared", "New Folder…", "Mine", "New Folder…"], Picks().Select(a => a.Title));
+        Assert.Equal(["Team", "Team", "Team", "Mine", "Mine"], Picks().Select(a => a.Section("AI")));
         _model.ResetMode();
 
         // The choice is remembered per group.

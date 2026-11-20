@@ -128,6 +128,9 @@ public sealed class ClipFolder
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
     /// <summary>Sync group id, or null for the personal space.</summary>
     public string? SpaceId { get; set; }
+    /// <summary>The folder it sits in (same space), or null at the top level. As stored: <see cref="FolderTree"/> says
+    /// how it reads (an unknown parent, a cycle or too deep is the top level).</summary>
+    public Guid? ParentId { get; set; }
 }
 
 /// <summary>A clipboard capture after hashing / image encoding, ready to store.</summary>
@@ -199,6 +202,8 @@ public sealed record SpaceRecord(string Id, string Kind, string Role, string? Na
     public bool IsGroup => Kind == "group";
     /// <summary>A contact: a two-person space without a name (docs/sync/PROTOCOL.md → Contacts).</summary>
     public bool IsDirect => Kind == SpaceKinds.Direct;
+    /// <summary>One authenticator of this user (docs/sync/PROTOCOL.md → Authenticators).</summary>
+    public bool IsAuthenticator => Kind == SpaceKinds.Authenticator;
     public bool IsOwner => Role == "owner";
     public string DisplayName => string.IsNullOrWhiteSpace(Name) ? (IsDirect ? "Contact" : "Untitled group") : Name!;
 
@@ -224,7 +229,7 @@ public sealed record SpaceRecord(string Id, string Kind, string Role, string? Na
 
 public static class SpaceKinds
 {
-    public const string Personal = "personal", Group = "group", Direct = "direct";
+    public const string Personal = "personal", Group = "group", Direct = "direct", Authenticator = "authenticator";
 }
 
 /// <summary>The signed-in sync user, for telling own items apart in groups.</summary>

@@ -445,7 +445,13 @@ final class SaveSecretState {
 
     init(item: ClipItem) {
         self.item = item
-        self.name = item.sourceAppName.map { "Password from \($0)" } ?? "New Secret"
+        self.name = SaveSecretState.suggestedName(for: item)
+    }
+
+    /// The item's label if it has one, else where it came from.
+    static func suggestedName(for item: ClipItem) -> String {
+        if let label = item.label?.trimmingCharacters(in: .whitespaces), !label.isEmpty { return label }
+        return item.sourceAppName.map { "Password from \($0)" } ?? "New Secret"
     }
 }
 
@@ -1618,18 +1624,28 @@ final class PanelViewModel {
 
     func beginSaveSecret(_ item: ClipItem) {
         selectedID = PanelEntry.clip(item).id
+        // Labelled already: that's its name, so there's nothing to ask.
+        if let label = item.label?.trimmingCharacters(in: .whitespaces), !label.isEmpty {
+            saveAsSecret(item, name: label)
+            return
+        }
         saveSecretForm = SaveSecretState(item: item)
         mode = .saveSecret
     }
 
     func submitSaveSecret() {
         guard let form = saveSecretForm else { return }
-        let name = form.name.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty, env.secrets.add(name: name, value: form.item.text) != nil else {
+        saveAsSecret(form.item, name: form.name.trimmingCharacters(in: .whitespaces))
+    }
+
+    private func saveAsSecret(_ item: ClipItem, name: String) {
+        // A personal item's secret stays in its folder; a group item's becomes a personal secret, as before.
+        let folderID = item.spaceID == nil ? item.folderID : nil
+        guard !name.isEmpty, env.secrets.add(name: name, value: item.text, folderID: folderID) != nil else {
             showNotice("Couldn't save to the Keychain")
             return
         }
-        if !form.item.isTransient { env.store.delete(form.item) }
+        if !item.isTransient { env.store.delete(item) }
         resetMode()
         refresh()
         showNotice("Saved “\(name)” to Secrets and removed it from history")

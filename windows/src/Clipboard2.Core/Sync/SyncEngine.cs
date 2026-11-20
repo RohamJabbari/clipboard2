@@ -144,8 +144,9 @@ public sealed partial class SyncEngine
     private readonly HashSet<string> _announceFromStart = [];
 
     public SyncEngine(ClipStore store, ISecretVault vault, SyncApi api, SyncIdentity identity, Func<DateTime>? clock = null,
-                      SpaceKeyPins? pins = null)
+                      SpaceKeyPins? pins = null, AuthenticatorStore? authenticators = null)
     {
+        Authenticators = authenticators ?? new AuthenticatorStore(new MemoryProtectedStore(), clock);
         this.store = store;
         this.vault = vault;
         this.api = api;
@@ -159,6 +160,8 @@ public sealed partial class SyncEngine
     public FolderArchiveCache FolderArchives { get; set; }
 
     public SyncIdentity Identity { get; }
+    /// <summary>This user's authenticators and the codes others share with them.</summary>
+    public AuthenticatorStore Authenticators { get; }
     public Action<string>? Logger { get; set; }
     public IReadOnlyCollection<SyncSpace> Spaces => _spaces.Values;
     public SyncSpace? Space(string id) => _spaces.GetValueOrDefault(id);
@@ -191,11 +194,16 @@ public sealed partial class SyncEngine
             ct.ThrowIfCancellationRequested();
             await PullAsync(space, report, ct);
         }
+        // Authenticators added here (or while signed out) get their space before the pushes.
+        await CreatePendingAuthenticatorsAsync(report, ct);
+        spaces = _spaces.Values.OrderBy(s => s.IsPersonal).ToList();
         foreach (var space in spaces)
         {
             ct.ThrowIfCancellationRequested();
             await PushAsync(space, report, ct);
         }
+        await TopUpSharesAsync(report, force: false, ct);
+        await ReceiveSharedCodesAsync(ct);
         report.Warnings.AddRange(_leftOut.Where(l => _spaces.ContainsKey(l.Key.Space)).Select(l => l.Value).Distinct());
         return report;
     }
@@ -282,6 +290,10 @@ public sealed partial class SyncEngine
         // Nothing cached: this is the first sync after signing in, so whatever contacts send is old news.
         var firstSync = cached.Count == 0;
         var blocked = new List<SpaceRecord>();
+        // An authenticator's space only ever has its owner in it; one listed otherwise isn't read (the seed stays
+        // with the owner), and its local copy goes like that of any space this user lost.
+        infos = [.. infos.Where(s => s.Kind != SpaceKinds.Authenticator || s.Role == "owner")];
+        live = infos.Select(s => s.Id).ToHashSet();
         foreach (var info in infos)
         {
             if (_spaces.TryGetValue(info.Id, out var known) && known.Info.WrappedKey.AsSpan().SequenceEqual(info.WrappedKey))
@@ -314,7 +326,9 @@ public sealed partial class SyncEngine
         foreach (var gone in _spaces.Keys.Where(id => !live.Contains(id)).ToList()) _spaces.Remove(gone);
         _keyChanged.IntersectWith(live);
         // A group the user left or lost, or a contact either of them ended.
-        foreach (var record in store.SyncSpaces().Where(r => (r.IsGroup || r.IsDirect) && !live.Contains(r.Id))) RemoveGroupLocally(record.Id);
+        foreach (var record in store.SyncSpaces().Where(r => (r.IsGroup || r.IsDirect || r.IsAuthenticator) && !live.Contains(r.Id))) RemoveGroupLocally(record.Id);
+        // An authenticator whose space went (deleted on another device, or transferred to someone else).
+        foreach (var gone in Authenticators.All.Where(a => a.SpaceId is { } s && !live.Contains(s)).ToList()) Authenticators.Delete(gone.Id);
         // A blocked group stays listed (with its local items) so it can be left.
         store.SaveSyncSpaces(_spaces.Values.Select(s => s.Record).Concat(blocked));
     }
@@ -327,6 +341,8 @@ public sealed partial class SyncEngine
         _announceFromStart.Remove(spaceId);
         _keyChanged.Remove(spaceId);
         foreach (var secret in vault.Secrets.Where(s => s.SpaceId == spaceId).ToList()) vault.Delete(secret);
+        foreach (var a in Authenticators.All.Where(a => a.SpaceId == spaceId).ToList()) Authenticators.Delete(a.Id);
+        _sharesCheckedAt.Remove(spaceId);
         store.DeleteSpaceData(spaceId);
     }
 
@@ -556,6 +572,7 @@ public sealed partial class SyncEngine
         LocalItem.SnippetItem s => s.Snippet.UpdatedAt,
         LocalItem.FolderItem f => f.Folder.UpdatedAt,
         LocalItem.Secret k => k.Ref.CreatedAt,
+        LocalItem.OtpItem o => o.Authenticator.UpdatedAt,
         LocalItem.Clip c => c.Item.PinnedAt is { } pinned && pinned > c.Item.LastCopiedAt ? pinned : c.Item.LastCopiedAt,
         _ => null,
     };
@@ -766,6 +783,9 @@ public sealed partial class SyncEngine
             case ItemPayload.FolderPayload f:
                 store.PutFolder(f.Folder);   // clips that already name it move into it
                 break;
+            case ItemPayload.Otp otp when space.Info.Kind == SpaceKinds.Authenticator:
+                Authenticators.Put(otp.Authenticator with { SpaceId = space.Id, Shares = Authenticators.Find(otp.Authenticator.Id)?.Shares });
+                break;
             case ItemPayload.Secret secret:
                 vault.Put(id, secret.Name, secret.Value, space.LocalId);
                 store.SetSecretFolder(ClipStore.SyncId(id), secret.Folder);   // an unknown id reads as the root
@@ -784,6 +804,11 @@ public sealed partial class SyncEngine
     private void DeleteLocal(SyncSpace space, string itemId, string category)
     {
         if (!Guid.TryParse(itemId, out var id)) return;
+        if (Authenticators.Find(ClipStore.SyncId(id)) is { } a && a.SpaceId == space.Id)
+        {
+            Authenticators.Delete(a.Id);
+            return;
+        }
         if (store.Find(id) is { } clip && clip.SpaceId == space.LocalId) store.Delete(clip);
         if (category is SyncCategory.History or SyncCategory.Pinned) return;
         // Only the folder: its clips keep naming it and read as the root of Saved, without being pushed again.
@@ -804,6 +829,7 @@ public sealed partial class SyncEngine
         public sealed record SnippetItem(string Id, Snippet Snippet) : LocalItem(Id);
         public sealed record FolderItem(string Id, ClipFolder Folder) : LocalItem(Id);
         public sealed record Secret(string Id, SecretRef Ref, string Value) : LocalItem(Id);
+        public sealed record OtpItem(string Id, Authenticator Authenticator) : LocalItem(Id);
     }
 
     private sealed record Rendered(JsonObject Payload, string Category, long SortAt);
@@ -817,6 +843,7 @@ public sealed partial class SyncEngine
         LocalItem.FolderItem f => new(SyncPayload.ForFolder(f.Folder), SyncCategory.Folder, SyncPayload.Millis(f.Folder.CreatedAt)),
         LocalItem.Secret k => new(SyncPayload.ForSecret(k.Ref.Name, k.Value, k.Ref.CreatedAt, store.SecretFolderId(k.Ref.Id)), SyncCategory.Secret,
             SyncPayload.Millis(k.Ref.CreatedAt ?? _now())),
+        LocalItem.OtpItem o => new(SyncPayload.ForOtp(o.Authenticator), SyncCategory.Otp, SyncPayload.Millis(o.Authenticator.CreatedAt)),
         _ => throw new InvalidOperationException(),
     };
 
@@ -859,6 +886,8 @@ public sealed partial class SyncEngine
     private LocalItem? Local(SyncSpace space, string itemId, string category)
     {
         if (!Guid.TryParse(itemId, out var id)) return null;
+        if (space.Info.Kind == SpaceKinds.Authenticator)
+            return Authenticators.Find(ClipStore.SyncId(id)) is { } a && a.SpaceId == space.Id ? new LocalItem.OtpItem(itemId, a) : null;
         if (store.Find(id) is { } clip && clip.SpaceId == space.LocalId) return new LocalItem.Clip(itemId, clip);
         if (store.AllSnippets().FirstOrDefault(s => s.Id == id && s.SpaceId == space.LocalId) is { } snippet)
             return new LocalItem.SnippetItem(itemId, snippet);
@@ -876,6 +905,15 @@ public sealed partial class SyncEngine
     {
         var push = new List<LocalItem>();
         var live = new HashSet<string>();
+        if (space.Info.Kind == SpaceKinds.Authenticator)
+        {
+            foreach (var a in Authenticators.All.Where(a => a.SpaceId == space.Id))
+            {
+                live.Add(a.Id);
+                push.Add(new LocalItem.OtpItem(a.Id, a));
+            }
+            return (push, live);
+        }
         var history = 0;
         foreach (var clip in store.ItemsInSpace(space.LocalId))   // newest first
         {

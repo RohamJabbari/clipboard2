@@ -26,6 +26,9 @@ export interface Limits {
   contactsPerUser: number;
   pendingContactRequests: number;
   contactCodesPerUser: number;
+  authenticatorsPerUser: number;
+  sharedAuthenticatorsPerUser: number;
+  sharesPerAuthenticator: number;
   scryptConcurrency: number;
   scryptQueue: number;
 }
@@ -51,6 +54,9 @@ export const limits = (): Limits => ({
   contactsPerUser: int("LIMIT_CONTACTS_PER_USER", 200),
   pendingContactRequests: int("LIMIT_PENDING_CONTACT_REQUESTS", 50),
   contactCodesPerUser: int("LIMIT_CONTACT_CODES_PER_USER", 20),
+  authenticatorsPerUser: int("LIMIT_AUTHENTICATORS_PER_USER", 200),
+  sharedAuthenticatorsPerUser: int("LIMIT_SHARED_AUTHENTICATORS_PER_USER", 200),
+  sharesPerAuthenticator: int("LIMIT_SHARES_PER_AUTHENTICATOR", 20),
   scryptConcurrency: int("SCRYPT_CONCURRENCY", 2),
   scryptQueue: int("SCRYPT_QUEUE", 8),
 });

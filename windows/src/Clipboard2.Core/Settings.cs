@@ -66,6 +66,8 @@ public sealed class Settings
     /// <summary>Like Sparkle on the Mac: download quietly, install when the app quits (or is idle a while).</summary>
     public bool InstallUpdatesAutomatically { get; set; } = true;
     public bool HasLaunchedBefore { get; set; }
+    /// <summary>The one-time "keep your important codes on your phone too" tip was shown (first authenticator).</summary>
+    public bool AuthenticatorTipShown { get; set; }
     /// <summary>Debug override for the sync API base URL; null uses the built-in one.</summary>
     public string? SyncApiBaseUrl { get; set; }
     /// <summary>The group the "send to group" shortcut stores into.</summary>
