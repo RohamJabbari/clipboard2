@@ -24,6 +24,7 @@ struct SyncSettingsView: View {
                 NeedsPasswordSection(sync: sync, email: email)
             case .signedIn(let email):
                 SyncStatusSection(sync: sync, email: email)
+                NotificationsSection()
                 SyncGroupsSection(sync: sync)
                 GroupSafetySection()
                 SyncContactsSection(sync: sync)

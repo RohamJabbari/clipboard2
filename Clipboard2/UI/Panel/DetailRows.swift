@@ -176,13 +176,20 @@ struct AddItemsView: View {
     var body: some View {
         let shown = form.shown
         VStack(alignment: .leading, spacing: 10) {
-            Label(form.folder.map { "Add to “\($0.name)”" } ?? "Add to Saved", systemImage: "plus.circle")
-                .font(.headline)
+            if let contact = form.contact {
+                Label("Send to \(contact.name)", systemImage: "paperplane")
+                    .font(.headline)
+            } else {
+                Label(form.folder.map { "Add to “\($0.name)”" } ?? "Add to Saved", systemImage: "plus.circle")
+                    .font(.headline)
+            }
             TextField("Search history", text: $form.query)
                 .textFieldStyle(.roundedBorder)
                 .focused($searchFocused)
             if shown.isEmpty {
-                Text(form.candidates.isEmpty ? "Everything in your history is saved already." : "No matches.")
+                Text(form.candidates.isEmpty
+                     ? (form.contact == nil ? "Everything in your history is saved already." : "Your history is empty.")
+                     : "No matches.")
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 0)
             } else {
@@ -209,7 +216,8 @@ struct AddItemsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button(form.checked.isEmpty ? "Add" : "Add \(form.checked.count)", action: onSubmit)
+                let verb = form.contact == nil ? "Add" : "Send"
+                Button(form.checked.isEmpty ? verb : "\(verb) \(form.checked.count)", action: onSubmit)
                     .keyboardShortcut(.defaultAction)
                     .disabled(form.checked.isEmpty)
             }

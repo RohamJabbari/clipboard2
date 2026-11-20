@@ -110,6 +110,9 @@ final class Preferences {
         static let pasteIcon = "pasteIcon"
         static let selectionIconHiddenApps = "selectionIconHiddenApps"
         static let pasteIconHiddenApps = "pasteIconHiddenApps"
+        static let notificationsEnabled = "notificationsEnabled"
+        static let notificationKindsOff = "notificationKindsOff"
+        static let mutedNotificationGroups = "mutedNotificationGroups"
     }
 
     /// 0 means "ask every time".
@@ -195,6 +198,33 @@ final class Preferences {
         didSet { defaults.set(explainSendToGroupChange, forKey: Key.explainSendToGroupChange) }
     }
 
+    /// Notifications (Settings → Sync): the master switch, the kinds switched off, muted groups.
+    var notificationsEnabled: Bool { didSet { defaults.set(notificationsEnabled, forKey: Key.notificationsEnabled) } }
+    var notificationKindsOff: Set<NotificationKind> {
+        didSet { defaults.set(notificationKindsOff.map(\.rawValue).sorted(), forKey: Key.notificationKindsOff) }
+    }
+    var mutedNotificationGroups: Set<String> {
+        didSet { defaults.set(mutedNotificationGroups.sorted(), forKey: Key.mutedNotificationGroups) }
+    }
+
+    var notificationSettings: NotificationSettings {
+        NotificationSettings(enabled: notificationsEnabled,
+                             kinds: Set(NotificationKind.allCases).subtracting(notificationKindsOff),
+                             mutedGroups: mutedNotificationGroups)
+    }
+
+    func notifies(_ kind: NotificationKind) -> Bool { !notificationKindsOff.contains(kind) }
+
+    func setNotifies(_ kind: NotificationKind, _ on: Bool) {
+        if on { notificationKindsOff.remove(kind) } else { notificationKindsOff.insert(kind) }
+    }
+
+    func isMuted(group id: String) -> Bool { mutedNotificationGroups.contains(id) }
+
+    func setMuted(_ muted: Bool, group id: String) {
+        if muted { mutedNotificationGroups.insert(id) } else { mutedNotificationGroups.remove(id) }
+    }
+
     init(defaults: UserDefaults) {
         self.defaults = defaults
         defaults.register(defaults: [
@@ -213,6 +243,7 @@ final class Preferences {
             Key.selectionIcon: true,
             Key.pasteIcon: true,
             Key.blockSensitiveGroupSends: true,
+            Key.notificationsEnabled: true,
         ])
         let storedMax = defaults.integer(forKey: Key.maxItems)
         maxItems = storedMax == 0 ? 0 : max(10, storedMax)
@@ -256,6 +287,9 @@ final class Preferences {
         blockSensitiveGroupSends = defaults.bool(forKey: Key.blockSensitiveGroupSends)
         clearedSendToGroupDefault = defaults.bool(forKey: Key.clearedSendToGroupDefault)
         explainSendToGroupChange = defaults.bool(forKey: Key.explainSendToGroupChange)
+        notificationsEnabled = defaults.bool(forKey: Key.notificationsEnabled)
+        notificationKindsOff = Set((defaults.stringArray(forKey: Key.notificationKindsOff) ?? []).compactMap(NotificationKind.init(rawValue:)))
+        mutedNotificationGroups = Set(defaults.stringArray(forKey: Key.mutedNotificationGroups) ?? [])
     }
 
     /// The save folder's name as Finder shows it ("Downloads", "Desktop").

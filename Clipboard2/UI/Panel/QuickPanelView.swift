@@ -37,7 +37,8 @@ struct QuickPanelView: View {
             searchBar
             FilterChips(selection: $model.filter, groupSelection: $model.groupFilter,
                         groupShowsSaved: $model.groupShowsSaved, groups: env.sync.groups,
-                        showsInbox: !model.sendableContacts.isEmpty,
+                        showsContacts: env.sync.isSignedIn, contactsShowPeople: $model.contactsShowPeople,
+                        pendingRequests: env.sync.contactRequests.incoming.count,
                         thisAppName: model.targetRef?.name, dropModel: model)
                 .padding(.horizontal, 14)
                 .padding(.bottom, 10)
@@ -75,14 +76,18 @@ struct QuickPanelView: View {
                     syncIndicator: env.sync.indicator,
                     onUpdate: { env.updates.installNow() },
                     tip: tips.isEmpty ? nil : tips[model.tipIndex % tips.count],
-                    onNextTip: { model.tipIndex &+= 1 })
+                    onNextTip: { model.tipIndex &+= 1 },
+                    people: model.showsPeople)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear { searchFocused = true }
         .onChange(of: model.focusToken) {
             searchFocused = ![.actions, .snippetForm, .saveSecret, .label, .editSecret, .shareToGroup, .folderName,
-                              .authenticatorForm, .authenticatorPeople, .folderPicker, .addItems].contains(model.mode)
+                              .authenticatorForm, .authenticatorPeople, .folderPicker, .addItems, .contactPicker,
+                              .addContact].contains(model.mode)
         }
+        .onChange(of: env.sync.contacts) { model.refresh() }
+        .onChange(of: env.sync.contactRequests) { model.refresh() }
         .onChange(of: env.store.revision) { model.refresh() }
         .onChange(of: env.authenticators.revision) { model.refresh() }
         .onChange(of: env.authenticators.suggestion) { model.refresh() }
@@ -165,7 +170,9 @@ struct QuickPanelView: View {
 
     private var resultsList: some View {
         Group {
-            if model.entries.isEmpty && model.isSavedView && model.query.isEmpty {
+            if model.showsPeople {
+                PeopleListView(model: model)
+            } else if model.entries.isEmpty && model.isSavedView && model.query.isEmpty {
                 ContentUnavailableView {
                     Label(model.openFolder != nil ? "This Folder Is Empty" : "Nothing Saved Yet",
                           systemImage: model.openFolder != nil ? "folder" : "bookmark")
@@ -178,7 +185,7 @@ struct QuickPanelView: View {
                 let inbox = model.filter == .inbox && model.groupFilter == nil
                 ContentUnavailableView {
                     Label(model.query.isEmpty ? (inbox ? "Your Inbox Is Empty" : "Nothing Here Yet") : "No Matches",
-                          systemImage: model.query.isEmpty ? model.filter.symbol : "magnifyingglass")
+                          systemImage: model.query.isEmpty ? (inbox ? "tray.and.arrow.down" : model.filter.symbol) : "magnifyingglass")
                 } description: {
                     Text(model.query.isEmpty
                          ? (inbox ? "What your contacts send you shows up here." : "Items appear as you copy them.")
@@ -306,6 +313,9 @@ struct QuickPanelView: View {
             if model.canShareToGroup, env.sync.groups.contains(where: { $0.id != ref.spaceID }) {
                 Button("Share to Group…") { model.beginShareSecret(ref) }
             }
+            if model.canSendToContact(ref) {
+                Button("Send to Contact…") { model.beginContactPicker(entries: model.entriesForContextAction(on: entry)) }
+            }
         }
         Menu("Assign to Quick Slot") {
             ForEach(QuickSlots.range, id: \.self) { n in
@@ -342,7 +352,9 @@ struct QuickPanelView: View {
                     }
                 }
             }
-            contactSends(for: entry, item: item)
+            if model.canSendToContact(item) {
+                Button("Send to Contact…") { model.beginContactPicker(entries: model.entriesForContextAction(on: entry)) }
+            }
             Divider()
             Button("Save to \(env.prefs.saveFolderName)") {
                 model.save(model.clipsForContextAction(on: entry), to: env.prefs.saveFolder)
@@ -445,22 +457,11 @@ struct QuickPanelView: View {
         if folder.spaceID == nil && model.canShareToGroup {
             Button("Share to Group…") { model.beginShareFolder(folder) }
         }
+        if !model.sendableContacts.isEmpty {
+            Button("Send to Contact…") { model.beginContactPicker(entries: [.folder(folder)]) }
+        }
         Divider()
         Button("Delete Folder", role: .destructive) { model.deleteFolder(folder) }
-    }
-
-    /// "Send to ‹contact›" for the row (or the selection it's part of); a submenu once there are many.
-    @ViewBuilder
-    private func contactSends(for entry: PanelEntry, item: ClipItem) -> some View {
-        let contacts = model.sendableContacts.filter { $0.id != item.spaceID }
-        let send = { (contact: SyncContact) in model.send(model.clipsForContextAction(on: entry), to: contact) }
-        if contacts.count > 4 {
-            Menu("Send to Contact") {
-                ForEach(contacts) { contact in Button(contact.name) { send(contact) } }
-            }
-        } else {
-            ForEach(contacts) { contact in Button("Send to \(contact.name)") { send(contact) } }
-        }
     }
 
     // MARK: Detail
@@ -510,12 +511,26 @@ struct QuickPanelView: View {
             if let form = model.addItemsForm {
                 AddItemsView(form: form) { model.submitAddItems() }
             }
+        case .contactPicker:
+            if let form = model.contactPicker {
+                ContactPickerView(form: form, model: model)
+            }
+        case .addContact:
+            if let form = model.addContactForm {
+                AddContactView(form: form, model: model)
+            }
         case .ai:
             if let run = model.aiRun {
                 AIResultView(run: run, model: model)
             }
         case .browse:
-            if model.isMultiSelecting {
+            if model.showsPeople {
+                if let row = model.selectedPerson {
+                    PersonPreview(row: row, model: model).id(row.id)
+                } else {
+                    Color.clear
+                }
+            } else if model.isMultiSelecting {
                 MultiSelectionPreview(clips: model.selectedClips, totalSelected: model.selectedIDs.count, model: model)
             } else if let folder = model.selectedEntry?.folder {
                 FolderPreview(folder: folder, count: model.folderCounts[folder.id] ?? 0, model: model)
@@ -546,15 +561,17 @@ struct FilterChips: View {
     /// The selected group's segment: its Saved (true) or its Copies.
     @Binding var groupShowsSaved: Bool
     var groups: [SyncGroup] = []
-    /// The Inbox chip: what contacts sent you. Only once there are contacts.
-    var showsInbox = false
+    /// The Contacts chip (Inbox | People): whenever you're signed in.
+    var showsContacts = false
+    @Binding var contactsShowPeople: Bool
+    var pendingRequests = 0
     let thisAppName: String?
     /// When set, group chips accept dropped history items and files and share them to the group.
     var dropModel: PanelViewModel?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        if groups.isEmpty && !showsInbox {
+        if groups.isEmpty && !showsContacts {
             chips
         } else {
             ScrollViewReader { proxy in
@@ -574,10 +591,18 @@ struct FilterChips: View {
 
     private var chips: some View {
         HStack(spacing: 2) {
-            ForEach(PanelFilter.chips(hasContacts: showsInbox)) { filter in
-                FilterChip(title: title(for: filter), selected: groupSelection == nil && filter == selection) {
-                    groupSelection = nil
-                    selection = filter
+            ForEach(PanelFilter.chips(showsContacts: showsContacts)) { filter in
+                if filter == .inbox {
+                    ContactsChip(selected: groupSelection == nil && selection == .inbox, showsPeople: $contactsShowPeople,
+                                 onSelect: {
+                                     groupSelection = nil
+                                     selection = .inbox
+                                 }, pendingRequests: pendingRequests)
+                } else {
+                    FilterChip(title: title(for: filter), selected: groupSelection == nil && filter == selection) {
+                        groupSelection = nil
+                        selection = filter
+                    }
                 }
             }
             if !groups.isEmpty {
@@ -601,6 +626,8 @@ struct FilterChips: View {
         // without animating).
         .animation(reduceMotion ? nil : ChipMotion.morph, value: groupSelection)
         .animation(reduceMotion ? nil : ChipMotion.morph, value: groupShowsSaved)
+        .animation(reduceMotion ? nil : ChipMotion.morph, value: selection)
+        .animation(reduceMotion ? nil : ChipMotion.morph, value: contactsShowPeople)
     }
 
     private func title(for filter: PanelFilter) -> String {
@@ -657,6 +684,7 @@ struct GroupChip: View {
         .scaleEffect(dropTargeted && !reduceMotion ? 1.06 : 1)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(group.name) group")
+        .contextMenu { GroupMuteButton(groupID: group.id) }
 
         if let dropModel {
             pill
@@ -1081,10 +1109,16 @@ struct HintBar: View {
     /// A rotating tip that teaches one shortcut at a time; clicking shows the next.
     var tip: String?
     var onNextTip: () -> Void = {}
+    /// Contacts → People is showing.
+    var people = false
 
     var body: some View {
         HStack(spacing: 14) {
             switch mode {
+            case .browse where people:
+                hint("⏎", "Send… / Accept")
+                hint("⌘N", "Add Contact")
+                hint("⌫", "Remove")
             case .browse where isEditingText:
                 hint("esc", "Done")
                 hint("⌘⏎", "Paste")
@@ -1131,6 +1165,13 @@ struct HintBar: View {
             case .addItems:
                 hint("↑↓", "Choose")
                 hint("space", "Tick")
+                hint("⏎", "Add")
+            case .contactPicker:
+                hint("↑↓", "Choose")
+                hint("space", "Tick")
+                hint("⏎", "Send")
+                hint("⌘⏎", "Send to Several")
+            case .addContact:
                 hint("⏎", "Add")
             case .shareToGroup:
                 hint("↑↓", "Choose")

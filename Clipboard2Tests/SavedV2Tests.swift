@@ -25,7 +25,7 @@ struct FilterRowTests {
 
     @Test func removedChipsFallBackToAll() {
         #expect(PanelFilter.chips == [.all, .labelled, .thisApp])
-        #expect(PanelFilter.chips(hasContacts: true) == [.all, .labelled, .thisApp, .inbox])
+        #expect(PanelFilter.chips(showsContacts: true) == [.all, .labelled, .thisApp, .inbox])
         for gone in ["text", "images", "files", "snippets", "secrets", "nonsense", ""] {
             #expect(PanelFilter(storedValue: gone) == .all)
         }

@@ -10,7 +10,7 @@ nonisolated enum PanelFilter: String, CaseIterable, Identifiable, Sendable {
     var title: String {
         switch self {
         case .all: "All"
-        case .inbox: "Inbox"
+        case .inbox: "Contacts"
         case .labelled: "Saved"
         case .thisApp: "This App"
         }
@@ -21,7 +21,7 @@ nonisolated enum PanelFilter: String, CaseIterable, Identifiable, Sendable {
         case .all: "tray.full"
         case .labelled: "bookmark"
         case .thisApp: "app"
-        case .inbox: "tray.and.arrow.down"
+        case .inbox: "person.crop.circle"
         }
     }
 
@@ -31,15 +31,18 @@ nonisolated enum PanelFilter: String, CaseIterable, Identifiable, Sendable {
         self = storedValue.flatMap(PanelFilter.init(rawValue:)) ?? .all
     }
 
-    /// All · Saved · This App, then the Inbox once there are contacts.
+    /// All · Saved · This App, then Contacts (Inbox | People) whenever you're signed in. The
+    /// `inbox` raw value stays the stored setting's.
     static let chips: [PanelFilter] = [.all, .labelled, .thisApp]
-    static func chips(hasContacts: Bool) -> [PanelFilter] { hasContacts ? chips + [.inbox] : chips }
+    static func chips(showsContacts: Bool) -> [PanelFilter] { showsContacts ? chips + [.inbox] : chips }
 }
 
-/// A stop in the filter row for ⇥: a chip, or one segment of a group's pill.
+/// A stop in the filter row for ⇥: a chip, one segment of a group's pill, or Contacts → People.
 nonisolated enum FilterStop: Equatable, Sendable {
     case chip(PanelFilter)
     case group(String, saved: Bool)
+    /// The Contacts pill's People segment (`chip(.inbox)` is its Inbox).
+    case people
 }
 
 enum PanelEntry: Identifiable {
@@ -130,8 +133,12 @@ enum PanelMode: Equatable {
     case authenticatorPeople
     /// The Folder row's picker (⌘⇧M).
     case folderPicker
-    /// Add Items in the Saved header.
+    /// Add Items in the Saved header, or Send… on a contact (`AddItemsState.contact`).
     case addItems
+    /// Send to Contact…: pick one or more contacts for the selection.
+    case contactPicker
+    /// Add Contact in Contacts → People: a username or a code.
+    case addContact
 }
 
 enum PanelAction: Identifiable, Hashable {
@@ -146,6 +153,8 @@ enum PanelAction: Identifiable, Hashable {
     case shareToGroup
     case sendToDevice(DeviceTarget)
     case sendToContact(SyncContact)
+    /// Send to Contact…: the inline contact picker.
+    case chooseContact
     case setUpAI
     case clearSlot(Int)
     case removeFromLabelled
@@ -185,6 +194,7 @@ enum PanelAction: Identifiable, Hashable {
         case .shareToGroup: "shareToGroup"
         case .sendToDevice(let device): "sendToDevice-" + device.id
         case .sendToContact(let contact): "sendToContact-" + contact.id
+        case .chooseContact: "chooseContact"
         case .setUpAI: "setUpAI"
         case .clearSlot(let n): "clearSlot-\(n)"
         case .removeFromLabelled: "removeFromLabelled"
@@ -212,7 +222,7 @@ enum PanelAction: Identifiable, Hashable {
         case .paste, .pastePlain, .copy, .quickLook: "Paste"
         case .transform: "Transform & Paste"
         case .ai, .setUpAI: "Ask \(aiName)"
-        case .sendToDevice, .sendToContact: "Send"
+        case .sendToDevice, .sendToContact, .chooseContact: "Send"
         case .saveToFolder, .saveToChosenFolder: "Save"
         case .addToSaved, .saveCopy, .moveToFolder, .moveToNewFolder, .copyToNewFolder, .removeFromFolder,
              .removeFromLabelled: "Saved"
@@ -237,6 +247,7 @@ enum PanelAction: Identifiable, Hashable {
         case .shareToGroup: "Share to Group…"
         case .sendToDevice(let device): "Send to \(device.name)"
         case .sendToContact(let contact): "Send to \(contact.name)"
+        case .chooseContact: "Send to Contact…"
         case .setUpAI: "Set Up AI…"
         case .clearSlot(let n): "Remove from Quick Slot ⌘\(n)"
         case .removeFromLabelled: "Remove from Saved"
@@ -271,7 +282,7 @@ enum PanelAction: Identifiable, Hashable {
         case .setLabel: "tag"
         case .shareToGroup: "person.2"
         case .sendToDevice: "laptopcomputer.and.arrow.down"
-        case .sendToContact: "paperplane"
+        case .sendToContact, .chooseContact: "paperplane"
         case .setUpAI: "sparkles"
         case .clearSlot: "number.square"
         case .removeFromLabelled: "bookmark.slash"
@@ -653,18 +664,22 @@ final class FolderPickerState {
 }
 
 /// Add Items in the Saved header: recent unsaved history of this space, checked to save here.
+/// Also Send… on a contact in Contacts → People: recent history, checked to send to them.
 @Observable
 final class AddItemsState {
     let candidates: [ClipItem]
     /// The open folder they go into; nil: the top level of Saved.
     let folder: ClipFolder?
+    /// Send… : the contact they go to (instead of Saved).
+    let contact: SyncContact?
     var query = "" { didSet { if query != oldValue { selection = 0 } } }
     var checked: Set<UUID> = []
     var selection = 0
 
-    init(candidates: [ClipItem], folder: ClipFolder?) {
+    init(candidates: [ClipItem], folder: ClipFolder?, contact: SyncContact? = nil) {
         self.candidates = candidates
         self.folder = folder
+        self.contact = contact
     }
 
     /// The candidates matching the search, newest first.
@@ -877,6 +892,29 @@ final class PanelViewModel {
     private(set) var peopleForm: AuthenticatorPeopleState?
     private(set) var folderPicker: FolderPickerState?
     private(set) var addItemsForm: AddItemsState?
+    private(set) var contactPicker: ContactPickerState?
+    private(set) var addContactForm: AddContactState?
+    /// Contacts shows People (requests and contacts) instead of the Inbox.
+    var contactsShowPeople = false {
+        didSet {
+            guard contactsShowPeople != oldValue else { return }
+            pendingRemoveContactID = nil
+            refresh(resetSelection: true)
+            if contactsShowPeople { Task { await env.sync.refreshContacts(); refresh() } }
+        }
+    }
+    /// Contacts → People's rows, after `refresh()`.
+    private(set) var people: [PeopleRow] = []
+    /// The selected row of People.
+    var peopleSelectionID: String? {
+        didSet { if peopleSelectionID != oldValue { pendingRemoveContactID = nil } }
+    }
+    /// The contact waiting for Remove's inline confirm.
+    private(set) var pendingRemoveContactID: String?
+    /// When you last sent each contact something or got something from them, by space id.
+    private(set) var lastExchange: [String: Date] = [:]
+    /// Touch ID before secrets leave for a contact (tests replace it).
+    @ObservationIgnored var authenticateSecrets: ((String) async -> Bool)?
     /// Ticks once a second while the panel is open, for authenticator codes and their rings.
     @ObservationIgnored let otpClock = OTPClock()
     /// The authenticator whose secret and QR code are showing (after Touch ID); cleared on any move.
@@ -1087,6 +1125,8 @@ final class PanelViewModel {
         peopleForm = nil
         folderPicker = nil
         addItemsForm = nil
+        contactPicker = nil
+        addContactForm = nil
         actionQuery = ""
         actionSelection = 0
         mode = .browse
@@ -1104,9 +1144,17 @@ final class PanelViewModel {
     }
 
     func refresh(resetSelection: Bool = false) {
+        refreshLastExchange()
         if let selectionItem {
             entries = [.clip(selectionItem)]
             selectedID = PanelEntry.clip(selectionItem).id
+            return
+        }
+        if showsPeople {
+            refreshPeople(resetSelection: resetSelection)
+            entries = []
+            sectionStarts = [:]
+            selectedID = nil
             return
         }
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1180,9 +1228,12 @@ final class PanelViewModel {
                 }
             }
             // Snippets and secrets join "All" only while searching, so history stays uncluttered.
+            // A contact's secrets are only ever in the Inbox (the ones they sent you).
             if filter == .all && !q.isEmpty {
                 snippets = env.snippets.all()
-                secrets = env.secrets.secrets
+                secrets = env.secrets.secrets.filter { !env.sync.isContactSpace($0.spaceID) }
+            } else if filter == .inbox {
+                secrets = env.secrets.secrets.filter(env.sync.isFromContact(secret:))
             }
         }
 
@@ -1191,6 +1242,10 @@ final class PanelViewModel {
             let kept = clips.map(PanelEntry.clip) + secrets.map(PanelEntry.secret) + snippets.map(PanelEntry.snippet)
                 + authenticators.map(PanelEntry.authenticator)
             result = folders.map(PanelEntry.folder) + kept.sorted { $0.savedDate > $1.savedDate }
+        } else if q.isEmpty && groupFilter == nil && filter == .inbox {
+            // What contacts sent, newest first, secrets among the clips.
+            let dated = clips.map { (PanelEntry.clip($0), $0.lastCopiedAt) } + secrets.map { (PanelEntry.secret($0), $0.createdAt ?? .distantPast) }
+            result = dated.sorted { $0.1 > $1.1 }.map(\.0)
         } else if q.isEmpty {
             result = clips.map(PanelEntry.clip) + snippets.map(PanelEntry.snippet) + secrets.map(PanelEntry.secret)
             // A copied authenticator link or QR code: offered once, at the top of All.
@@ -1238,7 +1293,7 @@ final class PanelViewModel {
 
         entries = Array(result.prefix(Self.maxEntries))
         sectionStarts = q.isEmpty ? Self.dateSections(entries, date: savedView ? { $0.folder == nil ? $0.savedDate : nil }
-                                                                         : { $0.clip?.lastCopiedAt }) : [:]
+                                                                         : { $0.clip?.lastCopiedAt ?? $0.secret?.createdAt }) : [:]
         if resetSelection || !userMovedSelection || !entries.contains(where: { $0.id == selectedID }) {
             selectedID = entries.first?.id
         } else {
@@ -1379,22 +1434,28 @@ final class PanelViewModel {
         showNotice("Deleted \(clips.count) items")
     }
 
-    /// The filter row as ⇥ walks it: each chip (the Inbox once there are contacts), then each
-    /// group's Copies and Saved.
+    /// The filter row as ⇥ walks it: each chip (Contacts' Inbox and People while signed in),
+    /// then each group's Copies and Saved.
     var filterStops: [FilterStop] {
-        PanelFilter.chips(hasContacts: !env.sync.contacts.isEmpty).map(FilterStop.chip)
+        PanelFilter.chips(showsContacts: env.sync.isSignedIn).flatMap { $0 == .inbox ? [FilterStop.chip($0), .people] : [.chip($0)] }
             + env.sync.groups.flatMap { [FilterStop.group($0.id, saved: false), .group($0.id, saved: true)] }
     }
 
     var currentStop: FilterStop {
-        groupFilter.map { .group($0, saved: groupShowsSaved) } ?? .chip(filter)
+        if let groupFilter { return .group(groupFilter, saved: groupShowsSaved) }
+        return filter == .inbox && contactsShowPeople ? .people : .chip(filter)
     }
 
     func select(_ stop: FilterStop) {
         switch stop {
         case .chip(let chip):
             groupFilter = nil
+            if chip == .inbox { contactsShowPeople = false }
             filter = chip
+        case .people:
+            groupFilter = nil
+            contactsShowPeople = true
+            filter = .inbox
         case .group(let id, let saved):
             groupFilter = id
             filter = .all
@@ -1878,6 +1939,10 @@ final class PanelViewModel {
             return
         }
         resetMode()
+        if let contact = form.contact {
+            sendToContacts([contact], entries: chosen.map(PanelEntry.clip))
+            return
+        }
         env.store.addToSaved(chosen)
         if let folder = form.folder { env.store.move(chosen, to: folder) }
         refresh()
@@ -2096,25 +2161,52 @@ final class PanelViewModel {
     /// Contacts the selection can be sent to (established ones: both people are in the space).
     var sendableContacts: [SyncContact] { env.sync.isSignedIn ? env.sync.contacts : [] }
 
-    /// "Send to ‹contact›" rows, one per contact, for saved and transient items alike.
-    var sendToContactActions: [PanelAction] { sendableContacts.map(PanelAction.sendToContact) }
+    /// Send to Contact… and the three most recent contacts as direct "Send to ‹name›" rows.
+    /// Never for what a contact sent you, or into the contact's own space.
+    func contactSendActions(excludingSpace spaceID: String? = nil) -> [PanelAction] {
+        let contacts = rankedContacts.filter { $0.id != spaceID }
+        guard !contacts.isEmpty else { return [] }
+        return [.chooseContact] + contacts.prefix(3).map(PanelAction.sendToContact)
+    }
 
-    /// Puts copies of the items in the contact's space: they show up in the contact's Inbox. Same
-    /// limits as sharing to a group.
-    func send(_ items: [ClipItem], to contact: SyncContact) {
-        guard !items.isEmpty else { return }
-        if let problem = items.lazy.compactMap(SyncEngine.groupShareProblem).first {
+    /// Contacts, the ones you last exchanged something with first.
+    var rankedContacts: [SyncContact] { PeopleList.ranked(sendableContacts, lastExchange: lastExchange) }
+
+    /// Puts copies of the clips and secrets in each contact's space: they show up in the contact's
+    /// Inbox. Same limits as sharing to a group; secrets were unlocked first.
+    func deliver(clips: [ClipItem], secrets: [(ref: SecretRef, value: String)], to contacts: [SyncContact]) {
+        guard !contacts.isEmpty, !clips.isEmpty || !secrets.isEmpty else { return }
+        if let problem = clips.lazy.compactMap(SyncEngine.groupShareProblem).first {
             refuseGroupShare(problem.replacingOccurrences(of: "Groups take", with: "Sync takes"))
             return
         }
-        copy(items, intoSpace: contact.id, keepLabel: false)
+        for contact in contacts {
+            copy(clips, intoSpace: contact.id, keepLabel: false)
+            for secret in secrets where secret.ref.spaceID != contact.id {
+                let already = env.secrets.secrets.contains {
+                    $0.spaceID == contact.id && $0.name == secret.ref.name && SecretVault.value(id: $0.id) == secret.value
+                }
+                if !already { _ = env.secrets.add(name: secret.ref.name, value: secret.value, spaceID: contact.id) }
+            }
+        }
+        env.sync.syncNow()
+        let text = Self.sentText(to: contacts.map(\.name))
         if isSelectionMode {
             onClose()
-            HUD.show("Sent to \(contact.name)", symbol: "paperplane.fill")
+            HUD.show(text, symbol: "paperplane.fill")
         } else {
-            if mode == .actions { mode = .browse }
+            if mode == .actions || mode == .contactPicker { resetMode() }
             refresh()
-            showNotice(items.count == 1 ? "Sent to \(contact.name)" : "Sent \(items.count) items to \(contact.name)")
+            showNotice(text)
+        }
+    }
+
+    /// "Sent to Sam", "Sent to Sam and Alex", "Sent to 3 contacts".
+    nonisolated static func sentText(to names: [String]) -> String {
+        switch names.count {
+        case 1: "Sent to \(names[0])"
+        case 2: "Sent to \(names[0]) and \(names[1])"
+        default: "Sent to \(names.count) contacts"
         }
     }
 
@@ -2413,7 +2505,7 @@ final class PanelViewModel {
             if clips.contains(where: { canLabel(.clip($0)) }) { actions.append(.setLabel) }
             actions += savedActions(for: clips)
             if canShareToGroup { actions.append(.shareToGroup) }
-            actions += sendToContactActions
+            if clips.contains(where: canSendToContact) { actions += contactSendActions() }
             return actions + [.saveToFolder, .saveToChosenFolder, .delete]
         }
         guard let entry = selectedEntry else { return [] }
@@ -2430,6 +2522,7 @@ final class PanelViewModel {
                 if folderTree(of: folder).parent(of: folder.id) != nil { actions.append(.moveFolderToTop) }
             }
             if folder.spaceID == nil && canShareToGroup { actions.append(.shareToGroup) }
+            if !sendableContacts.isEmpty { actions.append(.chooseContact) }
             return actions + [.deleteFolder]
         }
         var actions: [PanelAction] = [.paste]
@@ -2441,7 +2534,7 @@ final class PanelViewModel {
             actions += Transform.allCases.filter { $0 != .plainText }.map(PanelAction.transform)
             actions.append(.saveAsSecret)
             if canShareToGroup { actions.append(.shareToGroup) }
-            return actions + sendToContactActions
+            return actions + contactSendActions()
         case .clip(let item):
             if item.kind.isTextual { actions.append(.pastePlain) }
             actions.append(.copy)
@@ -2457,7 +2550,7 @@ final class PanelViewModel {
             actions += savedActions(for: [item])
             if canShareToGroup { actions.append(.shareToGroup) }
             actions += PanelAction.sendToDeviceActions(for: item, multiSelecting: false, targets: DeviceTarget.others(in: env.sync))
-            actions += sendableContacts.filter { $0.id != item.spaceID }.map(PanelAction.sendToContact)
+            if canSendToContact(item) { actions += contactSendActions(excludingSpace: item.spaceID) }
             actions += [.saveToFolder, .saveToChosenFolder]
         case .snippet, .folder, .authenticator, .authenticatorSuggestion:
             break
@@ -2466,6 +2559,7 @@ final class PanelViewModel {
             if canLabel(entry) { actions.append(.setLabel) }
             actions += savedActions(for: [], secrets: [ref])
             if canShareToGroup && env.sync.groups.contains(where: { $0.id != ref.spaceID }) { actions.append(.shareToGroup) }
+            if canSendToContact(ref) { actions += contactSendActions(excludingSpace: ref.spaceID) }
         }
         if let target = entry.slotTarget, let slot = env.slots.slot(for: target) {
             actions.append(.clearSlot(slot))
@@ -2671,8 +2765,9 @@ final class PanelViewModel {
             guard let item = entry.clip else { return }
             send(item, to: device)
         case .sendToContact(let contact):
-            guard let item = entry.clip else { return }
-            send([item], to: contact)
+            sendToContacts([contact], entries: [entry])
+        case .chooseContact:
+            beginContactPicker(entries: [entry])
         case .quickLook:
             toggleQuickLook()
         case .setUpAI:
@@ -2727,7 +2822,9 @@ final class PanelViewModel {
         case .shareToGroup:
             beginShare(clips)
         case .sendToContact(let contact):
-            send(clips, to: contact)
+            sendToContacts([contact], entries: clips.map(PanelEntry.clip))
+        case .chooseContact:
+            beginContactPicker(entries: clips.map(PanelEntry.clip))
         case .addToSaved:
             addToSaved(clips)
         case .saveCopy:
@@ -3157,6 +3254,8 @@ final class PanelViewModel {
         case .authenticatorPeople: handlePeopleKey(event)
         case .folderPicker: handlePickerKey(event)
         case .addItems: handleAddItemsKey(event)
+        case .contactPicker: handleContactPickerKey(event)
+        case .addContact: handleAddContactKey(event)
         }
     }
 
@@ -3220,6 +3319,7 @@ final class PanelViewModel {
         let option = flags.contains(.option)
         let shift = flags.contains(.shift)
         let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
+        if showsPeople, let handled = handlePeopleKey(event, command: command, chars: chars) { return handled }
 
         switch event.keyCode {
         case KeyCode.escape:
@@ -3427,4 +3527,381 @@ nonisolated enum KeyCode {
     /// kVK_ANSI_1 … kVK_ANSI_9 (positional, layout independent).
     private static let digits: [UInt16: Int] = [18: 1, 19: 2, 20: 3, 21: 4, 23: 5, 22: 6, 26: 7, 28: 8, 25: 9]
     static func digit(for keyCode: UInt16) -> Int? { digits[keyCode] }
+}
+
+// MARK: - Contacts: People, Send to Contact…, notifications
+
+/// A refusal shown as is.
+nonisolated struct PanelMessage: LocalizedError {
+    var errorDescription: String?
+    init(_ text: String) { errorDescription = text }
+}
+
+extension PanelViewModel {
+    /// Contacts → People is showing (instead of a list of entries).
+    var showsPeople: Bool { selectionItem == nil && groupFilter == nil && filter == .inbox && contactsShowPeople }
+
+    /// What new items the panel shows right now: a group's, or the Inbox's (nil for anything else).
+    var arrivalPlaceShown: ArrivalPlace? {
+        if let groupFilter { return .group(groupFilter) }
+        return filter == .inbox && !contactsShowPeople ? .inbox : nil
+    }
+
+    var selectedPerson: PeopleRow? { people.first { $0.id == peopleSelectionID } }
+
+    func refreshPeople(resetSelection: Bool) {
+        people = PeopleList.rows(contacts: env.sync.contacts, requests: env.sync.contactRequests,
+                                 lastExchange: lastExchange, query: query)
+        if resetSelection || !people.contains(where: { $0.id == peopleSelectionID }) {
+            peopleSelectionID = people.first?.id
+        }
+    }
+
+    func refreshLastExchange() {
+        guard env.sync.isSignedIn, !env.sync.contacts.isEmpty else {
+            if !lastExchange.isEmpty { lastExchange = [:] }
+            return
+        }
+        let fresh = env.sync.lastExchange()
+        if fresh != lastExchange { lastExchange = fresh }
+    }
+
+    func showInbox() { select(.chip(.inbox)) }
+
+    /// A notification was clicked: the panel shows what it was about.
+    func reveal(_ target: NotificationTarget) {
+        resetMode()
+        query = ""
+        switch target {
+        case .group(let id):
+            guard env.sync.groups.contains(where: { $0.id == id }) else { return }
+            select(.group(id, saved: false))
+        case .groupItem(let id, let entryID, let saved):
+            guard env.sync.groups.contains(where: { $0.id == id }) else { return }
+            select(.group(id, saved: saved))
+            focus(entryID)
+        case .people(let request):
+            select(.people)
+            if let request, people.contains(where: { $0.id == "in-" + request }) { peopleSelectionID = "in-" + request }
+        case .inbox(let entryID):
+            select(.chip(.inbox))
+            focus(entryID)
+        case .authenticator(let spaceId):
+            select(.chip(.labelled))
+            let item = env.authenticators.items.first { $0.owned?.spaceID == spaceId || $0.shared?.spaceId == spaceId }
+            focus(item.map { PanelEntry.authenticator($0).id })
+        }
+    }
+
+    private func focus(_ entryID: String?) {
+        guard let entryID, entries.contains(where: { $0.id == entryID }) else { return }
+        selectedID = entryID
+        userMovedSelection = true
+    }
+
+    // MARK: People
+
+    private func movePeople(by delta: Int) {
+        guard !people.isEmpty else { return }
+        let current = people.firstIndex { $0.id == peopleSelectionID } ?? (delta > 0 ? -1 : people.count)
+        peopleSelectionID = people[min(max(current + delta, 0), people.count - 1)].id
+    }
+
+    /// nil: not a People key (the usual browse handling applies).
+    fileprivate func handlePeopleKey(_ event: NSEvent, command: Bool, chars: String) -> Bool? {
+        switch event.keyCode {
+        case KeyCode.escape:
+            guard pendingRemoveContactID != nil else { return nil }
+            cancelRemove()
+            return true
+        case KeyCode.upArrow:
+            movePeople(by: -1)
+            return true
+        case KeyCode.downArrow:
+            movePeople(by: 1)
+            return true
+        case KeyCode.returnKey, KeyCode.keypadEnter:
+            switch selectedPerson {
+            case .incoming(let request): accept(request)
+            case .contact(let contact):
+                if pendingRemoveContactID == contact.id { remove(contact) } else { beginSendItems(to: contact) }
+            case .outgoing, nil: NSSound.beep()
+            }
+            return true
+        case KeyCode.delete, KeyCode.forwardDelete:
+            guard query.isEmpty else { return false }
+            if let contact = selectedPerson?.contact { askToRemove(contact) } else { NSSound.beep() }
+            return true
+        default:
+            if command && chars == "n" {
+                beginAddContact()
+                return true
+            }
+            return nil
+        }
+    }
+
+    func accept(_ request: ContactRequest) {
+        Task {
+            do {
+                try await env.sync.accept(request)
+                showNotice("You and \(request.name) are now contacts")
+            } catch {
+                showNotice(error.localizedDescription)
+            }
+            refresh()
+        }
+    }
+
+    /// Declines an incoming request or cancels an outgoing one.
+    func dismiss(_ request: ContactRequest) {
+        Task {
+            do {
+                try await env.sync.dismiss(request)
+            } catch {
+                showNotice(error.localizedDescription)
+            }
+            refresh()
+        }
+    }
+
+    /// Remove Contact…: an inline confirm in the right pane (never a dialog).
+    func askToRemove(_ contact: SyncContact) {
+        peopleSelectionID = "p-" + contact.id
+        pendingRemoveContactID = contact.id
+    }
+
+    func cancelRemove() { pendingRemoveContactID = nil }
+
+    func remove(_ contact: SyncContact) {
+        pendingRemoveContactID = nil
+        Task {
+            do {
+                try await env.sync.remove(contact)
+                showNotice("Removed \(contact.name)")
+            } catch {
+                showNotice(error.localizedDescription)
+            }
+            refresh()
+        }
+    }
+
+    /// Send… on a contact: recent history to tick, as in Add Items.
+    func beginSendItems(to contact: SyncContact) {
+        let candidates = env.store.items(inSpace: nil).filter { !$0.isTransient && !$0.isConcealed }
+        addItemsForm = AddItemsState(candidates: Array(candidates.prefix(Self.maxEntries)), folder: nil, contact: contact)
+        mode = .addItems
+    }
+
+    // MARK: Add Contact
+
+    func beginAddContact() {
+        guard env.sync.isSignedIn else {
+            NSSound.beep()
+            return
+        }
+        addContactForm = AddContactState()
+        mode = .addContact
+    }
+
+    func submitAddContact() {
+        guard let form = addContactForm, !form.busy else { return }
+        let text = form.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let preview = form.preview {
+            runContactForm(form) {
+                try await self.env.sync.addContact(preview)
+                self.finishAddContact("\(preview.name) is now your contact")
+            }
+        } else if AddContactState.isCode(text) {
+            runContactForm(form) {
+                let preview = try await self.env.sync.previewInvite(code: text)
+                guard preview.isContact else {
+                    throw PanelMessage("That's a group invite code. Join groups in Settings → Sync.")
+                }
+                form.preview = preview
+            }
+        } else if !text.isEmpty {
+            runContactForm(form) {
+                let request = try await self.env.sync.requestContact(username: text)
+                self.finishAddContact("Request sent to \(request.name)")
+            }
+        } else {
+            NSSound.beep()
+        }
+    }
+
+    func createContactCode() {
+        guard let form = addContactForm, !form.busy else { return }
+        runContactForm(form) {
+            form.code = try await self.env.sync.createContactCode()
+            form.copied = false
+        }
+    }
+
+    private func runContactForm(_ form: AddContactState, _ work: @escaping () async throws -> Void) {
+        form.busy = true
+        form.error = nil
+        Task {
+            do {
+                try await work()
+            } catch {
+                form.error = error.localizedDescription
+            }
+            form.busy = false
+        }
+    }
+
+    private func finishAddContact(_ text: String) {
+        resetMode()
+        if !showsPeople { select(.people) }
+        refresh()
+        showNotice(text)
+    }
+
+    fileprivate func handleAddContactKey(_ event: NSEvent) -> Bool {
+        switch event.keyCode {
+        case KeyCode.escape:
+            resetMode()
+        case KeyCode.returnKey, KeyCode.keypadEnter:
+            submitAddContact()
+        default:
+            return false
+        }
+        return true
+    }
+
+    // MARK: Send to Contact…
+
+    /// What a contact can't get: what a contact sent you (it goes no further).
+    func canSendToContact(_ item: ClipItem) -> Bool { !sendableContacts.isEmpty && !env.sync.isFromContact(item) }
+
+    func canSendToContact(_ ref: SecretRef) -> Bool { !sendableContacts.isEmpty && !env.sync.isFromContact(secret: ref) }
+
+    /// The rows a context-menu action on `entry` applies to: the selection if it's part of one.
+    func entriesForContextAction(on entry: PanelEntry) -> [PanelEntry] {
+        isMultiSelecting && isSelected(entry) ? entries.filter { selectedIDs.contains($0.id) } : [entry]
+    }
+
+    /// What sending `entries` sends: clips and secrets, a folder's whole subtree (its saved clips
+    /// and secrets), never what contacts sent you.
+    func contactItems(for entries: [PanelEntry]) -> (clips: [ClipItem], secrets: [SecretRef]) {
+        var clips: [ClipItem] = []
+        var secrets: [SecretRef] = []
+        for entry in entries {
+            switch entry {
+            case .clip(let item):
+                clips.append(item)
+            case .secret(let ref):
+                secrets.append(ref)
+            case .folder(let folder):
+                let ids = FolderTree(env.store.folders(inSpace: folder.spaceID)).subtree(of: folder.id)
+                clips += env.store.items(inSpace: folder.spaceID).filter { $0.isPinned && $0.folderID.map(ids.contains) == true }
+                secrets += env.secrets.secrets.filter { $0.spaceID == folder.spaceID && $0.folderID.map(ids.contains) == true }
+            case .snippet, .authenticator, .authenticatorSuggestion:
+                break
+            }
+        }
+        var seenClips = Set<UUID>(), seenSecrets = Set<String>()
+        clips = clips.filter { !env.sync.isFromContact($0) && seenClips.insert($0.id).inserted }
+        secrets = secrets.filter { !env.sync.isFromContact(secret: $0) && seenSecrets.insert($0.id).inserted }
+        return (clips, secrets)
+    }
+
+    /// Secrets are sent only after Touch ID (or within the unlock grace period). nil: not allowed.
+    private func unlock(_ refs: [SecretRef]) async -> [(ref: SecretRef, value: String)]? {
+        guard !refs.isEmpty else { return [] }
+        let reason = refs.count == 1 ? "send “\(refs[0].name)” to a contact" : "send \(refs.count) secrets to a contact"
+        let allowed = if let authenticateSecrets { await authenticateSecrets(reason) } else { await env.secrets.authenticate(reason: reason) }
+        guard allowed else { return nil }
+        return refs.compactMap { ref in SecretVault.value(id: ref.id).map { (ref: ref, value: $0) } }
+    }
+
+    /// Send to Contact…: the picker in the right pane, for these rows.
+    func beginContactPicker(entries: [PanelEntry]) {
+        let (clips, refs) = contactItems(for: entries)
+        guard !sendableContacts.isEmpty else {
+            NSSound.beep()
+            showNotice("Add a contact in Contacts → People first")
+            return
+        }
+        guard !clips.isEmpty || !refs.isEmpty else {
+            NSSound.beep()
+            showNotice("Nothing here can be sent to a contact")
+            return
+        }
+        if let problem = clips.lazy.compactMap(SyncEngine.groupShareProblem).first {
+            refuseGroupShare(problem.replacingOccurrences(of: "Groups take", with: "Sync takes"))
+            return
+        }
+        let open = { (secrets: [(ref: SecretRef, value: String)]) in
+            self.refreshLastExchange()
+            // Not back into the space everything already is in.
+            let spaces = Set(clips.map(\.spaceID) + refs.map(\.spaceID))
+            let contacts = self.rankedContacts.filter { !(spaces.count == 1 && spaces.first == $0.id) }
+            self.contactPicker = ContactPickerState(clips: clips, secrets: secrets, contacts: contacts)
+            self.mode = .contactPicker
+        }
+        if refs.isEmpty {
+            open([])
+        } else {
+            Task {
+                guard let secrets = await unlock(refs) else { return }
+                open(secrets)
+            }
+        }
+    }
+
+    func submitContactPicker(adding: Bool) {
+        guard let form = contactPicker else { return }
+        let recipients = form.recipients(adding: adding)
+        guard !recipients.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        deliver(clips: form.clips, secrets: form.secrets, to: recipients)
+    }
+
+    /// "Send to ‹name›" rows (⌘K) and the like: straight to these contacts.
+    func sendToContacts(_ contacts: [SyncContact], entries: [PanelEntry]) {
+        let (clips, refs) = contactItems(for: entries)
+        guard !clips.isEmpty || !refs.isEmpty else {
+            NSSound.beep()
+            showNotice("Nothing here can be sent to a contact")
+            return
+        }
+        if refs.isEmpty {
+            deliver(clips: clips, secrets: [], to: contacts)
+        } else {
+            Task {
+                guard let secrets = await unlock(refs) else { return }
+                deliver(clips: clips, secrets: secrets, to: contacts)
+            }
+        }
+    }
+
+    fileprivate func handleContactPickerKey(_ event: NSEvent) -> Bool {
+        guard let form = contactPicker else { return false }
+        let command = event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
+        switch event.keyCode {
+        case KeyCode.escape:
+            if isSelectionMode {
+                contactPicker = nil
+                mode = .actions
+            } else {
+                resetMode()
+            }
+        case KeyCode.upArrow:
+            form.selection = max(0, form.selection - 1)
+        case KeyCode.downArrow:
+            form.selection = min(max(0, form.shown.count - 1), form.selection + 1)
+        case KeyCode.returnKey, KeyCode.keypadEnter:
+            submitContactPicker(adding: command)
+        case KeyCode.space:
+            // Usernames have no spaces: space ticks, like in Add Items.
+            form.toggleHighlighted()
+        default:
+            return false
+        }
+        return true
+    }
 }

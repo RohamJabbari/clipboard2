@@ -277,6 +277,12 @@ final class SyncAccount {
     @ObservationIgnored var onContactArrivals: ((String) -> Void)?
     /// A new contact request came in: what to say ("Sam wants to add you as a contact").
     @ObservationIgnored var onContactRequest: ((String) -> Void)?
+    /// Told what every sync found (and about new contact requests); it decides what to notify.
+    @ObservationIgnored var notifications: NotificationHub?
+    /// New items from others since the last finished sync, for `notifications`.
+    @ObservationIgnored private var pendingArrivals: [NotificationArrival] = []
+    /// Group changes made here, so they aren't announced back.
+    @ObservationIgnored private(set) var ownActions = OwnActions()
 
     /// `makeService` builds the API client from a token provider (tests pass an in-memory server).
     init(prefs: Preferences, context: ModelContext, store: ClipStore, snippets: SnippetStore,
@@ -298,6 +304,9 @@ final class SyncAccount {
     // MARK: Derived state
 
     var isSignedIn: Bool {
+        #if DEBUG
+        if testSignedIn { return true }
+        #endif
         if case .signedIn = state { return true }
         return false
     }
@@ -379,16 +388,25 @@ final class SyncAccount {
 
     #if DEBUG
     @ObservationIgnored private var testUID: String?
+    /// Tests with contacts act signed in.
+    @ObservationIgnored private var testSignedIn = false
 
     /// Tests: pretend to be `uid` in these groups, with these item authors (id → uid).
-    func setUpForTesting(groups: [SyncGroup], uid: String?, authors: [String: String]) {
+    func setUpForTesting(groups: [SyncGroup], uid: String?, authors: [String: String], contacts: [SyncContact] = [],
+                         requests: ContactRequests = ContactRequests()) {
         self.groups = groups
+        self.contacts = contacts
+        contactRequests = requests
+        testSignedIn = !contacts.isEmpty || !requests.incoming.isEmpty || !requests.outgoing.isEmpty
         testUID = uid
         for (id, author) in authors { self.authors[id.lowercased()] = .some(author) }
     }
 
     func tearDownTesting() {
         groups = []
+        contacts = []
+        contactRequests = ContactRequests()
+        testSignedIn = false
         testUID = nil
         authors = [:]
     }
@@ -408,6 +426,23 @@ final class SyncAccount {
     /// Whether an item is in a contact's space, sent or received. Those live in the Inbox only:
     /// never in All, the other chips, the menu bar popover or the right-click menu.
     func isContactItem(_ item: ClipItem) -> Bool { contact(for: item.spaceID) != nil }
+
+    func isContactSpace(_ spaceID: String?) -> Bool { contact(for: spaceID) != nil }
+
+    /// A secret a contact sent you (they're listed in the Inbox, like clips).
+    func isFromContact(secret ref: SecretRef) -> Bool {
+        guard contact(for: ref.spaceID) != nil, let author = author(ofItemID: ref.id) else { return false }
+        return author != myUID
+    }
+
+    /// When you last sent each contact something or got something from them, by space id.
+    func lastExchange() -> [String: Date] {
+        var result: [String: Date] = [:]
+        for contact in contacts {
+            if let date = store.newestDate(inSpace: contact.id) { result[contact.id] = date }
+        }
+        return result
+    }
 
     /// Whether a list shows an item: the Inbox only what contacts sent you; everything else
     /// nothing of a contact's (what you sent is still in your history as the original).
@@ -490,7 +525,7 @@ final class SyncAccount {
         engine.onSpacesUpdated = { [weak self] in self?.loadGroups() }
         engine.onDownloadsChanged = { [weak self] in self?.downloads = $0 }
         engine.onSentToThisDevice = { [weak self] _, from in self?.onItemSentHere?(from ?? "another device") }
-        engine.onContactArrivals = { [weak self] in self?.announce($0) }
+        engine.onArrivals = { [weak self] in self?.announce($0) }
         for (space, key) in keys { engine.adoptSpaceKey(key, for: space) }
         self.engine = engine
         backoffUntil = nil
@@ -785,6 +820,9 @@ final class SyncAccount {
         contactRequests = ContactRequests()
         contactCodes = []
         seenRequests = nil
+        pendingArrivals = []
+        ownActions = OwnActions()
+        notifications?.forget()
         lastContactsRefresh = nil
         contactsGeneration += 1
         devices = []
@@ -994,6 +1032,8 @@ final class SyncAccount {
         repeat {
             tickRequested = false
             startedTicks &+= 1
+            // The first sync after signing in only records what's there.
+            let recordOnly = !engine.announcesArrivals
             do {
                 try await engine.tick()
                 engine.announcesArrivals = true   // from the second sync after signing in on
@@ -1007,6 +1047,7 @@ final class SyncAccount {
             }
             finishedTicks = startedTicks
             loadGroups()
+            if self.engine === engine { reportToNotifications(recordOnly: recordOnly) }
         } while tickRequested && self.engine === engine
         isTicking = false
         isSyncing = false
@@ -1124,6 +1165,7 @@ final class SyncAccount {
     }
 
     func renameGroup(_ group: SyncGroup, to name: String) async throws {
+        ownActions.renamedGroups[group.id] = name
         try await call { engine in
             guard let key = engine.spaceKey(for: group.id) else { throw SyncAccountError.missingGroupKey }
             try await engine.api.renameGroup(id: group.id,
@@ -1138,17 +1180,37 @@ final class SyncAccount {
     }
 
     func remove(_ member: RemoteMember, from group: SyncGroup) async throws {
-        try await call { try await $0.api.removeMember(groupId: group.id, uid: member.uid) }
+        // Noted first: a sync finishing while the call returns must already know it was us.
+        let key = OwnActions.member(member.uid, in: group.id)
+        ownActions.removedMembers.insert(key)
+        do {
+            try await call { try await $0.api.removeMember(groupId: group.id, uid: member.uid) }
+        } catch {
+            ownActions.removedMembers.remove(key)
+            throw error
+        }
         syncNow()
     }
 
     func leave(_ group: SyncGroup) async throws {
-        try await call { try await $0.api.removeMember(groupId: group.id, uid: $0.identity.uid) }
+        ownActions.leftGroups.insert(group.id)
+        do {
+            try await call { try await $0.api.removeMember(groupId: group.id, uid: $0.identity.uid) }
+        } catch {
+            ownActions.leftGroups.remove(group.id)
+            throw error
+        }
         syncNow()
     }
 
     func delete(_ group: SyncGroup) async throws {
-        try await call { try await $0.api.deleteGroup(id: group.id) }
+        ownActions.leftGroups.insert(group.id)
+        do {
+            try await call { try await $0.api.deleteGroup(id: group.id) }
+        } catch {
+            ownActions.leftGroups.remove(group.id)
+            throw error
+        }
         syncNow()
     }
 
@@ -1452,17 +1514,76 @@ final class SyncAccount {
         guard let seen = seenRequests else { return }
         let new = incoming.filter { !seen.contains($0.spaceId) }
         guard let first = new.first else { return }
+        notifications?.requestsArrived(new)
         onContactRequest?(new.count == 1 ? "\(first.name) wants to add you as a contact"
                                          : "\(new.count) people want to add you as a contact")
     }
 
-    /// Contacts sent something: refresh who wrote what, then say so once for the batch.
-    private func announce(_ arrivals: [ContactArrival]) {
+    /// Others put something in a group or sent it: refresh who wrote what, keep it for the
+    /// notifications at the end of the sync, and tell `onContactArrivals` about contacts' items.
+    private func announce(_ arrivals: [SyncArrival]) {
         loadGroups()
-        let items = arrivals.compactMap { store.item(withID: $0.itemID) }
+        for arrival in arrivals {
+            guard let found = notificationArrival(arrival) else { continue }
+            pendingArrivals.append(found)
+        }
+        let fromContacts = arrivals.filter { contact(for: $0.spaceId) != nil && $0.category.isClip }
+        let items = fromContacts.compactMap { UUID(uuidString: $0.itemID).flatMap(store.item(withID:)) }
         guard !items.isEmpty else { return }
-        let senders = Set(arrivals.compactMap { contact(for: $0.spaceId)?.name })
+        let senders = Set(fromContacts.compactMap { contact(for: $0.spaceId)?.name })
         onContactArrivals?(Self.arrivalText(items, from: senders.count == 1 ? senders.first : nil))
+    }
+
+    /// What an arrival is, for a notification's preview; nil when it's gone already.
+    private func notificationArrival(_ arrival: SyncArrival) -> NotificationArrival? {
+        let what: NotificationArrival.What
+        let entryID: String
+        switch arrival.category {
+        case .history, .pinned:
+            guard let id = UUID(uuidString: arrival.itemID), let item = store.item(withID: id) else { return nil }
+            what = NotificationDiff.what(of: item)
+            entryID = PanelEntry.clip(item).id
+        case .secret:
+            what = .secret
+            entryID = "k-" + arrival.itemID
+        case .snippet:
+            guard let id = UUID(uuidString: arrival.itemID), let snippet = snippets.snippet(withID: id) else { return nil }
+            what = .snippet(snippet.name)
+            entryID = PanelEntry.snippet(snippet).id
+        case .folder, .otp:
+            return nil
+        }
+        return NotificationArrival(entryID: entryID, spaceId: arrival.spaceId, authorUid: arrival.authorUid, what: what)
+    }
+
+    /// What notifications compare from one sync to the next.
+    func notificationSnapshot() -> NotificationSnapshot {
+        let spaces = (try? context.fetch(FetchDescriptor<SyncSpace>())) ?? []
+        let me = session?.uid
+        var snapshot = NotificationSnapshot()
+        for space in spaces {
+            if space.isGroup {
+                snapshot.groups[space.id] = .init(name: space.name.isEmpty ? "Group" : space.name, isOwner: space.isOwner,
+                                                  members: space.memberNames)
+            } else if space.isDirect {
+                snapshot.contacts[space.id] = .init(name: space.name.isEmpty ? "Contact" : space.name, ownedByMe: space.ownerUid == me)
+            } else if space.isAuthenticator {
+                snapshot.owned[space.id] = authenticators?.owned.first { $0.spaceID == space.id }?.issuer ?? ""
+            }
+        }
+        for shared in authenticators?.shared ?? [] {
+            snapshot.shared[shared.spaceId] = .init(ownerName: shared.ownerName, issuer: shared.issuer)
+        }
+        return snapshot
+    }
+
+    private func reportToNotifications(recordOnly: Bool) {
+        let arrivals = pendingArrivals
+        pendingArrivals = []
+        guard let notifications, let me = session?.uid else { return }
+        let snapshot = notificationSnapshot()
+        notifications.observe(snapshot, arrivals: arrivals, me: me, own: ownActions, recordOnly: recordOnly)
+        ownActions = ownActions.pruned(by: snapshot)
     }
 
     /// "Sam sent you “Report.pdf”", "Sam sent you 3 items", or for several senders "4 new items in your Inbox".
