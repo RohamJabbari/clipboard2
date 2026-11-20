@@ -50,7 +50,7 @@ beforeAll(async () => {
   await embedded.start();
   await embedded.createDatabase("c2test");
   pool = new pg.Pool({ connectionString: `postgres://postgres:postgres@localhost:${port}/c2test`, max: 4 });
-  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql", "003_hardening.sql", "004_contacts.sql", "005_folders.sql"]);
+  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql", "003_hardening.sql", "004_contacts.sql", "005_folders.sql", "006_authenticators.sql"]);
   expect(await migrate(pool)).toEqual([]);
 }, 120_000);
 
@@ -1674,3 +1674,424 @@ describe("contacts", () => {
     expect((await pool.query("SELECT 1 FROM spaces WHERE id = $1", [recent.spaceId])).rowCount).toBe(1);
   });
 });
+
+// MARK: Authenticators
+
+async function createAuthenticator(owner: TestUser, id = randomUUID()) {
+  const sk = randomBytes(32);
+  const res = await call(owner, "POST", "/v1/authenticators", { id, wrappedKey: b64(cc.wrapSpaceKey(sk, id, owner.uid, owner.id.pub)) });
+  return { id, sk, ...res };
+}
+
+const otpPayload = { v: 1, type: "otp", issuer: "GitHub", account: "me@example.com", secret: "JBSWY3DPEHPK3PXP", algorithm: "SHA1", digits: 6, period: 30 };
+
+/** Someone else in the space, put there directly: no route adds people yet, but if one ever does they must not see the seed. */
+async function addRawMember(spaceId: string, user: TestUser) {
+  await pool.query("INSERT INTO space_members (space_id, uid, role, wrapped_key) VALUES ($1, $2, 'member', $3)", [spaceId, user.uid, randomBytes(126)]);
+}
+
+describe("authenticators", () => {
+  it("creates an owned authenticator space and stores one otp item for its owner", async () => {
+    const alice = await person("alice");
+    const auth = await createAuthenticator(alice);
+    expect(auth.status).toBe(201);
+    expect(auth.body).toMatchObject({ id: auth.id, kind: "authenticator", role: "owner", ownerUid: alice.uid, encryptedName: null, memberCount: 1 });
+    expect(auth.body.members).toEqual([{ uid: alice.uid, name: "alice" }]);
+    const sk = cc.unwrapSpaceKey(Buffer.from(auth.body.wrappedKey, "base64"), auth.id, { uid: alice.uid, ...alice.id });
+    expect(sk.equals(auth.sk)).toBe(true);
+
+    const put = await putItem(alice, auth.id, auth.sk, { category: "otp", payload: otpPayload });
+    expect(put.status).toBe(200);
+    const items = (await call(alice, "GET", `/v1/spaces/${auth.id}/changes?since=0`)).body.items;
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ id: put.id, category: "otp", authorUid: alice.uid });
+    const plain = cc.aeadOpen(cc.itemKey(sk), Buffer.from(items[0].ciphertext, "base64"), cc.aad.item(auth.id, put.id, "otp"));
+    expect(JSON.parse(plain.toString()).secret).toBe("JBSWY3DPEHPK3PXP");
+    // Renaming overwrites the same item.
+    expect((await putItem(alice, auth.id, auth.sk, { id: put.id, category: "otp", payload: { ...otpPayload, issuer: "GH" } })).status).toBe(200);
+    expect((await call(alice, "DELETE", `/v1/spaces/${auth.id}/items/${put.id}?updatedAt=${Date.now()}`)).status).toBe(200);
+  });
+
+  it("refuses a taken id and more than the owned limit", async () => {
+    rebuild({ authenticatorsPerUser: 2 });
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const first = await createAuthenticator(alice);
+    expect((await createAuthenticator(bob, first.id)).status).toBe(409);
+    expect((await createAuthenticator(alice, alice.personalSpaceId)).status).toBe(409);
+    expect((await createAuthenticator(alice)).status).toBe(201);
+    const over = await createAuthenticator(alice);
+    expect(over.status).toBe(403);
+    expect(over.body.error).toBe("quota_exceeded");
+    // Other people's authenticators don't count.
+    expect((await createAuthenticator(bob)).status).toBe(201);
+    // Deleting one frees room.
+    expect((await call(alice, "DELETE", `/v1/authenticators/${first.id}`)).status).toBe(204);
+    expect((await createAuthenticator(alice)).status).toBe(201);
+  });
+
+  it("holds only one live otp item, and otp items only live in authenticators", async () => {
+    const alice = await person("alice");
+    const auth = await createAuthenticator(alice);
+    const first = await putItem(alice, auth.id, auth.sk, { category: "otp", payload: otpPayload });
+    expect(first.status).toBe(200);
+    const second = await putItem(alice, auth.id, auth.sk, { category: "otp", payload: otpPayload });
+    expect(second.status).toBe(403);
+    expect(second.body.error).toBe("quota_exceeded");
+    // After deleting the first, a replacement fits.
+    await call(alice, "DELETE", `/v1/spaces/${auth.id}/items/${first.id}?updatedAt=${Date.now()}`);
+    expect((await putItem(alice, auth.id, auth.sk, { category: "otp", payload: otpPayload })).status).toBe(200);
+
+    for (const category of ["history", "pinned", "snippet", "secret", "folder"]) {
+      expect((await putItem(alice, auth.id, auth.sk, { category })).body.error).toBe("invalid");
+    }
+    expect((await putItem(alice, alice.personalSpaceId, alice.personalKey, { category: "otp", payload: otpPayload })).body.error).toBe("invalid");
+    const group = await createGroup(alice);
+    expect((await putItem(alice, group.id, group.sk, { category: "otp", payload: otpPayload })).body.error).toBe("invalid");
+  });
+
+  it("refuses blob uploads, even for the owner", async () => {
+    const alice = await person("alice");
+    const auth = await createAuthenticator(alice);
+    const res = await call(alice, "POST", `/v1/spaces/${auth.id}/blobs`, { id: randomUUID(), size: 10 });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("forbidden");
+  });
+
+  it("never lets anyone but the owner read, write or delete the item", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const auth = await createAuthenticator(alice);
+    const put = await putItem(alice, auth.id, auth.sk, { category: "otp", payload: otpPayload });
+    // Outsiders don't learn the space exists.
+    expect((await call(bob, "GET", `/v1/spaces/${auth.id}/changes?since=0`)).status).toBe(404);
+    expect((await putItem(bob, auth.id, auth.sk, { category: "otp", payload: otpPayload })).status).toBe(404);
+    // Even someone in the space (no route puts them there today) is refused everything.
+    await addRawMember(auth.id, bob);
+    expect((await call(bob, "GET", `/v1/spaces/${auth.id}/changes?since=0`)).status).toBe(403);
+    expect((await call(bob, "GET", `/v1/spaces/${auth.id}/blobs/${randomUUID()}`)).status).toBe(403);
+    expect((await putItem(bob, auth.id, auth.sk, { id: put.id, category: "otp", payload: otpPayload })).status).toBe(403);
+    expect((await putItem(bob, auth.id, auth.sk, { category: "otp", payload: otpPayload })).status).toBe(403);
+    expect((await call(bob, "DELETE", `/v1/spaces/${auth.id}/items/${put.id}?updatedAt=${Date.now()}`)).status).toBe(403);
+    expect((await call(bob, "DELETE", `/v1/authenticators/${auth.id}`)).status).toBe(403);
+    expect((await call(alice, "GET", `/v1/spaces/${auth.id}/changes?since=0`)).body.items[0].deleted).toBeNull();
+  });
+
+  it("lists authenticators only when asked, with include as a comma list", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const req = await requestContact(alice, "bob");
+    await call(bob, "POST", `/v1/contacts/requests/${req.spaceId}/accept`);
+    await createGroup(alice);
+    const auth = await createAuthenticator(alice);
+    const kinds = async (q: string) => (await call(alice, "GET", `/v1/spaces${q}`)).body.spaces.map((s: { kind: string }) => s.kind);
+    expect(await kinds("")).toEqual(["personal", "group"]);
+    expect(await kinds("?include=direct")).toEqual(["personal", "group", "direct"]);
+    expect(await kinds("?include=authenticator")).toEqual(["personal", "group", "authenticator"]);
+    expect(await kinds("?include=direct,authenticator")).toEqual(["personal", "group", "direct", "authenticator"]);
+    expect(await kinds("?include=authenticators")).toEqual(["personal", "group"]);
+    const listed = (await call(alice, "GET", "/v1/spaces?include=authenticator")).body.spaces.find((s: { id: string }) => s.id === auth.id);
+    expect(listed).toMatchObject({ role: "owner", ownerUid: alice.uid, encryptedName: null });
+  });
+
+  it("deletes for the owner only, with its item; 404 for other kinds and strangers", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const auth = await createAuthenticator(alice);
+    await putItem(alice, auth.id, auth.sk, { category: "otp", payload: otpPayload });
+    expect((await call(bob, "DELETE", `/v1/authenticators/${auth.id}`)).status).toBe(404);
+    const group = await createGroup(alice);
+    expect((await call(alice, "DELETE", `/v1/authenticators/${group.id}`)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/authenticators/${alice.personalSpaceId}`)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/authenticators/${auth.id}`)).status).toBe(204);
+    expect((await pool.query("SELECT 1 FROM items WHERE space_id = $1", [auth.id])).rowCount).toBe(0);
+    expect((await call(alice, "GET", `/v1/spaces/${auth.id}/changes?since=0`)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/authenticators/${auth.id}`)).status).toBe(404);
+  });
+
+  it("answers group-only and contact routes with 404 for authenticators", async () => {
+    const alice = await person("alice");
+    const auth = await createAuthenticator(alice);
+    const name = b64(randomBytes(40));
+    expect((await call(alice, "PATCH", `/v1/groups/${auth.id}`, { encryptedName: name })).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/groups/${auth.id}`)).status).toBe(404);
+    expect((await call(alice, "GET", `/v1/groups/${auth.id}/members`)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/groups/${auth.id}/members/${alice.uid}`)).status).toBe(404);
+    expect((await createInvite(alice, { id: auth.id, sk: auth.sk })).status).toBe(404);
+    expect((await call(alice, "GET", `/v1/groups/${auth.id}/invites`)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/contacts/${auth.id}`)).status).toBe(404);
+    expect((await pool.query("SELECT 1 FROM spaces WHERE id = $1", [auth.id])).rowCount).toBe(1);
+  });
+
+  it("looks up users by uid only for contacts and group co-members", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const carol = await person("carol");
+    const dave = await person("dave");
+    const erin = await person("erin");
+    await befriend(alice, bob);
+    const group = await createGroup(alice);
+    expect((await invite(alice, group, carol)).status).toBe(201);
+    expect((await requestContact(alice, "dave")).status).toBe(201); // pending: not a relationship yet
+
+    const found = await call(alice, "GET", `/v1/users/id/${bob.uid}`);
+    expect(found.status).toBe(200);
+    expect(found.body).toEqual({ uid: bob.uid, username: "bob", name: "bob", publicKey: b64(bob.id.pub) });
+    expect((await call(carol, "GET", `/v1/users/id/${alice.uid}`)).body.uid).toBe(alice.uid);
+    expect((await call(alice, "GET", `/v1/users/id/${dave.uid}`)).status).toBe(404);
+    expect((await call(alice, "GET", `/v1/users/id/${erin.uid}`)).status).toBe(404);
+    expect((await call(alice, "GET", `/v1/users/id/${alice.uid}`)).status).toBe(404);
+    expect((await call(alice, "GET", `/v1/users/id/${randomUUID()}`)).status).toBe(404);
+    // Group co-members, not group-of-a-group: bob and carol don't know each other.
+    expect((await call(bob, "GET", `/v1/users/id/${carol.uid}`)).status).toBe(404);
+    // Leaving the group ends it.
+    await call(carol, "DELETE", `/v1/groups/${group.id}/members/${carol.uid}`);
+    expect((await call(carol, "GET", `/v1/users/id/${alice.uid}`)).status).toBe(404);
+  });
+
+  it("shares the invite rate limit for uid lookups", async () => {
+    rebuild({ invitesPerMinute: 2 });
+    const alice = await person("alice");
+    const bob = await person("bob");
+    await befriend(alice, bob);
+    rebuild({ invitesPerMinute: 2 }); // befriend used the lookup budget
+    expect((await call(alice, "GET", `/v1/users/id/${bob.uid}`)).status).toBe(200);
+    expect((await call(alice, "GET", "/v1/users/bob")).status).toBe(200);
+    expect((await call(alice, "GET", `/v1/users/id/${bob.uid}`)).status).toBe(429);
+  });
+
+  it("shares codes, never the seed, only with people the owner knows", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const carol = await person("carol");
+    await befriend(alice, bob);
+    const auth = await createAuthenticator(alice);
+    await putItem(alice, auth.id, auth.sk, { category: "otp", payload: otpPayload });
+
+    expect((await shareCodes(alice, auth.id, carol)).status).toBe(403);
+    expect((await shareCodes(alice, auth.id, carol)).body.error).toBe("forbidden");
+    expect((await shareCodes(alice, auth.id, alice)).status).toBe(400);
+    const batch = randomBytes(2000);
+    const until = Date.now() + 24 * 3600_000;
+    const shared = await shareCodes(alice, auth.id, bob, { sealedCodes: batch, codesUntil: until });
+    expect(shared.status).toBe(200);
+
+    // Bob gets the batch, not the space: no membership, no item, nothing in his space list.
+    const codes = (await call(bob, "GET", "/v1/shared-codes")).body.shared;
+    expect(codes).toEqual([{ spaceId: auth.id, ownerUid: alice.uid, ownerName: "alice", codesUntil: until, sealedCodes: b64(batch), updatedAt: expect.any(Number) }]);
+    expect((await call(bob, "GET", `/v1/spaces/${auth.id}/changes?since=0`)).status).toBe(404);
+    expect((await call(bob, "GET", "/v1/spaces?include=direct,authenticator")).body.spaces.map((s: { id: string }) => s.id)).not.toContain(auth.id);
+    expect((await call(bob, "GET", `/v1/authenticators/${auth.id}/shares`)).status).toBe(404);
+    expect((await call(alice, "GET", "/v1/shared-codes")).body.shared).toEqual([]);
+    expect((await pool.query("SELECT uid FROM space_members WHERE space_id = $1", [auth.id])).rows).toEqual([{ uid: alice.uid }]);
+
+    const listed = (await call(alice, "GET", `/v1/authenticators/${auth.id}/shares`)).body.shares;
+    expect(listed).toEqual([{ uid: bob.uid, username: "bob", name: "bob", codesUntil: until, createdAt: expect.any(Number) }]);
+
+    // A top-up replaces the batch; only the owner can upload.
+    const next = randomBytes(3000);
+    expect((await shareCodes(alice, auth.id, bob, { sealedCodes: next, codesUntil: until + 1000 })).status).toBe(200);
+    const after = (await call(bob, "GET", "/v1/shared-codes")).body.shared;
+    expect(after).toHaveLength(1);
+    expect(after[0]).toMatchObject({ sealedCodes: b64(next), codesUntil: until + 1000 });
+    expect(after[0].updatedAt).toBeGreaterThanOrEqual(codes[0].updatedAt);
+    expect((await shareCodes(bob, auth.id, bob)).status).toBe(404);
+    expect((await shareCodes(carol, auth.id, bob)).status).toBe(404);
+    // Shares exist only on authenticators.
+    const group = await createGroup(alice);
+    expect((await shareCodes(alice, group.id, bob)).status).toBe(404);
+  });
+
+  it("validates batches: at most 64 KiB and 25 hours ahead", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    await befriend(alice, bob);
+    const auth = await createAuthenticator(alice);
+    expect((await shareCodes(alice, auth.id, bob, { sealedCodes: randomBytes(64 * 1024) })).status).toBe(200);
+    expect((await shareCodes(alice, auth.id, bob, { sealedCodes: randomBytes(64 * 1024 + 1) })).body.error).toBe("invalid");
+    expect((await shareCodes(alice, auth.id, bob, { codesUntil: Date.now() + 24.9 * 3600_000 })).status).toBe(200);
+    expect((await shareCodes(alice, auth.id, bob, { codesUntil: Date.now() + 25.1 * 3600_000 })).body.error).toBe("invalid");
+    const empty = await call(alice, "PUT", `/v1/authenticators/${auth.id}/shares/${bob.uid}`, { codesUntil: Date.now(), sealedCodes: "" });
+    expect(empty.status).toBe(400);
+  });
+
+  it("limits shares per authenticator and authenticators shared with a user", async () => {
+    rebuild({ sharesPerAuthenticator: 2, sharedAuthenticatorsPerUser: 2 });
+    const alice = await person("alice");
+    const people = [await person("bob"), await person("carol"), await person("dave")];
+    const group = await createGroup(alice);
+    for (const p of people) expect((await invite(alice, group, p)).status).toBe(201);
+    const auth = await createAuthenticator(alice);
+    expect((await shareCodes(alice, auth.id, people[0]!)).status).toBe(200);
+    expect((await shareCodes(alice, auth.id, people[1]!)).status).toBe(200);
+    const over = await shareCodes(alice, auth.id, people[2]!);
+    expect(over.status).toBe(403);
+    expect(over.body.error).toBe("quota_exceeded");
+    // Topping up an existing share isn't a new one.
+    expect((await shareCodes(alice, auth.id, people[1]!)).status).toBe(200);
+
+    const second = await createAuthenticator(alice);
+    const third = await createAuthenticator(alice);
+    expect((await shareCodes(alice, second.id, people[0]!)).status).toBe(200);
+    const full = await shareCodes(alice, third.id, people[0]!);
+    expect(full.status).toBe(403);
+    expect(full.body.error).toBe("quota_exceeded");
+    // Leaving frees room.
+    expect((await call(people[0]!, "DELETE", `/v1/authenticators/${auth.id}/shares/${people[0]!.uid}`)).status).toBe(204);
+    expect((await shareCodes(alice, third.id, people[0]!)).status).toBe(200);
+  });
+
+  it("removes a share by the owner or the recipient leaving, deleting the batch at once", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const carol = await person("carol");
+    const group = await createGroup(alice);
+    await invite(alice, group, bob);
+    await invite(alice, group, carol);
+    const auth = await createAuthenticator(alice);
+    await shareCodes(alice, auth.id, bob);
+    await shareCodes(alice, auth.id, carol);
+
+    // Neither another recipient nor a stranger can remove someone.
+    expect((await call(carol, "DELETE", `/v1/authenticators/${auth.id}/shares/${bob.uid}`)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/authenticators/${auth.id}/shares/${alice.uid}`)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/authenticators/${group.id}/shares/${bob.uid}`)).status).toBe(404);
+
+    expect((await call(alice, "DELETE", `/v1/authenticators/${auth.id}/shares/${bob.uid}`)).status).toBe(204);
+    expect((await call(bob, "GET", "/v1/shared-codes")).body.shared).toEqual([]);
+    expect((await pool.query("SELECT 1 FROM authenticator_shares WHERE recipient_uid = $1", [bob.uid])).rowCount).toBe(0);
+    expect((await call(alice, "DELETE", `/v1/authenticators/${auth.id}/shares/${bob.uid}`)).status).toBe(404);
+
+    expect((await call(carol, "DELETE", `/v1/authenticators/${auth.id}/shares/${carol.uid}`)).status).toBe(204);
+    expect((await call(carol, "GET", "/v1/shared-codes")).body.shared).toEqual([]);
+    expect((await call(alice, "GET", `/v1/authenticators/${auth.id}/shares`)).body.shares).toEqual([]);
+  });
+
+  it("transfers ownership to someone it's shared with, swapping who holds the seed", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    const carol = await person("carol");
+    const group = await createGroup(alice);
+    await invite(alice, group, bob);
+    await invite(alice, group, carol);
+    const auth = await createAuthenticator(alice);
+    const item = await putItem(alice, auth.id, auth.sk, { category: "otp", payload: otpPayload });
+    await shareCodes(alice, auth.id, carol);
+    const wrapFor = (u: TestUser) => b64(cc.wrapSpaceKey(auth.sk, auth.id, u.uid, u.id.pub));
+
+    // Only to someone with a share, and only by the owner.
+    expect((await call(alice, "POST", `/v1/authenticators/${auth.id}/transfer`, { uid: bob.uid, wrappedKey: wrapFor(bob) })).status).toBe(400);
+    expect((await call(alice, "POST", `/v1/authenticators/${auth.id}/transfer`, { uid: alice.uid, wrappedKey: wrapFor(alice) })).status).toBe(400);
+    await shareCodes(alice, auth.id, bob);
+    expect((await call(bob, "POST", `/v1/authenticators/${auth.id}/transfer`, { uid: bob.uid, wrappedKey: wrapFor(bob) })).status).toBe(404);
+    expect((await call(alice, "POST", `/v1/authenticators/${group.id}/transfer`, { uid: bob.uid, wrappedKey: wrapFor(bob) })).status).toBe(404);
+
+    expect((await call(alice, "POST", `/v1/authenticators/${auth.id}/transfer`, { uid: bob.uid, wrappedKey: wrapFor(bob) })).status).toBe(204);
+
+    // Bob is now the only member and owner, and can read and write the item.
+    expect((await pool.query("SELECT uid, role FROM space_members WHERE space_id = $1", [auth.id])).rows).toEqual([{ uid: bob.uid, role: "owner" }]);
+    const bobsSpace = (await call(bob, "GET", "/v1/spaces?include=authenticator")).body.spaces.find((s: { id: string }) => s.id === auth.id);
+    expect(bobsSpace).toMatchObject({ kind: "authenticator", role: "owner", ownerUid: bob.uid, memberCount: 1 });
+    expect(cc.unwrapSpaceKey(Buffer.from(bobsSpace.wrappedKey, "base64"), auth.id, { uid: bob.uid, ...bob.id }).equals(auth.sk)).toBe(true);
+    const items = (await call(bob, "GET", `/v1/spaces/${auth.id}/changes?since=0`)).body.items;
+    expect(items.map((i: { id: string; authorUid: string }) => [i.id, i.authorUid])).toEqual([[item.id, bob.uid]]);
+    expect((await putItem(bob, auth.id, auth.sk, { id: item.id, category: "otp", payload: otpPayload })).status).toBe(200);
+
+    // Alice lost the seed: she can't read, write, share or delete, and it's gone from her space list.
+    expect((await call(alice, "GET", `/v1/spaces/${auth.id}/changes?since=0`)).status).toBe(404);
+    expect((await putItem(alice, auth.id, auth.sk, { id: item.id, category: "otp", payload: otpPayload })).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/spaces/${auth.id}/items/${item.id}?updatedAt=${Date.now()}`)).status).toBe(404);
+    expect((await shareCodes(alice, auth.id, carol)).status).toBe(404);
+    expect((await call(alice, "DELETE", `/v1/authenticators/${auth.id}`)).status).toBe(404);
+    expect((await call(alice, "GET", "/v1/spaces?include=authenticator")).body.spaces.map((s: { id: string }) => s.id)).not.toContain(auth.id);
+    // …and gets an empty share instead; Bob's share is gone; Carol's stays.
+    expect((await call(alice, "GET", "/v1/shared-codes")).body.shared).toEqual([
+      { spaceId: auth.id, ownerUid: bob.uid, ownerName: "bob", codesUntil: null, sealedCodes: null, updatedAt: expect.any(Number) },
+    ]);
+    expect((await call(bob, "GET", "/v1/shared-codes")).body.shared).toEqual([]);
+    const shares = (await call(bob, "GET", `/v1/authenticators/${auth.id}/shares`)).body.shares;
+    expect(shares.map((s: { uid: string }) => s.uid).sort()).toEqual([alice.uid, carol.uid].sort());
+    expect(shares.find((s: { uid: string }) => s.uid === alice.uid).codesUntil).toBeNull();
+    // The new owner tops Alice up, or removes her.
+    expect((await shareCodes(bob, auth.id, alice)).status).toBe(200);
+    expect((await call(bob, "DELETE", `/v1/authenticators/${auth.id}/shares/${alice.uid}`)).status).toBe(204);
+  });
+
+  it("checks the new owner's limit on transfer", async () => {
+    rebuild({ authenticatorsPerUser: 1 });
+    const alice = await person("alice");
+    const bob = await person("bob");
+    await befriend(alice, bob);
+    const auth = await createAuthenticator(alice);
+    await createAuthenticator(bob);
+    await shareCodes(alice, auth.id, bob);
+    const res = await call(alice, "POST", `/v1/authenticators/${auth.id}/transfer`, {
+      uid: bob.uid,
+      wrappedKey: b64(cc.wrapSpaceKey(auth.sk, auth.id, bob.uid, bob.id.pub)),
+    });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("quota_exceeded");
+    // Nothing changed.
+    expect((await pool.query("SELECT owner_uid FROM spaces WHERE id = $1", [auth.id])).rows[0].owner_uid).toBe(alice.uid);
+    expect((await call(bob, "GET", "/v1/shared-codes")).body.shared).toHaveLength(1);
+  });
+
+  it("deletes shares with the authenticator", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    await befriend(alice, bob);
+    const auth = await createAuthenticator(alice);
+    await shareCodes(alice, auth.id, bob);
+    expect((await call(alice, "DELETE", `/v1/authenticators/${auth.id}`)).status).toBe(204);
+    expect((await call(bob, "GET", "/v1/shared-codes")).body.shared).toEqual([]);
+  });
+
+  it("goes with its owner's account, and shares to a deleted account go too", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    await befriend(alice, bob);
+    const mine = await createAuthenticator(alice);
+    await putItem(alice, mine.id, mine.sk, { category: "otp", payload: otpPayload });
+    await shareCodes(alice, mine.id, bob);
+    const bobs = await createAuthenticator(bob);
+    await putItem(bob, bobs.id, bobs.sk, { category: "otp", payload: otpPayload });
+    await shareCodes(bob, bobs.id, alice);
+    expect((await call(alice, "DELETE", "/v1/account", { authKey: await authKeyOf(alice) })).status).toBe(204);
+    expect((await pool.query("SELECT 1 FROM spaces WHERE id = $1", [mine.id])).rowCount).toBe(0);
+    expect((await pool.query("SELECT 1 FROM items WHERE space_id = $1", [mine.id])).rowCount).toBe(0);
+    expect((await call(bob, "GET", "/v1/shared-codes")).body.shared).toEqual([]);
+    expect((await call(bob, "GET", `/v1/authenticators/${bobs.id}/shares`)).body.shares).toEqual([]);
+    expect((await call(bob, "GET", `/v1/spaces/${bobs.id}/changes?since=0`)).body.items[0].deleted).toBeNull();
+  });
+
+  it("keeps a transferred authenticator when the old owner deletes their account", async () => {
+    const alice = await person("alice");
+    const bob = await person("bob");
+    await befriend(alice, bob);
+    const auth = await createAuthenticator(alice);
+    await putItem(alice, auth.id, auth.sk, { category: "otp", payload: otpPayload });
+    await shareCodes(alice, auth.id, bob);
+    await call(alice, "POST", `/v1/authenticators/${auth.id}/transfer`, { uid: bob.uid, wrappedKey: b64(cc.wrapSpaceKey(auth.sk, auth.id, bob.uid, bob.id.pub)) });
+    expect((await call(alice, "DELETE", "/v1/account", { authKey: await authKeyOf(alice) })).status).toBe(204);
+    const items = (await call(bob, "GET", `/v1/spaces/${auth.id}/changes?since=0`)).body.items;
+    expect(items).toHaveLength(1);
+    expect(items[0].deleted).toBeNull();
+    expect((await call(bob, "GET", `/v1/authenticators/${auth.id}/shares`)).body.shares).toEqual([]);
+  });
+});
+
+/** Makes `to` a contact of `from` (request + accept). */
+async function befriend(from: Named, to: Named) {
+  const req = await requestContact(from, to.username);
+  expect(req.status).toBe(201);
+  expect((await call(to, "POST", `/v1/contacts/requests/${req.spaceId}/accept`)).status).toBe(201);
+  return req;
+}
+
+/** The owner uploads a batch for someone (random bytes: the server never opens it). */
+function shareCodes(owner: TestUser, spaceId: string, to: TestUser, opts: { sealedCodes?: Buffer; codesUntil?: number } = {}) {
+  return call(owner, "PUT", `/v1/authenticators/${spaceId}/shares/${to.uid}`, {
+    codesUntil: opts.codesUntil ?? Date.now() + 24 * 3600_000,
+    sealedCodes: b64(opts.sealedCodes ?? randomBytes(1000)),
+  });
+}

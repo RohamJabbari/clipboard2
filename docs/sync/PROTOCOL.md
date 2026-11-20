@@ -329,6 +329,9 @@ one live item, category `otp` ([payload](#item-payloads)), which syncs to the ow
 with never get it: the owner's devices send them **pre-computed codes**, sealed to each person.
 
 - **Owner only:** everything. The space never has other members, so nobody else can read the item.
+  It takes only `otp` items, at most one live (`400 invalid` for other categories, `403 quota_exceeded`
+  for a second), and no blobs (`403 forbidden`). `otp` items go nowhere else (`400 invalid`).
+- Group-only and contact routes answer `404` for authenticator spaces; authenticator routes answer `404` for other kinds.
 - **Listing:** `GET /v1/spaces` leaves `authenticator` spaces out unless asked: `?include=authenticator`.
   `include` takes a comma list (`?include=direct,authenticator`).
 - **Sharing needs a relationship:** a contact (an established direct space) or someone in a group with the
@@ -353,11 +356,11 @@ codesJSON   = {"v":1,"issuer":"…","account":"…","digits":6,"period":30,
 | `GET /v1/users/id/:uid` | `{uid, username, name, publicKey}`, only for the caller's contacts and people in a group with them; otherwise `404`. Shares the invite rate limit. |
 | `POST /v1/authenticators` `{id, wrappedKey}` | `201 Space`, `kind: "authenticator"`, the caller as owner. `409` if `id` is taken; `403 quota_exceeded` over the limit. |
 | `DELETE /v1/authenticators/:id` | `204`, owner only. Deletes the space, its item and every share. |
-| `GET /v1/authenticators/:id/shares` | `{shares: [{uid, username, name, codesUntil, createdAt}]}`, owner only. |
-| `PUT /v1/authenticators/:id/shares/:uid` `{codesUntil, sealedCodes}` | `200`. Owner only. Creates the share if needed (relationship and limits checked: `403 forbidden` / `403 quota_exceeded`, `400 invalid` for yourself) and replaces the batch. `sealedCodes` at most 64 KiB; `codesUntil` (ms) at most 25 h ahead. |
+| `GET /v1/authenticators/:id/shares` | `{shares: [{uid, username, name, codesUntil, createdAt}]}`, owner only; `codesUntil` is `null` for an empty share. |
+| `PUT /v1/authenticators/:id/shares/:uid` `{codesUntil, sealedCodes}` | `200 {}`. Owner only. Creates the share if needed (relationship and limits checked: `403 forbidden` / `403 quota_exceeded`, `400 invalid` for yourself) and replaces the batch. `sealedCodes` at most 64 KiB; `codesUntil` (ms) at most 25 h ahead. |
 | `DELETE /v1/authenticators/:id/shares/:uid` | `204`. The owner removes someone, or the recipient leaves. |
-| `GET /v1/shared-codes` | `{shared: [{spaceId, ownerUid, ownerName, codesUntil, sealedCodes, updatedAt}]}`, every share to the caller. Clients fetch it on every sync. |
-| `POST /v1/authenticators/:id/transfer` `{uid, wrappedKey}` | `204`. Owner only; `uid` must have a share (`400 invalid` otherwise). `wrappedKey` is SK wrapped to them. They become the only member and owner; their share is deleted; the old owner gets a share (empty until the new owner's devices top it up). |
+| `GET /v1/shared-codes` | `{shared: [{spaceId, ownerUid, ownerName, codesUntil, sealedCodes, updatedAt}]}`, every share to the caller. `codesUntil` and `sealedCodes` are `null` until the first batch. Clients fetch it on every sync. |
+| `POST /v1/authenticators/:id/transfer` `{uid, wrappedKey}` | `204`. Owner only; `uid` must have a share (`400 invalid` otherwise). `wrappedKey` is SK wrapped to them. They become the only member and owner; their share is deleted; the old owner gets a share (empty until the new owner's devices top it up). `403 quota_exceeded` if that takes either of them over a limit. |
 
 Changes to shares and batches notify the people involved the same way item changes do.
 
@@ -396,7 +399,7 @@ Item = {"id","category":"history|pinned|snippet|secret|folder|otp","seq","sortAt
 ```
 
 **Retention:**
-- `pinned`, `snippet`, `secret` and `folder` items stay until deleted.
+- `pinned`, `snippet`, `secret`, `folder` and `otp` items stay until deleted.
 - After any `history` upsert, the server keeps the newest **200** `history` items in that space by `sortAt`, ties broken by `id`. All others become `trimmed` tombstones, their blobs are deleted, and the `PUT` response lists them.
 - Tombstones are kept for **90 days**. A `since` older than the space's purge horizon returns `{resetRequired: true}`, and the client re-syncs from `since=0`. While re-walking from 0, the client sends `full=1` so pages below the horizon don't ask for another reset.
 
@@ -440,6 +443,7 @@ Item = {"id","category":"history|pinned|snippet|secret|folder|otp","seq","sortAt
 - KDF salt and iterations
 - session hashes, device names and last use
 - group membership and roles, and who is whose contact (including pending requests)
+- who an authenticator is shared with, each batch's size, `codesUntil` and upload time
 - invite ids and expiry
 - sign-up code hashes, who made and used each, and expiry
 - for about two minutes, auth attempt counts keyed by an HMAC of the IP or email
