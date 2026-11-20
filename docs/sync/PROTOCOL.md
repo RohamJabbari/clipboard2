@@ -124,7 +124,7 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
  "isPinned":false,"pinnedAt":null,"label":null,"copyCount":1,
  "createdAt":0,"lastCopiedAt":0,"contentHash":"text:…","folder":"<folder item id>"}
 // type "folder"
-{"v":1,"type":"folder","name":"…","label":null,"createdAt":0,"updatedAt":0}
+{"v":1,"type":"folder","name":"…","label":null,"parent":"<folder item id>","createdAt":0,"updatedAt":0}
 // type "snippet"
 {"v":1,"type":"snippet","name":"…","keyword":"…","body":"…","createdAt":0,"updatedAt":0}
 // type "secret"
@@ -149,7 +149,7 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
 
 Pinning or unpinning changes the category, and the category is part of the AAD, so the client re-encrypts and `PUT`s again.
 
-**Folders** group saved clips within one space (personal or group; not contacts in v1), one level deep.
+**Folders** group saved clips within one space (personal or group; not contacts in v1). A folder may sit in another folder of the same space (`parent`, omitted at the top level); an unknown parent, a cycle or more than 8 levels reads as top level. Deleting a folder moves its clips and subfolders to its parent.
 - A clip in a folder has `isPinned: true` and `folder` set to the folder item's id; it travels as `pinned`. Clearing `isPinned` clears `folder`.
 - A `folder` id the reader doesn't have (deleted, or not pulled yet) means the clip sits at the root of Saved.
 - Deleting a folder deletes only the folder: each member's client moves its clips to the root lazily (they already read as root, above), and the device that deleted it re-pushes its clips without `folder`.
