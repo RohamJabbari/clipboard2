@@ -14,6 +14,9 @@ public sealed class SavedV2Tests : IDisposable
     private readonly FakeHost _host = new();
     private readonly PanelModel _model;
 
+    /// <summary>The folder picker without its "New Folder in ‹folder›…" rows (nested-folders.md).</summary>
+    private List<PanelAction> Picks() => [.. _model.FilteredActions.Where(a => a is not PanelAction.MoveToNewFolder { ParentId: not null })];
+
     public SavedV2Tests()
     {
         _model = new PanelModel(_store, _settings, new QuickSlots(_settings), _vault, _host) { Self = () => new SyncSelf("me", "me") };
@@ -147,7 +150,7 @@ public sealed class SavedV2Tests : IDisposable
         var secretId = new PanelEntry.SecretEntry(secret).Id;
         _model.Select(secretId);
         _model.Perform(new PanelAction.MoveToFolder());
-        Assert.Equal([new PanelAction.MoveTo(folder.Id, "Keys"), new PanelAction.MoveToNewFolder()], _model.FilteredActions);
+        Assert.Equal([new PanelAction.MoveTo(folder.Id, "Keys"), new PanelAction.MoveToNewFolder()], Picks());
         _model.Perform(new PanelAction.MoveTo(folder.Id, "Keys"));
         Assert.Equal(folder.Id, _store.SecretFolderId(secret.Id));
         Assert.Equal("Moved to “Keys”", _model.Notice);
@@ -248,7 +251,7 @@ public sealed class SavedV2Tests : IDisposable
         _model.SetGroupFilter("g1");
         _model.Select(new PanelEntry.Clip(item).Id);
         _model.Perform(new PanelAction.MoveToFolder());
-        var picks = _model.FilteredActions;
+        var picks = Picks();
         Assert.Equal([new PanelAction.MoveTo(shared.Id, "Shared", "Team"), new PanelAction.MoveToNewFolder(false, "Team"),
                       new PanelAction.MoveTo(mine.Id, "Mine", "Mine"), new PanelAction.MoveToNewFolder(true, "Mine")], picks);
 
@@ -349,7 +352,7 @@ public sealed class SavedV2Tests : IDisposable
         _model.Perform(new PanelAction.ShareTo("g1", "Team"));
         Assert.Equal(new PanelAction.ShareTo("g1", "Team"), _model.PickingShareFolder);
         Assert.Equal([new PanelAction.ShareInto("g1", "Team", null, "No Folder"), new PanelAction.ShareInto("g1", "Team", specs.Id, "Specs")],
-            _model.FilteredActions);
+            Picks());
         // Escape goes back to the groups.
         _model.HandleKey(new KeyInput(PanelKey.Escape));
         Assert.True(_model.IsPickingGroup);

@@ -422,6 +422,20 @@ public sealed partial class QuickPanelWindow : Window
         AutomationName(newFolder, "New Folder");
         DockPanel.SetDock(newFolder, Dock.Right);
         bar.Children.Add(newFolder);
+        if (Model.CanAddItems)
+        {
+            var addItems = new Border { Padding = new Thickness(6, 2, 6, 2), CornerRadius = new CornerRadius(6), Cursor = Cursors.Hand, Background = Brushes.Transparent, ToolTip = "Add from clipboard history" };
+            var addContent = new StackPanel { Orientation = Orientation.Horizontal };
+            var addIcon = Glyphs.Icon(PlusGlyph, 13, Fluent.Accent);
+            addIcon.Margin = new Thickness(0, 0, 5, 0);
+            addContent.Children.Add(addIcon);
+            addContent.Children.Add(Fluent.Label("Add Items", 12, Fluent.Accent));
+            addItems.Child = addContent;
+            addItems.MouseLeftButtonUp += (_, _) => Model.BeginAddItems();
+            AutomationName(addItems, "Add Items");
+            DockPanel.SetDock(addItems, Dock.Right);
+            bar.Children.Add(addItems);
+        }
         if (Model.SavedSpace is null && Model.OpenFolderId is null && Model.Authenticators is not null)
         {
             // Authenticators are personal tools: only in the personal Saved, never in folders.
@@ -505,6 +519,7 @@ public sealed partial class QuickPanelWindow : Window
             switch (Model.Mode)
             {
                 case PanelMode.Actions when _actionFilter is not null: _actionFilter.Focus(); break;
+                case PanelMode.AddItems when _addItemsFilter is not null: _addItemsFilter.Focus(); break;
                 case PanelMode.Browse: _search.Focus(); _search.CaretIndex = _search.Text.Length; break;
             }
         }, System.Windows.Threading.DispatcherPriority.Input);
@@ -541,6 +556,7 @@ public sealed partial class QuickPanelWindow : Window
             Key.Tab => new(PanelKey.Tab, mods),
             Key.Delete => new(PanelKey.Delete, mods),
             Key.Back => new(PanelKey.Backspace, mods),
+            Key.Space => new(PanelKey.Space, mods),
             >= Key.D1 and <= Key.D9 => new(PanelKey.Digit, mods, Digit: key - Key.D0),
             >= Key.NumPad1 and <= Key.NumPad9 => new(PanelKey.Digit, mods, Digit: key - Key.NumPad0),
             >= Key.A and <= Key.Z => new(PanelKey.Letter, mods, Letter: (char)('a' + (key - Key.A))),
@@ -1128,6 +1144,7 @@ public sealed partial class QuickPanelWindow : Window
             PanelMode.Browse when Model.SelectedEntry is PanelEntry.SharedCodeEntry o => $"{o.Id}|{o.Shared.ReceivedAt.Ticks}|{o.Shared.IsOut(Model.Clock())}",
             PanelMode.AuthenticatorPeople => "people:" + string.Join(",", Model.PeopleOf?.People.Select(p => p.Uid) ?? []),
             PanelMode.AuthenticatorForm => "form:" + Model.AuthenticatorForm?.GetHashCode() + "|" + Model.AuthenticatorForm?.Error,
+            PanelMode.AddItems => "additems:" + Model.AddItemsForm?.GetHashCode(),
             PanelMode.Browse => Model.SelectedId,
             PanelMode.AI => Model.AIRun?.GetHashCode().ToString(),
             _ => Model.SelectedId,
@@ -1137,12 +1154,15 @@ public sealed partial class QuickPanelWindow : Window
         {
             _detailState = state;
             _actionFilter = null;
+            _addItemsFilter = null;
+            _addItemsList = null;
             _aiOutput = null;
             _fileRows.Clear();
             foreach (var stale in _codeViews.Keys.Where(k => k.StartsWith("detail:", StringComparison.Ordinal)).ToList()) _codeViews.Remove(stale);
             _detail.Child = Model.Mode switch
             {
                 PanelMode.AuthenticatorForm => BuildAuthenticatorForm(),
+                PanelMode.AddItems => BuildAddItems(),
                 PanelMode.AuthenticatorSecret => BuildAuthenticatorSecret(),
                 PanelMode.AuthenticatorPeople => BuildAuthenticatorPeople(),
                 PanelMode.ConfirmDelete => BuildConfirmDelete(),
@@ -1157,6 +1177,7 @@ public sealed partial class QuickPanelWindow : Window
             };
         }
         if (Model.Mode == PanelMode.Actions) FillActionList();
+        if (Model.Mode == PanelMode.AddItems) FillAddItems();
         if (Model.Mode == PanelMode.AI) UpdateAI();
         if (Model.Mode == PanelMode.Browse) UpdateFileRows();
     }
@@ -1397,11 +1418,11 @@ public sealed partial class QuickPanelWindow : Window
             row.Children.Add(Fluent.Label(value, 12));
             stack.Children.Add(row);
         }
+        LabelAndFolderRows(stack, entry);
         switch (entry)
         {
             case PanelEntry.Clip c:
                 var item = c.Item;
-                if (item.Label is not null) Line("Label", item.Label);
                 if (item.SourceName is not null) Line("From", item.SourceName);
                 Line("Copied", item.LastCopiedAt.ToLocalTime().ToString("g"));
                 if (item.CopyCount > 1) Line("Times copied", item.CopyCount.ToString());
@@ -1411,12 +1432,14 @@ public sealed partial class QuickPanelWindow : Window
                     ClipKind.File => item.Files.Count == 1 ? "File" : $"{item.Files.Count} files",
                     _ => $"{item.Kind.DisplayName()} · {item.Text.Length} characters",
                 });
-                if (Model.FolderOf(item) is { } folder) Line("Folder", folder.Name);
+                if (item.Label is not null && !Model.CanLabel(entry)) Line("Label", item.Label);
+                if (Model.FolderOf(item) is not null && !Model.CanMoveSelection) Line("Folder", Model.FolderLocation(entry)!);
                 Line("Expires", item.IsPinned ? "Never (saved)"
                     : item.ExpiryDate(_services.Settings.MaxAge) is { } expiry ? expiry.ToLocalTime().ToString("g") : "Never");
                 break;
             case PanelEntry.FolderEntry f:
-                if (f.Folder.Label is not null) Line("Label", f.Folder.Label);
+                if (f.Folder.Label is not null && !Model.CanLabel(f)) Line("Label", f.Folder.Label);
+                if (Model.ParentFolder(f.Folder) is not null) Line("In", "Saved › " + Model.FolderPathText(Model.ParentFolder(f.Folder)!.Id));
                 if (Model.GroupName(f) is { } group) Line("Group", group);
                 Line("Created", f.Folder.CreatedAt.ToLocalTime().ToString("g"));
                 break;
@@ -1430,7 +1453,7 @@ public sealed partial class QuickPanelWindow : Window
             case PanelEntry.SecretEntry k:
                 Line("Stored in", "Credential Manager");
                 if (k.Secret.CreatedAt is { } created) Line("Added", created.ToLocalTime().ToString("g"));
-                if (Model.FolderOf(k.Secret) is { } secretFolder) Line("Folder", secretFolder.Name);
+                if (Model.FolderOf(k.Secret) is not null && !Model.CanMoveSelection) Line("Folder", Model.FolderLocation(entry)!);
                 if (Model.GroupName(k) is { } secretGroup) Line("Group", secretGroup);
                 break;
         }
@@ -1447,6 +1470,7 @@ public sealed partial class QuickPanelWindow : Window
             : "Enter pastes them together where the app supports it.", 13, Fluent.Secondary, wrap: true));
         var list = new StackPanel { Margin = new Thickness(0, 12, 0, 0) };
         foreach (var c in clips) list.Children.Add(Fluent.Label("• " + c.DisplayTitle, 13));
+        MultiFolderRow(stack);
         stack.Children.Add(list);
         return Padded(new ScrollViewer { Content = stack, VerticalScrollBarVisibility = ScrollBarVisibility.Auto });
     }
@@ -1516,7 +1540,7 @@ public sealed partial class QuickPanelWindow : Window
             {
                 CornerRadius = new CornerRadius(6), Padding = new Thickness(8, 5, 8, 5),
                 Background = selected ? Fluent.Accent : Brushes.Transparent,
-                Child = Fluent.Label(action.Title, 14, selected ? Fluent.AccentText : null),
+                Child = ActionRowContent(action, selected),
             };
             var a = action;
             row.MouseLeftButtonUp += (_, _) => Model.Perform(a);
@@ -1527,6 +1551,19 @@ public sealed partial class QuickPanelWindow : Window
             Model.OtpPicker is { Kind: OtpPickerKind.Share } ? "Nobody to share with. Add contacts or join groups in Settings → Sync." : "No matching actions",
             13, Fluent.Secondary, wrap: true));
         selectedRow?.BringIntoView();
+    }
+
+    /// <summary>An action's title, with its shortcut on the right (Ctrl+L next to Label…).</summary>
+    private static UIElement ActionRowContent(PanelAction action, bool selected)
+    {
+        var title = Fluent.Label(action.Title, 14, selected ? Fluent.AccentText : null);
+        if (action.Shortcut is not { } shortcut) return title;
+        var dock = new DockPanel();
+        var keys = Fluent.Label(shortcut, 12, selected ? Fluent.AccentText : Fluent.Tertiary);
+        DockPanel.SetDock(keys, Dock.Right);
+        dock.Children.Add(keys);
+        dock.Children.Add(title);
+        return dock;
     }
 
     private ComboBox ModelPicker(bool rerun)
@@ -1751,6 +1788,7 @@ public sealed partial class QuickPanelWindow : Window
             PanelMode.Actions when Model.OtpPicker is { Kind: OtpPickerKind.Share } => "↑↓ Choose Person    Enter Share    Esc Back",
             PanelMode.Actions when Model.OtpPicker is { Kind: OtpPickerKind.Transfer } => "↑↓ Choose Person    Enter Transfer    Esc Back",
             PanelMode.ConfirmDelete => "Enter Delete    Esc Cancel",
+            PanelMode.AddItems => "↑↓ Choose    Space Check    Enter Add    Esc Cancel",
             PanelMode.AuthenticatorSecret or PanelMode.AuthenticatorPeople => "Esc Back",
             PanelMode.Actions when Model.IsPickingGroup => "↑↓ Choose Group    Enter Share    Esc Back",
             PanelMode.Actions when Model.PickingShareFolder is not null => "↑↓ Choose Folder    Enter Share    Esc Back",

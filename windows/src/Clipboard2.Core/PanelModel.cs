@@ -65,7 +65,7 @@ public abstract record PanelEntry
     };
 }
 
-public enum PanelMode { Browse, Actions, SnippetForm, SaveSecret, Label, EditSecret, AI, FolderName, AuthenticatorForm, AuthenticatorSecret, AuthenticatorPeople, ConfirmDelete }
+public enum PanelMode { Browse, Actions, SnippetForm, SaveSecret, Label, EditSecret, AI, FolderName, AuthenticatorForm, AuthenticatorSecret, AuthenticatorPeople, ConfirmDelete, AddItems }
 
 public abstract record PanelAction
 {
@@ -92,7 +92,7 @@ public abstract record PanelAction
     public sealed record MoveTo(Guid FolderId, string FolderName, string? SectionTitle = null) : PanelAction;
     /// <summary>Asks for a name, creates the folder and moves the selection in. <paramref name="Mine"/>: a personal
     /// folder, which group items are copied into.</summary>
-    public sealed record MoveToNewFolder(bool Mine = false, string? SectionTitle = null, Guid? ParentId = null) : PanelAction;
+    public sealed record MoveToNewFolder(bool Mine = false, string? SectionTitle = null, Guid? ParentId = null, string? ParentName = null) : PanelAction;
     /// <summary>A new folder inside the selected folder.</summary>
     public sealed record NewFolderInside : PanelAction;
     /// <summary>Share to Group's second step when the group has folders: where in the group's Saved the copies go
@@ -132,6 +132,15 @@ public abstract record PanelAction
     public sealed record DeleteAuthenticator : PanelAction;
     public sealed record LeaveAuthenticator : PanelAction;
 
+    /// <summary>The key that does it, shown next to its title.</summary>
+    public string? Shortcut => this switch
+    {
+        SetLabel => "Ctrl+L",
+        MoveToFolder => "Ctrl+Shift+M",
+        Preview => "Ctrl+Y",
+        _ => null,
+    };
+
     public string Section(string aiName) => this switch
     {
         Paste or PastePlain or Copy => "Paste",
@@ -170,6 +179,7 @@ public abstract record PanelAction
         RemoveFromSaved => "Remove from Saved",
         MoveToFolder => "Move to Folder…",
         MoveTo m => m.FolderName,
+        MoveToNewFolder { ParentName: { } parentName } => $"New Folder in {parentName}…",
         MoveToNewFolder => "New Folder…",
         RemoveFromFolder => "Move to Top Level",
         NewFolderInside => "New Folder Inside…",
@@ -279,6 +289,9 @@ public sealed class LabelForm(PanelEntry entry)
     };
     public bool IsSecret => Entry is PanelEntry.SecretEntry;
     public bool IsFolder => Entry is PanelEntry.FolderEntry;
+    /// <summary>Ctrl+L on several clips: the same label goes on each of these too.</summary>
+    public IReadOnlyList<ClipItem> AlsoClips { get; init; } = [];
+    public int Count => 1 + AlsoClips.Count;
 }
 
 /// <summary>The inline name prompt for a folder: renaming one (<see cref="Folder"/>), or naming a new one that
@@ -319,7 +332,7 @@ public sealed class SaveSecretForm(ClipItem item)
 }
 
 [Flags] public enum KeyMods { None = 0, Ctrl = 1, Shift = 2, Alt = 4 }
-public enum PanelKey { Other, Escape, Up, Down, Left, Right, PageUp, PageDown, Enter, Tab, Delete, Digit, Letter, Backspace }
+public enum PanelKey { Other, Escape, Up, Down, Left, Right, PageUp, PageDown, Enter, Tab, Delete, Digit, Letter, Backspace, Space }
 
 /// <summary>A key press, mapped from the UI framework so the logic is testable anywhere.</summary>
 public readonly record struct KeyInput(PanelKey Key, KeyMods Mods = KeyMods.None, int Digit = 0, char Letter = '\0')
@@ -460,6 +473,7 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
         IsPickingFolder = false;
         PickingShareFolder = null;
         ResetAuthenticatorMode();
+        AddItemsForm = null;
         Mode = PanelMode.Browse;
         Notify();
     }
@@ -904,8 +918,25 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
 
     /// <summary>The Move to Folder picker. One space: its folders (and New Folder…). A group's items also list the
     /// personal folders under "Mine", which save personal copies; items of several spaces list only "Mine".</summary>
-    private List<PanelAction> FolderPickActions() =>
-        FolderChoices(!IsMultiSelecting && SelectedEntry is PanelEntry.FolderEntry f ? [f] : FolderTargets);
+    private List<PanelAction> FolderPickActions()
+    {
+        var targets = !IsMultiSelecting && SelectedEntry is PanelEntry.FolderEntry f ? [f] : FolderTargets;
+        // After each section's New Folder…, one per folder that can take a subfolder: "New Folder in Work…".
+        var choices = new List<PanelAction>();
+        foreach (var choice in FolderChoices(targets))
+        {
+            choices.Add(choice);
+            if (choice is not PanelAction.MoveToNewFolder { ParentId: null } top) continue;
+            var space = top.Mine ? null : targets is [PanelEntry.FolderEntry ff] ? ff.Folder.SpaceId : targets.Select(SpaceOf).FirstOrDefault();
+            var moving = targets is [PanelEntry.FolderEntry fm] ? fm.Folder : null;
+            choices.AddRange(FoldersIn(space).Where(x => _tree.CanCreateIn(x.Id) && (moving is null || CanMoveFolder(moving, x)))
+                .Select(x => new PanelAction.MoveToNewFolder(top.Mine, top.SectionTitle, x.Id, _tree.PathText(x.Id))));
+        }
+        // The picker starts with "Top Level" when something picked is in a folder.
+        var nested = targets is [PanelEntry.FolderEntry folder] ? _tree.ParentOf(folder.Folder.Id) is not null && CanChangeFolder(folder.Folder)
+            : targets.Any(e => FolderOf(e) is not null);
+        return nested ? [new PanelAction.RemoveFromFolder(), .. choices] : choices;
+    }
 
     /// <summary>The sections of the right-click Move to Folder tree: (title, space, mine). One space: one untitled
     /// section; a group's items: the group's tree, then "Mine".</summary>
@@ -1474,8 +1505,10 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
         {
             case PanelEntry.Clip c:
                 // An item in a quick slot stays kept without its label, so the slot can't lose it.
-                store.SetLabel(form.Text, c.Item, keepPinned: slots.SlotFor(form.Entry.SlotTarget) is not null);
-                ShowNotice(c.Item.Label is null ? "Label removed" : "Labelled");
+                foreach (var item in form.AlsoClips.Prepend(c.Item))
+                    store.SetLabel(form.Text, item, keepPinned: slots.SlotFor(SlotTarget.ForClip(item.Id)) is not null);
+                ShowNotice(c.Item.Label is null ? (form.Count > 1 ? $"Label removed from {form.Count} items" : "Label removed")
+                    : form.Count > 1 ? $"Labelled {form.Count} items" : "Labelled");
                 break;
             case PanelEntry.FolderEntry f:
                 store.SetFolderLabel(f.Folder, form.Text);
@@ -2190,6 +2223,7 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
         PanelMode.SnippetForm or PanelMode.SaveSecret or PanelMode.Label or PanelMode.EditSecret or PanelMode.FolderName
             or PanelMode.AuthenticatorForm => HandleFormKey(key),
         PanelMode.AuthenticatorSecret or PanelMode.AuthenticatorPeople or PanelMode.ConfirmDelete => HandleAuthenticatorKey(key),
+        PanelMode.AddItems => HandleAddItemsKey(key),
         _ => HandleAIKey(key),
     };
 
@@ -2239,6 +2273,8 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
                 {
                     case 'k': OpenActions(); return true;
                     case 'y': TogglePreview(); return true;
+                    case 'l': BeginLabelSelection(); return true;
+                    case 'm' when key.Shift: BeginMoveSelection(); return true;
                     case 'a' when Query.Length == 0: SelectAll(); return true;
                     case ',':
                         host.ClosePanel();
@@ -2314,7 +2350,7 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
             case PanelKey.Enter:
                 if (AIRun?.IsFinished == true) PasteAIOutput();
                 return true;
-            case PanelKey.Left or PanelKey.Right or PanelKey.Backspace:
+            case PanelKey.Left or PanelKey.Right or PanelKey.Backspace or PanelKey.Space:
                 return false;   // the caret in the output, as before these were mapped
             case PanelKey.Letter when key.Ctrl:
                 if (char.ToLowerInvariant(key.Letter) == 'c') CopyAIOutput();
