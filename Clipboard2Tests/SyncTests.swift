@@ -789,7 +789,8 @@ actor FakeSyncServer {
     // MARK: Authenticators (PROTOCOL.md → Authenticators)
 
     struct ShareRecord {
-        var codesUntil: Int64
+        /// nil (with `sealedCodes`) for an empty share, as the server lists it.
+        var codesUntil: Int64?
         var sealedCodes: Data?
         var createdAt: Int64
         var updatedAt: Int64
@@ -883,7 +884,7 @@ actor FakeSyncServer {
         spaces[id] = space
         shares[id]?[recipient] = nil
         seq += 1
-        shares[id, default: [:]][uid] = ShareRecord(codesUntil: 0, sealedCodes: nil, createdAt: seq, updatedAt: seq)
+        shares[id, default: [:]][uid] = ShareRecord(codesUntil: nil, sealedCodes: nil, createdAt: seq, updatedAt: seq)
     }
 
     /// `includeDirect` is `?include=direct`: contacts with both people in them.

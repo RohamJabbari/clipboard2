@@ -664,11 +664,11 @@ final class SyncEngine {
         var result: [SharedAuthenticator] = []
         for entry in entries {
             var shared = known[entry.spaceId] ?? SharedAuthenticator(
-                spaceId: entry.spaceId, ownerUid: entry.ownerUid, ownerName: entry.ownerName, codesUntil: entry.codesUntil,
+                spaceId: entry.spaceId, ownerUid: entry.ownerUid, ownerName: entry.ownerName, codesUntil: entry.codesUntil ?? 0,
                 updatedAt: 0, batch: nil, issuer: "", account: "", addedAt: now().syncMillis)
             shared.ownerUid = entry.ownerUid
             shared.ownerName = entry.ownerName
-            shared.codesUntil = entry.codesUntil
+            shared.codesUntil = entry.codesUntil ?? 0
             if entry.updatedAt != shared.updatedAt || shared.batch == nil {
                 if let sealed = entry.sealedCodes, !sealed.isEmpty {
                     if let batch = Self.openBatch(sealed, spaceId: entry.spaceId, identity: identity) {
@@ -719,8 +719,10 @@ final class SyncEngine {
         authenticators.setShareCounts(counts)
     }
 
-    nonisolated static func needsTopUp(codesUntil: Int64, now: Date) -> Bool {
-        Date(syncMillis: codesUntil).timeIntervalSince(now) < CodeBatch.topUpThreshold
+    /// nil: an empty share (no batch yet, e.g. after a transfer).
+    nonisolated static func needsTopUp(codesUntil: Int64?, now: Date) -> Bool {
+        guard let codesUntil else { return true }
+        return Date(syncMillis: codesUntil).timeIntervalSince(now) < CodeBatch.topUpThreshold
     }
 
     /// Seals the next 24 h of codes to one person and replaces their batch.

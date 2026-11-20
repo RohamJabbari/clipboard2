@@ -224,8 +224,18 @@ struct CodeBatchTests {
         #expect(throws: (any Error).self) { try SyncCrypto.unwrapSpaceKey(sealed, spaceId: "space", uid: "bob", privateKey: bobKey) }
     }
 
+    @Test func emptySharesDecode() throws {
+        let shared = try JSONDecoder().decode(SharedCodesEntry.self, from: Data(
+            #"{"spaceId":"s","ownerUid":"a","ownerName":"A","codesUntil":null,"sealedCodes":null,"updatedAt":3}"#.utf8))
+        #expect(shared.codesUntil == nil && shared.sealedCodes == nil)
+        let share = try JSONDecoder().decode(AuthenticatorShare.self, from: Data(
+            #"{"uid":"b","username":null,"name":"b","codesUntil":null,"createdAt":1}"#.utf8))
+        #expect(share.codesUntil == nil)
+    }
+
     @Test func topUpBelowTwelveHours() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
+        #expect(SyncEngine.needsTopUp(codesUntil: nil, now: now))   // an empty share
         #expect(SyncEngine.needsTopUp(codesUntil: 0, now: now))
         #expect(SyncEngine.needsTopUp(codesUntil: now.addingTimeInterval(11 * 3600).syncMillis, now: now))
         #expect(!SyncEngine.needsTopUp(codesUntil: now.addingTimeInterval(13 * 3600).syncMillis, now: now))
@@ -398,7 +408,7 @@ struct AuthenticatorSyncTests {
         try await aliceMac.engine.tick()
         let second = try #require(await server.shares[space]?["bob"])
         #expect(second.updatedAt > first.updatedAt)
-        #expect(second.codesUntil > first.codesUntil + 12 * 3_600_000)
+        #expect((second.codesUntil ?? 0) > (first.codesUntil ?? 0) + 12 * 3_600_000)
 
         bobMac.engine.now = { clock }
         try await bobMac.engine.tick()

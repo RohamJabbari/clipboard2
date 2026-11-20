@@ -1518,7 +1518,7 @@ final class PanelViewModel {
                 form.shares.removeAll { $0.uid == share.uid }
                 form.selection = min(form.selection, max(0, form.shares.count - 1))
                 form.isBusy = false
-                let until = Date(syncMillis: share.codesUntil)
+                let until = Date(syncMillis: share.codesUntil ?? 0)
                 showNotice(until > .now
                            ? "Removed. Codes they already have work until \(until.formatted(date: .omitted, time: .shortened))."
                            : "Removed.")

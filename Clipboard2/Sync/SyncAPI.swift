@@ -199,8 +199,8 @@ nonisolated struct AuthenticatorShare: Codable, Sendable, Equatable, Identifiabl
     var uid: String
     var username: String?
     var name: String
-    /// Unix ms: when the codes they have run out.
-    var codesUntil: Int64
+    /// Unix ms: when the codes they have run out; nil for an empty share (no batch yet).
+    var codesUntil: Int64?
     var createdAt: Int64
     var id: String { uid }
 }
@@ -210,8 +210,9 @@ nonisolated struct SharedCodesEntry: Codable, Sendable, Equatable {
     var spaceId: String
     var ownerUid: String
     var ownerName: String
-    var codesUntil: Int64
-    /// Empty (or absent) until the owner's devices send the first batch, e.g. right after a transfer.
+    /// nil until the first batch.
+    var codesUntil: Int64?
+    /// nil (or empty) until the owner's devices send the first batch, e.g. right after a transfer.
     var sealedCodes: Data?
     var updatedAt: Int64
 }

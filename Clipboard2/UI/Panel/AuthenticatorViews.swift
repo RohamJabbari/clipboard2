@@ -556,7 +556,8 @@ struct AuthenticatorPeopleView: View {
     }
 
     private func codesText(_ share: AuthenticatorShare) -> String {
-        let until = Date(syncMillis: share.codesUntil)
+        guard let codesUntil = share.codesUntil else { return "No codes sent yet" }
+        let until = Date(syncMillis: codesUntil)
         return until > .now ? "Codes until \(until.formatted(date: .omitted, time: .shortened))" : "No codes right now"
     }
 
