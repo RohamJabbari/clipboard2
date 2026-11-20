@@ -76,6 +76,24 @@ public sealed class Settings
     public string? SaveFolder { get; set; }
     /// <summary>Groups whose chip shows their Saved items rather than All (the panel's All | Saved switch).</summary>
     public List<string> GroupsShowingSaved { get; set; } = [];
+    /// <summary>The Contacts chip shows People rather than the Inbox (its Inbox | People switch).</summary>
+    public bool ContactsShowPeople { get; set; }
+
+    // Notifications (Settings → Notifications): a master switch and one per kind, and groups muted one by one.
+    public bool NotificationsEnabled { get; set; } = true;
+    public bool NotifyGroupActivity { get; set; } = true;
+    public bool NotifyGroupMembers { get; set; } = true;
+    public bool NotifyContacts { get; set; } = true;
+    public bool NotifyAuthenticators { get; set; } = true;
+    public List<string> MutedGroups { get; set; } = [];
+
+    public bool IsNotificationKindOn(NotificationKind kind) => kind switch
+    {
+        NotificationKind.GroupActivity => NotifyGroupActivity,
+        NotificationKind.GroupMembers => NotifyGroupMembers,
+        NotificationKind.Contacts => NotifyContacts,
+        _ => NotifyAuthenticators,
+    };
 
     [JsonIgnore] public TimeSpan? MaxAge => MaxAgeMinutes > 0 ? TimeSpan.FromMinutes(MaxAgeMinutes) : null;
     [JsonIgnore] public HashSet<string> IgnoredIds => IgnoredApps.Select(a => a.Id.ToLowerInvariant()).ToHashSet();

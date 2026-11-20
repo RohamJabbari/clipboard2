@@ -144,6 +144,11 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
     /// <summary>Someone asked to be a contact since the last look (not raised for requests already pending at the
     /// first look after sign-in or launch).</summary>
     public event Action<ContactRequest>? ContactRequested;
+    /// <summary>What a sync found to notify about (docs/features/notifications-contacts.md), before settings, mutes
+    /// and the panel's view are applied (<see cref="NotificationDispatcher"/>). Raised on the ticks' thread.</summary>
+    public event Action<IReadOnlyList<AppNotification>>? Notifications;
+    /// <summary>Compares each sync with the last one.</summary>
+    public ActivityDetector Activity { get; } = new();
     /// <summary>Received clips whose image or files are still downloading (<see cref="SyncEngine.Downloads"/>).</summary>
     public IReadOnlyList<IncomingDownload> Downloads => _engine?.Downloads ?? [];
     /// <summary><see cref="Downloads"/> changed: throttled, and possibly raised off the UI thread.</summary>
@@ -213,6 +218,8 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
         {
             StartEngine(identity);
             Phase = _token is null ? SyncPhase.NeedsSignIn : SyncPhase.SignedIn;
+            // What was known when the app last ran: changes since then are announced. Never synced: nothing to compare.
+            if (_store.SyncSpaces().Count > 0) Activity.Seed(Snapshot(identity.Uid, requests: null));
         }
         else
         {
@@ -573,18 +580,21 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
     public Task<bool> RemoveMemberAsync(string id, string uid) => Run("Removing…", async ct =>
     {
         await _api.RemoveMemberAsync(id, uid, ct);
+        Activity.ExpectMemberRemoved(id, uid);
         await RequireEngine().RefreshSpacesAsync(ct);
     });
 
     public Task<bool> LeaveGroupAsync(string id) => Run("Leaving…", async ct =>
     {
         await _api.RemoveMemberAsync(id, Uid!, ct);
+        Activity.ExpectLeave(id);
         ForgetGroup(id);
     });
 
     public Task<bool> DeleteGroupAsync(string id) => Run("Deleting the group…", async ct =>
     {
         await _api.DeleteGroupAsync(id, ct);
+        Activity.ExpectLeave(id);
         ForgetGroup(id);
     });
 
@@ -1081,6 +1091,11 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
                 if (!_devicesFresh) await RefreshDevicesQuietlyAsync(ct);
                 var report = await engine.TickAsync(ct);
                 await RefreshContactsAsync(force: false, ct);
+                if (_engine == engine && Uid is { } self)
+                {
+                    var found = Activity.Observe(Snapshot(self, _seenRequests is null ? null : IncomingRequests), report.Arrivals);
+                    if (found.Count > 0) Notifications?.Invoke(found);
+                }
                 LastSync = _now();
                 _offline = false;
                 RetryAfter = null;
@@ -1165,6 +1180,10 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
 
     // MARK: Internals
 
+    /// <summary>What <see cref="Activity"/> compares: the spaces as stored, pending requests and authenticators.</summary>
+    private SyncSnapshot Snapshot(string self, IReadOnlyList<ContactRequest>? requests) =>
+        new(self, _store.SyncSpaces(), requests, [.. Authenticators.Shared], [.. Authenticators.All]);
+
     private void FinishSignIn(SessionInfo session, byte[] accountKey, byte[] priv)
     {
         var account = session.Account;
@@ -1182,6 +1201,7 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
             ["publicKey"] = Convert.ToBase64String(account.PublicKey), ["username"] = Username,
         }.ToJsonString(), "Clipboard2 sync – account");
         StartEngine(new SyncIdentity(account.Uid, Email ?? "", new EcKeyPair(priv, account.PublicKey), account.PersonalSpaceId));
+        Activity.Reset();   // the first sync after signing in only records
         Phase = SyncPhase.SignedIn;
         RetryAfter = null;
         _offline = false;
@@ -1244,6 +1264,7 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
         foreach (var own in Authenticators.All.Where(a => a.SpaceId is not null).ToList()) Authenticators.Put(own with { SpaceId = null, Shares = null });
         foreach (var secret in _vault.Secrets.Where(s => s.SpaceId is not null).ToList()) _vault.Delete(secret);
         _store.ResetSync();
+        Activity.Reset();
     }
 
     private static JsonObject? Parse(string? json)

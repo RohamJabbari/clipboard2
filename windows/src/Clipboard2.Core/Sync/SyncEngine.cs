@@ -34,6 +34,9 @@ public sealed class SyncReport
     public List<string> Warnings { get; } = [];
     /// <summary>The server refused a write because this PC's clock is ahead (400 clock_skew).</summary>
     public bool ClockSkew { get; set; }
+    /// <summary>New items others wrote in groups and contacts' spaces, for notifications. Not for a space's first pull
+    /// (joining, signing in) or a re-sync.</summary>
+    public List<Clipboard2.Core.SyncArrival> Arrivals { get; } = [];
 }
 
 /// <summary>A received clip whose image or files are still downloading; it's added to the history once they're in.</summary>
@@ -142,6 +145,8 @@ public sealed partial class SyncEngine
     /// <summary>Contacts this device has never synced but that are new (made here, or that appeared after this
     /// device's first sync): their very first pull is announced too.</summary>
     private readonly HashSet<string> _announceFromStart = [];
+    /// <summary>Spaces pulled at least once by this engine: an empty one's cursor stays 0, yet what comes next is new.</summary>
+    private readonly HashSet<string> _pulledOnce = [];
 
     public SyncEngine(ClipStore store, ISecretVault vault, SyncApi api, SyncIdentity identity, Func<DateTime>? clock = null,
                       SpaceKeyPins? pins = null, AuthenticatorStore? authenticators = null)
@@ -339,6 +344,7 @@ public sealed partial class SyncEngine
     {
         _spaces.Remove(spaceId);
         _announceFromStart.Remove(spaceId);
+        _pulledOnce.Remove(spaceId);
         _keyChanged.Remove(spaceId);
         foreach (var secret in vault.Secrets.Where(s => s.SpaceId == spaceId).ToList()) vault.Delete(secret);
         foreach (var a in Authenticators.All.Where(a => a.SpaceId == spaceId).ToList()) Authenticators.Delete(a.Id);
@@ -390,8 +396,11 @@ public sealed partial class SyncEngine
         var resync = store.IsResyncing(space.Id);
         var restarted = false;
         var complete = false;
-        // A contact's new items get a notice, except on the first pull of one that was already there (sign-in).
-        var announce = space.IsDirect && !resync && (since > 0 || _announceFromStart.Contains(space.Id));
+        // A contact's or a group's new items get a notice, except on the first pull of a space (sign-in, joining a
+        // group, an old contact on a new device): a new contact's very first pull is announced.
+        var announce = (space.IsDirect || space.Info.Kind == SpaceKinds.Group) && !resync
+            && (since > 0 || _pulledOnce.Contains(space.Id) || space.IsDirect && _announceFromStart.Contains(space.Id));
+        _pulledOnce.Add(space.Id);
         while (true)
         {
             var page = await api.ChangesAsync(space.Id, since, PageSize, ct, fullResync: resync);
@@ -419,8 +428,10 @@ public sealed partial class SyncEngine
                     foreach (var p in prepared)
                     {
                         var arrived = announce && IsArrival(space, p);
+                        var isNew = announce && IsNewFromOthers(space, p);
                         if (Apply(space, p) is { } notice) notices.Add(notice);
-                        if (arrived && store.Find(Guid.Parse(p.Item.Id)) is { } item) arrivals.Add(item);
+                        if (arrived && store.Find(Guid.Parse(p.Item.Id)) is { } item && space.IsDirect) arrivals.Add(item);
+                        if (isNew && Arrival(space, p) is { } arrival) report.Arrivals.Add(arrival);
                         report.Pulled++;
                     }
                     if (resync) store.MarkResyncSeen(space.Id, page.Items.Select(i => i.Id));
@@ -450,6 +461,28 @@ public sealed partial class SyncEngine
         && author != Identity.Uid
         && store.SyncMetaFor(space.Id, p.Item.Id) is null
         && Guid.TryParse(p.Item.Id, out var id) && store.Find(id) is null;
+
+    /// <summary>A clip, secret or snippet someone else wrote that this device hasn't had (folders aren't announced:
+    /// their items are).</summary>
+    private bool IsNewFromOthers(SyncSpace space, Prepared p) =>
+        p is { KeepLocal: false, Item: { Deleted: null, AuthorUid: { } author } }
+        && p.Payload is ItemPayload.Clip or ItemPayload.Secret or ItemPayload.SnippetPayload
+        && author != Identity.Uid
+        && store.SyncMetaFor(space.Id, p.Item.Id) is null;
+
+    /// <summary>How a just applied item is described in a notification: never a secret's name or value.</summary>
+    private SyncArrival? Arrival(SyncSpace space, Prepared p)
+    {
+        var id = Guid.Parse(p.Item.Id);
+        return p.Payload switch
+        {
+            ItemPayload.Clip when store.Find(id) is { } clip => new SyncArrival(space.Id, p.Item.AuthorUid, NotificationText.Describe(clip), "c-" + clip.Id),
+            ItemPayload.Secret when vault.Secrets.FirstOrDefault(s => SecretGuid(s) == id) is { } secret =>
+                new SyncArrival(space.Id, p.Item.AuthorUid, NotificationText.Secret, "k-" + secret.Id),
+            ItemPayload.SnippetPayload => new SyncArrival(space.Id, p.Item.AuthorUid, NotificationText.Snippet, "s-" + id),
+            _ => null,
+        };
+    }
 
     /// <summary>After a full re-sync: whatever the server no longer knows was deleted or trimmed long ago.</summary>
     private void Reconcile(SyncSpace space, HashSet<string> seen)
