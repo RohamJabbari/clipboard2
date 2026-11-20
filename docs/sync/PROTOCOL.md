@@ -129,6 +129,9 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
 {"v":1,"type":"snippet","name":"…","keyword":"…","body":"…","createdAt":0,"updatedAt":0}
 // type "secret"
 {"v":1,"type":"secret","name":"…","value":"…","createdAt":0,"folder":"<folder item id>"}
+// type "otp" (category "otp", only in authenticator spaces)
+{"v":1,"type":"otp","issuer":"GitHub","account":"me@example.com","secret":"<base32, no padding>",
+ "algorithm":"SHA1|SHA256|SHA512","digits":6,"period":30,"createdAt":0,"updatedAt":0}
 ```
 
 - **Images:** the PNG and its thumbnail are uploaded as two encrypted blobs. Their ids are listed in the payload and in `blobIds`.
@@ -142,6 +145,7 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
 | `snippet` | snippet | `updatedAt` |
 | `secret` | secret | `createdAt` |
 | `folder` | folder | `createdAt` |
+| `otp` | otp | `createdAt` |
 
 Pinning or unpinning changes the category, and the category is part of the AAD, so the client re-encrypts and `PUT`s again.
 
@@ -231,7 +235,7 @@ Account = {"uid","email","kdf":{"alg":"pbkdf2-sha256","salt","iterations"},
 | `DELETE /v1/groups/:id/members/:uid` | `204`. The owner can remove others; a member can remove themselves (leave). The owner can't leave and has to delete the group instead. |
 
 ```jsonc
-Space = {"id","kind":"personal|group|direct","role":"owner|member","ownerUid",
+Space = {"id","kind":"personal|group|direct|authenticator","role":"owner|member","ownerUid",
          "wrappedKey","encryptedName":null|"<b64>","memberCount",
          "members":[{"uid","name"}],"createdAt"}
 ```
@@ -317,6 +321,37 @@ The server sweeps opportunistically while handling `GET /v1/spaces`, at most eve
 space has the group storage limits (2 GB, 5 000 live items) and history retention (newest 200).
 Deleting an account deletes all its direct spaces.
 
+### Authenticators
+
+An **authenticator** (a TOTP account) is an `authenticator` space: one owner, any number of people it's
+shared with (`member`s), no name. It holds one live item, category `otp` ([payload](#item-payloads)).
+It's an ordinary space for keys, items, changes and pushes; what's different is who may do what.
+
+- **Owner only:** writing or deleting its item, sharing, removing others, transferring, deleting it.
+  Item `PUT`/`DELETE` by a member is `403 forbidden`. Blob uploads into it are `403 forbidden` (it has none).
+- **Members** read the item (so their app can compute codes) and may leave.
+- **Listing:** `GET /v1/spaces` leaves `authenticator` spaces out unless asked: `?include=authenticator`.
+  `include` takes a comma list (`?include=direct,authenticator`). `members` lists everyone, owner first.
+- **Sharing needs a relationship:** the owner may only share with a contact (an established direct space)
+  or someone they're in a group with; anyone else is `403 forbidden`. No accept step: it appears for them,
+  and they can leave.
+- Sharing hands over the secret. Removing someone stops syncing to them; it can't take back what they
+  have, which clients say when removing.
+- Group-only routes answer `404` for authenticator spaces; authenticator routes answer `404` for other kinds.
+
+| Request | Response |
+|---|---|
+| `GET /v1/users/id/:uid` | `{uid, username, name, publicKey}`, only for the caller's contacts and people in a group with them; otherwise `404`. Shares the invite rate limit. |
+| `POST /v1/authenticators` `{id, wrappedKey}` | `201 Space`, `kind: "authenticator"`, the caller as owner (`wrappedKey` = SK wrapped to the caller). `409` if `id` is taken; `403 quota_exceeded` over the limit. |
+| `GET /v1/authenticators/:id/members` | `{members: [{uid, username, name, role}]}`, members only, owner first. |
+| `POST /v1/authenticators/:id/members` `{uid, wrappedKey}` | `201`. Owner only. `wrappedKey` = SK wrapped to that person (`wrapSpaceKey` with their uid). `403 forbidden` without a relationship, `400 invalid` for yourself, `409 conflict` already a member, `403 quota_exceeded` over a limit. |
+| `DELETE /v1/authenticators/:id/members/:uid` | `204`. The owner removes someone, or a member leaves. The owner can't leave: transfer or delete. |
+| `POST /v1/authenticators/:id/transfer` `{uid}` | `204`. Owner only; `uid` must already be a member (`400 invalid` otherwise). They become owner, the caller becomes a member. |
+| `DELETE /v1/authenticators/:id` | `204`, owner only. Deletes the space and its item for everyone. |
+
+**Limits:** 200 authenticators per user (owned and shared with them), 20 people per authenticator
+besides the owner. Deleting an account deletes the authenticators it owns and leaves the others.
+
 ### Items
 
 **Endpoints:**
@@ -344,7 +379,7 @@ Deleting an account deletes all its direct spaces.
 - The writer becomes the item's `authorUid`.
 
 ```jsonc
-Item = {"id","category":"history|pinned|snippet|secret|folder","seq","sortAt","updatedAt",
+Item = {"id","category":"history|pinned|snippet|secret|folder|otp","seq","sortAt","updatedAt",
         "deleted":null|"user"|"trimmed","ciphertext":null|"<b64>","blobIds":[],"authorUid"}
 ```
 
