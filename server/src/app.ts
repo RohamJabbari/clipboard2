@@ -116,8 +116,8 @@ const acceptBody = z.object({ wrappedKey: sealed });
 const contactRequestBody = z.object({ username, spaceId: uuid, wrappedKey: sealed, recipientWrappedKey: sealed });
 const contactInviteBody = z.object({ spaceId: uuid, wrappedKey: sealed, inviteId, sealedKey: sealed });
 const authenticatorBody = z.object({ id: uuid, wrappedKey: sealed });
-/** A day of codes at a 30 s period is ~30 KB of JSON; 64 KiB leaves room for 8 digits or shorter periods. */
-const codesBody = z.object({ codesUntil: millis, sealedCodes: b64(64 * 1024).refine((b) => b.length > 0, "empty") });
+/** A day of codes is ~30 KB of JSON at 30 s; 128 KiB fits 8 digits at a 15 s period (~63 KB) twice over. */
+const codesBody = z.object({ codesUntil: millis, sealedCodes: b64(128 * 1024).refine((b) => b.length > 0, "empty") });
 const transferBody = z.object({ uid: uuid, wrappedKey: sealed });
 /** Batches cover 24 h from the current step; an hour of slack for clocks and slow uploads. */
 const MAX_CODES_AHEAD_MS = 25 * 60 * 60 * 1000;

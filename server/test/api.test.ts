@@ -1902,13 +1902,13 @@ describe("authenticators", () => {
     expect((await shareCodes(alice, group.id, bob)).status).toBe(404);
   });
 
-  it("validates batches: at most 64 KiB and 25 hours ahead", async () => {
+  it("validates batches: at most 128 KiB and 25 hours ahead", async () => {
     const alice = await person("alice");
     const bob = await person("bob");
     await befriend(alice, bob);
     const auth = await createAuthenticator(alice);
-    expect((await shareCodes(alice, auth.id, bob, { sealedCodes: randomBytes(64 * 1024) })).status).toBe(200);
-    expect((await shareCodes(alice, auth.id, bob, { sealedCodes: randomBytes(64 * 1024 + 1) })).body.error).toBe("invalid");
+    expect((await shareCodes(alice, auth.id, bob, { sealedCodes: randomBytes(128 * 1024) })).status).toBe(200);
+    expect((await shareCodes(alice, auth.id, bob, { sealedCodes: randomBytes(128 * 1024 + 1) })).body.error).toBe("invalid");
     expect((await shareCodes(alice, auth.id, bob, { codesUntil: Date.now() + 24.9 * 3600_000 })).status).toBe(200);
     expect((await shareCodes(alice, auth.id, bob, { codesUntil: Date.now() + 25.1 * 3600_000 })).body.error).toBe("invalid");
     const empty = await call(alice, "PUT", `/v1/authenticators/${auth.id}/shares/${bob.uid}`, { codesUntil: Date.now(), sealedCodes: "" });
