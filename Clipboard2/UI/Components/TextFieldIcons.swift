@@ -32,8 +32,9 @@ final class FloatingPanel: NSPanel {
 
 // MARK: - Paste icon in text fields
 
-/// A quiet icon in the corner of the focused text field in another app. Hovering it shows the
-/// newest copies; clicking one pastes it where the cursor is, without leaving the app. It stays
+/// A quiet icon in the corner of the focused text field in another app. Hovering it shows your
+/// copies, with Saved, each group and Contacts a click away, in a list that scrolls; clicking one
+/// pastes it where the cursor is, without leaving the app. It stays
 /// faint until the pointer reaches it, so it never competes with what's being typed.
 final class PasteIconController {
     private let env: AppEnvironment
@@ -48,7 +49,9 @@ final class PasteIconController {
     private static let iconSize = CGSize(width: 22, height: 22)
     /// Opacity while nobody's reaching for it; full on hover and while its list is open.
     static let idleAlpha: CGFloat = 0.35
-    static let itemCount = 6
+    /// Rows the list shows before it scrolls, and the most it holds.
+    static let visibleRows = 6
+    static let itemLimit = 500
 
     init(env: AppEnvironment) {
         self.env = env
@@ -130,13 +133,11 @@ final class PasteIconController {
 
     private func openPopover() {
         guard popover == nil, let field else { return }
-        // Contacts' items live in the panel's Inbox only.
-        let sync = env.sync
-        model.items = Array(env.store.allItems().lazy.filter { sync.isListed($0, inInbox: false) }.prefix(Self.itemCount))
-        model.hovered = nil
-        guard !model.items.isEmpty else { return }
+        model.sources = sources()
+        load(.copies)
         let view = PastePopoverView(
             model: model,
+            onSource: { [weak self] source in self?.load(source) },
             shortcut: KeyboardShortcuts.getShortcut(for: .toggleQuickPanel).map { "\($0)" },
             onPaste: { [weak self] item in
                 guard let self else { return }
@@ -183,7 +184,38 @@ final class PasteIconController {
         updateIconAlpha()
     }
 
-    /// "Don't Show in ‹App›": only the paste icon; the icon beside selected text stays.
+    /// Copies and Saved always; each group and Contacts while signed in to sync.
+    private func sources() -> [PasteSourceChip] {
+        var chips = [PasteSourceChip(source: .copies, title: "Copies", symbol: "clock"),
+                     PasteSourceChip(source: .saved, title: "Saved", symbol: "bookmark")]
+        guard env.sync.isSignedIn else { return chips }
+        chips += env.sync.groups.map { PasteSourceChip(source: .group($0.id), title: $0.name, symbol: "person.2") }
+        chips.append(PasteSourceChip(source: .contacts, title: "Contacts", symbol: "person.crop.circle"))
+        return chips
+    }
+
+    /// Fills the list from one source, newest first. Secrets stay in the panel (they need Touch ID).
+    private func load(_ source: PasteSource) {
+        let sync = env.sync
+        let items: [ClipItem]
+        switch source {
+        case .copies:
+            // Contacts' items live in the Inbox only.
+            items = Array(env.store.allItems().lazy.filter { sync.isListed($0, inInbox: false) }.prefix(Self.itemLimit))
+        case .saved:
+            items = Array(env.store.items(inSpace: nil).lazy.filter(\.isPinned).prefix(Self.itemLimit))
+        case .group(let id):
+            items = Array(env.store.items(inSpace: id).prefix(Self.itemLimit))
+        case .contacts:
+            items = Array(env.store.allItems().lazy.filter { sync.isListed($0, inInbox: true) }.prefix(Self.itemLimit))
+        }
+        model.source = source
+        model.items = items
+        model.hovered = nil
+        model.byline = { item in item.spaceID == nil ? nil : sync.badge(for: item)?.text }
+    }
+
+    /// "Don't Show in ‹App›": hides the paste icon in that app.
     private func hide(in app: NSRunningApplication) {
         guard let ref = FrontmostAppTracker.ref(for: app) else { return }
         if !env.prefs.pasteIconHiddenApps.contains(ref) { env.prefs.pasteIconHiddenApps.append(ref) }
@@ -193,10 +225,26 @@ final class PasteIconController {
     }
 }
 
+/// Where the paste list's items come from.
+enum PasteSource: Hashable {
+    case copies, saved, group(String), contacts
+}
+
+struct PasteSourceChip: Identifiable, Hashable {
+    let source: PasteSource
+    let title: String
+    let symbol: String
+    var id: PasteSource { source }
+}
+
 @Observable
 final class PastePopoverModel {
+    var sources: [PasteSourceChip] = []
+    var source: PasteSource = .copies
     var items: [ClipItem] = []
     var hovered: Int?
+    /// Who shared or sent a group or contact item, shown instead of the app it came from.
+    @ObservationIgnored var byline: (ClipItem) -> String? = { _ in nil }
 }
 
 /// Hosts a view and reports the pointer entering and leaving it, even while another app is
@@ -277,9 +325,10 @@ private struct PasteIconButton: View {
     }
 }
 
-/// The newest copies; the hovered one's full text shows underneath.
+/// Copies, Saved, groups and Contacts in a scrolling list; the hovered one's text shows underneath.
 private struct PastePopoverView: View {
     @Bindable var model: PastePopoverModel
+    let onSource: (PasteSource) -> Void
     let shortcut: String?
     let onPaste: (ClipItem) -> Void
     let onShowAll: () -> Void
@@ -309,16 +358,8 @@ private struct PastePopoverView: View {
             }
             .padding(.horizontal, 6)
             .padding(.bottom, 4)
-            ForEach(Array(model.items.enumerated()), id: \.element.id) { index, item in
-                Button { onPaste(item) } label: {
-                    row(item, hot: model.hovered == index)
-                }
-                .buttonStyle(.plain)
-                .background(RowHover { inside in
-                    if inside { model.hovered = index } else if model.hovered == index { model.hovered = nil }
-                })
-                .accessibilityLabel(PasteRowText.accessibility(item))
-            }
+            sourceChips
+            list
             Text(model.hovered.flatMap { model.items.indices.contains($0) ? PasteRowText.preview(model.items[$0]) : nil }
                  ?? "Click an item to paste it where you're typing.")
                 .font(.caption)
@@ -348,6 +389,58 @@ private struct PastePopoverView: View {
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Color.primary.opacity(0.12)))
     }
 
+    /// Copies · Saved · each group · Contacts. Scrolls sideways when there are many groups.
+    private var sourceChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                ForEach(model.sources) { chip in
+                    let selected = chip.source == model.source
+                    Button { onSource(chip.source) } label: {
+                        Label(chip.title, systemImage: chip.symbol)
+                            .labelStyle(.titleAndIcon)
+                            .font(.caption.weight(.medium))
+                            .lineLimit(1)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .foregroundStyle(selected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
+                            .background(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.primary.opacity(0.07)),
+                                        in: Capsule())
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .animation(.easeOut(duration: 0.15), value: model.source)
+                }
+            }
+            .padding(.horizontal, 4)
+        }
+        .padding(.bottom, 4)
+    }
+
+    /// A fixed height, so the popover doesn't jump between sources; it scrolls past six rows.
+    private var list: some View {
+        ScrollView(.vertical) {
+            LazyVStack(spacing: 2) {
+                ForEach(Array(model.items.enumerated()), id: \.element.id) { index, item in
+                    Button { onPaste(item) } label: {
+                        row(item, hot: model.hovered == index)
+                    }
+                    .buttonStyle(.plain)
+                    .background(RowHover { inside in
+                        if inside { model.hovered = index } else if model.hovered == index { model.hovered = nil }
+                    })
+                    .accessibilityLabel(PasteRowText.accessibility(item))
+                }
+            }
+        }
+        .id(model.source)   // back to the top when the source changes
+        .overlay {
+            if model.items.isEmpty {
+                Text("Nothing here yet").font(.callout).foregroundStyle(.secondary)
+            }
+        }
+        .frame(height: CGFloat(PasteIconController.visibleRows) * 44)
+    }
+
     private func row(_ item: ClipItem, hot: Bool) -> some View {
         HStack(spacing: 10) {
             ContentBadge(kind: .clip(item), isSelected: hot, size: 26)
@@ -355,7 +448,7 @@ private struct PastePopoverView: View {
                 Text(PasteRowText.title(item))
                     .lineLimit(1)
                     .foregroundStyle(hot ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
-                Text(PasteRowText.subtitle(item))
+                Text(PasteRowText.subtitle(item, byline: model.byline(item)))
                     .font(.caption)
                     .lineLimit(1)
                     .foregroundStyle(hot ? AnyShapeStyle(.white.opacity(0.85)) : AnyShapeStyle(.secondary))
@@ -387,8 +480,8 @@ private enum PasteRowText {
         return item.preview.isEmpty ? item.kind.displayName : item.preview
     }
 
-    static func subtitle(_ item: ClipItem) -> String {
-        let place = [item.sourceAppName, item.lastCopiedAt.shortRelative].compactMap { $0 }.joined(separator: " · ")
+    static func subtitle(_ item: ClipItem, byline: String? = nil) -> String {
+        let place = [byline ?? item.sourceAppName, item.lastCopiedAt.shortRelative].compactMap { $0 }.joined(separator: " · ")
         if let kind = hiddenKind(item) { return "Hidden \(kind.inlineName) · \(place)" }
         return place
     }
