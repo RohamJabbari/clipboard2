@@ -42,6 +42,7 @@ public sealed partial class SettingsWindow : Window
         AddTab("Transforms", "", BuildTransforms);
         AddTab("AI", Glyphs.Sparkle, BuildAI);
         AddTab("Sync", "", BuildSync);
+        AddTab("Notifications", "\uEA8F", BuildNotifications);
         AddTab("About", Glyphs.Info, BuildAbout);
         Action secrets = () => Dispatcher.BeginInvoke(() => RefreshTab("Secrets"));
         Action ai = () => Dispatcher.BeginInvoke(() => RefreshTab("AI"));
@@ -52,6 +53,8 @@ public sealed partial class SettingsWindow : Window
             RefreshTab("Sync");
         });
         UpdateSyncTabTitle();
+        // Back from Windows' notification settings: show whether they're on now.
+        Activated += (_, _) => RefreshTab("Notifications");
         _services.Secrets.Changed += secrets;
         _services.ClaudeAccount.Changed += ai;
         _services.ChatGptAccount.Changed += ai;
@@ -1263,7 +1266,8 @@ public sealed partial class SettingsWindow : Window
         if (contactRows.Count == 0)
             contactRows.Add(Fluent.Label("No contacts yet. A contact is one person you can send items to without making a group.", 13, Fluent.Secondary, wrap: true));
         page.Children.Add(Card([.. contactRows]));
-        page.Children.Add(Hint("Send an item with Ctrl+K → Send to ‹name›, or right-click it. What contacts send you appears under Inbox in the panel. " +
+        page.Children.Add(Hint("Send an item with Ctrl+K or right-click → Send to Contact…. What contacts send you appears under Contacts → Inbox in the panel, " +
+            "where People lists your contacts and requests too. " +
             "Removing a contact deletes everything you've sent each other, for both of you."));
     }
 

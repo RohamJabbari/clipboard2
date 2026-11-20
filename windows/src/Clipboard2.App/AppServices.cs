@@ -43,6 +43,9 @@ public sealed class AppServices : IPanelHost
     /// <summary>Reads the text in history images in the background, for search.</summary>
     public ImageTextIndexer ImageText { get; }
     public Dispatcher Dispatcher { get; }
+    /// <summary>Windows toasts (docs/features/notifications-contacts.md).</summary>
+    public ToastNotifier Notifier { get; }
+    private readonly NotificationDispatcher _notifications;
 
     private readonly ClipboardListener _listener = new();
     private QuickPanelWindow? _panelWindow;
@@ -84,6 +87,10 @@ public sealed class AppServices : IPanelHost
         Sync = new SyncAccount(Store, Secrets, Settings, Keys) { Logger = message => Log.Info("Sync: " + message), Authenticators = Authenticators };
         Panel.Authenticators = Authenticators;
         Panel.AuthenticatorSync = new AuthenticatorSyncAdapter(Sync);
+        Panel.ContactService = new SyncContactService(Sync);
+        Notifier = new ToastNotifier();
+        _notifications = new NotificationDispatcher(Settings, Notifier,
+            view => _panelWindow is { IsVisible: true } && Panel.IsShowing(view), ShowNotificationInHud);
         Authenticators.Changed += () =>
         {
             StoreChanged?.Invoke();
@@ -136,9 +143,11 @@ public sealed class AppServices : IPanelHost
             UpdateSendToGroupHotkey();
         };
         Sync.ReceivedFromDevice += (item, from) => _tray?.ShowBalloon($"Sent from {from}", item.Preview);
-        Sync.ReceivedFromContact += (item, from) => Dispatcher.BeginInvoke(() => QueueContactNotice(from, item.Preview));
-        Sync.ContactRequested += request => Dispatcher.BeginInvoke(() => Hud.ShowNotice(Tracker.TargetWindow, Glyphs.Contact,
-            $"{request.Name} wants to add you as a contact", "Accept or decline in Settings → Sync."));
+        // Contacts' items and requests, group activity and authenticators: system notifications (the HUD only when
+        // they're off or not allowed).
+        ToastNotifier.Activated += target => Dispatcher.BeginInvoke(() => OpenTarget(target));
+        ToastNotifier.Initialize();
+        Sync.Notifications += found => Dispatcher.BeginInvoke(() => _notifications.Dispatch(found));
         _contactNoticeTimer.Tick += (_, _) => ShowContactNotice();
         RunMaintenance();
         ScheduleSync();
@@ -547,6 +556,26 @@ public sealed class AppServices : IPanelHost
         });
     }
 
+    /// <summary>Send to Contact with secrets: one Windows Hello, then each copy into its contact's space and folder.</summary>
+    public void CopySecretsToSpaces(IReadOnlyList<(SecretRef Secret, string SpaceId, Guid? FolderId)> secrets, string reason, string notice) =>
+        _ = CopySecretsToSpacesAsync(secrets, reason, notice);
+
+    private async Task CopySecretsToSpacesAsync(IReadOnlyList<(SecretRef Secret, string SpaceId, Guid? FolderId)> secrets, string reason, string notice)
+    {
+        if (secrets.Count == 0 || !await Secrets.AuthenticateAsync(reason)) return;
+        Dispatcher.Invoke(() =>
+        {
+            var copied = 0;
+            foreach (var (secret, spaceId, folderId) in secrets)
+            {
+                if (Secrets.ReadValue(secret) is not { } value || Secrets.Add(secret.Name, value, spaceId) is not { } copy) continue;
+                if (folderId is { } folder) Store.SetSecretFolder(copy.Id, folder);
+                copied++;
+            }
+            Panel.ShowNotice(copied == secrets.Count ? notice : "Couldn't save to Credential Manager");
+        });
+    }
+
     private void WriteSecretWithAutoClear(string value, int? seconds = null)
     {
         ClipboardIO.WriteSecret(value);
@@ -693,13 +722,14 @@ public sealed class AppServices : IPanelHost
         Hud.ShowMessage(Tracker.TargetWindow, Glyphs.Check, $"Sent to {contact.DisplayName}");
     }
 
-    // What contacts send arrives in a burst per sync: one quiet notice for all of it, never a dialog.
-    private readonly List<(string From, string Preview)> _contactArrivals = [];
+    // With notifications off or not allowed, what contacts send (and their requests) is still announced: one quiet
+    // HUD notice for a burst, never a dialog.
+    private readonly List<AppNotification> _hudNotices = [];
     private readonly DispatcherTimer _contactNoticeTimer = new() { Interval = TimeSpan.FromSeconds(1) };
 
-    private void QueueContactNotice(string from, string preview)
+    private void ShowNotificationInHud(AppNotification notification)
     {
-        _contactArrivals.Add((from, preview));
+        _hudNotices.Add(notification);
         _contactNoticeTimer.Stop();
         _contactNoticeTimer.Start();
     }
@@ -707,10 +737,28 @@ public sealed class AppServices : IPanelHost
     private void ShowContactNotice()
     {
         _contactNoticeTimer.Stop();
-        if (_contactArrivals.Count == 0) return;
-        var title = ContactNotice.Title(_contactArrivals);
-        _contactArrivals.Clear();
-        Hud.ShowNotice(Tracker.TargetWindow, Glyphs.Inbox, title, $"In your Inbox ({Settings.Hotkeys.GetValueOrDefault(Hotkey.QuickPanel)} → Inbox)");
+        if (_hudNotices.Count == 0) return;
+        var notices = _hudNotices.ToList();
+        _hudNotices.Clear();
+        var hotkey = Settings.Hotkeys.GetValueOrDefault(Hotkey.QuickPanel);
+        if (notices.All(n => n.Target is NotificationTarget.People))
+        {
+            var first = notices[0];
+            var title = notices.Count == 1 ? (first.Title == "Contact request" ? first.Body : $"{first.Title} {first.Body}") : $"{notices.Count} contact updates";
+            Hud.ShowNotice(Tracker.TargetWindow, Glyphs.Contact, title, $"See Contacts ({hotkey} → Contacts → People)");
+            return;
+        }
+        var items = notices.Where(n => n.Target is NotificationTarget.Inbox).ToList();
+        var line = items.Count == 1 ? $"{items[0].Title} {items[0].Body}" : $"{items.Count} contacts sent you items";
+        Hud.ShowNotice(Tracker.TargetWindow, Glyphs.Inbox, line, $"In your Inbox ({hotkey} → Contacts)");
+    }
+
+    /// <summary>A notification was clicked: the panel opens at what it's about.</summary>
+    public void OpenTarget(NotificationTarget? target)
+    {
+        if (target is null) return;
+        if (_panelWindow is not { IsVisible: true }) ShowPanel();
+        Panel.ShowTarget(target);
     }
 
     private HudWindow? _hud;

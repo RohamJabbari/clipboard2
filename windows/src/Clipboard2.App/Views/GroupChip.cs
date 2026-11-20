@@ -11,14 +11,14 @@ namespace Clipboard2.App.Views;
 /// with a highlight that slides between the two segments; selecting another chip folds it back the same way
 /// (docs/features/saved-v2.md §5). Kept across renders so the motion can run: <see cref="Update"/> animates only
 /// what changed, with a ~250 ms cubic ease-out, the segment labels fading in once the pill has started to widen. With
-/// Windows' animations off it snaps.</summary>
+/// Windows' animations off it snaps. The Contacts chip uses it too, as <c>[👤 Contacts | Inbox · People]</c>.</summary>
 internal sealed class GroupChip : Border
 {
     private const double MorphMs = 250, FadeInDelayMs = 70, FadeInMs = 180, FadeOutMs = 110, ChipHeight = 26, SegmentHeight = 20;
     private static readonly IEasingFunction Ease = new CubicEase { EasingMode = EasingMode.EaseOut };
     private static readonly Thickness CompactPadding = new(10, 0, 10, 0), OpenPadding = new(10, 0, 3, 0);
 
-    private readonly TextBlock _icon = Glyphs.Icon(Glyphs.Group, 13);
+    private readonly TextBlock _icon;
     private readonly TextBlock _name = Fluent.Label("", 13);
     /// <summary>Holds the segments; its width runs between 0 (compact) and the segments' natural width.</summary>
     private readonly Border _segmentsHost = new() { Width = 0, ClipToBounds = true, VerticalAlignment = VerticalAlignment.Center };
@@ -51,10 +51,16 @@ internal sealed class GroupChip : Border
 
     public string GroupId { get; }
     public string GroupName { get; private set; } = "";
+    private readonly string _first, _second;
+    private readonly bool _isGroup;
 
-    public GroupChip(string groupId, string name)
+    /// <param name="segments">The two segments' labels (Copies · Saved for a group).</param>
+    public GroupChip(string groupId, string name, string? glyph = null, (string First, string Second)? segments = null)
     {
         GroupId = groupId;
+        _isGroup = glyph is null;
+        _icon = Glyphs.Icon(glyph ?? Glyphs.Group, 13);
+        (_first, _second) = segments ?? ("Copies", "Saved");
         Height = ChipHeight;
         CornerRadius = new CornerRadius(ChipHeight / 2);
         Padding = CompactPadding;
@@ -72,7 +78,7 @@ internal sealed class GroupChip : Border
         for (var i = 0; i < 2; i++)
         {
             var saved = i == 1;
-            _labels[i] = Fluent.Label(saved ? "Saved" : "Copies", 12, _labelBrushes[i], FontWeights.SemiBold);
+            _labels[i] = Fluent.Label(saved ? _second : _first, 12, _labelBrushes[i], FontWeights.SemiBold);
             _labels[i].Opacity = 0;
             _segments[i] = new Border
             {
@@ -108,7 +114,7 @@ internal sealed class GroupChip : Border
         if (name == GroupName) return;
         GroupName = name;
         _name.Text = name;
-        ToolTip = $"Drop items or files here to share them to “{name}”";
+        if (_isGroup) ToolTip = $"Drop items or files here to share them to “{name}”";
         Describe();
     }
 
@@ -179,10 +185,12 @@ internal sealed class GroupChip : Border
 
     private void Describe()
     {
-        var state = _open == true ? $", selected, showing {(_saved ? "Saved" : "Copies")}" : "";
-        System.Windows.Automation.AutomationProperties.SetName(this, $"{GroupName} group filter{state}");
-        System.Windows.Automation.AutomationProperties.SetName(_segments[0], $"Show what was copied in {GroupName}" + (_open == true && !_saved ? ", selected" : ""));
-        System.Windows.Automation.AutomationProperties.SetName(_segments[1], $"Show what's saved in {GroupName}" + (_open == true && _saved ? ", selected" : ""));
+        var state = _open == true ? $", selected, showing {(_saved ? _second : _first)}" : "";
+        System.Windows.Automation.AutomationProperties.SetName(this, $"{GroupName} {(_isGroup ? "group " : "")}filter{state}");
+        System.Windows.Automation.AutomationProperties.SetName(_segments[0],
+            (_isGroup ? $"Show what was copied in {GroupName}" : $"Show {_first}") + (_open == true && !_saved ? ", selected" : ""));
+        System.Windows.Automation.AutomationProperties.SetName(_segments[1],
+            (_isGroup ? $"Show what's saved in {GroupName}" : $"Show {_second}") + (_open == true && _saved ? ", selected" : ""));
     }
 
     // MARK: Animation helpers (snap when not animating)

@@ -22,17 +22,25 @@ public static class Program
     {
         // Velopack install/update/uninstall hooks run (and exit) here. Its apply-on-startup is off:
         // UpdateService.ApplyPendingAtLaunch does that silently and restarts with --background.
+        // The AUMID is the one on Velopack's Start-menu shortcut, also when run from a build: toasts are attributed
+        // to it (Platform/Toasts.cs).
         VelopackApp.Build()
             .SetAutoApplyOnStartup(false)
+            .SetAppUserModelId(ToastNotifier.Aumid)
             .OnAfterUpdateFastCallback(_ => { })
-            .OnBeforeUninstallFastCallback(_ => StartupRegistration.SetEnabled(false))   // no dead Run entry left behind
+            .OnBeforeUninstallFastCallback(_ =>
+            {
+                StartupRegistration.SetEnabled(false);   // no dead Run entry left behind
+                ToastNotifier.Uninstall();
+            })
             .Run();
 
         using var mutex = new Mutex(true, MutexName, out var isFirst);
         if (!isFirst)
         {
-            // Already running: ask that instance to open its panel, then quit.
-            try { EventWaitHandle.OpenExisting(ShowEventName).Set(); } catch { }
+            // Already running: ask that instance to open its panel, then quit. A toast click reaches the running
+            // instance through COM, so a process started for one has nothing to do.
+            if (!args.Contains("-ToastActivated")) try { EventWaitHandle.OpenExisting(ShowEventName).Set(); } catch { }
             return;
         }
         try
@@ -62,7 +70,8 @@ public static class Program
             try
             {
                 services = new AppServices();
-                services.Start(background: args.Contains("--background"));
+                // Started by a click on a toast: its target opens the panel, no "is running" balloon.
+                services.Start(background: args.Contains("--background") || args.Contains("-ToastActivated") || ToastNotifier.WasLaunchedByToast());
             }
             catch (Exception ex)
             {

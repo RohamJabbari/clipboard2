@@ -128,7 +128,11 @@ public sealed partial class QuickPanelWindow : Window
         Deactivated += (_, _) => OwnWindowDeactivated();
         Model.Changed += QueueRender;
         _services.StoreChanged += () => Dispatcher.BeginInvoke(() => { if (IsVisible) Model.Refresh(); });
-        _services.Sync.Changed += () => Dispatcher.BeginInvoke(_syncStatus.Update);
+        _services.Sync.Changed += () => Dispatcher.BeginInvoke(() =>
+        {
+            _syncStatus.Update();
+            if (IsVisible && Model.ShowsPeople) Model.Refresh();   // requests answered, contacts added
+        });
         _services.Sync.DownloadsChanged += () => Dispatcher.BeginInvoke(() => { if (IsVisible) UpdateIncoming(); });
         _services.ImageText.Indexed += OnImageTextRead;
         SetUpDropTargets();
@@ -520,6 +524,7 @@ public sealed partial class QuickPanelWindow : Window
             {
                 case PanelMode.Actions when _actionFilter is not null: _actionFilter.Focus(); break;
                 case PanelMode.AddItems when _addItemsFilter is not null: _addItemsFilter.Focus(); break;
+                case PanelMode.SendToContact when _contactPickerFilter is not null: _contactPickerFilter.Focus(); break;
                 case PanelMode.Browse: _search.Focus(); _search.CaretIndex = _search.Text.Length; break;
             }
         }, System.Windows.Threading.DispatcherPriority.Input);
@@ -532,6 +537,8 @@ public sealed partial class QuickPanelWindow : Window
         var input = ToKeyInput(e);
         // Tab moves between fields inside forms.
         if (input.Key == PanelKey.Tab && Model.Mode is PanelMode.SnippetForm) return;
+        // Typing in People's Add Contact field: the field takes the keys (it handles Enter itself).
+        if (_addContactField is { IsKeyboardFocused: true } && input.Key is not (PanelKey.Escape or PanelKey.Tab or PanelKey.Up or PanelKey.Down)) return;
         if (input.Key != PanelKey.Other && Model.HandleKey(input)) e.Handled = true;
     }
 
@@ -636,6 +643,18 @@ public sealed partial class QuickPanelWindow : Window
             foreach (var filter in Model.ChipFilters)
             {
                 var f = filter;
+                if (filter == PanelFilter.Inbox)
+                {
+                    // Contacts: [Contacts | Inbox · People], morphing like a group's chip.
+                    if (_contactsChip is null)
+                    {
+                        _contactsChip = new GroupChip("contacts", PanelFilter.Inbox.Title(), Glyphs.Contact, ("Inbox", "People"));
+                        _contactsChip.Chosen += () => Model.SetFilter(PanelFilter.Inbox);
+                        _contactsChip.SegmentChosen += people => Model.SetContactsShowPeople(people);
+                    }
+                    _chips.Children.Add(_contactsChip);
+                    continue;
+                }
                 AddChip(ChipTitle(filter), Glyphs.For(filter), Model.GroupFilter is null && filter == Model.Filter, () => Model.SetFilter(f));
             }
             if (groups.Count > 0)
@@ -649,6 +668,16 @@ public sealed partial class QuickPanelWindow : Window
                     chip.Chosen += () => Model.SetGroupFilter(groupId);   // on the open pill: back to its root, nothing new
                     chip.SegmentChosen += saved => Model.SetGroupShowsSaved(saved);
                     MakeGroupDropTarget(chip);
+                    // Right-click: Mute Notifications, per group.
+                    var muteMenu = new ContextMenu();
+                    chip.ContextMenu = muteMenu;
+                    chip.ContextMenuOpening += (_, _) =>
+                    {
+                        muteMenu.Items.Clear();
+                        var mute = new MenuItem { Header = "Mute Notifications", IsCheckable = true, IsChecked = Model.IsGroupMuted(groupId) };
+                        mute.Click += (_, _) => Model.SetGroupMuted(groupId, mute.IsChecked);
+                        muteMenu.Items.Add(mute);
+                    };
                 }
                 chip.SetName(name);
                 _chips.Children.Add(chip);
@@ -657,9 +686,11 @@ public sealed partial class QuickPanelWindow : Window
         }
         foreach (var (id, _) in groups)
             _groupChips[id].Update(Model.GroupFilter == id, Model.GroupShowsSaved(id), animate: !_snapChips);
+        _contactsChip?.Update(Model.GroupFilter is null && Model.Filter == PanelFilter.Inbox, _services.Settings.ContactsShowPeople, animate: !_snapChips);
         _snapChips = false;
     }
 
+    private GroupChip? _contactsChip;
     private readonly Dictionary<string, GroupChip> _groupChips = [];
     private string? _chipRowKey;
     /// <summary>Set when the panel opens: the chips take their state without animating.</summary>
@@ -697,6 +728,12 @@ public sealed partial class QuickPanelWindow : Window
 
     private void RenderRows()
     {
+        if (Model.ShowsPeople)
+        {
+            RenderPeople();
+            return;
+        }
+        _peopleKey = null;
         var ids = Model.Entries.Select(e => e.Id).ToList();
         var multi = Model.IsMultiSelecting;
         if (!ids.SequenceEqual(_renderedIds) || _rowViews.Count != ids.Count)
@@ -956,6 +993,8 @@ public sealed partial class QuickPanelWindow : Window
             if (Model.ParentFolder(f.Folder) is not null && Model.CanChangeFolder(f.Folder))
                 menu.Items.Add(Item("Move to Top Level", () => Model.MoveFolder(f.Folder, null)));
             if (f.Folder.SpaceId is null && ShareMenu(entry, Focus) is { } shareFolder) menu.Items.Add(shareFolder);
+            if (Model.ContactNames.Count > 0 && Model.CanSendToContact(entry))
+                menu.Items.Add(Item("Send to Contact…", () => { Focus(); Model.BeginSendToContact(); }));
             menu.Items.Add(new Separator());
             menu.Items.Add(Item("Delete Folder", () => Model.DeleteFolder(f.Folder)));
             return;
@@ -974,17 +1013,8 @@ public sealed partial class QuickPanelWindow : Window
         }
         menu.Items.Add(slots);
         if (ShareMenu(entry, Focus) is { } share) menu.Items.Add(share);
-        if (entry.ClipItem is { } forContact && Model.ContactNames.Where(c => c.Key != forContact.SpaceId).ToList() is { Count: > 0 } contacts)
-        {
-            var send = new MenuItem { Header = "Send to Contact" };
-            foreach (var (spaceId, name) in contacts.OrderBy(c => c.Value, StringComparer.CurrentCultureIgnoreCase))
-                send.Items.Add(Item($"Send to {name}", () =>
-                {
-                    Model.Select(entry.Id);
-                    Model.Perform(new PanelAction.SendToContact(spaceId, name));
-                }));
-            menu.Items.Add(send);
-        }
+        if (Model.ContactNames.Count > 0 && Model.CanSendToContact(entry))
+            menu.Items.Add(Item("Send to Contact…", () => { Focus(); Model.BeginSendToContact(); }));
         if (entry.ClipItem is { } sendable && sendable != Model.SelectionItem && _services.OtherDevices is { Count: > 0 } devices)
         {
             var send = new MenuItem { Header = "Send to Device" };
@@ -1145,6 +1175,8 @@ public sealed partial class QuickPanelWindow : Window
             PanelMode.AuthenticatorPeople => "people:" + string.Join(",", Model.PeopleOf?.People.Select(p => p.Uid) ?? []),
             PanelMode.AuthenticatorForm => "form:" + Model.AuthenticatorForm?.GetHashCode() + "|" + Model.AuthenticatorForm?.Error,
             PanelMode.AddItems => "additems:" + Model.AddItemsForm?.GetHashCode(),
+            PanelMode.SendToContact => "picker:" + Model.ContactPicker?.GetHashCode(),
+            PanelMode.Browse when Model.ShowsPeople => "person:" + Model.SelectedPerson?.Id,
             PanelMode.Browse => Model.SelectedId,
             PanelMode.AI => Model.AIRun?.GetHashCode().ToString(),
             _ => Model.SelectedId,
@@ -1156,6 +1188,8 @@ public sealed partial class QuickPanelWindow : Window
             _actionFilter = null;
             _addItemsFilter = null;
             _addItemsList = null;
+            _contactPickerFilter = null;
+            _contactPickerList = null;
             _aiOutput = null;
             _fileRows.Clear();
             foreach (var stale in _codeViews.Keys.Where(k => k.StartsWith("detail:", StringComparison.Ordinal)).ToList()) _codeViews.Remove(stale);
@@ -1163,6 +1197,7 @@ public sealed partial class QuickPanelWindow : Window
             {
                 PanelMode.AuthenticatorForm => BuildAuthenticatorForm(),
                 PanelMode.AddItems => BuildAddItems(),
+                PanelMode.SendToContact => BuildContactPicker(),
                 PanelMode.AuthenticatorSecret => BuildAuthenticatorSecret(),
                 PanelMode.AuthenticatorPeople => BuildAuthenticatorPeople(),
                 PanelMode.ConfirmDelete => BuildConfirmDelete(),
@@ -1173,11 +1208,13 @@ public sealed partial class QuickPanelWindow : Window
                 PanelMode.EditSecret => BuildEditSecret(),
                 PanelMode.FolderName => BuildFolderName(),
                 PanelMode.AI => BuildAI(),
+                _ when Model.ShowsPeople => BuildPersonDetail(),
                 _ => Model.IsMultiSelecting ? BuildMulti() : (Model.SelectedEntry is { } e ? BuildPreview(e) : new Border()),
             };
         }
         if (Model.Mode == PanelMode.Actions) FillActionList();
         if (Model.Mode == PanelMode.AddItems) FillAddItems();
+        if (Model.Mode == PanelMode.SendToContact) FillContactPicker();
         if (Model.Mode == PanelMode.AI) UpdateAI();
         if (Model.Mode == PanelMode.Browse) UpdateFileRows();
     }
@@ -1772,6 +1809,13 @@ public sealed partial class QuickPanelWindow : Window
         _syncStatus.Update();
         _hints.Text = Model.Mode switch
         {
+            PanelMode.Browse when Model.ShowsPeople => Model.SelectedPerson switch
+            {
+                PersonRow.Incoming => "↑↓ Choose    Enter Accept    Type to Search    Tab Filter    Esc Close",
+                PersonRow.Contact c when Model.ConfirmingRemoval == c.Space.Id => "Enter Remove    Esc Keep",
+                PersonRow.Contact => "↑↓ Choose    Enter Send…    Type to Search    Tab Filter    Esc Close",
+                _ => "↑↓ Choose    Type to Search    Tab Filter    Esc Close",
+            },
             PanelMode.Browse when Model.IsPreviewing => "←→ Previous/Next    ↑↓ Choose Item    Enter Paste    Esc Close Preview",
             PanelMode.Browse when Model.PickedFiles.Count > 0 && Model.PickableItem is { } item =>
                 $"Enter Paste {Model.PickedFiles.Count} of {item.Files.Count} files    Ctrl+K Actions    Esc All Files",
@@ -1788,7 +1832,9 @@ public sealed partial class QuickPanelWindow : Window
             PanelMode.Actions when Model.OtpPicker is { Kind: OtpPickerKind.Share } => "↑↓ Choose Person    Enter Share    Esc Back",
             PanelMode.Actions when Model.OtpPicker is { Kind: OtpPickerKind.Transfer } => "↑↓ Choose Person    Enter Transfer    Esc Back",
             PanelMode.ConfirmDelete => "Enter Delete    Esc Cancel",
+            PanelMode.AddItems when Model.AddItemsForm?.SendTo is not null => "↑↓ Choose    Space Check    Enter Send    Esc Cancel",
             PanelMode.AddItems => "↑↓ Choose    Space Check    Enter Add    Esc Cancel",
+            PanelMode.SendToContact => "↑↓ Choose    Space Tick    Enter Send    Ctrl+Enter Send to Several    Esc Cancel",
             PanelMode.AuthenticatorSecret or PanelMode.AuthenticatorPeople => "Esc Back",
             PanelMode.Actions when Model.IsPickingGroup => "↑↓ Choose Group    Enter Share    Esc Back",
             PanelMode.Actions when Model.PickingShareFolder is not null => "↑↓ Choose Folder    Enter Share    Esc Back",

@@ -105,7 +105,7 @@ public sealed partial class QuickPanelWindow
         grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
         var header = new StackPanel { Margin = new Thickness(14, 8, 14, 8) };
         var where = Model.OpenFolder?.Name ?? "Saved";
-        header.Children.Add(Fluent.Label($"Add to {where}", 15, null, FontWeights.SemiBold));
+        header.Children.Add(Fluent.Label(Model.AddItemsForm?.SendTo is { } to ? $"Send to {to.DisplayName}" : $"Add to {where}", 15, null, FontWeights.SemiBold));
         var filter = new Grid();
         _addItemsFilter = new TextBox { BorderThickness = new Thickness(0), Background = Brushes.Transparent, FontSize = 14, Text = Model.AddItemsForm?.Query ?? "" };
         _addItemsFilter.TextChanged += (_, _) => Model.SetAddItemsQuery(_addItemsFilter.Text);
