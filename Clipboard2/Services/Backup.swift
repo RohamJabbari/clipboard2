@@ -244,13 +244,16 @@ nonisolated struct BackupFolder: Codable, Equatable, Sendable {
     var id: String
     var name: String
     var label: String?
+    /// The backup id of the folder it's in (1.8+); omitted at the top level.
+    var parent: String?
     var createdAt: Int64
     var updatedAt: Int64
 
-    init(id: String, name: String, label: String?, createdAt: Int64, updatedAt: Int64) {
+    init(id: String, name: String, label: String?, parent: String? = nil, createdAt: Int64, updatedAt: Int64) {
         self.id = id
         self.name = name
         self.label = label
+        self.parent = parent
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
@@ -262,6 +265,7 @@ nonisolated struct BackupFolder: Codable, Equatable, Sendable {
         id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
         label = try c.decodeIfPresent(String.self, forKey: .label)
+        parent = try c.decodeIfPresent(String.self, forKey: .parent)
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
         updatedAt = try c.decodeIfPresent(Int64.self, forKey: .updatedAt) ?? createdAt
     }
@@ -454,8 +458,13 @@ enum BackupExporter {
                          createdAt: ($0.ref.createdAt ?? .now).backupMillis,
                          folder: $0.ref.folderID?.uuidString.lowercased())
         }
-        let folderList = store.folders(inSpace: nil).map {
+        // Parents first, each with its effective parent (an unusable one reads as top level).
+        let personalFolders = store.folders(inSpace: nil)
+        let tree = FolderTree(personalFolders)
+        let byID = Dictionary(personalFolders.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let folderList = tree.flattened().compactMap { byID[$0.node.id] }.map {
             BackupFolder(id: $0.id.uuidString.lowercased(), name: $0.name, label: $0.label,
+                         parent: tree.parent(of: $0.id)?.uuidString.lowercased(),
                          createdAt: $0.createdAt.backupMillis, updatedAt: $0.updatedAt.backupMillis)
         }
         // A clip pointing at a folder that isn't here goes to the root.
@@ -630,24 +639,56 @@ enum BackupImporter {
     /// The backup's folders, read first: each joins the personal folder with the same name
     /// (ignoring case), otherwise it's added with a new id. Returns backup folder id → local id.
     private static func mergeFolders(_ incoming: [BackupFolder], into store: ClipStore) -> [String: UUID] {
-        var byName = Dictionary(store.folders(inSpace: nil).map { ($0.name.lowercased(), $0) }, uniquingKeysWith: { first, _ in first })
+        struct Key: Hashable { var parent: UUID?; var name: String }
+        let local = store.folders(inSpace: nil)
+        let tree = FolderTree(local)
+        var byKey: [Key: UUID] = [:]
+        var depth: [UUID: Int] = [:]
+        for folder in local {
+            let key = Key(parent: tree.parent(of: folder.id), name: folder.name.lowercased())
+            if byKey[key] == nil { byKey[key] = folder.id }
+            depth[folder.id] = tree.depth(of: folder.id)
+        }
+        let ids = Set(incoming.map(\.id))
         var map: [String: UUID] = [:]
         var inserted = false
-        for backup in incoming where map[backup.id] == nil {
-            let name = backup.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            let key = (name.isEmpty ? "Folder" : name).lowercased()
-            if let existing = byName[key] {
-                map[backup.id] = existing.id
-                continue
+        var pending = incoming
+        // Parents first. A parent that isn't in the file, a cycle or a ninth level: top level.
+        while !pending.isEmpty {
+            var rest: [BackupFolder] = []
+            var progressed = false
+            for backup in pending where map[backup.id] == nil {
+                let parentID = backup.parent.flatMap { ids.contains($0) && $0 != backup.id ? $0 : nil }
+                if let parentID, map[parentID] == nil {
+                    rest.append(backup)
+                    continue
+                }
+                progressed = true
+                var parent = parentID.flatMap { map[$0] }
+                if let id = parent, (depth[id] ?? 1) >= FolderTree.maxDepth { parent = nil }
+                let name = backup.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                let display = name.isEmpty ? "Folder" : name
+                let key = Key(parent: parent, name: display.lowercased())
+                if let existing = byKey[key] {
+                    map[backup.id] = existing
+                    continue
+                }
+                let folder = ClipFolder(name: display, spaceID: nil)
+                folder.label = backup.label?.isEmpty == true ? nil : backup.label
+                folder.parentID = parent
+                folder.createdAt = Date(backupMillis: backup.createdAt)
+                folder.updatedAt = Date(backupMillis: backup.updatedAt)
+                store.insertSynced(folder)
+                byKey[key] = folder.id
+                depth[folder.id] = (parent.flatMap { depth[$0] } ?? 0) + 1
+                map[backup.id] = folder.id
+                inserted = true
             }
-            let folder = ClipFolder(name: name.isEmpty ? "Folder" : name, spaceID: nil)
-            folder.label = backup.label?.isEmpty == true ? nil : backup.label
-            folder.createdAt = Date(backupMillis: backup.createdAt)
-            folder.updatedAt = Date(backupMillis: backup.updatedAt)
-            store.insertSynced(folder)
-            byName[key] = folder
-            map[backup.id] = folder.id
-            inserted = true
+            if !progressed {
+                // Only cycles are left: they go in at the top level.
+                for index in rest.indices { rest[index].parent = nil }
+            }
+            pending = rest
         }
         if inserted { store.commitSynced() }
         return map

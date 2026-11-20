@@ -158,6 +158,10 @@ enum PanelAction: Identifiable, Hashable {
     case openFolder
     case renameFolder
     case deleteFolder
+    /// The selected folder (with everything in it) into another folder of its space.
+    case moveFolder(ClipFolder)
+    case moveFolderToTop
+    case newSubfolder
     case saveToFolder
     case saveToChosenFolder
     case delete
@@ -189,6 +193,9 @@ enum PanelAction: Identifiable, Hashable {
         case .openFolder: "openFolder"
         case .renameFolder: "renameFolder"
         case .deleteFolder: "deleteFolder"
+        case .moveFolder(let folder): "moveFolder-" + folder.id.uuidString
+        case .moveFolderToTop: "moveFolderToTop"
+        case .newSubfolder: "newSubfolder"
         case .saveToFolder: "saveToFolder"
         case .saveToChosenFolder: "saveToChosenFolder"
         case .delete: "delete"
@@ -205,7 +212,7 @@ enum PanelAction: Identifiable, Hashable {
         case .saveToFolder, .saveToChosenFolder: "Save"
         case .addToSaved, .saveCopy, .moveToFolder, .moveToNewFolder, .copyToNewFolder, .removeFromFolder,
              .removeFromLabelled: "Saved"
-        case .openFolder, .renameFolder, .deleteFolder: "Folder"
+        case .openFolder, .renameFolder, .deleteFolder, .moveFolder, .moveFolderToTop, .newSubfolder: "Folder"
         case .saveAsSecret, .setLabel, .shareToGroup, .clearSlot, .delete: "Item"
         case .authenticator: "Authenticator"
         }
@@ -234,10 +241,13 @@ enum PanelAction: Identifiable, Hashable {
         case .moveToFolder(let folder): "Move to “\(folder.name)”"
         case .moveToNewFolder: "Move to New Folder…"
         case .copyToNewFolder: "Save a Copy to New Folder…"
-        case .removeFromFolder: "Remove from Folder"
+        case .removeFromFolder: "Move to Top Level"
         case .openFolder: "Open"
         case .renameFolder: "Rename…"
         case .deleteFolder: "Delete Folder"
+        case .moveFolder(let folder): "Move to “\(folder.name)”"
+        case .moveFolderToTop: "Move to Top Level"
+        case .newSubfolder: "New Folder Inside…"
         case .saveToFolder: "Save to \(folderName)"
         case .saveToChosenFolder: "Save to…"
         case .delete: "Delete"
@@ -270,6 +280,9 @@ enum PanelAction: Identifiable, Hashable {
         case .openFolder: "folder"
         case .renameFolder: "pencil"
         case .deleteFolder: "trash"
+        case .moveFolder: "folder"
+        case .moveFolderToTop: "arrow.up.to.line"
+        case .newSubfolder: "folder.badge.plus"
         case .saveToFolder: "square.and.arrow.down"
         case .saveToChosenFolder: "folder"
         case .delete: "trash"
@@ -571,9 +584,12 @@ final class FolderNameState {
 
     let purpose: Purpose
     var name: String
+    /// A new folder goes in this one (same space); nil at the top level.
+    let parent: ClipFolder?
 
-    init(purpose: Purpose) {
+    init(purpose: Purpose, parent: ClipFolder? = nil) {
         self.purpose = purpose
+        self.parent = parent
         switch purpose {
         case .rename(let folder): name = folder.name
         case .create: name = "New Folder"
@@ -629,9 +645,15 @@ final class PanelViewModel {
     private(set) var openFolderID: UUID?
     /// Number of saved clips and secrets in each folder of the Saved list being shown.
     private(set) var folderCounts: [UUID: Int] = [:]
-    /// Search results inside a folder, from the Saved root, by entry id: the folder's name, shown
-    /// under them.
+    /// Number of subfolders in each folder of the Saved list being shown.
+    private(set) var subfolderCounts: [UUID: Int] = [:]
+    /// Search results below the open folder (or the root), by entry id: their folder's path
+    /// relative to where you are ("Work › Clients"), shown under them.
     private(set) var folderCaptions: [String: String] = [:]
+    /// The folders of the Saved list being shown, as a tree (refreshed with the list).
+    private(set) var savedTree = FolderTree(nodes: [])
+    /// A folder row being dragged (drops on itself or below it are refused while it's set).
+    var draggingFolderID: UUID?
     /// Groups showing their Saved items instead of their Copies (remembered per group).
     private(set) var groupsShowingSaved: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "panelGroupsShowingSaved") ?? [])
 
@@ -669,12 +691,33 @@ final class PanelViewModel {
         userMovedSelection = false
     }
 
-    /// Back to the root of Saved, with the folder selected.
+    /// Up one level (to the parent folder, or the root of Saved), with the folder selected.
     func closeFolder() {
         guard let id = openFolderID else { return }
-        openFolderID = nil
+        openFolderID = savedTree.parent(of: id)
+        query = ""
         refresh(resetSelection: true)
         if entries.contains(where: { $0.id == "f-" + id.uuidString }) { selectedID = "f-" + id.uuidString }
+    }
+
+    /// Jumps to a breadcrumb segment: a folder of the path, or (nil) the root of Saved.
+    func showLevel(_ folderID: UUID?) {
+        guard isSavedView, folderID != openFolderID else { return }
+        let from = openFolderID
+        openFolderID = folderID
+        query = ""
+        refresh(resetSelection: true)
+        // The child on the way back down is selected, like going up one level.
+        if let from, let child = savedTree.path(to: from).first(where: { savedTree.parent(of: $0.id) == folderID }) {
+            let id = "f-" + child.id.uuidString
+            if entries.contains(where: { $0.id == id }) { selectedID = id }
+        }
+    }
+
+    /// The open folder's path from the top level ("Work", "Clients").
+    var openFolderPath: [ClipFolder] {
+        guard isSavedView, let openFolderID else { return [] }
+        return savedTree.path(to: openFolderID).compactMap { env.store.folder(withID: $0.id) }
     }
     private(set) var entries: [PanelEntry] = []
     /// Date headings ("Today", "Yesterday"…) keyed by the first row under each; empty while searching.
@@ -969,33 +1012,43 @@ final class PanelViewModel {
             // Searching from the root finds what's in folders too, captioned with the folder's name.
             let all = env.store.folders(inSpace: savedSpaceID)
             let byID = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let tree = FolderTree(all)
+            savedTree = tree
             let saved = env.store.items(inSpace: savedSpaceID).filter(\.isPinned)
             let spaceSecrets = env.secrets.secrets.filter { $0.spaceID == savedSpaceID }
             if let open = openFolderID, byID[open] == nil { openFolderID = nil }   // deleted meanwhile
+            // The folder something shows in: nil (the root) when it has none or one that isn't here.
+            let place = { (id: UUID?) -> UUID? in id.flatMap { byID[$0] != nil ? $0 : nil } }
             var counts: [UUID: Int] = [:]
-            for id in saved.compactMap(\.folderID) + spaceSecrets.compactMap(\.folderID) where byID[id] != nil {
+            for id in saved.compactMap({ place($0.folderID) }) + spaceSecrets.compactMap({ place($0.folderID) }) {
                 counts[id, default: 0] += 1
             }
             folderCounts = counts
-            if let open = openFolderID {
-                clips = saved.filter { $0.folderID == open }
-                secrets = spaceSecrets.filter { $0.folderID == open }
+            subfolderCounts = Dictionary(all.map { ($0.id, tree.children(of: $0.id).count) }, uniquingKeysWith: { first, _ in first })
+            let open = openFolderID
+            if open == nil { snippets = env.snippets.snippets(inSpace: savedSpaceID) }
+            if q.isEmpty {
+                // This level: its subfolders (by name), then its items.
+                folders = tree.children(of: open).compactMap { byID[$0.id] }
+                clips = saved.filter { place($0.folderID) == open }
+                secrets = spaceSecrets.filter { place($0.folderID) == open }
             } else {
-                folders = all
-                snippets = env.snippets.snippets(inSpace: savedSpaceID)
-                if q.isEmpty {
-                    clips = saved.filter { $0.folderID.flatMap { byID[$0] } == nil }
-                    secrets = spaceSecrets.filter { $0.folderID.flatMap { byID[$0] } == nil }
-                } else {
-                    clips = saved
-                    secrets = spaceSecrets
-                    for item in saved {
-                        if let id = item.folderID, let folder = byID[id] { folderCaptions[PanelEntry.clip(item).id] = folder.name }
-                    }
-                    for ref in spaceSecrets {
-                        if let id = ref.folderID, let folder = byID[id] { folderCaptions[PanelEntry.secret(ref).id] = folder.name }
-                    }
+                // The whole subtree below where you are, each result captioned with its path from here.
+                let scope: Set<UUID>? = open.map { tree.descendants(of: $0) }
+                let inScope = { (folder: UUID?) -> Bool in
+                    guard let scope else { return true }
+                    return folder == open || folder.map(scope.contains) == true
                 }
+                folders = all.filter { scope?.contains($0.id) ?? true }
+                clips = saved.filter { inScope(place($0.folderID)) }
+                secrets = spaceSecrets.filter { inScope(place($0.folderID)) }
+                let caption = { (folder: UUID?) -> String? in
+                    guard let folder, folder != open else { return nil }
+                    return tree.pathName(of: folder, relativeTo: open)
+                }
+                for item in clips { folderCaptions[PanelEntry.clip(item).id] = caption(place(item.folderID)) }
+                for ref in secrets { folderCaptions[PanelEntry.secret(ref).id] = caption(place(ref.folderID)) }
+                for folder in folders { folderCaptions[PanelEntry.folder(folder).id] = caption(tree.parent(of: folder.id)) }
             }
         } else if let groupFilter {
             clips = env.store.allItems().filter { $0.spaceID == groupFilter }
@@ -1664,7 +1717,7 @@ final class PanelViewModel {
 
     /// Every group's folders, for the share form's destination.
     private var groupFolders: [String: [ClipFolder]] {
-        Dictionary(env.sync.groups.map { ($0.id, env.store.folders(inSpace: $0.id)) }, uniquingKeysWith: { first, _ in first })
+        Dictionary(env.sync.groups.map { ($0.id, treeOrderedFolders(inSpace: $0.id)) }, uniquingKeysWith: { first, _ in first })
     }
 
     func submitShare() {
@@ -1677,7 +1730,7 @@ final class PanelViewModel {
                 shareSecret(ref, value: value, to: group, folder: destination)
             }
         } else if let folder = form.folder {
-            share(folder, to: group)
+            share(folder, to: group, parent: destination)
         } else {
             share(form.items, to: group, folder: destination)
         }
@@ -1687,24 +1740,37 @@ final class PanelViewModel {
     func beginShareFolder(_ folder: ClipFolder) {
         guard canShareToGroup, folder.spaceID == nil else { return }
         selectedID = PanelEntry.folder(folder).id
-        shareForm = ShareGroupState(items: env.store.items(inFolder: folder), folder: folder, groups: env.sync.groups,
-                                    defaultGroupID: env.prefs.syncDefaultGroupID)
+        shareForm = ShareGroupState(items: subtreeItems(of: folder), folder: folder, groups: env.sync.groups,
+                                    defaultGroupID: env.prefs.syncDefaultGroupID, foldersByGroup: groupFolders)
         mode = .shareToGroup
     }
 
-    /// Copies a personal folder (new id, same name and label) and copies of its clips and
-    /// secrets into the group. Yours stays as it is; later changes don't follow. Secrets are read
-    /// after Touch ID.
-    func share(_ folder: ClipFolder, to group: SyncGroup) {
-        let items = env.store.items(inFolder: folder)
+    /// The saved clips in a folder and every folder below it.
+    func subtreeItems(of folder: ClipFolder) -> [ClipItem] {
+        let ids = folderTree(of: folder).subtree(of: folder.id)
+        return ids.compactMap(env.store.folder(withID:)).flatMap(env.store.items(inFolder:))
+    }
+
+    /// Copies a personal folder with its whole subtree (new ids, same names, labels and
+    /// structure), its clips and its secrets into the group, in `parent` (one of the group's
+    /// folders) or at its top level. Yours stays as it is; later changes don't follow. Secrets
+    /// are read after one Touch ID.
+    func share(_ folder: ClipFolder, to group: SyncGroup, parent: ClipFolder? = nil) {
+        let items = subtreeItems(of: folder)
         if let problem = items.lazy.compactMap(SyncEngine.groupShareProblem).first {
             refuseGroupShare(problem)
             return
         }
-        let secrets = env.secrets.secrets(inFolder: folder)
+        let folderIDs = folderTree(of: folder).subtree(of: folder.id)
+        let secrets = env.secrets.secrets.filter { $0.spaceID == folder.spaceID && $0.folderID.map(folderIDs.contains) == true }
         let finish = { [self] (values: [(SecretRef, String)]) in
-            let copy = env.store.shareCopy(of: folder, toSpace: group.id)
-            for (ref, value) in values { env.secrets.add(name: ref.name, value: value, spaceID: group.id, folderID: copy.id) }
+            var copies: [UUID: UUID] = [:]
+            env.store.shareCopy(of: folder, toSpace: group.id, parent: parent.flatMap { $0.spaceID == group.id ? $0 : nil }) { original, copy in
+                copies[original] = copy.id
+            }
+            for (ref, value) in values {
+                env.secrets.add(name: ref.name, value: value, spaceID: group.id, folderID: ref.folderID.flatMap { copies[$0] })
+            }
             env.sync.syncNow()
             refresh()
             showNotice("Shared “\(folder.name)” to \(group.name)")
@@ -1977,6 +2043,8 @@ final class PanelViewModel {
         case .secret(let id):
             guard let ref = env.secrets.secrets.first(where: { $0.id == id }) else { return ([], []) }
             entry = .secret(ref)
+        case .folder:
+            return ([], [])
         }
         if isMultiSelecting && selectedIDs.contains(entry.id) { return (selectedClips, selectedSecrets) }
         return (entry.clip.map { [$0] } ?? [], entry.secret.map { [$0] } ?? [])
@@ -1993,6 +2061,10 @@ final class PanelViewModel {
     func drop(_ reference: PanelDrag.Reference, onFolder folderID: UUID) -> Bool {
         guard let folder = env.store.folder(withID: folderID) else { return false }
         onDropFinished()
+        if case .folder(let moving) = reference {
+            guard let source = env.store.folder(withID: moving) else { return false }
+            return moveFolder(source, under: folder)
+        }
         let (clips, secrets) = dragged(reference)
         place(clips, secrets: secrets, in: folder)
         return true
@@ -2006,6 +2078,11 @@ final class PanelViewModel {
 
     @discardableResult
     func dropOnSavedRoot(_ reference: PanelDrag.Reference) -> Bool {
+        if case .folder(let moving) = reference {
+            onDropFinished()
+            guard let source = env.store.folder(withID: moving) else { return false }
+            return moveFolder(source, under: nil)
+        }
         let (clips, secrets) = dragged(reference)
         onDropFinished()
         let inFolders = (clips.filter { $0.folderID != nil }, secrets.filter { $0.folderID != nil })
@@ -2108,6 +2185,11 @@ final class PanelViewModel {
         if entry.isSuggestion { return [] }
         if case .folder(let folder) = entry {
             var actions: [PanelAction] = [.openFolder, .renameFolder, .setLabel]
+            if canChangeFolder(folder) {
+                if FolderTree(env.store.folders(inSpace: folder.spaceID)).canCreate(in: folder.id) { actions.append(.newSubfolder) }
+                actions += folderTargets(forMoving: folder).map(PanelAction.moveFolder)
+                if folderTree(of: folder).parent(of: folder.id) != nil { actions.append(.moveFolderToTop) }
+            }
             if folder.spaceID == nil && canShareToGroup { actions.append(.shareToGroup) }
             return actions + [.deleteFolder]
         }
@@ -2204,11 +2286,13 @@ final class PanelViewModel {
         }
         if action == .delete, isRemovingFromGroup { return "Remove from Group" }
         if case .moveToFolder(let folder) = action, folder.spaceID == nil, selectionHasGroupItems {
-            return "Save a Copy to “\(folder.name)”"
+            return "Save a Copy to \(folderPathName(folder))"
         }
         if case .moveToFolder(let folder) = action, let space = folder.spaceID, let name = env.sync.groupName(for: space) {
-            return "Move to “\(folder.name)” in \(name)"
+            return "Move to \(folderPathName(folder)) in \(name)"
         }
+        if case .moveToFolder(let folder) = action { return "Move to \(folderPathName(folder))" }
+        if case .moveFolder(let folder) = action { return "Move to \(folderPathName(folder))" }
         if action == .moveToNewFolder, let space = (selectedClips.first?.spaceID ?? selectedSecrets.first?.spaceID),
            let name = env.sync.groupName(for: space) {
             return "Move to New Folder in \(name)…"
@@ -2338,6 +2422,12 @@ final class PanelViewModel {
             if let folder = entry.folder { beginRename(folder) }
         case .deleteFolder:
             if let folder = entry.folder { deleteFolder(folder) }
+        case .moveFolder(let target):
+            if let folder = entry.folder { moveFolder(folder, under: target) }
+        case .moveFolderToTop:
+            if let folder = entry.folder { moveFolder(folder, under: nil) }
+        case .newSubfolder:
+            if let folder = entry.folder { beginNewFolder(in: folder) }
         case .sendToDevice(let device):
             guard let item = entry.clip else { return }
             send(item, to: device)
@@ -2526,16 +2616,82 @@ final class PanelViewModel {
         let allIn = { (folder: ClipFolder) in
             clips.allSatisfy { $0.folderID == folder.id } && secrets.allSatisfy { $0.folderID == folder.id }
         }
-        let personal = env.store.folders(inSpace: nil)
+        let personal = treeOrderedFolders(inSpace: nil)
         if spaces == [nil] {
             return FolderMenu(group: nil, personal: personal.filter { !allIn($0) }, copiesToPersonal: false)
         }
         var group: (id: String, name: String, folders: [ClipFolder])?
         if spaces.count == 1, let id = spaces.first ?? nil,
            clips.allSatisfy(env.sync.canChange), secrets.allSatisfy({ env.sync.canChange(itemID: $0.id, spaceID: $0.spaceID) }) {
-            group = (id, env.sync.groupName(for: id) ?? "Group", env.store.folders(inSpace: id).filter { !allIn($0) })
+            group = (id, env.sync.groupName(for: id) ?? "Group", treeOrderedFolders(inSpace: id).filter { !allIn($0) })
         }
         return FolderMenu(group: group, personal: personal, copiesToPersonal: true)
+    }
+
+    // MARK: Folders in folders
+
+    /// A space's folders, each followed by its subfolders.
+    func treeOrderedFolders(inSpace spaceID: String?) -> [ClipFolder] {
+        let folders = env.store.folders(inSpace: spaceID)
+        let byID = Dictionary(folders.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return FolderTree(folders).flattened().compactMap { byID[$0.node.id] }
+    }
+
+    /// The tree of the folder's space.
+    func folderTree(of folder: ClipFolder) -> FolderTree {
+        folder.spaceID == savedSpaceID && isSavedView ? savedTree : env.store.tree(inSpace: folder.spaceID)
+    }
+
+    /// "Work › Clients".
+    func folderPathName(_ folder: ClipFolder) -> String {
+        let name = folderTree(of: folder).pathName(of: folder.id)
+        return name.isEmpty ? folder.name : name
+    }
+
+    /// Moving a group's folder needs its author or the group's owner (the server refuses others).
+    func canChangeFolder(_ folder: ClipFolder) -> Bool {
+        env.sync.canChange(itemID: folder.id.uuidString, spaceID: folder.spaceID)
+    }
+
+    /// The folders a folder may move into: its space's, minus itself, everything below it, its
+    /// current parent and anything too deep.
+    func folderTargets(forMoving folder: ClipFolder) -> [ClipFolder] {
+        let tree = env.store.tree(inSpace: folder.spaceID)
+        return treeOrderedFolders(inSpace: folder.spaceID).filter { tree.canMove(folder.id, under: $0.id) }
+    }
+
+    func canMoveFolder(_ id: UUID, under target: UUID?) -> Bool {
+        guard let folder = env.store.folder(withID: id), canChangeFolder(folder) else { return false }
+        if let target {
+            guard let parent = env.store.folder(withID: target), parent.spaceID == folder.spaceID else { return false }
+        }
+        return env.store.tree(inSpace: folder.spaceID).canMove(id, under: target)
+    }
+
+    /// Moves a folder (and everything in it) into another folder, or (nil) to the top level.
+    @discardableResult
+    func moveFolder(_ folder: ClipFolder, under target: ClipFolder?) -> Bool {
+        if mode == .actions { mode = .browse }
+        guard canMoveFolder(folder.id, under: target?.id), env.store.moveFolder(folder, under: target) else {
+            NSSound.beep()
+            showNotice(canChangeFolder(folder) ? "Can't move “\(folder.name)” there" : "Only its author or the group's owner can move it")
+            return false
+        }
+        refresh()
+        let id = PanelEntry.folder(folder).id
+        if entries.contains(where: { $0.id == id }) { selectedID = id }
+        showNotice(target.map { "Moved “\(folder.name)” to \(folderPathName($0))" } ?? "Moved “\(folder.name)” to the top level")
+        return true
+    }
+
+    /// New Folder Inside…: a subfolder of `folder`.
+    func beginNewFolder(in folder: ClipFolder) {
+        guard canChangeFolder(folder) || folder.spaceID == nil, env.store.tree(inSpace: folder.spaceID).canCreate(in: folder.id) else {
+            NSSound.beep()
+            return
+        }
+        folderNameForm = FolderNameState(purpose: .create(spaceID: folder.spaceID, moving: []), parent: folder)
+        mode = .folderName
     }
 
     /// The folder an item shows in, if any.
@@ -2642,7 +2798,10 @@ final class PanelViewModel {
 
     /// Names a new folder in the panel; `moving` clips and `secrets` go into it (Move to Folder ▸
     /// New Folder…). `personal`: a personal folder, taking copies of group items.
-    func beginNewFolder(moving clips: [ClipItem] = [], secrets: [SecretRef] = [], personal: Bool = false) {
+    /// `parent`: the level it's created at (a folder of that space); without one, the open
+    /// folder when nothing moves into it (New Folder inside an open folder makes a subfolder).
+    func beginNewFolder(moving clips: [ClipItem] = [], secrets: [SecretRef] = [], personal: Bool = false,
+                        parent: ClipFolder? = nil) {
         let space = personal ? nil : clips.first?.spaceID ?? secrets.first?.spaceID ?? (clips.isEmpty && secrets.isEmpty ? savedSpaceID : nil)
         if clips.isEmpty && secrets.isEmpty {
             guard space == nil || isGroupSpace(space) else { return }
@@ -2651,7 +2810,14 @@ final class PanelViewModel {
             // Into a group's new folder only when its items may be moved there.
             if space != nil && menu.group == nil { return }
         }
-        folderNameForm = FolderNameState(purpose: .create(spaceID: space, moving: clips, secrets: secrets))
+        var level = parent.flatMap { $0.spaceID == space ? $0 : nil }
+        if parent == nil, clips.isEmpty, secrets.isEmpty, space == savedSpaceID { level = openFolder }
+        if let level, !env.store.tree(inSpace: space).canCreate(in: level.id) {
+            NSSound.beep()
+            showNotice("Folders go at most \(FolderTree.maxDepth) levels deep")
+            return
+        }
+        folderNameForm = FolderNameState(purpose: .create(spaceID: space, moving: clips, secrets: secrets), parent: level)
         mode = .folderName
     }
 
@@ -2676,7 +2842,7 @@ final class PanelViewModel {
             selectedID = PanelEntry.folder(folder).id
             showNotice("Renamed to “\(folder.name)”")
         case .create(let space, let moving, let secrets):
-            let folder = env.store.createFolder(named: name, inSpace: space)
+            let folder = env.store.createFolder(named: name, inSpace: space, parent: form.parent)
             resetMode()
             if moving.isEmpty && secrets.isEmpty {
                 refresh()
@@ -2689,18 +2855,22 @@ final class PanelViewModel {
         }
     }
 
-    /// Its clips stay saved, at the root; nothing to confirm.
+    /// Its clips, secrets and subfolders move up to its parent (the root of Saved for a
+    /// top-level folder); nothing to confirm.
     func deleteFolder(_ folder: ClipFolder) {
         if mode == .actions { mode = .browse }
         let index = selectedIndex
-        if openFolderID == folder.id { openFolderID = nil }
-        // Its secrets go to the root (and re-sync without it), like its clips.
+        let tree = env.store.tree(inSpace: folder.spaceID)
+        let parentID = tree.parent(of: folder.id)
+        let parent = parentID.flatMap(env.store.folder(withID:))
+        if let open = openFolderID, tree.subtree(of: folder.id).contains(open) { openFolderID = parentID }
+        // Its secrets go up a level too (and re-sync with the new place), like its clips.
         let secrets = env.secrets.secrets(inFolder: folder)
-        env.secrets.setFolder(nil, for: secrets)
+        env.secrets.setFolder(parentID, for: secrets)
         let moved = env.store.deleteFolder(folder) + secrets.count
         refresh()
         if let index, !entries.isEmpty { selectedID = entries[min(index, entries.count - 1)].id }
-        showNotice("Folder deleted · \(moved) \(moved == 1 ? "item" : "items") moved to Saved")
+        showNotice("Folder deleted · moved \(moved) \(moved == 1 ? "item" : "items") to \(parent.map { folderPathName($0) } ?? "Saved")")
     }
 
     /// ⌫ never deletes secrets (too easy to hit by accident); ⌘K → Delete does.
@@ -2820,6 +2990,11 @@ final class PanelViewModel {
             // With text in the search field every delete variant edits the text
             // (⌥⌫ deletes a word, ⌘⌫ the line); only an empty field deletes items.
             guard query.isEmpty else { return false }
+            // Inside a folder, ⌫ goes up one level (like esc and ←); ⌘K → Delete still deletes.
+            if event.keyCode == KeyCode.delete, openFolderID != nil, !command {
+                closeFolder()
+                return true
+            }
             if isMultiSelecting { deleteSelectedClips() } else { deleteSelection() }
             return true
         default:

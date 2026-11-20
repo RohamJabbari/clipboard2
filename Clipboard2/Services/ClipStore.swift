@@ -184,13 +184,36 @@ final class ClipStore {
         return (try? context.fetch(descriptor)) ?? []
     }
 
+    /// The folders of a space as a tree.
+    func tree(inSpace spaceID: String?) -> FolderTree {
+        FolderTree(folders(inSpace: spaceID))
+    }
+
+    /// `parent`: a folder of the same space it goes in (ignored if it's another space's or
+    /// already 8 levels deep); nil at the top level.
     @discardableResult
-    func createFolder(named name: String = "New Folder", inSpace spaceID: String?, now: Date = .now) -> ClipFolder {
+    func createFolder(named name: String = "New Folder", inSpace spaceID: String?, parent: ClipFolder? = nil,
+                      now: Date = .now) -> ClipFolder {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let folder = ClipFolder(name: trimmed.isEmpty ? "New Folder" : trimmed, spaceID: spaceID, now: now)
+        if let parent, parent.spaceID == spaceID, tree(inSpace: spaceID).canCreate(in: parent.id) {
+            folder.parentID = parent.id
+        }
         context.insert(folder)
         commit()
         return folder
+    }
+
+    /// Moves a folder (with everything in it) into another folder of its space, or (nil) to the
+    /// top level. Refuses moves into itself or below itself, and deeper than 8 levels.
+    @discardableResult
+    func moveFolder(_ folder: ClipFolder, under parent: ClipFolder?, now: Date = .now) -> Bool {
+        if let parent, parent.spaceID != folder.spaceID { return false }
+        guard tree(inSpace: folder.spaceID).canMove(folder.id, under: parent?.id) else { return false }
+        folder.parentID = parent?.id
+        folder.updatedAt = max(now, folder.updatedAt.addingTimeInterval(0.001))
+        commit()
+        return true
     }
 
     /// An empty name is ignored.
@@ -212,15 +235,23 @@ final class ClipStore {
         commit()
     }
 
-    /// Deletes the folder; its clips stay saved, at the root of Saved (their `folderID` is
-    /// cleared, so sync pushes them without it). Returns how many moved.
+    /// Deletes the folder; its clips stay saved and, with its subfolders, move up to its parent
+    /// (the root of Saved for a top-level folder), so sync pushes them with the new place.
+    /// Returns how many clips moved.
     @discardableResult
-    func deleteFolder(_ folder: ClipFolder) -> Int {
+    func deleteFolder(_ folder: ClipFolder, now: Date = .now) -> Int {
         let id: UUID? = folder.id
         let spaceID = folder.spaceID
+        let tree = tree(inSpace: spaceID)
+        let parent = tree.parent(of: folder.id)
         let descriptor = FetchDescriptor<ClipItem>(predicate: #Predicate { $0.folderID == id && $0.spaceID == spaceID })
         let items = (try? context.fetch(descriptor)) ?? []
-        for item in items { item.folderID = nil }
+        for item in items { item.folderID = parent }
+        for child in tree.children(of: folder.id) {
+            guard let subfolder = self.folder(withID: child.id) else { continue }
+            subfolder.parentID = parent
+            subfolder.updatedAt = max(now, subfolder.updatedAt.addingTimeInterval(0.001))
+        }
         context.delete(folder)
         commit()
         return items.filter(\.isPinned).count
@@ -253,24 +284,37 @@ final class ClipStore {
         if changed { commit() }
     }
 
-    /// Copies a folder and its clips into a group with new ids (Share to Group). The original
-    /// stays as it is; later changes don't follow. Returns the copy.
+    /// Copies a folder, its subfolders and their clips into a group with new ids, keeping the
+    /// structure (Share to Group); with `parent` (one of the group's folders) it goes in there.
+    /// The original stays as it is; later changes don't follow. Returns the copy; `mapping` gets
+    /// original folder id → copy, e.g. to put copied secrets in the right place.
     @discardableResult
-    func shareCopy(of folder: ClipFolder, toSpace spaceID: String?, now: Date = .now) -> ClipFolder {
-        let items = items(inFolder: folder)
-        let copy = ClipFolder(name: folder.name, spaceID: spaceID, now: now)
-        copy.label = folder.label
-        context.insert(copy)
-        for item in items {
-            let shared = shareCopy(of: item, toSpace: spaceID, now: now)
-            if !shared.isPinned {
-                shared.isPinned = true
-                shared.pinnedAt = now
+    func shareCopy(of folder: ClipFolder, toSpace spaceID: String?, parent: ClipFolder? = nil, now: Date = .now,
+                   mapping: ((UUID, ClipFolder) -> Void)? = nil) -> ClipFolder {
+        let tree = tree(inSpace: folder.spaceID)
+        func copySubtree(_ original: ClipFolder, under parentID: UUID?) -> ClipFolder {
+            let made = ClipFolder(name: original.name, spaceID: spaceID, now: now)
+            made.label = original.label
+            made.parentID = parentID
+            context.insert(made)
+            mapping?(original.id, made)
+            for item in items(inFolder: original) {
+                let shared = shareCopy(of: item, toSpace: spaceID, now: now)
+                if !shared.isPinned {
+                    shared.isPinned = true
+                    shared.pinnedAt = now
+                }
+                shared.folderID = made.id
             }
-            shared.folderID = copy.id
+            for child in tree.children(of: original.id) {
+                if let subfolder = self.folder(withID: child.id) { _ = copySubtree(subfolder, under: made.id) }
+            }
+            return made
         }
+        let target = parent.flatMap { $0.spaceID == spaceID ? $0.id : nil }
+        let result = copySubtree(folder, under: target)
         commit()
-        return copy
+        return result
     }
 
     /// Inserts a folder received from sync (without committing).

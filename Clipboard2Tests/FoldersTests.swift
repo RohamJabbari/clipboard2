@@ -472,10 +472,11 @@ struct FolderPanelTests {
         model.filter = .labelled
         guard let folder else { return }
         model.selectedID = PanelEntry.folder(folder).id
-        #expect(model.availableActions == [.openFolder, .renameFolder, .setLabel, .deleteFolder]
-                || model.availableActions.contains(.shareToGroup))
+        let actions = model.availableActions
+        #expect(Array(actions.prefix(4)) == [.openFolder, .renameFolder, .setLabel, .newSubfolder])
+        #expect(actions.last == .deleteFolder && !actions.contains(.moveFolderToTop))
         model.perform(.deleteFolder)
-        #expect(model.notice == "Folder deleted · 2 items moved to Saved")
+        #expect(model.notice == "Folder deleted · moved 2 items to Saved")
         #expect(a.isPinned && a.folderID == nil && env.store.folder(withID: folder.id) == nil)
     }
 

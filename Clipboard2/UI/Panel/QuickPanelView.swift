@@ -261,8 +261,9 @@ struct QuickPanelView: View {
             }
             .contextMenu { contextMenu(for: entry) }
             .modifier(ClipDragSource(item: entry.clip.flatMap { $0.isTransient ? nil : $0 },
-                                     blobs: env.blobs, pickedFiles: model.pickedFileURLs))
-            .modifier(SecretDragSource(ref: entry.secret))
+                                     blobs: env.blobs, pickedFiles: model.pickedFileURLs,
+                                     onStart: { model.draggingFolderID = nil }))
+            .modifier(SecretDragSource(ref: entry.secret, onStart: { model.draggingFolderID = nil }))
     }
 
     /// A click selects; a double-click activates (pastes the code, or opens the add form).
@@ -393,16 +394,19 @@ struct QuickPanelView: View {
             Menu("Move to Folder") {
                 if let group = menu.group {
                     Section(group.name) {
-                        ForEach(group.folders) { folder in
-                            Button(folder.name) { model.place(clips, secrets: secrets, in: folder) }
-                        }
-                        Button("New Folder…") { model.beginNewFolder(moving: clips, secrets: secrets) }
+                        FolderMoveMenu(folders: env.store.folders(inSpace: group.id), parent: nil,
+                                       onPick: { model.place(clips, secrets: secrets, in: $0) },
+                                       onNew: { model.beginNewFolder(moving: clips, secrets: secrets, parent: $0) })
                     }
                 }
+                let mine = FolderMoveMenu(folders: env.store.folders(inSpace: nil), parent: nil,
+                                          onPick: { model.place(clips, secrets: secrets, in: $0) },
+                                          onNew: { model.beginNewFolder(moving: clips, secrets: secrets,
+                                                                        personal: menu.copiesToPersonal, parent: $0) })
                 if menu.copiesToPersonal {
-                    Section("Mine") { personalFolderItems(menu, clips: clips, secrets: secrets) }
+                    Section("Mine") { mine }
                 } else {
-                    personalFolderItems(menu, clips: clips, secrets: secrets)
+                    mine
                 }
             }
         }
@@ -410,7 +414,7 @@ struct QuickPanelView: View {
         let changeable = clips.allSatisfy(env.sync.canChange)
             && secrets.allSatisfy { env.sync.canChange(itemID: $0.id, spaceID: $0.spaceID) }
         if inFolder && changeable {
-            Button("Remove from Folder") { model.removeFromFolder(clips, secrets: secrets) }
+            Button("Move to Top Level") { model.removeFromFolder(clips, secrets: secrets) }
         }
     }
 
@@ -419,20 +423,29 @@ struct QuickPanelView: View {
         Button("Open") { model.openFolder(folder) }
         Button("Rename…") { model.beginRename(folder) }
         Button(folder.label == nil ? "Label…" : "Edit Label…") { model.beginLabel(.folder(folder)) }
+        if model.canChangeFolder(folder) {
+            let tree = env.store.tree(inSpace: folder.spaceID)
+            if tree.canCreate(in: folder.id) {
+                Button("New Folder Inside…") { model.beginNewFolder(in: folder) }
+            }
+            let excluded = tree.subtree(of: folder.id)
+            let targets = model.folderTargets(forMoving: folder)
+            if !targets.isEmpty {
+                Menu("Move to Folder") {
+                    FolderMoveMenu(folders: env.store.folders(inSpace: folder.spaceID), parent: nil, excluding: excluded,
+                                   allowed: Set(targets.map(\.id)),
+                                   onPick: { model.moveFolder(folder, under: $0) }, onNew: nil)
+                }
+            }
+            if tree.parent(of: folder.id) != nil {
+                Button("Move to Top Level") { model.moveFolder(folder, under: nil) }
+            }
+        }
         if folder.spaceID == nil && model.canShareToGroup {
             Button("Share to Group…") { model.beginShareFolder(folder) }
         }
         Divider()
         Button("Delete Folder", role: .destructive) { model.deleteFolder(folder) }
-    }
-
-    @ViewBuilder
-    private func personalFolderItems(_ menu: PanelViewModel.FolderMenu, clips: [ClipItem], secrets: [SecretRef]) -> some View {
-        ForEach(menu.personal) { folder in
-            Button(folder.name) { model.place(clips, secrets: secrets, in: folder) }
-        }
-        if !menu.personal.isEmpty { Divider() }
-        Button("New Folder…") { model.beginNewFolder(moving: clips, secrets: secrets, personal: menu.copiesToPersonal) }
     }
 
     /// "Send to ‹contact›" for the row (or the selection it's part of); a submenu once there are many.
@@ -808,10 +821,12 @@ struct PanelRow: View {
     var sharing: PreviewSharing?
     /// For a contact's item: who it's from or to (group items show `sharing` instead).
     var badge: SyncBadge?
-    /// A search result inside a folder (from the Saved root): the folder's name.
+    /// A search result below where you are: its folder's path from here ("Work › Clients").
     var folderCaption: String?
     /// A folder row: how many saved items it holds.
     var folderCount = 0
+    /// A folder row: how many subfolders it holds.
+    var subfolderCount = 0
     /// Something droppable hovers over this folder row.
     var dropHighlighted = false
     @State private var hovering = false
@@ -1008,7 +1023,7 @@ struct PanelRow: View {
         case .secret:
             return "Secret · ••••••••"
         case .folder:
-            return folderCount == 1 ? "Folder · 1 item" : "Folder · \(folderCount) items"
+            return FolderCaption.text(folders: subfolderCount, items: folderCount)
         case .authenticator(let item): return item.subtitle
         case .authenticatorSuggestion(let account): return account.issuer
         }
@@ -1025,7 +1040,7 @@ struct PanelRow: View {
         case .secret(let ref): return "Secret \(ref.name)"
         case .folder(let folder):
             return "Folder \(folder.name)" + (folder.label.map { ", label \($0)" } ?? "")
-                + ", \(folderCount) \(folderCount == 1 ? "item" : "items")"
+                + ", " + FolderCaption.text(folders: subfolderCount, items: folderCount)
         case .authenticator(let item): return "Authenticator \(item.title)"
         case .authenticatorSuggestion: return "Add to Authenticator"
         }

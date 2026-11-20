@@ -254,7 +254,9 @@ struct ShareToGroupView: View {
                     Label("\(group.name) · Saved", systemImage: "bookmark").tag(UUID?.none)
                     Divider()
                     ForEach(form.destinations) { folder in
-                        Label(folder.name, systemImage: "folder").tag(UUID?.some(folder.id))
+                        // The group's tree, each folder by its path ("Work › Clients").
+                        Label(FolderTree(form.destinations).pathName(of: folder.id), systemImage: "folder")
+                            .tag(UUID?.some(folder.id))
                     }
                 }
                 .pickerStyle(.menu)

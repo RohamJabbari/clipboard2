@@ -264,7 +264,8 @@ nonisolated enum StoreSchemaV3: VersionedSchema {
     }
 }
 
-/// The current models: an image item can be concealed (it holds an authenticator QR code).
+/// The current models: an image item can be concealed (it holds an authenticator QR code), and
+/// a folder can sit in another folder.
 nonisolated enum StoreSchemaV4: VersionedSchema {
     static let versionIdentifier = Schema.Version(4, 0, 0)
     static var models: [any PersistentModel.Type] {

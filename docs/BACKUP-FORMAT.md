@@ -75,8 +75,10 @@ Personal snippets only.
 
 ### `folders`
 
-Added in 1.6, omitted when there are none. A folder payload (`"v":1,"type":"folder","name","label","createdAt",
-"updatedAt"`) plus `"id"`. Personal folders only. A clip in one carries its `id` in the clip's `folder` field,
+Added in 1.6, omitted when there are none. A folder payload (`"v":1,"type":"folder","name","label","parent","createdAt",
+"updatedAt"`) plus `"id"`. Personal folders only. `parent` (1.8+) is the backup `id` of the folder it's in, omitted at
+the top level; writers list parents before their subfolders and write a folder whose parent is unusable (unknown, a
+cycle, deeper than 8 levels) as top level. A clip in one carries its `id` in the clip's `folder` field,
 as in sync. Older readers ignore both, and those clips import at the root of Saved.
 
 ### `secrets`
@@ -109,8 +111,10 @@ Import merges into the personal space and never deletes or overwrites anything:
   entry in the same file had it. Otherwise inserted with a **new** local id (the backup's `id` is informational),
   keeping `createdAt`, `lastCopiedAt`, `copyCount`, pin and label. Images are written from `image`/`thumb`;
   an image entry without a decodable `image` is skipped.
-- **Folders:** read first. One joins the personal folder with the same name (case-insensitive) if there is one;
-  otherwise it's added with a new id. Imported clips go into the folder their `folder` names; an id that isn't
+- **Folders:** read first, parents before their subfolders. One joins the personal folder with the same name
+  (case-insensitive) **within the same parent** if there is one; otherwise it's added with a new id under that
+  parent. A `parent` that isn't among `folders`, a cycle, or a folder that would be a ninth level goes in at the
+  top level. Imported clips go into the folder their `folder` names; an id that isn't
   among `folders` leaves them at the root of Saved. Clips skipped as duplicates keep their current folder.
 - **Snippets:** skipped when one with the same `(name, body)` exists. Otherwise inserted with a new id.
 - **Secrets:** skipped when one with the same `(name, value)` exists. Otherwise added as a new secret.

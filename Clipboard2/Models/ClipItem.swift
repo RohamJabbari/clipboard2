@@ -148,6 +148,9 @@ final class ClipFolder {
     var updatedAt: Date = Date.now
     /// The sync group this folder belongs to; nil is the personal space.
     var spaceID: String?
+    /// The folder it's in (same space); nil at the top level. An unknown parent, a cycle or more
+    /// than 8 levels reads as top level (`FolderTree`).
+    var parentID: UUID?
 
     init(name: String, spaceID: String? = nil, now: Date = .now) {
         self.id = UUID()

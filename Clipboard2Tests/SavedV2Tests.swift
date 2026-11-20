@@ -172,7 +172,7 @@ struct SavedMixingTests {
         env.secrets.setFolder(folder.id, for: env.secrets.secrets.filter { $0.id == ref.id })
         model.deleteFolder(folder)
         #expect(env.secrets.secrets.first { $0.id == ref.id }?.folderID == nil)
-        #expect(model.notice == "Folder deleted · 1 item moved to Saved")
+        #expect(model.notice == "Folder deleted · moved 1 item to Saved")
     }
 
     @Test func aDraggedSecretDropsIntoAFolder() throws {

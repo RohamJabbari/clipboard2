@@ -12,13 +12,17 @@ enum PanelDrag {
     enum Reference: Equatable {
         case clip(UUID)
         case secret(String)
+        /// A Saved folder row (it can be moved into another folder, or up a level).
+        case folder(UUID)
 
         static let secretPrefix = "secret:"
+        static let folderPrefix = "folder:"
 
         var data: Data {
             switch self {
             case .clip(let id): Data(id.uuidString.utf8)
             case .secret(let id): Data((Self.secretPrefix + id).utf8)
+            case .folder(let id): Data((Self.folderPrefix + id.uuidString).utf8)
             }
         }
 
@@ -28,12 +32,27 @@ enum PanelDrag {
                 let id = String(text.dropFirst(Self.secretPrefix.count))
                 guard !id.isEmpty else { return nil }
                 self = .secret(id)
+            } else if text.hasPrefix(Self.folderPrefix) {
+                guard let id = UUID(uuidString: String(text.dropFirst(Self.folderPrefix.count))) else { return nil }
+                self = .folder(id)
             } else if let id = UUID(uuidString: text) {
                 self = .clip(id)
             } else {
                 return nil
             }
         }
+    }
+
+    /// A folder row's drag: only its reference, visible to this process alone.
+    static func provider(forFolder folder: ClipFolder) -> NSItemProvider {
+        let provider = NSItemProvider()
+        let data = Reference.folder(folder.id).data
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.clipboard2Clip.identifier, visibility: .ownProcess) { completion in
+            completion(data, nil)
+            return nil
+        }
+        provider.suggestedName = folder.name
+        return provider
     }
 
     /// A secret row's drag: only its reference, visible to this process alone.
@@ -130,9 +149,9 @@ struct PanelDropDelegate: DropDelegate {
     enum Target: Equatable {
         case list
         case group(String)
-        /// A Saved folder row: clips move in.
+        /// A Saved folder row: clips, secrets and folders move in.
         case folder(UUID)
-        /// The "Saved" breadcrumb inside a folder: clips move out to the root.
+        /// The "Saved" breadcrumb inside a folder: clips and folders move out to the root.
         case savedRoot
     }
 
@@ -144,8 +163,14 @@ struct PanelDropDelegate: DropDelegate {
         let isClip = info.hasItemsConforming(to: [.clipboard2Clip])
         switch target {
         case .list: return !isClip && info.hasItemsConforming(to: [.fileURL])
-        case .group: return isClip || info.hasItemsConforming(to: [.fileURL])
-        case .folder, .savedRoot: return isClip
+        case .group: return isClip && model.draggingFolderID == nil || info.hasItemsConforming(to: [.fileURL])
+        case .folder(let id):
+            // A dragged folder never goes into itself or below itself.
+            if let dragged = model.draggingFolderID { return isClip && model.canMoveFolder(dragged, under: id) }
+            return isClip
+        case .savedRoot:
+            if let dragged = model.draggingFolderID { return isClip && model.canMoveFolder(dragged, under: nil) }
+            return isClip
         }
     }
 
@@ -164,6 +189,7 @@ struct PanelDropDelegate: DropDelegate {
 
     func performDrop(info: DropInfo) -> Bool {
         setTargeted(false)
+        defer { model.draggingFolderID = nil }
         guard validateDrop(info: info) else { return false }
         let model = model
         switch target {
@@ -189,7 +215,7 @@ struct PanelDropDelegate: DropDelegate {
                     switch await PanelDrag.loadReference(from: providers) {
                     case .clip(let id): model.dropClip(id: id, onGroup: groupID)
                     case .secret(let id): model.dropSecret(id: id, onGroup: groupID)
-                    case nil: break
+                    case .folder, nil: break
                     }
                 }
             } else {
@@ -214,10 +240,15 @@ struct PanelDropDelegate: DropDelegate {
 /// out of the panel: it carries no value).
 struct SecretDragSource: ViewModifier {
     let ref: SecretRef?
+    /// Called when the drag starts.
+    var onStart: () -> Void = {}
 
     func body(content: Content) -> some View {
         if let ref {
-            content.onDrag { PanelDrag.provider(for: ref) }
+            content.onDrag {
+                onStart()
+                return PanelDrag.provider(for: ref)
+            }
         } else {
             content
         }
@@ -230,13 +261,21 @@ struct ClipDragSource: ViewModifier {
     let blobs: BlobStore
     /// The files picked in the preview, read when the drag starts.
     var pickedFiles: (ClipItem) -> [URL]? = { _ in nil }
+    /// Called when the drag starts.
+    var onStart: () -> Void = {}
     @State private var fileDrag = MultiFileDragSource()
 
     func body(content: Content) -> some View {
         if let item, PanelDrag.needsMultiFileDrag(item) {
-            content.gesture(DragGesture(minimumDistance: 4).onChanged { _ in startFileDrag(item) })
+            content.gesture(DragGesture(minimumDistance: 4).onChanged { _ in
+                onStart()
+                startFileDrag(item)
+            })
         } else if let item {
-            content.onDrag { PanelDrag.provider(for: item, blobs: blobs, files: pickedFiles(item)) }
+            content.onDrag {
+                onStart()
+                return PanelDrag.provider(for: item, blobs: blobs, files: pickedFiles(item))
+            }
         } else {
             content
         }

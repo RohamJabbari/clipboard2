@@ -188,13 +188,17 @@ nonisolated struct FolderPayload: Codable, Equatable, Sendable {
     var type = "folder"
     var name: String
     var label: String?
+    /// The folder item it's in (1.8+); omitted at the top level, so older folders keep their
+    /// fingerprints.
+    var parent: String?
     var createdAt: Int64
     var updatedAt: Int64
     var rev: Int64?
 
-    init(name: String, label: String? = nil, createdAt: Int64, updatedAt: Int64) {
+    init(name: String, label: String? = nil, parent: String? = nil, createdAt: Int64, updatedAt: Int64) {
         self.name = name
         self.label = label
+        self.parent = parent
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
@@ -205,6 +209,7 @@ nonisolated struct FolderPayload: Codable, Equatable, Sendable {
         type = try c.decodeIfPresent(String.self, forKey: .type) ?? "folder"
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Folder"
         label = try c.decodeIfPresent(String.self, forKey: .label)
+        parent = try c.decodeIfPresent(String.self, forKey: .parent)
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
         updatedAt = try c.decodeIfPresent(Int64.self, forKey: .updatedAt) ?? createdAt
         rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
@@ -458,8 +463,8 @@ extension SnippetPayload {
 
 extension FolderPayload {
     init(folder: ClipFolder) {
-        self.init(name: folder.name, label: folder.label, createdAt: folder.createdAt.syncMillis,
-                  updatedAt: folder.updatedAt.syncMillis)
+        self.init(name: folder.name, label: folder.label, parent: folder.parentID?.uuidString.lowercased(),
+                  createdAt: folder.createdAt.syncMillis, updatedAt: folder.updatedAt.syncMillis)
     }
 
     func apply(to folder: ClipFolder, arrivedAt: Date = .now) {
@@ -467,6 +472,8 @@ extension FolderPayload {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         folder.name = trimmed.isEmpty ? "Folder" : trimmed
         folder.label = label?.isEmpty == true ? nil : label
+        // Kept even when that folder isn't here (yet): it shows at the top level until it is.
+        folder.parentID = parent.flatMap(UUID.init(uuidString:))
         folder.createdAt = Date(syncMillis: min(createdAt, arrived))
         folder.updatedAt = Date(syncMillis: min(updatedAt, arrived))
     }

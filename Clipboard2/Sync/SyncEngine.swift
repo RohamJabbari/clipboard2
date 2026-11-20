@@ -1297,7 +1297,11 @@ final class SyncEngine {
         // Folders before their clips, so a member who pulls mid-push finds the folder first.
         // Never in a contact's space (not in v1).
         if !isDirect {
-            for folder in store.folders(inSpace: localSpace) {
+            // Parents before their subfolders, so a member never sees one at the top level for long.
+            let folders = store.folders(inSpace: localSpace)
+            let byID = Dictionary(folders.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let ordered = FolderTree(folders).flattened().compactMap { byID[$0.node.id] }
+            for folder in ordered {
                 let id = folder.id.uuidString.lowercased()
                 let meta = metaByID[id]
                 let payload = SyncPayload.folder(FolderPayload(folder: folder))
