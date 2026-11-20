@@ -1,6 +1,6 @@
 # Authenticator (1.8)
 
-TOTP codes in Clipboard2. Each authenticator has **one owner**. The owner can **transfer** it and **share** it so other people can get codes too. The wire format and server rules are in `docs/sync/PROTOCOL.md`, "Authenticators" and the `otp` payload. Mac and Windows build the same thing.
+TOTP codes in Clipboard2. Each authenticator has **one owner**. The owner can **transfer** it, and can **share** it so other people get codes. They never get the seed: the owner's devices send them pre-computed codes for the next 24 hours. The wire format and server rules are in `docs/sync/PROTOCOL.md`, "Authenticators" and the `otp` payload. Mac and Windows build the same thing.
 
 ## Codes
 - Implement RFC 6238 TOTP: SHA1/SHA256/SHA512, 6–8 digits, any period (default 30 s).
@@ -42,25 +42,32 @@ All three ways end in the same small form: Issuer, Account, plus Advanced (algor
 - **Everyone:** Paste Code, Copy Code.
 - **Owner:**
   - **Rename** (edit issuer/account).
-  - **Share…**: a picker of your contacts and members of your groups, deduplicated, excluding people it's already shared with. It shows a one-line warning: "They'll be able to get codes. Removing them later won't erase what they've seen."
-  - **People…**: lists who it's shared with, with Remove per person. The notice after removing says: "Removed. To fully revoke, reset 2FA on the site."
-  - **Transfer Ownership…**: choose one of the people it's shared with. You stay on as someone it's shared with, and the new owner can remove you.
-  - **Show Secret / QR**: needs Touch ID / Windows Hello. Shows the base32 secret and a QR code to move it to a phone app.
-  - **Delete**: removes it for everyone. Use an inline confirm in the panel (the same pattern as other destructive panel actions), not a modal.
-- **Someone it's shared with:** **Leave**. It's removed from your list.
-- Hide actions the server would refuse. Don't let someone try them and then show a warning.
+  - **Share…**: a picker of your contacts and members of your groups, deduplicated, excluding people it's already shared with. It sends them codes, never the secret.
+  - **People…**: lists who it's shared with, each with "codes until ‹time›" and Remove. The notice after removing says "Removed. Codes they already have work until ‹time›."
+  - **Transfer Ownership…**: choose one of the people it's shared with. Its one-line note says "They'll get the secret and own it; you'll get codes like everyone else."
+  - **Show Secret / QR**: needs Touch ID / Windows Hello.
+  - **Delete**: removes it for everyone. Use an inline confirm.
+- **Shared with you:**
+  - The row shows the code from the received batch, the countdown, and "Shared by ‹owner›".
+  - When fewer than 2 hours of codes are left, the subtitle reads "Codes until ‹time›".
+  - When they run out, it reads "No codes, ‹owner›'s devices have been offline", and the code is dashed.
+  - Action: **Leave**.
+- Hide actions the server would refuse.
 
 ## Sync
-- List spaces with `?include=direct,authenticator`.
+- List spaces with `?include=direct,authenticator`. Your own authenticators sync across your devices as items.
 - Creating an authenticator:
-  1. `POST /v1/authenticators` with a fresh SK wrapped to yourself.
-  2. Push the single `otp` item.
-- Sharing: `GET /v1/users/id/:uid` for their public key, `wrapSpaceKey`, then `POST …/members`.
-- Transfer, remove, leave and delete use the matching routes.
-- Pull `otp` items like secrets.
-- When an authenticator space disappears from `GET /v1/spaces` (you were removed, it was deleted, or you left), delete it locally.
-- Older clients ignore `authenticator` spaces, because they don't ask for them.
-- Reuse the existing space/key/item machinery.
+  1. `POST /v1/authenticators`.
+  2. Push the `otp` item.
+- Sharing: `GET /v1/users/id/:uid` for their public key, then seal and `PUT` the first batch at once.
+- Top-ups:
+  - On every sync, any owner device tops up each share with fewer than 12 h of codes left, using `GET …/shares`.
+  - Build each batch from the current step for 24 h (2 880 codes at 30 s).
+- Received codes: on every sync, `GET /v1/shared-codes`.
+  - Unseal each batch with your identity key and store the batches locally, protected like secrets.
+  - Drop authenticators that aren't listed anymore.
+- Transfer: wrap the space key to the new owner, then `POST …/transfer`. After that, the old owner's devices drop their copy of the seed and show it as shared with them.
+- Older clients ignore all of this.
 
 ## Security notes for the UI
 - A one-time tip on the first add, inline rather than a dialog: "Keep your most important 2FA codes on your phone too. Clipboard2 is convenient, but it puts the password and the code in one place."
