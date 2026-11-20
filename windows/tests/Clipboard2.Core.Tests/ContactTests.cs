@@ -300,7 +300,7 @@ public sealed partial class SyncEngineTests
         var send = Assert.Single(panel.AvailableActions.OfType<PanelAction.SendToContact>());
         Assert.Equal("Send to friend", send.Title);
         panel.Perform(send);
-        Assert.Equal("Sent 2 items to friend", panel.Notice);
+        Assert.Equal("Sent to friend", panel.Notice);
         await a.Sync();
         await b.Sync();
         Assert.Equal(["one", "two"], Inbox(b).Select(e => e.ClipItem!.Text).Order());
@@ -353,7 +353,7 @@ public sealed partial class SyncEngineTests
         Assert.Empty(b.Store.ItemsInSpace(space));
         Assert.Null(b.Keys.Read("sync/space-pin/" + space));
         Assert.False(_cloud.SpaceExists(space));
-        Assert.DoesNotContain(PanelFilter.Inbox, Panel(b).ChipFilters);
+        Assert.Contains(PanelFilter.Inbox, Panel(b).ChipFilters);   // Contacts stays while signed in
 
         await a.Sync();
         Assert.Empty(a.Account.Contacts);

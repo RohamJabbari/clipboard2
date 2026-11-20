@@ -16,13 +16,14 @@ public static class PanelFilters
         f is PanelFilter.Text or PanelFilter.Images or PanelFilter.Files or PanelFilter.Snippets or PanelFilter.Secrets;
     /// <summary>A removed filter falls back to All.</summary>
     public static PanelFilter Normalized(this PanelFilter f) => f.IsRemoved() ? PanelFilter.All : f;
-    /// <summary>The chips always shown: All · Saved · This App. Inbox joins them once there are contacts
-    /// (<see cref="PanelModel.ChipFilters"/>), and the groups follow.</summary>
+    /// <summary>The chips always shown: All · Saved · This App. Contacts (<see cref="PanelFilter.Inbox"/>) joins them
+    /// while signed in to sync (<see cref="PanelModel.ChipFilters"/>), and the groups follow.</summary>
     public static readonly PanelFilter[] Chips = [PanelFilter.All, PanelFilter.Labelled, PanelFilter.ThisApp];
     public static string Title(this PanelFilter f) => f switch
     {
         PanelFilter.ThisApp => "This App",
         PanelFilter.Labelled => "Saved",
+        PanelFilter.Inbox => "Contacts",
         _ => f.ToString(),
     };
 }
@@ -65,7 +66,7 @@ public abstract record PanelEntry
     };
 }
 
-public enum PanelMode { Browse, Actions, SnippetForm, SaveSecret, Label, EditSecret, AI, FolderName, AuthenticatorForm, AuthenticatorSecret, AuthenticatorPeople, ConfirmDelete, AddItems }
+public enum PanelMode { Browse, Actions, SnippetForm, SaveSecret, Label, EditSecret, AI, FolderName, AuthenticatorForm, AuthenticatorSecret, AuthenticatorPeople, ConfirmDelete, AddItems, SendToContact }
 
 public abstract record PanelAction
 {
@@ -115,6 +116,8 @@ public abstract record PanelAction
     public sealed record SendTo(string DeviceId, string DeviceName) : PanelAction;
     /// <summary>Sends a copy into a contact's space: it shows up in their Inbox.</summary>
     public sealed record SendToContact(string SpaceId, string ContactName) : PanelAction;
+    /// <summary>Opens the contact picker (several contacts, search).</summary>
+    public sealed record SendToContactPicker : PanelAction;
     /// <summary>The large preview (Ctrl+Y).</summary>
     public sealed record Preview : PanelAction;
     public sealed record Delete : PanelAction;
@@ -149,7 +152,7 @@ public abstract record PanelAction
         ShareTo => "Share to Group",
         ShareInto s => $"Share to “{s.GroupName}”",
         SendTo => "Send to Device",
-        SendToContact => "Send to Contact",
+        SendToContact or SendToContactPicker => "Send to Contact",
         MoveTo m => m.SectionTitle ?? "Move to Folder",
         MoveToNewFolder m => m.SectionTitle ?? "Move to Folder",
         OpenFolder or RenameFolder or DeleteFolder or NewFolderInside => "Folder",
@@ -193,6 +196,7 @@ public abstract record PanelAction
         ShareTo s => s.GroupName,
         SendTo d => $"Send to {d.DeviceName}",
         SendToContact c => $"Send to {c.ContactName}",
+        SendToContactPicker => "Send to Contact…",
         Preview => "Preview",
         AddAuthenticator => "Add to Authenticator…",
         PasteCode => "Paste Code",
@@ -235,6 +239,13 @@ public interface IPanelHost
     void CopySecretsToFolders(IReadOnlyList<(SecretRef Secret, Guid? FolderId)> secrets, string? spaceId, string reason, string notice)
     {
         foreach (var group in secrets.GroupBy(s => s.FolderId)) CopySecrets([.. group.Select(s => s.Secret)], spaceId, group.Key, reason, notice);
+    }
+    /// <summary>Like <see cref="CopySecrets"/>, each into its own space and folder (Send to Contact to several
+    /// contacts), with one Windows Hello confirmation.</summary>
+    void CopySecretsToSpaces(IReadOnlyList<(SecretRef Secret, string SpaceId, Guid? FolderId)> secrets, string reason, string notice)
+    {
+        foreach (var group in secrets.GroupBy(s => (s.SpaceId, s.FolderId)))
+            CopySecrets([.. group.Select(s => s.Secret)], group.Key.SpaceId, group.Key.FolderId, reason, notice);
     }
     string? CurrentClipboardText();
     void OpenSettings();
@@ -382,8 +393,9 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
     private Dictionary<(string Space, string LocalId), string?> _authors = [];
     /// <summary>Contacts (their direct space id → their name), for "Send to ‹contact›".</summary>
     public IReadOnlyDictionary<string, string> ContactNames { get; private set; } = new Dictionary<string, string>();
-    /// <summary>The chips: the built-in ones, plus Inbox once there are contacts.</summary>
-    public IReadOnlyList<PanelFilter> ChipFilters => _contacts.Count > 0 || Filter == PanelFilter.Inbox ? [.. PanelFilters.Chips, PanelFilter.Inbox] : PanelFilters.Chips;
+    /// <summary>The chips: the built-in ones, plus Contacts while signed in to sync (or while there are contacts).</summary>
+    public IReadOnlyList<PanelFilter> ChipFilters =>
+        IsSyncSignedIn || _contacts.Count > 0 || Filter == PanelFilter.Inbox ? [.. PanelFilters.Chips, PanelFilter.Inbox] : PanelFilters.Chips;
     /// <summary>In the action menu: picking the group to share with.</summary>
     public bool IsPickingGroup { get; private set; }
     /// <summary>In the action menu: picking the folder to move the selection into.</summary>
@@ -474,6 +486,7 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
         PickingShareFolder = null;
         ResetAuthenticatorMode();
         AddItemsForm = null;
+        ContactPicker = null;
         Mode = PanelMode.Browse;
         Notify();
     }
@@ -497,6 +510,7 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
         Filter = filter;
         GroupFilter = null;
         OpenFolderId = null;
+        ConfirmingRemoval = null;
         Refresh(resetSelection: true);
         if (filter == PanelFilter.Inbox) GroupFilterSelected?.Invoke();   // fetch what contacts just sent
     }
@@ -1059,6 +1073,14 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
         _tree = new FolderTree(_folders.Values);
         _secretFolders = store.SecretFolders();
         var saved = IsSavedView;
+        if (ShowsPeople)
+        {
+            // Contacts ▸ People lists people, not items.
+            RefreshPeople(resetSelection);
+            Entries = [];
+            Select(null);
+            return;
+        }
         // A folder deleted (here or elsewhere) while open: back to the root.
         if (OpenFolderId is { } openId && (!saved || !_folders.TryGetValue(openId, out var openFolder) || openFolder.SpaceId != SavedSpace))
             OpenFolderId = null;
@@ -1633,10 +1655,14 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
     private IEnumerable<PanelAction> SendActions =>
         OtherDevices.OrderBy(d => d.Name, StringComparer.CurrentCultureIgnoreCase).Select(d => new PanelAction.SendTo(d.Id, d.Name));
 
-    /// <summary>"Send to ‹contact›" for each contact, except the one whose space the item is already in.</summary>
-    private IEnumerable<PanelAction> ContactActions(string? exceptSpace) =>
-        ContactNames.Where(c => c.Key != exceptSpace).OrderBy(c => c.Value, StringComparer.CurrentCultureIgnoreCase)
-            .Select(c => new PanelAction.SendToContact(c.Key, c.Value));
+    /// <summary>Send to Contact… (the picker) and the three most recent contacts as direct "Send to ‹contact›" rows,
+    /// except the one whose space the item is already in.</summary>
+    private IEnumerable<PanelAction> ContactActions(string? exceptSpace)
+    {
+        if (!CanSendSelectionToContact) return [];
+        return [new PanelAction.SendToContactPicker(),
+                .. ContactsByRecency().Where(c => c.Id != exceptSpace).Take(RecentContactActions).Select(c => new PanelAction.SendToContact(c.Id, c.DisplayName))];
+    }
 
     public void SetActionQuery(string query)
     {
@@ -1678,7 +1704,7 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
                 {
                     var targets = FolderTargets;
                     if (targets.Count == 0) return [];
-                    return [.. CanShare ? [new PanelAction.ShareToGroup()] : Array.Empty<PanelAction>(), .. SavedActions(targets)];
+                    return [.. CanShare ? [new PanelAction.ShareToGroup()] : Array.Empty<PanelAction>(), .. ContactActions(null), .. SavedActions(targets)];
                 }
                 List<PanelAction> multi = [new PanelAction.Paste()];
                 if (clips.All(c => c.Kind.IsTextual())) multi.AddRange([new PanelAction.PastePlain(), new PanelAction.Copy(), .. TransformActions]);
@@ -1703,6 +1729,7 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
                 }
                 // A group's folder isn't shared on: its clips are already the group's.
                 if (folderEntry.Folder.SpaceId is null && CanShare) folderActions.Add(new PanelAction.ShareToGroup());
+                folderActions.AddRange(ContactActions(null));
                 return [.. folderActions, new PanelAction.DeleteFolder()];
             }
             List<PanelAction> actions = [new PanelAction.Paste()];
@@ -1736,6 +1763,10 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
             {
                 actions.AddRange(ContactActions(c2.Item.SpaceId));
                 actions.AddRange(SendActions);
+            }
+            else if (entry is PanelEntry.SecretEntry k2)
+            {
+                actions.AddRange(ContactActions(k2.Secret.SpaceId));
             }
             if (slots.SlotFor(entry.SlotTarget) is { } slot) actions.Add(new PanelAction.ClearSlot(slot));
             if (entry is PanelEntry.Clip c3) actions.Add(DeleteAction([c3.Item]));
@@ -1836,6 +1867,12 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
                 return;
             case PanelAction.ShareInto into:
                 ShareSelection(into.GroupId, into.GroupName, into.FolderId);
+                return;
+            case PanelAction.SendToContactPicker:
+                BeginSendToContact();
+                return;
+            case PanelAction.SendToContact send when !(SelectedEntry is PanelEntry.Clip { Item: var only } && only == SelectionItem):
+                if (_contacts.GetValueOrDefault(send.SpaceId) is { } contact) SendEntries(SendableSelection(), [contact]);
                 return;
         }
         if (IsMultiSelecting) { PerformOnSelection(action); return; }
@@ -1962,19 +1999,6 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
                 break;
             case PanelAction.ShareToGroup:
                 BeginShareToGroup();
-                break;
-            case PanelAction.SendToContact send:
-                // All or nothing, like sharing to a group.
-                if (clips.Where(c => c.SpaceId != send.SpaceId).Select(SyncEngine.ContactSendProblem).FirstOrDefault(p => p is not null) is { } tooBig)
-                {
-                    ResetMode();
-                    ShowNotice(tooBig);
-                    break;
-                }
-                foreach (var c in clips.Where(c => c.SpaceId != send.SpaceId)) store.CopyToSpace(c, send.SpaceId, keepLabel: false);
-                ResetMode();
-                Refresh();
-                ShowNotice($"Sent {clips.Count} items to {send.ContactName}");
                 break;
             case PanelAction.Preview:
                 Mode = PanelMode.Browse;
@@ -2224,11 +2248,13 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
             or PanelMode.AuthenticatorForm => HandleFormKey(key),
         PanelMode.AuthenticatorSecret or PanelMode.AuthenticatorPeople or PanelMode.ConfirmDelete => HandleAuthenticatorKey(key),
         PanelMode.AddItems => HandleAddItemsKey(key),
+        PanelMode.SendToContact => HandleContactPickerKey(key),
         _ => HandleAIKey(key),
     };
 
     private bool HandleBrowseKey(KeyInput key)
     {
+        if (ShowsPeople && HandlePeopleKey(key)) return true;
         switch (key.Key)
         {
             case PanelKey.Escape:

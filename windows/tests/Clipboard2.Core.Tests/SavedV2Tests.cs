@@ -389,12 +389,13 @@ public sealed class SavedV2Tests : IDisposable
         _model.PrepareForOpen(null);
         _model.SetFilter(PanelFilter.ThisApp);
         List<(string?, bool)> seen = [];
-        for (var i = 0; i < 5; i++)
+        for (var i = 0; i < 6; i++)
         {
             _model.HandleKey(new KeyInput(PanelKey.Tab));
             seen.Add((_model.GroupFilter, _model.IsSavedView));
         }
-        Assert.Equal([("g1", false), ("g1", true), ("g2", false), ("g2", true), (null, false)], seen);
+        // Signed in: Contacts comes after This App, before the groups.
+        Assert.Equal([(null, false), ("g1", false), ("g1", true), ("g2", false), ("g2", true), (null, false)], seen);
         Assert.Equal(PanelFilter.All, _model.Filter);
 
         _model.HandleKey(new KeyInput(PanelKey.Tab, KeyMods.Shift));

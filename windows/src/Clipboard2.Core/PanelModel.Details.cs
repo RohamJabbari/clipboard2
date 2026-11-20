@@ -7,6 +7,8 @@ public sealed class AddItemsForm
     public List<ClipItem> Candidates { get; set; } = [];
     public HashSet<Guid> Checked { get; } = [];
     public int Cursor { get; set; }
+    /// <summary>Contacts ▸ People ▸ Send…: the checked clips go to this contact instead of into Saved.</summary>
+    public SpaceRecord? SendTo { get; init; }
     public ClipItem? Current => Cursor >= 0 && Cursor < Candidates.Count ? Candidates[Cursor] : null;
 }
 
@@ -110,7 +112,9 @@ public sealed partial class PanelModel
     {
         if (AddItemsForm is not { } form) return;
         var q = form.Query.Trim();
-        var unsaved = store.ItemsInSpace(SavedSpace).Where(i => !i.IsPinned && CanChange(i));
+        // Sending: the personal history and Saved, newest first.
+        var unsaved = form.SendTo is not null ? store.ItemsInSpace(null)
+            : store.ItemsInSpace(SavedSpace).Where(i => !i.IsPinned && CanChange(i));
         form.Candidates = q.Length == 0 ? [.. unsaved.Take(AddItemsLimit)]
             : [.. unsaved.Select(i => (Item: i, Score: FuzzyMatcher.Score(q, i.SearchableText))).Where(x => x.Score is not null)
                 .OrderByDescending(x => x.Score).ThenByDescending(x => x.Item.LastCopiedAt).Take(AddItemsLimit).Select(x => x.Item)];
@@ -140,6 +144,14 @@ public sealed partial class PanelModel
     {
         if (AddItemsForm is not { } form) return;
         var ids = form.Checked.Count > 0 ? form.Checked : form.Current is { } current ? [current.Id] : new HashSet<Guid>();
+        if (form.SendTo is { } contact)
+        {
+            var picked = ids.Select(store.Find).OfType<ClipItem>().Select(i => (PanelEntry)new PanelEntry.Clip(i)).ToList();
+            ResetMode();
+            if (picked.Count == 0) ShowNotice("Nothing to send");
+            else SendEntries(picked, [contact]);
+            return;
+        }
         var items = ids.Select(store.Find).OfType<ClipItem>().Where(i => !i.IsPinned && i.SpaceId == SavedSpace && CanChange(i)).ToList();
         var folder = OpenFolder;
         ResetMode();
