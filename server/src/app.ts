@@ -75,7 +75,7 @@ const b64 = (maxBytes: number) =>
     .transform((s) => Buffer.from(s, "base64"))
     .refine((b) => b.length <= maxBytes, `at most ${maxBytes} bytes`);
 const millis = z.number().int().nonnegative().max(8.64e15);
-const category = z.enum(["history", "pinned", "snippet", "secret", "folder"]);
+const category = z.enum(["history", "pinned", "snippet", "secret", "folder", "otp"]);
 const kdf = z.object({ salt: b64(64).refine((b) => b.length >= 16, "salt too short"), iterations: z.number().int().min(100_000).max(10_000_000) });
 const sealed = b64(4096);
 const publicKey = b64(65).refine((b) => b.length === 65 && b[0] === 0x04, "X9.63 uncompressed P-256 key");
@@ -115,7 +115,16 @@ const inviteBody = z.object({ inviteId, sealedKey: sealed });
 const acceptBody = z.object({ wrappedKey: sealed });
 const contactRequestBody = z.object({ username, spaceId: uuid, wrappedKey: sealed, recipientWrappedKey: sealed });
 const contactInviteBody = z.object({ spaceId: uuid, wrappedKey: sealed, inviteId, sealedKey: sealed });
-/** `include=direct` (comma-separated list) adds contacts; older clients would show them as unnamed groups. */
+const authenticatorBody = z.object({ id: uuid, wrappedKey: sealed });
+/** A day of codes at a 30 s period is ~30 KB of JSON; 64 KiB leaves room for 8 digits or shorter periods. */
+const codesBody = z.object({ codesUntil: millis, sealedCodes: b64(64 * 1024).refine((b) => b.length > 0, "empty") });
+const transferBody = z.object({ uid: uuid, wrappedKey: sealed });
+/** Batches cover 24 h from the current step; an hour of slack for clocks and slow uploads. */
+const MAX_CODES_AHEAD_MS = 25 * 60 * 60 * 1000;
+/**
+ * `include` is a comma-separated list: `direct` adds contacts, `authenticator` adds authenticators.
+ * Older clients don't ask, since they'd show them as unnamed groups.
+ */
 const spacesQuery = z.object({ include: z.string().max(100).optional() });
 const changesQuery = z.object({
   since: z.coerce.number().int().nonnegative().default(0),
@@ -250,6 +259,30 @@ function requireItemWriter(membership: { role: string; kind: string }, item: Ite
   if (membership.kind === "group" && membership.role !== "owner" && item.author_uid !== uid) {
     throw forbidden("Only the item's author or the group owner can change it");
   }
+}
+
+/**
+ * The seed in an authenticator's `otp` item never leaves its owner: the owner is the space's only
+ * member. Belt and braces should anyone else ever end up in one: they can't read or write anything.
+ */
+function requireAuthenticatorOwner(membership: { role: string; kind: string }) {
+  if (membership.kind === "authenticator" && membership.role !== "owner") throw forbidden("Only the authenticator's owner can do that");
+}
+
+/** True if `a` and `b` are contacts (a direct space with both in it) or share a group. */
+async function related(db: Queryable, a: string, b: string): Promise<boolean> {
+  if (a === b) return false;
+  const [low, high] = orderedPair(a, b);
+  const { rows } = await db.query<{ ok: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM direct_pairs p WHERE p.uid_low = $1 AND p.uid_high = $2
+         AND (SELECT count(*) FROM space_members m WHERE m.space_id = p.space_id) = 2)
+     OR EXISTS (
+       SELECT 1 FROM space_members x JOIN space_members y ON y.space_id = x.space_id JOIN spaces s ON s.id = x.space_id
+       WHERE s.kind = 'group' AND x.uid = $1 AND y.uid = $2) AS ok`,
+    [low, high],
+  );
+  return rows[0]?.ok === true;
 }
 
 function refuseClockSkew(...times: number[]) {
@@ -630,7 +663,7 @@ export function buildApp(deps: Deps): FastifyInstance {
         [uid],
       );
       paths.push(...unused.map((r) => blobPath(r.space_id, r.id)));
-      // Cascades to sessions, owned spaces (items, blobs, members, invites), their sign-up codes and memberships elsewhere.
+      // Cascades to sessions, owned spaces (items, blobs, members, invites; authenticators included), their sign-up codes and memberships elsewhere.
       await db.query("DELETE FROM users WHERE uid = $1", [uid]);
       return paths;
     });
@@ -774,14 +807,15 @@ export function buildApp(deps: Deps): FastifyInstance {
 
   app.get("/v1/spaces", async (request) => {
     const query = spacesQuery.parse(request.query);
-    const withDirect = (query.include ?? "").split(",").includes("direct");
+    const include = (query.include ?? "").split(",");
     await sweepDirectSpaces(request);
     // Direct spaces only once both people are in: pending ones are in /v1/contacts/requests and /invites.
     const { rows } = await pool.query(
       `${SPACE_SELECT} WHERE m.uid = $1
          AND (s.kind <> 'direct' OR ($2 AND (SELECT count(*) FROM space_members x WHERE x.space_id = s.id) = 2))
+         AND (s.kind <> 'authenticator' OR $3)
        ORDER BY s.kind DESC, s.created_at`,
-      [request.caller.uid, withDirect],
+      [request.caller.uid, include.includes("direct"), include.includes("authenticator")],
     );
     return { spaces: rows.map(spaceJson) };
   });
@@ -1142,6 +1176,180 @@ export function buildApp(deps: Deps): FastifyInstance {
     return reply.status(204).send();
   });
 
+  // MARK: Authenticators
+
+  app.post("/v1/authenticators", async (request, reply) => {
+    const body = authenticatorBody.parse(request.body);
+    const { uid } = request.caller;
+    const row = await tx(pool, async (db) => {
+      await lockUsers(db, [uid]);
+      const owned = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM spaces WHERE owner_uid = $1 AND kind = 'authenticator'", [uid]);
+      if ((owned.rows[0]?.n ?? 0) >= limits.authenticatorsPerUser) {
+        throw new ApiError(403, "quota_exceeded", `You can have at most ${limits.authenticatorsPerUser} authenticators`);
+      }
+      await db.query("INSERT INTO spaces (id, kind, owner_uid) VALUES ($1, 'authenticator', $2)", [body.id, uid]);
+      await db.query("INSERT INTO space_members (space_id, uid, role, wrapped_key) VALUES ($1, $2, 'owner', $3)", [body.id, uid, body.wrappedKey]);
+      const { rows } = await db.query(`${SPACE_SELECT} WHERE m.uid = $1 AND s.id = $2`, [uid, body.id]);
+      return rows[0];
+    }).catch((error: { code?: string }) => {
+      if (error.code === "23505") throw new ApiError(409, "conflict", "That id is already taken");
+      throw error;
+    });
+    return reply.status(201).send(spaceJson(row));
+  });
+
+  /** 404 unless it's an authenticator the caller is in (only ever its owner); with `lock`, holds the space row. */
+  const requireOwnedAuthenticator = async (db: Queryable, id: string, uid: string, lock = false) => {
+    const membership = await requireMember(db, id, uid, lock);
+    if (membership.kind !== "authenticator") throw notFound();
+    requireAuthenticatorOwner(membership);
+  };
+
+  app.delete<{ Params: { id: string } }>("/v1/authenticators/:id", async (request, reply) => {
+    const id = uuid.parse(request.params.id);
+    const paths = await tx(pool, async (db) => {
+      await requireOwnedAuthenticator(db, id, request.caller.uid, true);
+      const paths = await blobPathsOfSpaces(db, [id]);
+      // Cascades to the item and every share.
+      await db.query("DELETE FROM spaces WHERE id = $1", [id]);
+      return paths;
+    });
+    await deleteObjects(paths, request);
+    return reply.status(204).send();
+  });
+
+  app.get<{ Params: { uid: string } }>("/v1/users/id/:uid", async (request) => {
+    const target = uuid.parse(request.params.uid);
+    throttleInvites(request);
+    // Only people the caller already knows: nobody can collect public keys or usernames by uid.
+    if (!(await related(pool, request.caller.uid, target))) throw notFound();
+    const { rows } = await pool.query<{ uid: string; username: string | null; name: string; public_key: Buffer }>(
+      `SELECT u.uid, u.username, ${nameOf} AS name, u.public_key FROM users u WHERE u.uid = $1`,
+      [target],
+    );
+    const user = rows[0];
+    if (!user) throw notFound();
+    return { uid: user.uid, username: user.username, name: user.name, publicKey: user.public_key.toString("base64") };
+  });
+
+  app.get<{ Params: { id: string } }>("/v1/authenticators/:id/shares", async (request) => {
+    const id = uuid.parse(request.params.id);
+    await requireOwnedAuthenticator(pool, id, request.caller.uid);
+    const { rows } = await pool.query<{ uid: string; username: string | null; name: string; codes_until: string | null; created_at: Date }>(
+      `SELECT u.uid, u.username, ${nameOf} AS name, a.codes_until, a.created_at
+       FROM authenticator_shares a JOIN users u ON u.uid = a.recipient_uid WHERE a.space_id = $1 ORDER BY a.created_at, a.recipient_uid`,
+      [id],
+    );
+    return {
+      shares: rows.map((r) => ({
+        uid: r.uid,
+        username: r.username,
+        name: r.name,
+        codesUntil: r.codes_until === null ? null : Number(r.codes_until),
+        createdAt: r.created_at.getTime(),
+      })),
+    };
+  });
+
+  app.put<{ Params: { id: string; uid: string } }>("/v1/authenticators/:id/shares/:uid", async (request) => {
+    const id = uuid.parse(request.params.id);
+    const target = uuid.parse(request.params.uid);
+    const body = codesBody.parse(request.body);
+    const me = request.caller.uid;
+    if (body.codesUntil > Date.now() + MAX_CODES_AHEAD_MS) throw new ApiError(400, "invalid", "codesUntil is more than 25 hours ahead");
+    await tx(pool, async (db) => {
+      await requireOwnedAuthenticator(db, id, me, true);
+      if (target === me) throw new ApiError(400, "invalid", "You can't share with yourself");
+      const updated = await db.query(
+        "UPDATE authenticator_shares SET codes_until = $3, sealed_codes = $4, updated_at = now() WHERE space_id = $1 AND recipient_uid = $2",
+        [id, target, body.codesUntil, body.sealedCodes],
+      );
+      if (updated.rowCount) return;
+      await lockUsers(db, [target]);
+      if (!(await related(db, me, target))) throw forbidden("You can only share with your contacts and people in your groups");
+      const shares = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM authenticator_shares WHERE space_id = $1", [id]);
+      if ((shares.rows[0]?.n ?? 0) >= limits.sharesPerAuthenticator) {
+        throw new ApiError(403, "quota_exceeded", `An authenticator can be shared with at most ${limits.sharesPerAuthenticator} people`);
+      }
+      const theirs = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM authenticator_shares WHERE recipient_uid = $1", [target]);
+      if ((theirs.rows[0]?.n ?? 0) >= limits.sharedAuthenticatorsPerUser) throw new ApiError(403, "quota_exceeded", "They can't take more shared authenticators");
+      await db.query("INSERT INTO authenticator_shares (space_id, recipient_uid, codes_until, sealed_codes) VALUES ($1, $2, $3, $4)", [
+        id,
+        target,
+        body.codesUntil,
+        body.sealedCodes,
+      ]);
+    });
+    return {};
+  });
+
+  app.delete<{ Params: { id: string; uid: string } }>("/v1/authenticators/:id/shares/:uid", async (request, reply) => {
+    const id = uuid.parse(request.params.id);
+    const target = uuid.parse(request.params.uid);
+    const me = request.caller.uid;
+    await tx(pool, async (db) => {
+      const { rows } = await db.query<{ owner_uid: string }>("SELECT owner_uid FROM spaces WHERE id = $1 AND kind = 'authenticator' FOR NO KEY UPDATE", [id]);
+      const space = rows[0];
+      // The owner removes anyone; a recipient only leaves. Everyone else learns nothing.
+      if (!space || (space.owner_uid !== me && target !== me)) throw notFound();
+      const removed = await db.query("DELETE FROM authenticator_shares WHERE space_id = $1 AND recipient_uid = $2", [id, target]);
+      if (!removed.rowCount) throw notFound();
+    });
+    return reply.status(204).send();
+  });
+
+  app.get("/v1/shared-codes", async (request) => {
+    const { rows } = await pool.query<{
+      space_id: string;
+      owner_uid: string;
+      owner_name: string;
+      codes_until: string | null;
+      sealed_codes: Buffer | null;
+      updated_at: Date;
+    }>(
+      `SELECT a.space_id, s.owner_uid, ${nameOf} AS owner_name, a.codes_until, a.sealed_codes, a.updated_at
+       FROM authenticator_shares a JOIN spaces s ON s.id = a.space_id JOIN users u ON u.uid = s.owner_uid
+       WHERE a.recipient_uid = $1 ORDER BY a.created_at, a.space_id`,
+      [request.caller.uid],
+    );
+    return {
+      shared: rows.map((r) => ({
+        spaceId: r.space_id,
+        ownerUid: r.owner_uid,
+        ownerName: r.owner_name,
+        codesUntil: r.codes_until === null ? null : Number(r.codes_until),
+        sealedCodes: r.sealed_codes ? r.sealed_codes.toString("base64") : null,
+        updatedAt: r.updated_at.getTime(),
+      })),
+    };
+  });
+
+  app.post<{ Params: { id: string } }>("/v1/authenticators/:id/transfer", async (request, reply) => {
+    const id = uuid.parse(request.params.id);
+    const body = transferBody.parse(request.body);
+    const me = request.caller.uid;
+    await tx(pool, async (db) => {
+      await requireOwnedAuthenticator(db, id, me, true);
+      const share = await db.query("DELETE FROM authenticator_shares WHERE space_id = $1 AND recipient_uid = $2", [id, body.uid]);
+      if (!share.rowCount) throw new ApiError(400, "invalid", "Share it with them first");
+      await lockUsers(db, [me, body.uid]);
+      const owned = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM spaces WHERE owner_uid = $1 AND kind = 'authenticator'", [body.uid]);
+      if ((owned.rows[0]?.n ?? 0) >= limits.authenticatorsPerUser) throw new ApiError(403, "quota_exceeded", "They can't own more authenticators");
+      const mine = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM authenticator_shares WHERE recipient_uid = $1", [me]);
+      if ((mine.rows[0]?.n ?? 0) >= limits.sharedAuthenticatorsPerUser) {
+        throw new ApiError(403, "quota_exceeded", `You can have at most ${limits.sharedAuthenticatorsPerUser} authenticators shared with you`);
+      }
+      // The new owner becomes the only member; the item (and its storage) is theirs from now on.
+      await db.query("DELETE FROM space_members WHERE space_id = $1", [id]);
+      await db.query("INSERT INTO space_members (space_id, uid, role, wrapped_key) VALUES ($1, $2, 'owner', $3)", [id, body.uid, body.wrappedKey]);
+      await db.query("UPDATE spaces SET owner_uid = $2 WHERE id = $1", [id, body.uid]);
+      await db.query("UPDATE items SET author_uid = $2 WHERE space_id = $1", [id, body.uid]);
+      // The old owner keeps getting codes once the new owner's devices top this up.
+      await db.query("INSERT INTO authenticator_shares (space_id, recipient_uid) VALUES ($1, $2)", [id, me]);
+    });
+    return reply.status(204).send();
+  });
+
   // MARK: Items
 
   /** Drops tombstones older than the retention window, at most hourly per space, and raises the reset horizon. */
@@ -1161,7 +1369,7 @@ export function buildApp(deps: Deps): FastifyInstance {
   app.get<{ Params: { id: string } }>("/v1/spaces/:id/changes", async (request) => {
     const id = uuid.parse(request.params.id);
     const query = changesQuery.parse(request.query);
-    await requireMember(pool, id, request.caller.uid);
+    requireAuthenticatorOwner(await requireMember(pool, id, request.caller.uid));
     await purgeTombstones(id);
     // One snapshot for the horizon and the page, so a purge in between can't hide tombstones from this cursor.
     return tx(pool, async (db) => {
@@ -1193,6 +1401,11 @@ export function buildApp(deps: Deps): FastifyInstance {
 
     const outcome = await tx(pool, async (db) => {
       const membership = await requireMember(db, spaceId, uid, true);
+      requireAuthenticatorOwner(membership);
+      // An authenticator holds its `otp` item and nothing else; `otp` lives nowhere else.
+      if ((membership.kind === "authenticator") !== (body.category === "otp")) {
+        throw new ApiError(400, "invalid", "otp items go in authenticators, and authenticators hold only otp items");
+      }
       await requireContactEstablished(db, spaceId, membership);
       const { rows: current } = await db.query<ItemRow>(`SELECT ${ITEM_COLUMNS} FROM items WHERE space_id = $1 AND id = $2 FOR UPDATE`, [spaceId, itemId]);
       const existing = current[0];
@@ -1211,7 +1424,9 @@ export function buildApp(deps: Deps): FastifyInstance {
           "SELECT count(*)::int AS n FROM items WHERE space_id = $1 AND deleted IS NULL AND category <> 'history'",
           [spaceId],
         );
-        if ((count.rows[0]?.n ?? 0) >= limits.nonHistoryPerSpace) {
+        const n = count.rows[0]?.n ?? 0;
+        if (membership.kind === "authenticator" && n >= 1) throw new ApiError(403, "quota_exceeded", "An authenticator holds one item");
+        if (n >= limits.nonHistoryPerSpace) {
           throw new ApiError(403, "quota_exceeded", `A space can hold at most ${limits.nonHistoryPerSpace} saved items, folders, snippets and secrets`);
         }
       }
@@ -1293,6 +1508,7 @@ export function buildApp(deps: Deps): FastifyInstance {
     refuseClockSkew(updatedAt);
     const outcome = await tx(pool, async (db) => {
       const membership = await requireMember(db, spaceId, request.caller.uid, true);
+      requireAuthenticatorOwner(membership);
       const { rows } = await db.query<ItemRow>(`SELECT ${ITEM_COLUMNS} FROM items WHERE space_id = $1 AND id = $2 FOR UPDATE`, [spaceId, itemId]);
       const existing = rows[0];
       if (!existing) return { seq: 0, paths: [] as string[] };
@@ -1342,6 +1558,7 @@ export function buildApp(deps: Deps): FastifyInstance {
     await sweepUnusedBlobs(uid, request);
     await tx(pool, async (db) => {
       const membership = await requireMember(db, spaceId, uid, true);
+      if (membership.kind === "authenticator") throw forbidden("Authenticators have no blobs");
       await requireContactEstablished(db, spaceId, membership);
       const { rows } = await db.query<{ size: number; owner_uid: string | null }>("SELECT size, owner_uid FROM blobs WHERE space_id = $1 AND id = $2", [
         spaceId,
@@ -1369,7 +1586,7 @@ export function buildApp(deps: Deps): FastifyInstance {
   app.get<{ Params: { id: string; blobId: string } }>("/v1/spaces/:id/blobs/:blobId", async (request) => {
     const spaceId = uuid.parse(request.params.id);
     const blobId = uuid.parse(request.params.blobId);
-    await requireMember(pool, spaceId, request.caller.uid);
+    requireAuthenticatorOwner(await requireMember(pool, spaceId, request.caller.uid));
     const found = await pool.query("SELECT 1 FROM blobs WHERE space_id = $1 AND id = $2", [spaceId, blobId]);
     if (!found.rowCount) throw notFound();
     return storage.signedGetUrl(blobPath(spaceId, blobId));
