@@ -129,7 +129,7 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
 {"v":1,"type":"snippet","name":"…","keyword":"…","body":"…","createdAt":0,"updatedAt":0}
 // type "secret"
 {"v":1,"type":"secret","name":"…","value":"…","createdAt":0,"folder":"<folder item id>"}
-// type "otp" (category "otp", only in authenticator spaces)
+// type "otp" (category "otp", only in authenticator spaces; never sent to anyone but the owner)
 {"v":1,"type":"otp","issuer":"GitHub","account":"me@example.com","secret":"<base32, no padding>",
  "algorithm":"SHA1|SHA256|SHA512","digits":6,"period":30,"createdAt":0,"updatedAt":0}
 ```
@@ -323,34 +323,46 @@ Deleting an account deletes all its direct spaces.
 
 ### Authenticators
 
-An **authenticator** (a TOTP account) is an `authenticator` space: one owner, any number of people it's
-shared with (`member`s), no name. It holds one live item, category `otp` ([payload](#item-payloads)).
-It's an ordinary space for keys, items, changes and pushes; what's different is who may do what.
+An **authenticator** (a TOTP account) is an `authenticator` space whose only member is its owner. It holds
+one live item, category `otp` ([payload](#item-payloads)), which syncs to the owner's devices like any item.
+**The seed never leaves the owner's devices** (or the server, sealed, as for every item). People it's shared
+with never get it: the owner's devices send them **pre-computed codes**, sealed to each person.
 
-- **Owner only:** writing or deleting its item, sharing, removing others, transferring, deleting it.
-  Item `PUT`/`DELETE` by a member is `403 forbidden`. Blob uploads into it are `403 forbidden` (it has none).
-- **Members** read the item (so their app can compute codes) and may leave.
+- **Owner only:** everything. The space never has other members, so nobody else can read the item.
 - **Listing:** `GET /v1/spaces` leaves `authenticator` spaces out unless asked: `?include=authenticator`.
-  `include` takes a comma list (`?include=direct,authenticator`). `members` lists everyone, owner first.
-- **Sharing needs a relationship:** the owner may only share with a contact (an established direct space)
-  or someone they're in a group with; anyone else is `403 forbidden`. No accept step: it appears for them,
-  and they can leave.
-- Sharing hands over the secret. Removing someone stops syncing to them; it can't take back what they
-  have, which clients say when removing.
-- Group-only routes answer `404` for authenticator spaces; authenticator routes answer `404` for other kinds.
+  `include` takes a comma list (`?include=direct,authenticator`).
+- **Sharing needs a relationship:** a contact (an established direct space) or someone in a group with the
+  owner; anyone else is `403 forbidden`. No accept step; the recipient can leave.
+- **Code batches.** For each person, the owner's devices upload the codes from the current step through the
+  next 24 hours. Any owner device that syncs tops a share up once fewer than 12 hours remain
+  (`codesUntil - now < 12h`), and right after sharing. Each upload replaces that person's batch.
+- **Removing someone** deletes their batch on the server at once; codes they already downloaded keep working
+  until they run out (at most 24 hours). Clients say so when removing.
+- **Transfer** is the one time the seed moves: the new owner must be able to make codes. It needs an
+  existing share with them, and the old owner then becomes someone it's shared with.
+
+```
+sealedCodes = eph.pub(65) ‖ AEAD(ck, codesJSON, "c2/otpcodes/v1/" + spaceId + "/" + recipientUid)
+ck          = HKDF(ECDH(eph.priv, recipientPub), eph.pub ‖ recipientPub, "c2/otpcodes/v1/" + spaceId)
+codesJSON   = {"v":1,"issuer":"…","account":"…","digits":6,"period":30,
+               "from":<unix seconds, start of the first step>,"codes":["123456", …]}   one per step, in order
+```
 
 | Request | Response |
 |---|---|
 | `GET /v1/users/id/:uid` | `{uid, username, name, publicKey}`, only for the caller's contacts and people in a group with them; otherwise `404`. Shares the invite rate limit. |
-| `POST /v1/authenticators` `{id, wrappedKey}` | `201 Space`, `kind: "authenticator"`, the caller as owner (`wrappedKey` = SK wrapped to the caller). `409` if `id` is taken; `403 quota_exceeded` over the limit. |
-| `GET /v1/authenticators/:id/members` | `{members: [{uid, username, name, role}]}`, members only, owner first. |
-| `POST /v1/authenticators/:id/members` `{uid, wrappedKey}` | `201`. Owner only. `wrappedKey` = SK wrapped to that person (`wrapSpaceKey` with their uid). `403 forbidden` without a relationship, `400 invalid` for yourself, `409 conflict` already a member, `403 quota_exceeded` over a limit. |
-| `DELETE /v1/authenticators/:id/members/:uid` | `204`. The owner removes someone, or a member leaves. The owner can't leave: transfer or delete. |
-| `POST /v1/authenticators/:id/transfer` `{uid}` | `204`. Owner only; `uid` must already be a member (`400 invalid` otherwise). They become owner, the caller becomes a member. |
-| `DELETE /v1/authenticators/:id` | `204`, owner only. Deletes the space and its item for everyone. |
+| `POST /v1/authenticators` `{id, wrappedKey}` | `201 Space`, `kind: "authenticator"`, the caller as owner. `409` if `id` is taken; `403 quota_exceeded` over the limit. |
+| `DELETE /v1/authenticators/:id` | `204`, owner only. Deletes the space, its item and every share. |
+| `GET /v1/authenticators/:id/shares` | `{shares: [{uid, username, name, codesUntil, createdAt}]}`, owner only. |
+| `PUT /v1/authenticators/:id/shares/:uid` `{codesUntil, sealedCodes}` | `200`. Owner only. Creates the share if needed (relationship and limits checked: `403 forbidden` / `403 quota_exceeded`, `400 invalid` for yourself) and replaces the batch. `sealedCodes` at most 64 KiB; `codesUntil` (ms) at most 25 h ahead. |
+| `DELETE /v1/authenticators/:id/shares/:uid` | `204`. The owner removes someone, or the recipient leaves. |
+| `GET /v1/shared-codes` | `{shared: [{spaceId, ownerUid, ownerName, codesUntil, sealedCodes, updatedAt}]}`, every share to the caller. Clients fetch it on every sync. |
+| `POST /v1/authenticators/:id/transfer` `{uid, wrappedKey}` | `204`. Owner only; `uid` must have a share (`400 invalid` otherwise). `wrappedKey` is SK wrapped to them. They become the only member and owner; their share is deleted; the old owner gets a share (empty until the new owner's devices top it up). |
 
-**Limits:** 200 authenticators per user (owned and shared with them), 20 people per authenticator
-besides the owner. Deleting an account deletes the authenticators it owns and leaves the others.
+Changes to shares and batches notify the people involved the same way item changes do.
+
+**Limits:** 200 authenticators owned per user, 200 shared with a user, 20 shares per authenticator.
+Deleting an account deletes the authenticators it owns and the shares to it.
 
 ### Items
 
