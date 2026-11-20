@@ -297,7 +297,12 @@ public sealed class EditSecretForm(SecretRef secret, string value)
 public sealed class SaveSecretForm(ClipItem item)
 {
     public ClipItem Item { get; } = item;
-    public string Name { get; set; } = item.SourceName is { } app ? $"Password from {app}" : "New Secret";
+    public string Name { get; set; } = SuggestedName(item);
+
+    /// <summary>The item's label if it has one, else where it came from.</summary>
+    public static string SuggestedName(ClipItem item) =>
+        item.Label?.Trim() is { Length: > 0 } label ? label
+        : item.SourceName is { } app ? $"Password from {app}" : "New Secret";
 }
 
 [Flags] public enum KeyMods { None = 0, Ctrl = 1, Shift = 2, Alt = 4 }
@@ -1365,6 +1370,12 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
     public void BeginSaveSecret(ClipItem item)
     {
         Select(new PanelEntry.Clip(item).Id);
+        // Labelled already: that's its name, so there's nothing to ask.
+        if (item.Label?.Trim() is { Length: > 0 } label)
+        {
+            SaveAsSecret(item, label);
+            return;
+        }
         SaveSecretForm = new SaveSecretForm(item);
         Mode = PanelMode.SaveSecret;
         Notify();
@@ -1373,13 +1384,19 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
     public void SubmitSaveSecret()
     {
         if (SaveSecretForm is not { } form) return;
-        var name = form.Name.Trim();
-        if (name.Length == 0 || secrets.Add(name, form.Item.Text) is null)
+        SaveAsSecret(form.Item, form.Name.Trim());
+    }
+
+    private void SaveAsSecret(ClipItem item, string name)
+    {
+        if (name.Length == 0 || secrets.Add(name, item.Text) is not { } secret)
         {
             ShowNotice("Couldn't save to Credential Manager");
             return;
         }
-        if (form.Item != SelectionItem) store.Delete(form.Item);
+        // A personal item's secret stays in its folder; a group item's becomes a personal secret, as before.
+        if (item.SpaceId is null && item.FolderId is { } folderId) store.SetSecretFolder(secret.Id, folderId);
+        if (item != SelectionItem) store.Delete(item);
         ResetMode();
         Refresh();
         ShowNotice($"Saved “{name}” to Secrets and removed it from history");
