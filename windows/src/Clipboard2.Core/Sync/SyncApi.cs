@@ -56,6 +56,12 @@ public sealed record OpenSignupCode(string Id, long CreatedAt, long ExpiresAt);
 /// <summary>One signed-in session of this account: a device. Times are UTC.</summary>
 public sealed record SyncDevice(string Id, string Name, DateTime CreatedAt, DateTime LastUsedAt, bool IsCurrent);
 
+/// <summary>A share of one of the caller's authenticators. Times are milliseconds.</summary>
+public sealed record OtpShareInfo(string Uid, string Name, long CodesUntil, long CreatedAt);
+
+/// <summary>An authenticator shared with the caller: its latest sealed batch (null until topped up).</summary>
+public sealed record SharedCodes(string SpaceId, string OwnerUid, string OwnerName, long CodesUntil, byte[]? SealedCodes, long UpdatedAt);
+
 public sealed record BlobUpload(string Url, string Method, IReadOnlyDictionary<string, string> Headers);
 
 public abstract record WriteOutcome
@@ -190,8 +196,54 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
     public async Task<List<SpaceInfo>> GetSpacesAsync(CancellationToken ct = default)
     {
         // Contacts are direct spaces, listed only when asked for (older clients would show them as unnamed groups).
-        var (_, json) = await SendAsync(HttpMethod.Get, "/v1/spaces?include=direct", null, ct);
+        var (_, json) = await SendAsync(HttpMethod.Get, "/v1/spaces?include=direct,authenticator", null, ct);
         return (json?["spaces"] as JsonArray ?? []).OfType<JsonObject>().Select(Space).ToList();
+    }
+
+    // MARK: Authenticators
+
+    public async Task<SpaceInfo> CreateAuthenticatorAsync(string id, byte[] wrappedKey, CancellationToken ct = default)
+    {
+        var (_, json) = await SendAsync(HttpMethod.Post, "/v1/authenticators", new JsonObject { ["id"] = id, ["wrappedKey"] = B64(wrappedKey) }, ct);
+        return Space(json!);
+    }
+
+    public Task DeleteAuthenticatorAsync(string id, CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Delete, $"/v1/authenticators/{id}", null, ct);
+
+    public async Task<List<OtpShareInfo>> SharesAsync(string id, CancellationToken ct = default)
+    {
+        var (_, json) = await SendAsync(HttpMethod.Get, $"/v1/authenticators/{id}/shares", null, ct);
+        return (json?["shares"] as JsonArray ?? []).OfType<JsonObject>()
+            .Select(s => new OtpShareInfo(S(s, "uid"), Str(s, "name") ?? Str(s, "username") ?? "", L(s, "codesUntil"), L(s, "createdAt"))).ToList();
+    }
+
+    /// <summary>Creates the share if needed and replaces its batch.</summary>
+    public Task PutShareAsync(string id, string uid, long codesUntil, byte[] sealedCodes, CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Put, $"/v1/authenticators/{id}/shares/{Uri.EscapeDataString(uid)}",
+            new JsonObject { ["codesUntil"] = codesUntil, ["sealedCodes"] = B64(sealedCodes) }, ct);
+
+    /// <summary>The owner removes someone, or the recipient leaves.</summary>
+    public Task DeleteShareAsync(string id, string uid, CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Delete, $"/v1/authenticators/{id}/shares/{Uri.EscapeDataString(uid)}", null, ct);
+
+    public Task TransferAuthenticatorAsync(string id, string uid, byte[] wrappedKey, CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Post, $"/v1/authenticators/{id}/transfer", new JsonObject { ["uid"] = uid, ["wrappedKey"] = B64(wrappedKey) }, ct);
+
+    /// <summary>Every authenticator shared with the caller, with its sealed batch (null before the first top-up).</summary>
+    public async Task<List<SharedCodes>> SharedCodesAsync(CancellationToken ct = default)
+    {
+        var (_, json) = await SendAsync(HttpMethod.Get, "/v1/shared-codes", null, ct);
+        return (json?["shared"] as JsonArray ?? []).OfType<JsonObject>()
+            .Select(s => new SharedCodes(S(s, "spaceId"), S(s, "ownerUid"), Str(s, "ownerName") ?? "", L(s, "codesUntil"),
+                Str(s, "sealedCodes") is { } b64 ? Convert.FromBase64String(b64) : null, L(s, "updatedAt"))).ToList();
+    }
+
+    /// <summary>GET /v1/users/id/:uid: only contacts and people in a group with the caller (404 otherwise).</summary>
+    public async Task<SyncUser> LookupUserByIdAsync(string uid, CancellationToken ct = default)
+    {
+        var (_, json) = await SendAsync(HttpMethod.Get, $"/v1/users/id/{Uri.EscapeDataString(uid)}", null, ct);
+        return new SyncUser(S(json!, "uid"), Str(json!, "username"), Str(json!, "name") ?? Str(json!, "username") ?? "", Bytes(json!, "publicKey"));
     }
 
     public async Task<SpaceInfo> CreateGroupAsync(string id, byte[] encryptedName, byte[] wrappedKey, CancellationToken ct = default)

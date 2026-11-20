@@ -116,12 +116,21 @@ internal sealed class FakeCloud : HttpMessageHandler
 
     private sealed class Space
     {
-        public required string Id, Kind, Owner;
+        public required string Id, Kind;
+        public required string Owner;
         public string? Name;
         public long CreatedAt;
         public long PurgedSeq;
         public Dictionary<string, (string Role, string Key)> Members { get; } = [];
         public Dictionary<string, Item> Items { get; } = [];
+        /// <summary>Authenticator shares: recipient uid → their batch.</summary>
+        public Dictionary<string, ShareRow> Shares { get; } = [];
+    }
+
+    public sealed class ShareRow
+    {
+        public long CodesUntil, CreatedAt, UpdatedAt;
+        public string? SealedCodes;
     }
 
     public sealed class Item
@@ -167,6 +176,12 @@ internal sealed class FakeCloud : HttpMessageHandler
     public string IssueSignupCode(string? owner = null) => NewSignupCode(owner).Code;
 
     public IReadOnlyList<Item> Items(string spaceId) => [.. _spaces[spaceId].Items.Values];
+    /// <summary>An authenticator's shares by recipient uid.</summary>
+    public IReadOnlyDictionary<string, ShareRow> Shares(string spaceId) => _spaces[spaceId].Shares;
+    public string OwnerOf(string spaceId) => _spaces[spaceId].Owner;
+    public IReadOnlyList<string> SpaceMembers(string spaceId) => [.. _spaces[spaceId].Members.Keys];
+    /// <summary>Lets a share's codes run low, as if the owner's devices had been offline.</summary>
+    public void SetCodesUntil(string spaceId, string uid, long codesUntil) => _spaces[spaceId].Shares[uid].CodesUntil = codesUntil;
     public IReadOnlyList<Item> LiveItems(string spaceId) => [.. _spaces[spaceId].Items.Values.Where(i => i.Deleted is null)];
     public Item ItemById(string spaceId, string id) => _spaces[spaceId].Items[id];
     public int BlobCount(string spaceId) => _blobs.Keys.Count(k => k.Space == spaceId);
@@ -449,9 +464,11 @@ internal sealed class FakeCloud : HttpMessageHandler
                 return NoContent();
             case "spaces" when path.Length == 2:
                 SpacesQueries.Add(url.Query);
-                var withDirect = (query["include"] ?? "").Split(',').Contains("direct");
+                var include = (query["include"] ?? "").Split(',');
+                var withDirect = include.Contains("direct");
                 return Ok(new JsonObject { ["spaces"] = new JsonArray([.. _spaces.Values.Where(s => s.Members.ContainsKey(caller.Uid))
                     .Where(s => s.Kind != "direct" || (withDirect && s.Members.Count == 2))
+                    .Where(s => s.Kind != "authenticator" || include.Contains("authenticator"))
                     .OrderByDescending(s => s.Kind).ThenBy(s => s.CreatedAt).Select(s => (JsonNode?)SpaceJson(s, caller.Uid))]) });
             case "groups" when path.Length == 2 && method == "POST":
                 var group = new Space { Id = B("id"), Kind = "group", Owner = caller.Uid, Name = B("encryptedName"), CreatedAt = ++_seq };
@@ -509,6 +526,20 @@ internal sealed class FakeCloud : HttpMessageHandler
                 inv.Used = true;
                 invSpace.Members[caller.Uid] = ("member", B("wrappedKey"));
                 return Json(HttpStatusCode.Created, SpaceJson(invSpace, caller.Uid));
+            case "users" when path.Length == 4 && path[2] == "id" && method == "GET":
+                var byId = UserByUid(Uri.UnescapeDataString(path[3]));
+                if (byId is null || byId == caller || !Related(caller.Uid, byId.Uid)) throw new HttpError(HttpStatusCode.NotFound, "not_found");
+                return Ok(new JsonObject { ["uid"] = byId.Uid, ["username"] = byId.Username, ["name"] = byId.Name, ["publicKey"] = byId.Account["publicKey"]!.GetValue<string>() });
+            case "authenticators":
+                return Authenticators(method, path, body, caller);
+            case "shared-codes" when method == "GET":
+                return Ok(new JsonObject { ["shared"] = new JsonArray([.. _spaces.Values.Where(sp => sp.Kind == "authenticator" && sp.Shares.ContainsKey(caller.Uid))
+                    .Select(sp => (JsonNode?)new JsonObject
+                    {
+                        ["spaceId"] = sp.Id, ["ownerUid"] = sp.Owner, ["ownerName"] = UserByUid(sp.Owner)?.Name,
+                        ["codesUntil"] = sp.Shares[caller.Uid].CodesUntil, ["sealedCodes"] = sp.Shares[caller.Uid].SealedCodes,
+                        ["updatedAt"] = sp.Shares[caller.Uid].UpdatedAt,
+                    })]) });
             case "users" when !NoContacts && method == "GET":
                 var found = _users.Values.FirstOrDefault(u => string.Equals(u.Username, Uri.UnescapeDataString(path[2]), StringComparison.OrdinalIgnoreCase))
                     ?? throw new HttpError(HttpStatusCode.NotFound, "not_found");
@@ -622,6 +653,68 @@ internal sealed class FakeCloud : HttpMessageHandler
                 if (!_spaces.TryGetValue(path[2], out var ended) || ended.Kind != "direct" || !ended.Members.ContainsKey(me))
                     throw new HttpError(HttpStatusCode.NotFound, "not_found");
                 DropSpace(ended.Id);
+                return NoContent();
+        }
+        throw new HttpError(HttpStatusCode.NotFound, "not_found");
+    }
+
+    /// <summary>A contact (an established direct space) or someone in a group with them.</summary>
+    private bool Related(string a, string b) =>
+        _spaces.Values.Any(s => (s.Kind == "direct" && s.Members.Count == 2 || s.Kind == "group") && s.Members.ContainsKey(a) && s.Members.ContainsKey(b));
+
+    private HttpResponseMessage Authenticators(string method, string[] path, JsonObject? body, User caller)
+    {
+        string B(string k) => body![k]!.GetValue<string>();
+        if (path.Length == 2 && method == "POST")
+        {
+            if (_spaces.ContainsKey(B("id"))) throw new HttpError(HttpStatusCode.Conflict, "conflict");
+            var created = new Space { Id = B("id"), Kind = "authenticator", Owner = caller.Uid, CreatedAt = ++_seq };
+            created.Members[caller.Uid] = ("owner", B("wrappedKey"));
+            _spaces[created.Id] = created;
+            return Json(HttpStatusCode.Created, SpaceJson(created, caller.Uid));
+        }
+        if (!_spaces.TryGetValue(path[2], out var space) || space.Kind != "authenticator") throw new HttpError(HttpStatusCode.NotFound, "not_found");
+        var owner = space.Owner == caller.Uid;
+        // Leaving: the recipient deletes their own share.
+        if (path.Length == 5 && path[3] == "shares" && method == "DELETE" && path[4] == caller.Uid && space.Shares.Remove(caller.Uid)) return NoContent();
+        if (!owner) throw new HttpError(HttpStatusCode.NotFound, "not_found");
+        switch (path.Length)
+        {
+            case 3 when method == "DELETE":
+                DropSpace(space.Id);
+                return NoContent();
+            case 4 when path[3] == "shares" && method == "GET":
+                return Ok(new JsonObject { ["shares"] = new JsonArray([.. space.Shares.Select(p => (JsonNode?)new JsonObject
+                {
+                    ["uid"] = p.Key, ["username"] = UserByUid(p.Key)?.Username, ["name"] = UserByUid(p.Key)?.Name,
+                    ["codesUntil"] = p.Value.CodesUntil, ["createdAt"] = p.Value.CreatedAt,
+                })]) });
+            case 5 when path[3] == "shares" && method == "PUT":
+                var uid = Uri.UnescapeDataString(path[4]);
+                if (uid == caller.Uid) throw new HttpError(HttpStatusCode.BadRequest, "invalid");
+                if (UserByUid(uid) is null || !Related(caller.Uid, uid)) throw new HttpError(HttpStatusCode.Forbidden, "forbidden");
+                var until = body!["codesUntil"]!.GetValue<long>();
+                if (until > Clock() + 25L * 3_600_000) throw new HttpError(HttpStatusCode.BadRequest, "invalid");
+                if (B("sealedCodes").Length > 64 * 1024 * 4 / 3 + 4) throw new HttpError(HttpStatusCode.BadRequest, "too_large");
+                if (!space.Shares.TryGetValue(uid, out var row))
+                {
+                    if (space.Shares.Count >= 20) throw new HttpError(HttpStatusCode.Forbidden, "quota_exceeded");
+                    space.Shares[uid] = row = new ShareRow { CreatedAt = Clock() };
+                }
+                row.CodesUntil = until;
+                row.SealedCodes = B("sealedCodes");
+                row.UpdatedAt = Math.Max(Clock(), row.UpdatedAt + 1);
+                return Ok(new JsonObject());
+            case 5 when path[3] == "shares" && method == "DELETE":
+                if (!space.Shares.Remove(Uri.UnescapeDataString(path[4]))) throw new HttpError(HttpStatusCode.NotFound, "not_found");
+                return NoContent();
+            case 4 when path[3] == "transfer" && method == "POST":
+                var to = B("uid");
+                if (!space.Shares.Remove(to)) throw new HttpError(HttpStatusCode.BadRequest, "invalid");
+                space.Members.Clear();
+                space.Members[to] = ("owner", B("wrappedKey"));
+                space.Owner = to;
+                space.Shares[caller.Uid] = new ShareRow { CreatedAt = Clock(), UpdatedAt = Clock() };
                 return NoContent();
         }
         throw new HttpError(HttpStatusCode.NotFound, "not_found");

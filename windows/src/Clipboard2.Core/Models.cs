@@ -199,6 +199,8 @@ public sealed record SpaceRecord(string Id, string Kind, string Role, string? Na
     public bool IsGroup => Kind == "group";
     /// <summary>A contact: a two-person space without a name (docs/sync/PROTOCOL.md → Contacts).</summary>
     public bool IsDirect => Kind == SpaceKinds.Direct;
+    /// <summary>One authenticator of this user (docs/sync/PROTOCOL.md → Authenticators).</summary>
+    public bool IsAuthenticator => Kind == SpaceKinds.Authenticator;
     public bool IsOwner => Role == "owner";
     public string DisplayName => string.IsNullOrWhiteSpace(Name) ? (IsDirect ? "Contact" : "Untitled group") : Name!;
 
@@ -224,7 +226,7 @@ public sealed record SpaceRecord(string Id, string Kind, string Role, string? Na
 
 public static class SpaceKinds
 {
-    public const string Personal = "personal", Group = "group", Direct = "direct";
+    public const string Personal = "personal", Group = "group", Direct = "direct", Authenticator = "authenticator";
 }
 
 /// <summary>The signed-in sync user, for telling own items apart in groups.</summary>

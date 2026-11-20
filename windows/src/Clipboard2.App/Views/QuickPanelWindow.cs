@@ -19,7 +19,7 @@ using Transform = Clipboard2.Core.Transform;
 namespace Clipboard2.App.Views;
 
 /// <summary>The Ctrl+Shift+V panel: search, filter chips, list, preview, Ctrl+K actions, AI.</summary>
-public sealed class QuickPanelWindow : Window
+public sealed partial class QuickPanelWindow : Window
 {
     private readonly AppServices _services;
     private PanelModel Model => _services.Panel;
@@ -132,6 +132,7 @@ public sealed class QuickPanelWindow : Window
         _services.Sync.DownloadsChanged += () => Dispatcher.BeginInvoke(() => { if (IsVisible) UpdateIncoming(); });
         _services.ImageText.Indexed += OnImageTextRead;
         SetUpDropTargets();
+        StartCodeTimer();
     }
 
     private static void AutomationName(DependencyObject element, string name) =>
@@ -418,6 +419,21 @@ public sealed class QuickPanelWindow : Window
         AutomationName(newFolder, "New Folder");
         DockPanel.SetDock(newFolder, Dock.Right);
         bar.Children.Add(newFolder);
+        if (Model.SavedSpace is null && Model.OpenFolderId is null && Model.Authenticators is not null)
+        {
+            // Authenticators are personal tools: only in the personal Saved, never in folders.
+            var newOtp = new Border { Padding = new Thickness(6, 2, 6, 2), CornerRadius = new CornerRadius(6), Cursor = Cursors.Hand, Background = Brushes.Transparent, ToolTip = "New Authenticator…" };
+            var otpContent = new StackPanel { Orientation = Orientation.Horizontal };
+            var otpIcon = Glyphs.Icon(Glyphs.Lock, 13, Fluent.Accent);
+            otpIcon.Margin = new Thickness(0, 0, 5, 0);
+            otpContent.Children.Add(otpIcon);
+            otpContent.Children.Add(Fluent.Label("New Authenticator…", 12, Fluent.Accent));
+            newOtp.Child = otpContent;
+            newOtp.MouseLeftButtonUp += (_, _) => Model.BeginAddAuthenticator();
+            AutomationName(newOtp, "New Authenticator");
+            DockPanel.SetDock(newOtp, Dock.Right);
+            bar.Children.Add(newOtp);
+        }
 
         var crumbs = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
         var open = Model.OpenFolder;
@@ -750,7 +766,12 @@ public sealed class QuickPanelWindow : Window
         Grid.SetColumn(leading, 1);
         grid.Children.Add(leading);
 
-        var (title, subtitle) = Describe(entry);
+        var (title, subtitle) = entry switch
+        {
+            PanelEntry.AuthenticatorEntry a => (a.Authenticator.Title, Model.AuthenticatorSubtitle(entry)),
+            PanelEntry.SharedCodeEntry o => (o.Shared.Title, Model.AuthenticatorSubtitle(entry)),
+            _ => Describe(entry),
+        };
         var texts = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
         texts.Children.Add(Fluent.Label(title, 14, fg));
         texts.Children.Add(Fluent.Label(subtitle, 12, sub));
@@ -758,6 +779,7 @@ public sealed class QuickPanelWindow : Window
         grid.Children.Add(texts);
 
         var trailing = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+        if (IsOtpEntry(entry)) trailing.Children.Add(CodeBadge(entry, selected, 17, detail: false));
         var groupName = Model.GroupName(entry);
         var author = entry is PanelEntry.FolderEntry ? null : Model.GroupBadge(entry);
         if (entry is PanelEntry.FolderEntry { Folder.Label: { } folderLabel }) trailing.Children.Add(LabelPill(folderLabel, selected));
@@ -847,6 +869,10 @@ public sealed class QuickPanelWindow : Window
                 return Box(Glyphs.Icon(Glyphs.Snippet, 18, selected ? Fluent.AccentText : Fluent.Accent));
             case PanelEntry.FolderEntry:
                 return Box(Glyphs.Icon(Glyphs.Folder, 18, selected ? Fluent.AccentText : Fluent.Accent));
+            case PanelEntry.SharedCodeEntry:
+                return Box(Glyphs.Icon(Glyphs.Contact, 18, selected ? Fluent.AccentText : Fluent.Accent));
+            case PanelEntry.AuthenticatorEntry or PanelEntry.OtpSuggestion:
+                return Box(Glyphs.Icon(Glyphs.Clock, 18, selected ? Fluent.AccentText : Fluent.Accent));
             default:   // a secret: the lock, as it sits among clips in Saved
                 return Box(Glyphs.Icon(Glyphs.Lock, 18, selected ? Fluent.AccentText : Fluent.Accent));
         }
@@ -860,6 +886,7 @@ public sealed class QuickPanelWindow : Window
         PanelEntry.SnippetEntry s => (s.Snippet.Name.Length == 0 ? "Untitled Snippet" : s.Snippet.Name, s.Snippet.Keyword.Length == 0 ? "Snippet" : $"Snippet · {s.Snippet.Keyword}"),
         PanelEntry.SecretEntry k => (k.Secret.Name, "••••••••"),
         PanelEntry.FolderEntry f => (f.Folder.Name, ItemCount(f.Count)),
+        PanelEntry.OtpSuggestion o => ("Add to Authenticator", string.Join(" · ", new[] { o.Draft.Issuer, o.Draft.Account }.Where(s => s.Length > 0))),
         _ => ("", ""),
     };
 
@@ -871,6 +898,11 @@ public sealed class QuickPanelWindow : Window
         MenuItem Item(string header, Action action) { var i = new MenuItem { Header = header }; i.Click += (_, _) => action(); return i; }
         // Right-clicking one of several selected items acts on them all.
         void Focus() { if (!(Model.IsMultiSelecting && Model.IsSelected(entry))) Model.Select(entry.Id); }
+        if (entry is PanelEntry.AuthenticatorEntry or PanelEntry.SharedCodeEntry or PanelEntry.OtpSuggestion)
+        {
+            FillAuthenticatorMenu(menu, entry);
+            return;
+        }
         if (entry is PanelEntry.FolderEntry f)
         {
             menu.Items.Add(Item("Open", () => Model.Activate(entry)));
@@ -1035,6 +1067,11 @@ public sealed class QuickPanelWindow : Window
             PanelMode.Browse when Model.IsMultiSelecting => "multi:" + string.Join(",", Model.SelectedIds.Order()),
             // A folder's details change without the selection changing (renamed, labelled, items dropped in).
             PanelMode.Browse when Model.SelectedEntry is PanelEntry.FolderEntry f => $"{f.Id}|{f.Folder.Name}|{f.Folder.Label}|{f.Count}",
+            PanelMode.Browse when Model.SelectedEntry is PanelEntry.AuthenticatorEntry a =>
+                $"{a.Id}|{a.Authenticator.Title}|{a.Authenticator.Account}|{string.Join(",", a.Authenticator.People.Select(p => p.Name))}",
+            PanelMode.Browse when Model.SelectedEntry is PanelEntry.SharedCodeEntry o => $"{o.Id}|{o.Shared.ReceivedAt.Ticks}|{o.Shared.IsOut(Model.Clock())}",
+            PanelMode.AuthenticatorPeople => "people:" + string.Join(",", Model.PeopleOf?.People.Select(p => p.Uid) ?? []),
+            PanelMode.AuthenticatorForm => "form:" + Model.AuthenticatorForm?.GetHashCode() + "|" + Model.AuthenticatorForm?.Error,
             PanelMode.Browse => Model.SelectedId,
             PanelMode.AI => Model.AIRun?.GetHashCode().ToString(),
             _ => Model.SelectedId,
@@ -1046,8 +1083,13 @@ public sealed class QuickPanelWindow : Window
             _actionFilter = null;
             _aiOutput = null;
             _fileRows.Clear();
+            foreach (var stale in _codeViews.Keys.Where(k => k.StartsWith("detail:", StringComparison.Ordinal)).ToList()) _codeViews.Remove(stale);
             _detail.Child = Model.Mode switch
             {
+                PanelMode.AuthenticatorForm => BuildAuthenticatorForm(),
+                PanelMode.AuthenticatorSecret => BuildAuthenticatorSecret(),
+                PanelMode.AuthenticatorPeople => BuildAuthenticatorPeople(),
+                PanelMode.ConfirmDelete => BuildConfirmDelete(),
                 PanelMode.Actions => BuildActions(),
                 PanelMode.SnippetForm => BuildSnippetForm(),
                 PanelMode.SaveSecret => BuildSaveSecret(),
@@ -1080,6 +1122,8 @@ public sealed class QuickPanelWindow : Window
             PanelEntry.SnippetEntry s => TextView(s.Snippet.Body),
             PanelEntry.SecretEntry k => SecretView(k.Secret),
             PanelEntry.FolderEntry f => FolderView(f),
+            PanelEntry.AuthenticatorEntry or PanelEntry.SharedCodeEntry => AuthenticatorView(entry),
+            PanelEntry.OtpSuggestion o => OtpSuggestionView(o),
             _ => new Border(),
         };
         grid.Children.Add(body);
@@ -1324,6 +1368,9 @@ public sealed class QuickPanelWindow : Window
                 Line("Snippet", s.Snippet.Name);
                 if (s.Snippet.Keyword.Length > 0) Line("Keyword", s.Snippet.Keyword);
                 break;
+            case PanelEntry.AuthenticatorEntry or PanelEntry.SharedCodeEntry:
+                AuthenticatorMetadata(entry, Line);
+                break;
             case PanelEntry.SecretEntry k:
                 Line("Stored in", "Credential Manager");
                 if (k.Secret.CreatedAt is { } created) Line("Added", created.ToLocalTime().ToString("g"));
@@ -1389,7 +1436,9 @@ public sealed class QuickPanelWindow : Window
         _actionList.Children.Clear();
         if (_actionFilter is not null && _actionFilter.Text != Model.ActionQuery) _actionFilter.Text = Model.ActionQuery;
         if (_actionHint is not null)
-            _actionHint.Text = Model.IsPickingGroup ? "Choose a group to share with"
+            _actionHint.Text = Model.OtpPicker is { } otpPicker
+                ? (otpPicker.Kind == OtpPickerKind.Share ? "Share with… " : "Transfer to… ") + Model.OtpPickerNote
+                : Model.IsPickingGroup ? "Choose a group to share with"
                 : Model.PickingShareFolder is { } share ? $"Choose where in “{share.GroupName}” it goes"
                 : Model.IsPickingFolder ? "Choose a folder to move to" : $"Filter actions or ask {Model.AIName}";
         var actions = Model.FilteredActions;
@@ -1418,7 +1467,9 @@ public sealed class QuickPanelWindow : Window
             _actionList.Children.Add(row);
             if (selected) selectedRow = row;
         }
-        if (actions.Count == 0) _actionList.Children.Add(Fluent.Label("No matching actions", 13, Fluent.Secondary));
+        if (actions.Count == 0) _actionList.Children.Add(Fluent.Label(
+            Model.OtpPicker is { Kind: OtpPickerKind.Share } ? "Nobody to share with. Add contacts or join groups in Settings → Sync." : "No matching actions",
+            13, Fluent.Secondary, wrap: true));
         selectedRow?.BringIntoView();
     }
 
@@ -1633,11 +1684,18 @@ public sealed class QuickPanelWindow : Window
                 $"Enter Paste {Model.PickedFiles.Count} of {item.Files.Count} files    Ctrl+K Actions    Esc All Files",
             PanelMode.Browse when Model.IsMultiSelecting => $"Enter Paste {Model.SelectedClips.Count} items    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Y Preview    Del Delete    Esc Close",
             PanelMode.Browse when Model.SelectedEntry is PanelEntry.FolderEntry => "Enter Open    Ctrl+K Actions    Del Delete Folder    Tab Filter    Esc Close",
+            PanelMode.Browse when Model.SelectedEntry is PanelEntry.AuthenticatorEntry => "Enter Paste Code    Ctrl+K Actions    Del Delete    Tab Filter    Esc Close",
+            PanelMode.Browse when Model.SelectedEntry is PanelEntry.SharedCodeEntry => "Enter Paste Code    Ctrl+K Actions    Tab Filter    Esc Close",
+            PanelMode.Browse when Model.SelectedEntry is PanelEntry.OtpSuggestion => "Enter Add to Authenticator    Esc Dismiss",
             PanelMode.Browse when Model.OpenFolderId is not null => "Enter Paste    Ctrl+K Actions    Ctrl+Y Preview    Backspace Saved    Esc Back",
             // The compact panel has no room for one more hint.
             PanelMode.Browse when _services.Settings.PanelSize == PanelSize.Compact =>
                 "Enter Paste    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Shift+1–9 Assign Slot    Tab Filter    Esc Close",
             PanelMode.Browse => "Enter Paste    Shift+Enter Plain Text    Ctrl+K Actions    Ctrl+Y Preview    Ctrl+Shift+1–9 Assign Slot    Tab Filter    Esc Close",
+            PanelMode.Actions when Model.OtpPicker is { Kind: OtpPickerKind.Share } => "↑↓ Choose Person    Enter Share    Esc Back",
+            PanelMode.Actions when Model.OtpPicker is { Kind: OtpPickerKind.Transfer } => "↑↓ Choose Person    Enter Transfer    Esc Back",
+            PanelMode.ConfirmDelete => "Enter Delete    Esc Cancel",
+            PanelMode.AuthenticatorSecret or PanelMode.AuthenticatorPeople => "Esc Back",
             PanelMode.Actions when Model.IsPickingGroup => "↑↓ Choose Group    Enter Share    Esc Back",
             PanelMode.Actions when Model.PickingShareFolder is not null => "↑↓ Choose Folder    Enter Share    Esc Back",
             PanelMode.Actions when Model.IsPickingFolder => "↑↓ Choose Folder    Enter Move    Esc Back",

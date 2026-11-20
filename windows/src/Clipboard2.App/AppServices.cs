@@ -29,6 +29,8 @@ public sealed class AppServices : IPanelHost
     public ClipStore Store { get; }
     public CredentialKeyStore Keys { get; } = new();
     public SecretVault Secrets { get; }
+    /// <summary>Authenticators and codes shared with this user, in Credential Manager.</summary>
+    public AuthenticatorStore Authenticators { get; }
     public QuickSlots Slots { get; }
     public ForegroundTracker Tracker { get; } = new();
     public HotkeyManager Hotkeys { get; } = new();
@@ -74,11 +76,19 @@ public sealed class AppServices : IPanelHost
             Logger = message => Log.Info("Image text: " + message),
         };
         Secrets = new SecretVault(Settings);
+        Authenticators = new AuthenticatorStore(new CredentialProtectedStore());
         Slots = new QuickSlots(Settings);
         Models = new ModelLister(Keys);
         Panel = new PanelModel(Store, Settings, Slots, Secrets, this);
         Panel.GroupFilterSelected += () => _ = Sync.SyncNowAsync();
-        Sync = new SyncAccount(Store, Secrets, Settings, Keys) { Logger = message => Log.Info("Sync: " + message) };
+        Sync = new SyncAccount(Store, Secrets, Settings, Keys) { Logger = message => Log.Info("Sync: " + message), Authenticators = Authenticators };
+        Panel.Authenticators = Authenticators;
+        Panel.AuthenticatorSync = new AuthenticatorSyncAdapter(Sync);
+        Authenticators.Changed += () =>
+        {
+            StoreChanged?.Invoke();
+            ScheduleSync();
+        };
         Panel.Self = () => Sync.Self;
         Panel.Devices = () => Sync.IsSignedIn
             ? [.. Sync.Devices.Where(d => !d.IsCurrent).Select(d => new DeviceTarget(d.Id, d.Name))]
@@ -247,8 +257,15 @@ public sealed class AppServices : IPanelHost
             var source = Tracker.AppFor(sourceWindow);
             var raw = ClipboardIO.Read(Settings.IgnoredIds, source, out _);
             if (raw is null) return;
+            // An authenticator link is a 2FA seed: never history. Offered as Add to Authenticator instead.
+            if (raw.Kind.IsTextual() && OtpAuthUri.IsOtpAuth(raw.Text))
+            {
+                OfferAuthenticatorLink(raw.Text);
+                return;
+            }
             var processed = await CaptureProcessor.ProcessAsync(raw, Store.Blobs);
-            if (processed is null) return;
+            if (processed is null || !CaptureFilter.ShouldStore(processed)) return;
+            if (raw.Image is { } image) _ = FindOtpQrAsync(image);
             if (processed.Kind.IsTextual() && Secrets.ValueHashes.Contains(processed.Hash))
                 return;   // a saved secret: never in history
             Store.Ingest(processed);
@@ -258,6 +275,42 @@ public sealed class AppServices : IPanelHost
         catch (Exception ex)
         {
             Log.Error("Capture failed", ex);
+        }
+    }
+
+    /// <summary>A copied otpauth link: "Authenticator link copied", and the panel offers to add it (HOTP is refused).</summary>
+    private void OfferAuthenticatorLink(string text)
+    {
+        if (OtpAuthUri.Parse(text, out var error) is { } draft)
+        {
+            Panel.OfferAuthenticator(draft);
+            Hud.ShowNotice(Tracker.TargetWindow, Glyphs.Lock, "Authenticator link copied", "Open Clipboard2 to add it to your authenticators. It isn't kept in history.");
+        }
+        else
+        {
+            Hud.ShowWarning(Tracker.TargetWindow, "Authenticator link not added", error ?? "That link can't be used.");
+        }
+    }
+
+    /// <summary>A copied image or screenshot with an otpauth QR code: offered like a copied link (the image itself
+    /// is kept as a normal clip).</summary>
+    private async Task FindOtpQrAsync(System.Windows.Media.Imaging.BitmapSource image)
+    {
+        try
+        {
+            var link = await Task.Run(() =>
+            {
+                var bgra = new System.Windows.Media.Imaging.FormatConvertedBitmap(image, System.Windows.Media.PixelFormats.Bgra32, null, 0);
+                if ((long)bgra.PixelWidth * bgra.PixelHeight > 25_000_000) return null;
+                var pixels = new byte[bgra.PixelWidth * 4 * bgra.PixelHeight];
+                bgra.CopyPixels(pixels, bgra.PixelWidth * 4, 0);
+                return QrCodes.FindOtpAuth(pixels, bgra.PixelWidth, bgra.PixelHeight);
+            });
+            if (link is not null) await Dispatcher.InvokeAsync(() => OfferAuthenticatorLink(link));
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Looking for a QR code failed", ex);
         }
     }
 
@@ -423,6 +476,23 @@ public sealed class AppServices : IPanelHost
 
     public void PasteSecret(SecretRef secret) => _ = PasteSecretAsync(secret, TargetForPaste);
 
+    // MARK: Authenticator codes
+
+    /// <summary>Codes are cleared like copied secrets: after 30 s.</summary>
+    public const int CodeClearSeconds = 30;
+
+    /// <summary>A code: kept out of history (ours, Win+V and cloud clipboard), cleared after 30 s.</summary>
+    public void PasteTransient(string text)
+    {
+        var target = TargetForPaste;
+        WriteSecretWithAutoClear(text, CodeClearSeconds);
+        _ = SendPasteAsync(target);
+    }
+
+    public void CopyTransient(string text) => WriteSecretWithAutoClear(text, CodeClearSeconds);
+
+    public Task<bool> VerifyUserAsync(string reason) => Secrets.VerifyFreshAsync(reason);
+
     private async Task PasteSecretAsync(SecretRef secret, IntPtr target)
     {
         var value = await Secrets.RevealAsync(secret, $"paste “{secret.Name}”");
@@ -457,12 +527,13 @@ public sealed class AppServices : IPanelHost
         });
     }
 
-    private void WriteSecretWithAutoClear(string value)
+    private void WriteSecretWithAutoClear(string value, int? seconds = null)
     {
         ClipboardIO.WriteSecret(value);
-        if (Settings.SecretClearSeconds <= 0) return;
+        var clearAfter = seconds ?? Settings.SecretClearSeconds;
+        if (clearAfter <= 0) return;
         var sequence = Native.GetClipboardSequenceNumber();
-        var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(Settings.SecretClearSeconds) };
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(clearAfter) };
         timer.Tick += (_, _) =>
         {
             timer.Stop();
@@ -559,7 +630,8 @@ public sealed class AppServices : IPanelHost
         var raw = await CopySelectionCaptureAsync(source);
         var capture = raw is null ? null : await CaptureProcessor.ProcessAsync(raw, Store.Blobs);
         // A saved secret (or blank text) never goes to a group this way.
-        if (capture is null || (capture.Kind.IsTextual() && (string.IsNullOrWhiteSpace(capture.Text) || Secrets.ValueHashes.Contains(capture.Hash))))
+        if (capture is null || !CaptureFilter.ShouldStore(capture)
+            || (capture.Kind.IsTextual() && (string.IsNullOrWhiteSpace(capture.Text) || Secrets.ValueHashes.Contains(capture.Hash))))
         {
             System.Media.SystemSounds.Beep.Play();
             return;
@@ -785,7 +857,7 @@ public sealed class AppServices : IPanelHost
         ClipItem? item = null;
         if (capture is not null)
         {
-            if (capture.Kind.IsTextual() && (string.IsNullOrWhiteSpace(capture.Text) || Secrets.ValueHashes.Contains(capture.Hash)))
+            if (!CaptureFilter.ShouldStore(capture) || capture.Kind.IsTextual() && (string.IsNullOrWhiteSpace(capture.Text) || Secrets.ValueHashes.Contains(capture.Hash)))
             {
                 System.Media.SystemSounds.Beep.Play();
                 return;
@@ -814,7 +886,7 @@ public sealed class AppServices : IPanelHost
     public ClipItem? AddDroppedText(string text, string? spaceId = null)
     {
         var capture = ProcessedCapture.ForText(text);
-        if (string.IsNullOrWhiteSpace(text) || Secrets.ValueHashes.Contains(capture.Hash)) return null;
+        if (string.IsNullOrWhiteSpace(text) || Secrets.ValueHashes.Contains(capture.Hash) || !CaptureFilter.ShouldStore(capture)) return null;
         var item = Store.Ingest(capture, spaceId: spaceId);
         Sync.ReportActivity();
         return item;
@@ -842,4 +914,17 @@ public sealed class AppServices : IPanelHost
     public string AIShortName => Settings.AIProvider.ShortName();
     public string AIProviderTitle => Settings.AIProvider.Title();
     public IAIStreamingClient MakeAIClient() => AIClientFactory.Make(Settings.AIProvider, Settings.AIModel, Settings.CustomBaseUrl, Keys);
+}
+
+/// <summary>The panel's view of sync for authenticators.</summary>
+public sealed class AuthenticatorSyncAdapter(SyncAccount sync) : IAuthenticatorSync
+{
+    public bool IsSignedIn => sync.IsSignedIn;
+    public string? Error => sync.Error;
+    public List<(string Uid, string Name)> ShareCandidates(Authenticator a) => sync.ShareCandidates(a);
+    public Task<bool> ShareAsync(Authenticator a, string uid, string name) => sync.ShareAuthenticatorAsync(a, uid, name);
+    public Task<DateTime?> RemoveAsync(Authenticator a, string uid) => sync.RemoveAuthenticatorShareAsync(a, uid);
+    public Task<bool> TransferAsync(Authenticator a, string uid, string name) => sync.TransferAuthenticatorAsync(a, uid, name);
+    public Task<bool> LeaveAsync(SharedAuthenticator shared) => sync.LeaveAuthenticatorAsync(shared);
+    public Task<bool> DeleteAsync(Authenticator a) => sync.DeleteAuthenticatorAsync(a);
 }

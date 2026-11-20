@@ -149,6 +149,26 @@ public static class SyncCrypto
         return Open(wk, wrapped[65..], Aad.SpaceKey(spaceId, myUid));
     }
 
+    // MARK: Authenticator code batches
+
+    /// <summary><c>eph.pub ‖ AEAD(HKDF(ECDH(eph, recipientPub), eph.pub ‖ recipientPub, "c2/otpcodes/v1/" + spaceId), codesJSON)</c>,
+    /// AAD <c>"c2/otpcodes/v1/" + spaceId + "/" + recipientUid</c>: like <see cref="WrapSpaceKey"/>.</summary>
+    public static byte[] SealCodes(byte[] codesJson, string spaceId, string recipientUid, byte[] recipientPublic,
+                                   EcKeyPair? ephemeral = null, byte[]? nonce = null)
+    {
+        var eph = ephemeral ?? GenerateKeyPair();
+        var ck = Hkdf(Ecdh(eph, recipientPublic), [.. eph.Public, .. recipientPublic], $"c2/otpcodes/v1/{spaceId}");
+        return [.. eph.Public, .. Seal(ck, codesJson, $"c2/otpcodes/v1/{spaceId}/{recipientUid}", nonce)];
+    }
+
+    public static byte[] OpenCodes(byte[] sealedCodes, string spaceId, string myUid, EcKeyPair identity)
+    {
+        if (sealedCodes.Length < 65 + NonceSize + TagSize) throw new CryptographicException("Sealed codes are too short");
+        var ephPublic = sealedCodes[..65];
+        var ck = Hkdf(Ecdh(identity, ephPublic), [.. ephPublic, .. identity.Public], $"c2/otpcodes/v1/{spaceId}");
+        return Open(ck, sealedCodes[65..], $"c2/otpcodes/v1/{spaceId}/{myUid}");
+    }
+
     // MARK: Invite codes
 
     /// <summary>The invite id the server sees: hex SHA-256 of the code bytes.</summary>

@@ -107,7 +107,7 @@ public sealed partial class SettingsWindow
         SetBackupStatus("Exporting…", busy: true);
         try
         {
-            var source = Backup.Snapshot(_services.Store);
+            var source = Backup.Snapshot(_services.Store) with { Authenticators = secrets is null ? [] : _services.Authenticators.All };
             await Task.Run(() =>
             {
                 var plaintext = Backup.CreatePlaintext(source, secrets, app: "windows");
@@ -118,7 +118,7 @@ public sealed partial class SettingsWindow
                 File.Move(temp, path, overwrite: true);
             });
             var clips = source.Items.Count(i => i.Kind != ClipKind.Image || i.ImageFile is not null);
-            var what = $"{clips} items, {source.Snippets.Count} snippets" + (secrets is null ? "" : $" and {secrets.Count} secrets");
+            var what = $"{clips} items, {source.Snippets.Count} snippets" + (secrets is null ? "" : $", {secrets.Count} secrets and {source.Authenticators.Count} authenticators");
             SetBackupStatus($"Exported {what} to {Path.GetFileName(path)}.", busy: false);
         }
         catch (Exception ex)
@@ -160,10 +160,10 @@ public sealed partial class SettingsWindow
         try
         {
             var summary = Backup.Summarize(root);
-            var includeSecrets = summary.Secrets > 0 && MessageBox.Show(this,
-                $"This backup contains {summary.Secrets} secrets. Add them to Credential Manager too?", "Import Backup",
+            var includeSecrets = summary.Secrets + summary.Authenticators > 0 && MessageBox.Show(this,
+                summary.Authenticators > 0 ? $"This backup contains {summary.Secrets} secrets and {summary.Authenticators} authenticators. Add them to Credential Manager too?" : $"This backup contains {summary.Secrets} secrets. Add them to Credential Manager too?", "Import Backup",
                 MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes;
-            var result = Backup.Merge(root, _services.Store, includeSecrets ? _services.Secrets : null);
+            var result = Backup.Merge(root, _services.Store, includeSecrets ? _services.Secrets : null, _services.Authenticators);
             _services.RunMaintenance();
             SetBackupStatus(result.Describe(), busy: false);
         }

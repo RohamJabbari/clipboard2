@@ -34,6 +34,12 @@ public abstract record PanelEntry
     public sealed record SecretEntry(SecretRef Secret) : PanelEntry;
     /// <summary>A folder row in Saved, with the number of saved clips in it.</summary>
     public sealed record FolderEntry(ClipFolder Folder, int Count) : PanelEntry;
+    /// <summary>One of this user's authenticators (owner: it has the seed).</summary>
+    public sealed record AuthenticatorEntry(Authenticator Authenticator) : PanelEntry;
+    /// <summary>An authenticator shared with this user: codes only.</summary>
+    public sealed record SharedCodeEntry(SharedAuthenticator Shared) : PanelEntry;
+    /// <summary>The one-off "Add to Authenticator" row at the top of All after an otpauth link was copied.</summary>
+    public sealed record OtpSuggestion(OtpAuthDraft Draft) : PanelEntry;
 
     public string Id => this switch
     {
@@ -41,6 +47,9 @@ public abstract record PanelEntry
         SnippetEntry s => "s-" + s.Snippet.Id,
         SecretEntry k => "k-" + k.Secret.Id,
         FolderEntry f => "f-" + f.Folder.Id,
+        AuthenticatorEntry a => "a-" + a.Authenticator.Id,
+        SharedCodeEntry o => "o-" + o.Shared.SpaceId,
+        OtpSuggestion => "otp-suggestion",
         _ => "",
     };
 
@@ -56,7 +65,7 @@ public abstract record PanelEntry
     };
 }
 
-public enum PanelMode { Browse, Actions, SnippetForm, SaveSecret, Label, EditSecret, AI, FolderName }
+public enum PanelMode { Browse, Actions, SnippetForm, SaveSecret, Label, EditSecret, AI, FolderName, AuthenticatorForm, AuthenticatorSecret, AuthenticatorPeople, ConfirmDelete }
 
 public abstract record PanelAction
 {
@@ -107,6 +116,19 @@ public abstract record PanelAction
     /// <summary>The large preview (Ctrl+Y).</summary>
     public sealed record Preview : PanelAction;
     public sealed record Delete : PanelAction;
+    // Authenticators
+    public sealed record AddAuthenticator : PanelAction;
+    public sealed record PasteCode : PanelAction;
+    public sealed record CopyCode : PanelAction;
+    public sealed record RenameAuthenticator : PanelAction;
+    public sealed record ShareAuthenticator : PanelAction;
+    public sealed record ShareAuthenticatorWith(string Uid, string Name) : PanelAction;
+    public sealed record AuthenticatorPeople : PanelAction;
+    public sealed record TransferAuthenticator : PanelAction;
+    public sealed record TransferAuthenticatorTo(string Uid, string Name) : PanelAction;
+    public sealed record ShowAuthenticatorSecret : PanelAction;
+    public sealed record DeleteAuthenticator : PanelAction;
+    public sealed record LeaveAuthenticator : PanelAction;
 
     public string Section(string aiName) => this switch
     {
@@ -120,6 +142,11 @@ public abstract record PanelAction
         MoveTo m => m.SectionTitle ?? "Move to Folder",
         MoveToNewFolder m => m.SectionTitle ?? "Move to Folder",
         OpenFolder or RenameFolder or DeleteFolder => "Folder",
+        PasteCode or CopyCode => "Paste",
+        ShareAuthenticatorWith => "Share with",
+        TransferAuthenticatorTo => "Transfer to",
+        AddAuthenticator or RenameAuthenticator or ShareAuthenticator or AuthenticatorPeople or TransferAuthenticator
+            or ShowAuthenticatorSecret or DeleteAuthenticator or LeaveAuthenticator => "Authenticator",
         _ => "Item",
     };
 
@@ -154,6 +181,18 @@ public abstract record PanelAction
         SendTo d => $"Send to {d.DeviceName}",
         SendToContact c => $"Send to {c.ContactName}",
         Preview => "Preview",
+        AddAuthenticator => "Add to Authenticator…",
+        PasteCode => "Paste Code",
+        CopyCode => "Copy Code",
+        RenameAuthenticator => "Rename…",
+        ShareAuthenticator => "Share…",
+        ShareAuthenticatorWith s => s.Name,
+        AuthenticatorPeople => "People…",
+        TransferAuthenticator => "Transfer Ownership…",
+        TransferAuthenticatorTo t => t.Name,
+        ShowAuthenticatorSecret => "Show Secret / QR",
+        DeleteAuthenticator => "Delete",
+        LeaveAuthenticator => "Leave",
         _ => "Delete",
     };
 }
@@ -188,6 +227,12 @@ public interface IPanelHost
     string AIProviderTitle { get; }
     bool IsAIReady { get; }
     string AIShortName { get; }
+    /// <summary>Pastes text that must never be recorded (an authenticator code): transient, cleared after 30 s.</summary>
+    void PasteTransient(string text) => PasteText(text);
+    /// <summary>Copies text that must never be recorded (an authenticator code): transient, cleared after 30 s.</summary>
+    void CopyTransient(string text) => CopyText(text);
+    /// <summary>Windows Hello before showing a seed; false when cancelled or unavailable.</summary>
+    Task<bool> VerifyUserAsync(string reason) => Task.FromResult(true);
 }
 
 /// <summary>Secret values live outside the database (Credential Manager); this is the panel's view.</summary>
@@ -268,8 +313,11 @@ public readonly record struct KeyInput(PanelKey Key, KeyMods Mods = KeyMods.None
 
 /// <summary>The quick panel: search, filters, selection (incl. multi-select), quick slots, the
 /// Ctrl+K action menu, snippet/secret/label forms and AI runs. UI-free.</summary>
-public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots slots, ISecretVault secrets, IPanelHost host)
+public sealed partial class PanelModel(ClipStore store, Settings settings, QuickSlots slots, ISecretVault secrets, IPanelHost host)
 {
+    private IPanelHost Host => host;
+    private Settings PanelSettings => settings;
+
     public const int MaxEntries = 300;
 
     public event Action? Changed;
@@ -392,6 +440,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         IsPickingGroup = false;
         IsPickingFolder = false;
         PickingShareFolder = null;
+        ResetAuthenticatorMode();
         Mode = PanelMode.Browse;
         Notify();
     }
@@ -883,19 +932,24 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 : searchingAll || inbox ? [.. secrets.Secrets.Where(s => Listed(s.SpaceId, new PanelEntry.SecretEntry(s)))] : [];
         }
 
+        // Authenticators: personal tools, in the personal Saved (not in folders), and in searches of All.
+        var otps = (saved && SavedSpace is null && OpenFolderId is null) || (!saved && group is null && Filter == PanelFilter.All && q.Length > 0)
+            ? AuthenticatorRows() : [];
         List<PanelEntry> result;
         if (q.Length == 0 && saved)
         {
-            // Folders by name, then clips, secrets and snippets mixed, newest first.
+            // Folders by name, then clips, secrets, snippets and authenticators mixed, newest first.
             List<(PanelEntry Entry, DateTime Date)> kept = [.. clips.Select(c => ((PanelEntry)new PanelEntry.Clip(c), SavedDate(c))),
                 .. secretList.Select(s => ((PanelEntry)new PanelEntry.SecretEntry(s), s.CreatedAt ?? DateTime.MinValue)),
-                .. snippets.Select(s => ((PanelEntry)new PanelEntry.SnippetEntry(s), s.UpdatedAt))];
+                .. snippets.Select(s => ((PanelEntry)new PanelEntry.SnippetEntry(s), s.UpdatedAt)), .. otps];
             result = [.. folderRows, .. kept.OrderByDescending(x => x.Date).Select(x => x.Entry)];
         }
         else if (q.Length == 0)
         {
             result = [.. clips.Select(c => new PanelEntry.Clip(c)), .. snippets.Select(s => new PanelEntry.SnippetEntry(s)),
                       .. secretList.Select(s => new PanelEntry.SecretEntry(s))];
+            // An otpauth link just copied: offered once, at the top of All.
+            if (PendingOtp is { } draft && Filter == PanelFilter.All && group is null) result.Insert(0, new PanelEntry.OtpSuggestion(draft));
         }
         else
         {
@@ -917,6 +971,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             foreach (var secret in secretList)   // names only — values never leave the vault for search
                 if (FuzzyMatcher.Score(q, secret.Name) is { } s)
                     scored.Add((new PanelEntry.SecretEntry(secret), s + 500, secret.CreatedAt ?? DateTime.MinValue));
+            foreach (var (entry, date) in otps)   // issuer and account only
+                if (FuzzyMatcher.Score(q, AuthenticatorSearchText(entry)) is { } s) scored.Add((entry, s + 500, date));
             result = [.. scored.OrderByDescending(x => x.Score).ThenByDescending(x => x.Date).Select(x => x.Entry)];
         }
         Entries = result.Take(MaxEntries).ToList();
@@ -1098,6 +1154,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         _ when IsMultiSelecting => "Nothing to preview",
         PanelEntry.SecretEntry => "Secrets aren't previewed",
         PanelEntry.SnippetEntry => "Snippets aren't previewed",
+        PanelEntry.AuthenticatorEntry or PanelEntry.SharedCodeEntry => "Authenticators aren't previewed",
         _ => "Nothing to preview",
     };
 
@@ -1144,7 +1201,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     /// <summary>The Ctrl+number shown on a row: its slot, or its position if that number is free.</summary>
     public (int Number, bool IsSlot)? ShortcutNumber(PanelEntry entry, int index)
     {
-        if (entry is PanelEntry.FolderEntry) return null;
+        if (entry is PanelEntry.FolderEntry or PanelEntry.AuthenticatorEntry or PanelEntry.SharedCodeEntry or PanelEntry.OtpSuggestion) return null;
         if (slots.SlotFor(entry.SlotTarget) is { } slot) return (slot, true);
         var position = index + 1;
         return position <= 9 && slots.Target(position) is null ? (position, false) : null;
@@ -1172,7 +1229,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     public void AssignSelection(int slot)
     {
-        if (SelectedEntry is not { } entry || entry is PanelEntry.FolderEntry) return;
+        if (SelectedEntry is not { } entry || entry is PanelEntry.FolderEntry or PanelEntry.AuthenticatorEntry or PanelEntry.SharedCodeEntry
+            or PanelEntry.OtpSuggestion) return;
         if (entry is PanelEntry.Clip { Item.IsPinned: false } clip) store.TogglePin(clip.Item);
         slots.Assign(entry.SlotTarget, slot);
         Refresh();
@@ -1214,6 +1272,12 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 break;
             case PanelEntry.FolderEntry f:
                 OpenFolderById(f.Folder.Id);
+                break;
+            case PanelEntry.AuthenticatorEntry or PanelEntry.SharedCodeEntry:
+                _ = PasteCodeAsync(entry);
+                break;
+            case PanelEntry.OtpSuggestion o:
+                BeginAddAuthenticator(o.Draft);
                 break;
         }
     }
@@ -1427,6 +1491,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 return [.. multi, DeleteAction(clips)];
             }
             if (SelectedEntry is not { } entry) return [];
+            if (AuthenticatorActions(entry) is { } otpActions) return otpActions;
             if (entry is PanelEntry.FolderEntry folderEntry)
             {
                 List<PanelAction> folderActions = [new PanelAction.OpenFolder(), new PanelAction.RenameFolder(), new PanelAction.SetLabel()];
@@ -1497,9 +1562,10 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
         get
         {
             var q = ActionQuery.Trim();
-            if (IsPickingGroup || IsPickingFolder || PickingShareFolder is not null)
+            if (IsPickingGroup || IsPickingFolder || PickingShareFolder is not null || OtpPicker is not null)
             {
-                var choices = PickingShareFolder is { } share ? ShareFolderActions(share)
+                var choices = OtpPicker is not null ? OtpPickerActions()
+                    : PickingShareFolder is { } share ? ShareFolderActions(share)
                     : IsPickingFolder ? FolderPickActions() : ShareActions(!IsMultiSelecting && SelectedEntry is { } e ? SpaceOf(e) : null);
                 return q.Length == 0 ? choices
                     : [.. choices.Select(a => (Action: a, Score: FuzzyMatcher.Score(q, a.Title))).Where(x => x.Score is not null)
@@ -1521,6 +1587,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
 
     public void Perform(PanelAction action)
     {
+        if (PerformAuthenticatorAction(action)) return;
         // Folder moves and sharing act on clips and secrets alike, one or several.
         switch (action)
         {
@@ -1933,7 +2000,9 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
     {
         PanelMode.Browse => HandleBrowseKey(key),
         PanelMode.Actions => HandleActionKey(key),
-        PanelMode.SnippetForm or PanelMode.SaveSecret or PanelMode.Label or PanelMode.EditSecret or PanelMode.FolderName => HandleFormKey(key),
+        PanelMode.SnippetForm or PanelMode.SaveSecret or PanelMode.Label or PanelMode.EditSecret or PanelMode.FolderName
+            or PanelMode.AuthenticatorForm => HandleFormKey(key),
+        PanelMode.AuthenticatorSecret or PanelMode.AuthenticatorPeople or PanelMode.ConfirmDelete => HandleAuthenticatorKey(key),
         _ => HandleAIKey(key),
     };
 
@@ -1946,6 +2015,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                 // In a folder, Escape goes back to Saved's root rather than closing.
                 if (IsPreviewing) ClosePreview();
                 else if (PickedFiles.Count > 0) ClearPickedFiles();
+                else if (Entries.Any(e => e is PanelEntry.OtpSuggestion)) DismissOtpSuggestion();
                 else if (OpenFolderId is not null) CloseFolder();
                 else host.ClosePanel();
                 return true;
@@ -1968,7 +2038,8 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             case PanelKey.Delete:
                 // With text in the search box, Delete/Ctrl+Backspace edit the text.
                 if (Query.Length > 0) return false;
-                if (IsMultiSelecting) DeleteSelectedClips(); else DeleteSelection();
+                if (!IsMultiSelecting && SelectedEntry is PanelEntry.AuthenticatorEntry { Authenticator: var doomed }) BeginDeleteAuthenticator(doomed);
+                else if (IsMultiSelecting) DeleteSelectedClips(); else DeleteSelection();
                 return true;
             case PanelKey.Digit when key.Ctrl:
                 if (key.Shift) AssignSelection(key.Digit); else ActivateShortcut(key.Digit);
@@ -1998,7 +2069,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
             case PanelKey.Escape:
                 // Picking a group's folder goes back to the groups; picking a group or a folder, to the actions.
                 if (PickingShareFolder is not null) { PickingShareFolder = null; IsPickingGroup = true; ActionQuery = ""; ActionSelection = 0; Notify(); }
-                else if (IsPickingGroup || IsPickingFolder) { IsPickingGroup = false; IsPickingFolder = false; ActionQuery = ""; ActionSelection = 0; Notify(); }
+                else if (IsPickingGroup || IsPickingFolder || OtpPicker is not null) { IsPickingGroup = false; IsPickingFolder = false; OtpPicker = null; ActionQuery = ""; ActionSelection = 0; Notify(); }
                 else if (IsSelectionMode) host.ClosePanel();
                 else { Mode = PanelMode.Browse; Notify(); }
                 return true;
@@ -2028,6 +2099,7 @@ public sealed class PanelModel(ClipStore store, Settings settings, QuickSlots sl
                     case PanelMode.Label: SubmitLabel(); break;
                     case PanelMode.EditSecret: SubmitEditSecret(); break;
                     case PanelMode.FolderName: SubmitFolderName(); break;
+                    case PanelMode.AuthenticatorForm: SubmitAuthenticatorForm(); break;
                     default: SubmitSnippetForm(); break;
                 }
                 return true;
