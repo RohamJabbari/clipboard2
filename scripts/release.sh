@@ -27,7 +27,11 @@ xcrun stapler validate "$APP" >/dev/null || { echo "The app isn't notarized; ref
 ZIP="dist/$APP_NAME-$VERSION.zip"
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
 
-SIGN_UPDATE=$(ls build/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update build-dev/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update 2>/dev/null | head -1)
+SIGN_UPDATE=""
+for dir in build/SourcePackages/artifacts/sparkle/Sparkle/bin build-dev/SourcePackages/artifacts/sparkle/Sparkle/bin .tools/sparkle-bin; do
+    [[ -x "$dir/sign_update" ]] && { SIGN_UPDATE="$dir/sign_update"; break; }
+done
+[[ -n "$SIGN_UPDATE" ]] || { echo "Sparkle's sign_update isn't there: run 'make build' once."; exit 1; }
 SIGNATURE=$("$SIGN_UPDATE" --account at.softmaze.Clipboard2 "$ZIP")
 URL="https://github.com/$REPO/releases/download/v$VERSION/$APP_NAME-$VERSION.zip"
 python3 scripts/appcast.py appcast.xml "$VERSION" "$BUILD" "$URL" "$SIGNATURE"
