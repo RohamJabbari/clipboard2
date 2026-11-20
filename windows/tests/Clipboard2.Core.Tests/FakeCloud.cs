@@ -695,7 +695,7 @@ internal sealed class FakeCloud : HttpMessageHandler
                 if (UserByUid(uid) is null || !Related(caller.Uid, uid)) throw new HttpError(HttpStatusCode.Forbidden, "forbidden");
                 var until = body!["codesUntil"]!.GetValue<long>();
                 if (until > Clock() + 25L * 3_600_000) throw new HttpError(HttpStatusCode.BadRequest, "invalid");
-                if (B("sealedCodes").Length > 64 * 1024 * 4 / 3 + 4) throw new HttpError(HttpStatusCode.BadRequest, "too_large");
+                if (B("sealedCodes").Length > 128 * 1024 * 4 / 3 + 4) throw new HttpError(HttpStatusCode.BadRequest, "too_large");
                 if (!space.Shares.TryGetValue(uid, out var row))
                 {
                     if (space.Shares.Count >= 20) throw new HttpError(HttpStatusCode.Forbidden, "quota_exceeded");
