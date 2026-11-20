@@ -425,6 +425,22 @@ public sealed class PanelTests : IDisposable
     }
 
     [Fact]
+    public void SaveAsSecretUsesTheLabelAndKeepsTheFolder()
+    {
+        var item = Add("GOCSPX-abc");
+        var folder = _store.CreateFolder("Werkstatt");
+        _store.MoveToFolder([item], folder);
+        _store.SetLabel("Mail sign-in client secret", _store.AllItems().Single());
+        _model.PrepareForOpen(null);
+        _model.BeginSaveSecret(_store.AllItems().Single());
+        Assert.Null(_model.SaveSecretForm);                        // labelled: saved without asking
+        var secret = Assert.Single(_vault.Secrets);
+        Assert.Equal("Mail sign-in client secret", secret.Name);
+        Assert.Equal(folder.Id, _store.SecretFolders()[secret.Id]);
+        Assert.Equal(0, _store.Count());
+    }
+
+    [Fact]
     public void SecretsSearchByNameAndNeverDeleteOnPlainDelete()
     {
         _vault.Add("Prod DB password", "x");

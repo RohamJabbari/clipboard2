@@ -132,6 +132,22 @@ struct SavedMixingTests {
         #expect(model.entries.contains { $0.id == PanelEntry.secret(rootSecret).id })
     }
 
+    @Test func saveAsSecretUsesTheLabelAndKeepsTheFolder() throws {
+        let tag = UUID().uuidString
+        let folder = env.store.createFolder(named: "Werkstatt \(tag)", inSpace: nil)
+        let item = env.store.ingest(.text("GOCSPX-\(tag)"))
+        env.store.move([item], to: folder)
+        env.store.setLabel("Client secret \(tag)", for: item)
+        defer { if env.store.folder(withID: folder.id) != nil { env.store.deleteFolder(folder) } }
+
+        model.beginSaveSecret(item)
+        #expect(model.saveSecretForm == nil)                       // labelled: saved without asking
+        let ref = try #require(env.secrets.secrets.first { $0.name == "Client secret \(tag)" })
+        defer { env.secrets.delete(ref) }
+        #expect(ref.folderID == folder.id)
+        #expect(env.store.item(withID: item.id) == nil)
+    }
+
     @Test func secretsMoveIntoFoldersAndOutAndADeletedFolderReleasesThem() throws {
         let tag = UUID().uuidString
         let folder = env.store.createFolder(named: "Keys \(tag)", inSpace: nil)

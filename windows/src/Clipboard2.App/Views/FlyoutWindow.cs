@@ -193,10 +193,14 @@ public sealed class FlyoutWindow : Window
         {
             menu.Items.Add(Item("Save as Secret…", () =>
             {
-                var suggested = item.SourceName is { } app ? $"Password from {app}" : "New Secret";
-                if (InputDialog.Ask("Save as Secret", "Moves it to Credential Manager and out of history.", suggested, okTitle: "Save") is { Length: > 0 } name
-                    && _services.Secrets.Add(name.Trim(), item.Text) is not null)
+                var suggested = SaveSecretForm.SuggestedName(item);
+                // Labelled already: that's its name, so there's nothing to ask.
+                var name = item.Label?.Trim() is { Length: > 0 } label ? label
+                    : InputDialog.Ask("Save as Secret", "Moves it to Credential Manager and out of history.", suggested, okTitle: "Save");
+                if (name is { Length: > 0 }
+                    && _services.Secrets.Add(name.Trim(), item.Text) is { } secret)
                 {
+                    if (item.SpaceId is null && item.FolderId is { } folderId) _services.Store.SetSecretFolder(secret.Id, folderId);
                     _services.Slots.Remove(SlotTarget.ForClip(item.Id));
                     _services.Store.Delete(item);
                 }

@@ -212,7 +212,7 @@ struct MenuBarContentView: View {
                 if item.kind.isTextual {
                     Button("Save as Secret…") {
                         confirmClear = false
-                        secretName = item.sourceAppName.map { "Password from \($0)" } ?? "New Secret"
+                        secretName = SaveSecretState.suggestedName(for: item)
                         savingSecret = item
                     }
                 }
