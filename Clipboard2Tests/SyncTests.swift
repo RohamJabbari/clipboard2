@@ -681,6 +681,10 @@ actor FakeSyncServer {
         spaces[space]?.members[uid] = nil
     }
 
+    func rename(space: String, encryptedName: Data) {
+        spaces[space]?.encryptedName = encryptedName
+    }
+
     // MARK: Contacts
 
     struct PendingContact {
@@ -1060,7 +1064,7 @@ nonisolated struct FakeClient: SyncService {
         await server.createSpace(id: id, kind: "group", owner: uid, wrappedKey: wrappedKey, encryptedName: encryptedName)
         return try #require(await server.spaces(for: uid).first { $0.id == id })
     }
-    func renameGroup(id: String, encryptedName: Data) async throws {}
+    func renameGroup(id: String, encryptedName: Data) async throws { await server.rename(space: id, encryptedName: encryptedName) }
     func deleteGroup(id: String) async throws {}
     func members(groupId: String) async throws -> [RemoteMember] { [] }
     func removeMember(groupId: String, uid: String) async throws { await server.removeMember(space: groupId, uid: uid) }

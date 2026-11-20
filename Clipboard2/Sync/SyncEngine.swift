@@ -59,13 +59,13 @@ final class SyncEngine {
     /// and every 150 ms while any is running.
     var onDownloadsChanged: (([IncomingDownload]) -> Void)?
     private(set) var downloads: [IncomingDownload] = []
-    /// New items a contact sent, after each pull of their space that brought some.
-    var onContactArrivals: (([ContactArrival]) -> Void)?
+    /// New items someone else put in a group or a contact's space, after each pull that brought some.
+    var onArrivals: (([SyncArrival]) -> Void)?
     /// Off while a fresh sign-in downloads what's already there, so that isn't announced as new.
     var announcesArrivals = true
-    /// The space being pulled whose new items count as arrivals (a contact's, not resyncing).
+    /// The space being pulled whose new items count as arrivals (a group's or a contact's, not resyncing).
     private var announcingSpace: String?
-    private var arrivals: [ContactArrival] = []
+    private var arrivals: [SyncArrival] = []
     private var activeDownloads: [UUID: ActiveDownload] = [:]
     private var downloadsTicker: Task<Void, Never>?
 
@@ -410,7 +410,7 @@ final class SyncEngine {
         let spaceId = space.id
         var received = false
         commitsDeferred += 1
-        announcingSpace = announcesArrivals && space.isDirect && !space.resyncing ? spaceId : nil
+        announcingSpace = announcesArrivals && (space.isDirect || space.isGroup) && !space.resyncing ? spaceId : nil
         defer {
             commitsDeferred -= 1
             announcingSpace = nil
@@ -915,16 +915,20 @@ final class SyncEngine {
                    seq: remote.seq, updatedAt: remote.updatedAt, blobIds: blobIds, fileBlobs: fileBlobs,
                    localStamp: dirty ? "" : Self.stamp(item), authorUid: remote.authorUid)
         if forThisDevice { onSentToThisDevice?(uuid, payload.fromDevice) }
-        if existing == nil, announcingSpace == spaceId, let author = remote.authorUid, author != identity.uid {
-            arrivals.append(ContactArrival(itemID: uuid, spaceId: spaceId))
-        }
+        if existing == nil { noteArrival(remote, spaceId: spaceId, category: payload.category) }
+    }
+
+    /// A new item from someone else in the space being announced.
+    private func noteArrival(_ remote: RemoteItem, spaceId: String, category: SyncCategory) {
+        guard announcingSpace == spaceId, let author = remote.authorUid, author != identity.uid else { return }
+        arrivals.append(SyncArrival(itemID: remote.id, spaceId: spaceId, authorUid: author, category: category))
     }
 
     private func announceArrivals() {
         guard !arrivals.isEmpty else { return }
         let batch = arrivals
         arrivals = []
-        if !isStopped { onContactArrivals?(batch) }
+        if !isStopped { onArrivals?(batch) }
     }
 
     nonisolated struct ReceivedFile: Sendable {
@@ -1043,6 +1047,7 @@ final class SyncEngine {
         }
         recordMeta(id: remote.id, spaceId: spaceId, category: .snippet, fingerprint: snippetFingerprint(snippet),
                    seq: remote.seq, updatedAt: remote.updatedAt, authorUid: remote.authorUid)
+        if existing == nil { noteArrival(remote, spaceId: spaceId, category: .snippet) }
     }
 
     /// Like a snippet. Clips that point at a folder before it arrives show at the root until now.
@@ -1092,6 +1097,7 @@ final class SyncEngine {
         recordMeta(id: remote.id, spaceId: spaceId, category: .secret, fingerprint: ref.flatMap(secretFingerprint) ?? "",
                    seq: remote.seq, updatedAt: remote.updatedAt, localStamp: ref.flatMap(Self.secretStamp) ?? "",
                    authorUid: remote.authorUid)
+        if existing == nil { noteArrival(remote, spaceId: spaceId, category: .secret) }
     }
 
     // MARK: Parallel image downloads
@@ -1876,10 +1882,13 @@ final class SyncEngine {
     }
 }
 
-/// A new item a contact sent (it's in the store, in their direct space).
-nonisolated struct ContactArrival: Sendable, Equatable {
-    var itemID: UUID
+/// A new item someone else put in a group or sent as a contact (it's stored here by now).
+nonisolated struct SyncArrival: Sendable, Equatable {
+    /// The server's item id (lowercase).
+    var itemID: String
     var spaceId: String
+    var authorUid: String
+    var category: SyncCategory
 }
 
 /// A synced clip whose image or files are still downloading ("Receiving report.pdf, 12 of 80 MB").

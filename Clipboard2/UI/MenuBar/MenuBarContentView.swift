@@ -110,7 +110,7 @@ struct MenuBarContentView: View {
             if env.sync.isSignedIn && !env.sync.contactRequests.incoming.isEmpty {
                 ContactRequestsRow(requests: env.sync.contactRequests.incoming) {
                     dismiss()
-                    SettingsOpener.open(tab: .sync)
+                    env.open(.people(requestSpaceId: env.sync.contactRequests.incoming.first?.spaceId))
                 }
                 Divider()
             }

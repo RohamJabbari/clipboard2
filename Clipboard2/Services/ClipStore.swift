@@ -27,6 +27,16 @@ final class ClipStore {
         return (try? context.fetch(descriptor)) ?? []
     }
 
+    /// When the newest item of a space was copied or arrived.
+    func newestDate(inSpace spaceID: String?) -> Date? {
+        var descriptor = FetchDescriptor<ClipItem>(
+            predicate: #Predicate { $0.spaceID == spaceID },
+            sortBy: [SortDescriptor(\.lastCopiedAt, order: .reverse)]
+        )
+        descriptor.fetchLimit = 1
+        return (try? context.fetch(descriptor))?.first?.lastCopiedAt
+    }
+
     /// Items of one space (nil = personal), newest first.
     func items(inSpace spaceID: String?) -> [ClipItem] {
         let descriptor = FetchDescriptor<ClipItem>(

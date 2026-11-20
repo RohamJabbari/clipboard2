@@ -34,6 +34,8 @@ final class AppEnvironment {
     let slots: QuickSlots
     let authenticators: AuthenticatorStore
     let sync: SyncAccount
+    /// System notifications for what syncs bring (docs/features/notifications-contacts.md).
+    let notifications: NotificationHub
     let claudeAccount = SubscriptionAccount(cli: .claude)
     let chatGPTAccount = SubscriptionAccount(cli: .codex)
     let updates = UpdateController()
@@ -78,6 +80,8 @@ final class AppEnvironment {
         authenticators = AuthenticatorStore(backing: Self.isRunningTests ? MemoryAuthenticatorBacking() : KeychainAuthenticatorBacking())
         sync = SyncAccount(prefs: prefs, context: container.mainContext, store: store, snippets: snippets, secrets: secrets,
                            authenticators: authenticators)
+        notifications = NotificationHub(prefs: prefs)
+        sync.notifications = notifications
     }
 
     /// Every persisted model (the newest store version); tests build in-memory containers from it.
@@ -148,9 +152,13 @@ final class AppEnvironment {
         clearOldSendToGroupDefault()
         sync.onSessionChange = { [weak self] active in self?.setSendToGroupShortcut(active: active) }
         sync.onItemSentHere = { device in HUD.show("Sent from \(device)", symbol: "arrow.down.circle.fill") }
-        // Contacts: a quiet notice, never a dialog. The Inbox and Settings → Sync hold the rest.
-        sync.onContactArrivals = { text in HUD.show(text, symbol: "tray.and.arrow.down.fill", duration: .seconds(3)) }
-        sync.onContactRequest = { text in HUD.show(text, symbol: "person.crop.circle.badge.plus", duration: .seconds(3)) }
+        // System notifications; the HUD bubbles for contacts only when they're off or not allowed.
+        notifications.poster = SystemNotifier { [weak self] target in self?.open(target) }
+        notifications.showing = { [weak self] in
+            guard let self, self.panel.isVisible else { return nil }
+            return self.panel.model.arrivalPlaceShown
+        }
+        Task { await notifications.refreshPermission() }
         applyAppearance()
         if let storeOpenError {
             // On the stand-in store: no capture, no sync, no sweeps (they'd delete every file).
@@ -718,6 +726,11 @@ final class AppEnvironment {
 
     func showQuickPanel() {
         panel.show()
+    }
+
+    /// A notification was clicked: the panel, at what it was about.
+    func open(_ target: NotificationTarget) {
+        panel.show { [weak self] in self?.panel.model.reveal(target) }
     }
 
     func handle(url: URL) {
