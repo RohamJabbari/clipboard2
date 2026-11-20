@@ -145,11 +145,9 @@ final class Preferences {
     var panelSize: PanelSize { didSet { defaults.set(panelSize.rawValue, forKey: Key.panelSize) } }
     var panelOrigin: PanelOrigin { didSet { defaults.set(panelOrigin.rawValue, forKey: Key.panelOrigin) } }
     /// The icon beside text selected in other apps.
-    var selectionIcon: Bool { didSet { defaults.set(selectionIcon, forKey: Key.selectionIcon) } }
     /// The paste icon in the corner of the focused text field in other apps.
     var pasteIcon: Bool { didSet { defaults.set(pasteIcon, forKey: Key.pasteIcon) } }
     /// Apps where each icon stays away ("Don't Show in …"); hiding one leaves the other.
-    var selectionIconHiddenApps: [AppRef] { didSet { store(selectionIconHiddenApps, Key.selectionIconHiddenApps) } }
     var pasteIconHiddenApps: [AppRef] { didSet { store(pasteIconHiddenApps, Key.pasteIconHiddenApps) } }
     var ignoredApps: [AppRef] { didSet { store(ignoredApps, Key.ignoredApps) } }
     var appTransforms: [AppTransformRule] { didSet { store(appTransforms, Key.appTransforms) } }
@@ -240,7 +238,6 @@ final class Preferences {
             Key.contextMenuEnabled: true,
             Key.contextMenuModifier: ContextMenuModifier.command.rawValue,
             Key.confirmGroupSends: true,
-            Key.selectionIcon: true,
             Key.pasteIcon: true,
             Key.blockSensitiveGroupSends: true,
             Key.notificationsEnabled: true,
@@ -258,9 +255,7 @@ final class Preferences {
         appearance = AppearanceMode(rawValue: defaults.string(forKey: Key.appearance) ?? "") ?? .system
         panelSize = PanelSize(rawValue: defaults.string(forKey: Key.panelSize) ?? "") ?? .regular
         panelOrigin = PanelOrigin(rawValue: defaults.string(forKey: Key.panelOrigin) ?? "") ?? .top
-        selectionIcon = defaults.bool(forKey: Key.selectionIcon)
         pasteIcon = defaults.bool(forKey: Key.pasteIcon)
-        selectionIconHiddenApps = Self.load([AppRef].self, defaults, Key.selectionIconHiddenApps) ?? []
         pasteIconHiddenApps = Self.load([AppRef].self, defaults, Key.pasteIconHiddenApps) ?? []
         ignoredApps = Self.load([AppRef].self, defaults, Key.ignoredApps) ?? AppRef.defaultIgnored
         appTransforms = Self.load([AppTransformRule].self, defaults, Key.appTransforms) ?? []

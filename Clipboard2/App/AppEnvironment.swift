@@ -48,7 +48,6 @@ final class AppEnvironment {
     @ObservationIgnored private lazy var serviceProvider = ServiceProvider(env: self)
     @ObservationIgnored private(set) lazy var contextMenu = ContextMenuController(env: self)
     @ObservationIgnored private(set) lazy var textFieldWatcher = TextFieldWatcher()
-    @ObservationIgnored private(set) lazy var selectionIcon = SelectionIconController(env: self)
     @ObservationIgnored private(set) lazy var pasteIcon = PasteIconController(env: self)
     @ObservationIgnored private var maintenanceRuns = 0
     /// On-device text recognition for image items (search finds screenshots by their words).
@@ -288,28 +287,18 @@ final class AppEnvironment {
 
     /// Watches other apps' text fields while an icon that needs it is on and Accessibility is allowed.
     func updateTextFieldIcons() {
-        guard prefs.selectionIcon || prefs.pasteIcon, AXPermission.isTrusted else {
+        guard prefs.pasteIcon, AXPermission.isTrusted else {
             textFieldWatcher.stop()
-            selectionIcon.hideAll()
             pasteIcon.hide()
             return
         }
-        textFieldWatcher.onChange = { [weak self] selection, field in self?.textFieldChanged(selection, field) }
+        textFieldWatcher.onChange = { [weak self] field in self?.textFieldChanged(field) }
         textFieldWatcher.start()
     }
 
-    /// Selected text gets the action icon; a focused field with nothing selected gets the paste icon.
-    private func textFieldChanged(_ selection: TextFieldWatcher.Selection?, _ field: TextFieldWatcher.Field?) {
-        let shownSelection = selection.flatMap { selection in
-            prefs.selectionIcon && !isTextIconHidden(in: selection.app, hiddenApps: prefs.selectionIconHiddenApps)
-                ? selection : nil
-        }
-        selectionIcon.update(shownSelection)
-        let shownField = field.flatMap { field in
-            prefs.pasteIcon && shownSelection == nil && !isTextIconHidden(in: field.app, hiddenApps: prefs.pasteIconHiddenApps)
-                ? field : nil
-        }
-        pasteIcon.update(shownField)
+    /// A focused field gets the paste icon.
+    private func textFieldChanged(_ field: TextFieldWatcher.Field?) {
+        pasteIcon.update(field.flatMap { isTextIconHidden(in: $0.app, hiddenApps: prefs.pasteIconHiddenApps) ? nil : $0 })
     }
 
     /// Never while the quick panel is open, in apps the user hid that icon in, or in apps whose

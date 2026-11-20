@@ -144,25 +144,16 @@ struct GeneralSettingsView: View {
     }
 }
 
-/// The icon beside selected text in other apps, and where it stays away.
+/// The paste icon in other apps' text fields, and where it stays away.
 private struct TextFieldIconsSection: View {
     @Environment(AppEnvironment.self) private var env
 
     var body: some View {
         @Bindable var prefs = env.prefs
         Section {
-            Toggle(isOn: $prefs.selectionIcon) {
-                Text("Icon next to selected text")
-                Text("Click it to fix, translate or summarize the selection without leaving the app.")
-            }
             Toggle(isOn: $prefs.pasteIcon) {
                 Text("Paste icon in text fields")
                 Text("Hover it to see your newest copies and paste one where you're typing.")
-            }
-            ForEach(prefs.selectionIconHiddenApps, id: \.bundleID) { app in
-                hiddenRow(app, "Selection icon hidden in \(app.name)") {
-                    prefs.selectionIconHiddenApps.removeAll { $0.bundleID == app.bundleID }
-                }
             }
             ForEach(prefs.pasteIconHiddenApps, id: \.bundleID) { app in
                 hiddenRow(app, "Paste icon hidden in \(app.name)") {
@@ -174,7 +165,6 @@ private struct TextFieldIconsSection: View {
         } footer: {
             Hint("Never in password fields, or in the apps under History → Never record from these apps. Needs Accessibility.")
         }
-        .onChange(of: prefs.selectionIcon) { env.updateTextFieldIcons() }
         .onChange(of: prefs.pasteIcon) { env.updateTextFieldIcons() }
     }
 

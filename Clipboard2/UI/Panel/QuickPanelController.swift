@@ -221,7 +221,6 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         let t0 = CACurrentMediaTime()
         let interval = Self.signposter.beginInterval("PanelOpen")
         // The panel takes over from the icons in other apps' text fields.
-        env.selectionIcon.hideAll()
         env.pasteIcon.hide()
         let panel = self.panel ?? makePanel()
         self.panel = panel
