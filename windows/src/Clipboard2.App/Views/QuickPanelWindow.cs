@@ -268,13 +268,14 @@ public sealed partial class QuickPanelWindow : Window
     private void BeginRowDrag(Border row, PanelEntry entry, MouseEventArgs e)
     {
         if (e.LeftButton != MouseButtonState.Pressed || _dragEntry != entry) return;
-        if (entry is not (PanelEntry.Clip or PanelEntry.SecretEntry) || entry.ClipItem is { } selection && selection == Model.SelectionItem) return;
+        if (entry is not (PanelEntry.Clip or PanelEntry.SecretEntry or PanelEntry.FolderEntry) || entry.ClipItem is { } selection && selection == Model.SelectionItem) return;
+        if (entry is PanelEntry.FolderEntry f && !Model.CanChangeFolder(f.Folder)) return;
         var delta = e.GetPosition(this) - _dragStart;
         if (Math.Abs(delta.X) < SystemParameters.MinimumHorizontalDragDistance && Math.Abs(delta.Y) < SystemParameters.MinimumVerticalDragDistance) return;
         _dragEntry = null;
         var data = new DataObject();
         data.SetData(EntryFormat, entry.Id);
-        // A secret drags only within the panel (onto a folder or a group): its value never goes on the drag.
+        // A secret (or a folder) drags only within the panel (onto a folder or a group): a secret's value never goes on the drag.
         if (entry.ClipItem is not { } item)
         {
             DragDrop.DoDragDrop(row, data, DragDropEffects.Copy);
@@ -379,9 +380,11 @@ public sealed partial class QuickPanelWindow : Window
     private void MakeFolderDropTarget(Border target, Guid? folderId)
     {
         target.AllowDrop = true;
+        // A folder never goes into itself or below itself: such a target doesn't light up and refuses the drop.
+        bool Valid(DragEventArgs e) => e.Data.GetData(EntryFormat) is string id && Model.CanDrop(id, folderId);
         target.DragEnter += (_, e) =>
         {
-            if (!e.Data.GetDataPresent(EntryFormat)) return;
+            if (!Valid(e)) return;
             target.BorderBrush = Fluent.Accent;
             target.BorderThickness = new Thickness(2);
         };
@@ -389,14 +392,14 @@ public sealed partial class QuickPanelWindow : Window
         target.DragOver += (_, e) =>
         {
             // Copy: the only effect rows offer (Move would let Explorer move a file clip's real files).
-            e.Effects = e.Data.GetDataPresent(EntryFormat) ? DragDropEffects.Copy : DragDropEffects.None;
+            e.Effects = Valid(e) ? DragDropEffects.Copy : DragDropEffects.None;
             e.Handled = true;
         };
         target.Drop += (_, e) =>
         {
             e.Handled = true;
             target.BorderThickness = new Thickness(0);
-            if (e.Data.GetData(EntryFormat) is string id) Model.DropOnFolder(id, folderId);
+            if (e.Data.GetData(EntryFormat) is string id && Model.CanDrop(id, folderId)) Model.DropOnFolder(id, folderId);
         };
     }
 
@@ -445,16 +448,35 @@ public sealed partial class QuickPanelWindow : Window
         crumbs.Children.Add(root);
         if (open is not null)
         {
-            // Back to the root; clips dragged here move out of the folder.
+            // The full path; every segment but the last goes there, and every segment takes drops.
             root.Cursor = Cursors.Hand;
-            root.ToolTip = "Back to Saved. Drop items here to take them out of the folder.";
-            root.MouseLeftButtonUp += (_, _) => Model.CloseFolder();
+            root.ToolTip = "Back to Saved. Drop items here to move them to the top level.";
+            root.MouseLeftButtonUp += (_, _) => Model.GoToFolder(null);
             AutomationName(root, "Back to Saved");
             MakeFolderDropTarget(root, null);
-            var chevron = Glyphs.Icon(Glyphs.ChevronRight, 10, Fluent.Secondary);
-            chevron.Margin = new Thickness(4, 0, 4, 0);
-            crumbs.Children.Add(chevron);
-            crumbs.Children.Add(Fluent.Label(open.Name, 13, null, FontWeights.SemiBold));
+            var path = Model.OpenFolderPath;
+            foreach (var segment in path)
+            {
+                var chevron = Glyphs.Icon(Glyphs.ChevronRight, 10, Fluent.Secondary);
+                chevron.Margin = new Thickness(4, 0, 4, 0);
+                crumbs.Children.Add(chevron);
+                var last = segment.Id == open.Id;
+                var crumb = new Border
+                {
+                    Child = Fluent.Label(segment.Name, 13, last ? null : Fluent.Accent, FontWeights.SemiBold),
+                    Padding = new Thickness(4, 1, 4, 1), CornerRadius = new CornerRadius(4), Background = Brushes.Transparent,
+                };
+                var id = segment.Id;
+                if (!last)
+                {
+                    crumb.Cursor = Cursors.Hand;
+                    crumb.ToolTip = $"Go to “{segment.Name}”. Drop items here to move them into it.";
+                    crumb.MouseLeftButtonUp += (_, _) => Model.GoToFolder(id);
+                    AutomationName(crumb, $"Go to {segment.Name}");
+                }
+                MakeFolderDropTarget(crumb, id);
+                crumbs.Children.Add(crumb);
+            }
             if (open.Label is { } label) crumbs.Children.Add(LabelPill(label, false));
         }
         bar.Children.Add(crumbs);
@@ -885,12 +907,17 @@ public sealed partial class QuickPanelWindow : Window
         PanelEntry.Clip c => (c.Item.DisplayTitle, string.Join(" · ", new[] { c.Item.SourceName, Fluent.Relative(c.Item.LastCopiedAt) }.Where(s => !string.IsNullOrEmpty(s)))),
         PanelEntry.SnippetEntry s => (s.Snippet.Name.Length == 0 ? "Untitled Snippet" : s.Snippet.Name, s.Snippet.Keyword.Length == 0 ? "Snippet" : $"Snippet · {s.Snippet.Keyword}"),
         PanelEntry.SecretEntry k => (k.Secret.Name, "••••••••"),
-        PanelEntry.FolderEntry f => (f.Folder.Name, ItemCount(f.Count)),
+        PanelEntry.FolderEntry f => (f.Folder.Name, FolderCount(f.Folders, f.Count)),
         PanelEntry.OtpSuggestion o => ("Add to Authenticator", string.Join(" · ", new[] { o.Draft.Issuer, o.Draft.Account }.Where(s => s.Length > 0))),
         _ => ("", ""),
     };
 
     private static string ItemCount(int count) => count == 1 ? "1 item" : $"{count} items";
+
+    /// <summary>"3 folders · 12 items", leaving out a zero part.</summary>
+    private static string FolderCount(int folders, int items) =>
+        folders == 0 ? ItemCount(items)
+        : (folders == 1 ? "1 folder" : $"{folders} folders") + (items == 0 ? "" : " · " + ItemCount(items));
 
     private void FillContextMenu(ContextMenu menu, PanelEntry entry)
     {
@@ -908,6 +935,10 @@ public sealed partial class QuickPanelWindow : Window
             menu.Items.Add(Item("Open", () => Model.Activate(entry)));
             menu.Items.Add(Item("Rename…", () => Model.BeginRenameFolder(f.Folder)));
             menu.Items.Add(Item(f.Folder.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
+            menu.Items.Add(Item("New Folder Inside…", () => Model.NewFolderInside(f.Folder)));
+            if (Model.FolderMenuSections([entry]).Count > 0) menu.Items.Add(MoveToFolderMenu(entry, Focus));
+            if (Model.ParentFolder(f.Folder) is not null && Model.CanChangeFolder(f.Folder))
+                menu.Items.Add(Item("Move to Top Level", () => Model.MoveFolder(f.Folder, null)));
             if (f.Folder.SpaceId is null && ShareMenu(entry, Focus) is { } shareFolder) menu.Items.Add(shareFolder);
             menu.Items.Add(new Separator());
             menu.Items.Add(Item("Delete Folder", () => Model.DeleteFolder(f.Folder)));
@@ -949,7 +980,7 @@ public sealed partial class QuickPanelWindow : Window
         {
             menu.Items.Add(new Separator());
             if (Model.CanUseFolders(entry)) menu.Items.Add(MoveToFolderMenu(entry, Focus));
-            if (Model.FolderOf(entry) is not null) menu.Items.Add(Item("Remove from Folder", () => { Focus(); Model.Perform(new PanelAction.RemoveFromFolder()); }));
+            if (Model.FolderOf(entry) is not null) menu.Items.Add(Item("Move to Top Level", () => { Focus(); Model.Perform(new PanelAction.RemoveFromFolder()); }));
         }
         if (entry.ClipItem is { } item)
         {
@@ -974,7 +1005,7 @@ public sealed partial class QuickPanelWindow : Window
                 if (!item.IsPinned) menu.Items.Add(Item(Model.CanChange(item) ? "Add to Saved" : "Save a Copy", () => Model.AddToSaved(Targets())));
                 if (item.IsPinned && item.Label is null) menu.Items.Add(Item("Remove from Saved", () => Model.RemoveFromSaved(Targets())));
                 if (Model.CanUseFolders(item)) menu.Items.Add(MoveToFolderMenu(entry, Focus));
-                if (Model.FolderOf(item) is not null) menu.Items.Add(Item("Remove from Folder", () => { Focus(); Model.Perform(new PanelAction.RemoveFromFolder()); }));
+                if (Model.FolderOf(item) is not null) menu.Items.Add(Item("Move to Top Level", () => { Focus(); Model.Perform(new PanelAction.RemoveFromFolder()); }));
                 menu.Items.Add(Item($"Save to {Model.SaveFolderName}", () => Model.Save(Targets(), _services.SaveFolder)));
                 menu.Items.Add(Item("Save to…", () => { if (_services.ChooseSaveFolder() is { } folder) Model.Save(Targets(), folder); }));
             }
@@ -989,31 +1020,56 @@ public sealed partial class QuickPanelWindow : Window
     /// personal copies.</summary>
     private MenuItem MoveToFolderMenu(PanelEntry entry, Action focus)
     {
+        // A tree: a folder with subfolders is a submenu whose first entry is the folder itself; New Folder… comes last
+        // at each level. Moving a folder leaves out itself and everything below it.
         var menu = new MenuItem { Header = "Move to Folder" };
         var targets = Model.IsMultiSelecting && Model.IsSelected(entry) ? Model.FolderTargets : [entry];
-        string? section = null;
-        foreach (var choice in Model.FolderChoices(targets))
+        var moving = targets is [PanelEntry.FolderEntry f] ? f.Folder : null;
+        var current = targets.Select(t => Model.FolderOf(t)?.Id).Distinct().ToList() is [{ } only] ? only : (Guid?)null;
+        MenuItem Row(string header, string glyph, PanelAction action)
         {
-            var title = choice switch { PanelAction.MoveTo m => m.SectionTitle, PanelAction.MoveToNewFolder n => n.SectionTitle, _ => null };
-            if (title is not null && title != section)
-            {
-                if (section is not null) menu.Items.Add(new Separator());
-                section = title;
-                menu.Items.Add(new MenuItem { Header = title, IsEnabled = false, FontWeight = FontWeights.SemiBold });
-            }
-            else if (choice is PanelAction.MoveToNewFolder && title is null && menu.Items.Count > 0) menu.Items.Add(new Separator());
-            var action = choice;
-            var row = new MenuItem
-            {
-                Header = choice.Title,
-                Icon = Glyphs.Icon(choice is PanelAction.MoveToNewFolder ? Glyphs.NewFolder : Glyphs.Folder, 14),
-            };
+            var row = new MenuItem { Header = header, Icon = Glyphs.Icon(glyph, 14) };
             row.Click += (_, _) =>
             {
                 focus();
                 Model.Perform(action);
             };
-            menu.Items.Add(row);
+            return row;
+        }
+        void Level(ItemsControl into, Guid? parent, string? space, string? section, bool mine)
+        {
+            foreach (var folder in Model.FolderChildren(parent, space))
+            {
+                if (moving is not null && folder.Id == moving.Id) continue;
+                var children = Model.FolderChildren(folder.Id, space).Where(c => moving is null || c.Id != moving.Id).ToList();
+                var usable = moving is null ? folder.Id != current : Model.CanMoveFolder(moving, folder);
+                var move = new PanelAction.MoveTo(folder.Id, folder.Name, section);
+                if (children.Count == 0)
+                {
+                    var row = Row(folder.Name, Glyphs.Folder, move);
+                    row.IsEnabled = usable;
+                    into.Items.Add(row);
+                    continue;
+                }
+                var sub = new MenuItem { Header = folder.Name, Icon = Glyphs.Icon(Glyphs.Folder, 14) };
+                var self = Row(folder.Name, Glyphs.Folder, move);
+                self.IsEnabled = usable;
+                sub.Items.Add(self);
+                sub.Items.Add(new Separator());
+                Level(sub, folder.Id, space, section, mine);
+                into.Items.Add(sub);
+            }
+            if (into.Items.Count > 0 && into.Items[^1] is not Separator) into.Items.Add(new Separator());
+            into.Items.Add(Row("New Folder…", Glyphs.NewFolder, new PanelAction.MoveToNewFolder(mine, section, parent)));
+        }
+        foreach (var (title, space, mine) in Model.FolderMenuSections(targets))
+        {
+            if (title is not null)
+            {
+                if (menu.Items.Count > 0) menu.Items.Add(new Separator());
+                menu.Items.Add(new MenuItem { Header = title, IsEnabled = false, FontWeight = FontWeights.SemiBold });
+            }
+            Level(menu, null, space, title, mine);
         }
         return menu;
     }
@@ -1034,7 +1090,7 @@ public sealed partial class QuickPanelWindow : Window
         foreach (var (id, name) in groups)
         {
             var item = new MenuItem { Header = name };
-            var folders = entry is PanelEntry.Clip or PanelEntry.SecretEntry ? Model.FoldersIn(id) : [];
+            var folders = entry is PanelEntry.Clip or PanelEntry.SecretEntry or PanelEntry.FolderEntry ? Model.FoldersIn(id) : [];
             if (folders.Count == 0)
             {
                 item.Click += (_, _) => { focus(); Model.ShareSelection(id, name, null); };
@@ -1047,7 +1103,7 @@ public sealed partial class QuickPanelWindow : Window
                 item.Items.Add(new Separator());
                 foreach (var folder in folders)
                 {
-                    var into = new MenuItem { Header = folder.Name, Icon = Glyphs.Icon(Glyphs.Folder, 14) };
+                    var into = new MenuItem { Header = Model.FolderPathText(folder.Id), Icon = Glyphs.Icon(Glyphs.Folder, 14) };
                     var folderId = folder.Id;
                     into.Click += (_, _) => { focus(); Model.ShareSelection(id, name, folderId); };
                     item.Items.Add(into);

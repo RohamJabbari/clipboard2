@@ -97,6 +97,7 @@ public static partial class SyncPayload
         if (folder.Label is { } label) json["label"] = label;
         json["createdAt"] = Millis(folder.CreatedAt);
         json["updatedAt"] = Millis(folder.UpdatedAt);
+        if (folder.ParentId is { } parent) json["parent"] = ClipStore.SyncId(parent);   // 1.8; left out at the top level
         return json;
     }
 
@@ -251,6 +252,7 @@ public static partial class SyncPayload
                     Label = Str(json, "label") is { Length: > 0 } label ? label : null,
                     CreatedAt = Time(json, "createdAt") ?? DateTime.UtcNow,
                     UpdatedAt = Time(json, "updatedAt") ?? Time(json, "createdAt") ?? DateTime.UtcNow,
+                    ParentId = Guid.TryParse(Str(json, "parent"), out var parentFolder) && parentFolder != id ? parentFolder : null,
                 });
             case "secret":
                 return new ItemPayload.Secret(Str(json, "name") ?? "Untitled", Str(json, "value") ?? "", Time(json, "createdAt"),

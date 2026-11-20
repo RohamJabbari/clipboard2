@@ -172,7 +172,7 @@ public sealed class SavedV2Tests : IDisposable
 
         // Deleting the folder moves both to the root.
         _model.DeleteFolder(folder);
-        Assert.Equal("Folder deleted · 2 items moved to Saved", _model.Notice);
+        Assert.Equal("Folder deleted · moved 2 items to Saved", _model.Notice);
         Assert.Null(_store.SecretFolderId(secret.Id));
         Assert.Equal(["note", "secret api key"], Titles().OrderBy(t => t).ToList());
     }

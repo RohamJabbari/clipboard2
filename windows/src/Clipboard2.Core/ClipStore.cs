@@ -74,7 +74,7 @@ public sealed class ClipStore : IDisposable
     }
 
     /// <summary>Schema version stored in <c>PRAGMA user_version</c>. v0 is the original, unversioned schema.</summary>
-    public const int SchemaVersion = 6;
+    public const int SchemaVersion = 7;
 
     public int UserVersion => Convert.ToInt32(Scalar("PRAGMA user_version"));
 
@@ -145,6 +145,11 @@ public sealed class ClipStore : IDisposable
                 // v6: secrets in folders. Secrets live in the vault, so the folder each one is in is kept here, by the
                 // secret's id (lowercase hyphenated when it's a UUID).
                 Exec("CREATE TABLE IF NOT EXISTS secret_folders (secret_id TEXT PRIMARY KEY, folder_id TEXT NOT NULL);");
+            }
+            if (version < 7)
+            {
+                // v7: folders in folders. Null = top level; an id this device doesn't have reads as top level too.
+                Exec("ALTER TABLE folders ADD COLUMN parent_id TEXT;");
             }
             Exec($"PRAGMA user_version = {SchemaVersion}");
             Exec("COMMIT");
@@ -478,7 +483,7 @@ public sealed class ClipStore : IDisposable
     public List<ClipFolder> AllFolders()
     {
         using var cmd = _db.CreateCommand();
-        cmd.CommandText = "SELECT id, name, label, created, updated, space_id FROM folders ORDER BY name COLLATE NOCASE";
+        cmd.CommandText = "SELECT id, name, label, created, updated, space_id, parent_id FROM folders ORDER BY name COLLATE NOCASE";
         using var r = cmd.ExecuteReader();
         var list = new List<ClipFolder>();
         while (r.Read())
@@ -486,6 +491,7 @@ public sealed class ClipStore : IDisposable
             {
                 Id = Guid.Parse(r.GetString(0)), Name = r.GetString(1), Label = r.IsDBNull(2) ? null : r.GetString(2),
                 CreatedAt = FromUnix(r.GetInt64(3)), UpdatedAt = FromUnix(r.GetInt64(4)), SpaceId = r.IsDBNull(5) ? null : r.GetString(5),
+                ParentId = !r.IsDBNull(6) && Guid.TryParse(r.GetString(6), out var parent) ? parent : null,
             });
         return list;
     }
@@ -499,9 +505,12 @@ public sealed class ClipStore : IDisposable
     public ClipFolder? FolderOf(ClipItem item) =>
         item.IsPinned && item.FolderId is { } id && FindFolder(id) is { } folder && folder.SpaceId == item.SpaceId ? folder : null;
 
-    public ClipFolder CreateFolder(string name = ClipFolder.DefaultName, string? spaceId = null)
+    /// <summary>The folders of one space as a tree.</summary>
+    public FolderTree FolderTree(string? spaceId) => new(FoldersInSpace(spaceId));
+
+    public ClipFolder CreateFolder(string name = ClipFolder.DefaultName, string? spaceId = null, Guid? parentId = null)
     {
-        var folder = new ClipFolder { Name = CleanFolderName(name), SpaceId = spaceId };
+        var folder = new ClipFolder { Name = CleanFolderName(name), SpaceId = spaceId, ParentId = parentId };
         PutFolder(folder);
         return folder;
     }
@@ -521,6 +530,18 @@ public sealed class ClipStore : IDisposable
         UpdateFolder(folder);
     }
 
+    /// <summary>Moves a folder into another of its space (null: the top level). False when that would put it in
+    /// itself, below itself or deeper than <see cref="Core.FolderTree.MaxDepth"/>.</summary>
+    public bool MoveFolder(ClipFolder folder, ClipFolder? parent)
+    {
+        var tree = FolderTree(folder.SpaceId);
+        if (!tree.CanMove(folder, parent)) return false;
+        if (tree.ParentOf(folder.Id) == parent?.Id && folder.ParentId == parent?.Id) return true;
+        folder.ParentId = parent?.Id;
+        UpdateFolder(folder);
+        return true;
+    }
+
     private static string CleanFolderName(string name) => name.Trim() is { Length: > 0 } trimmed ? trimmed : ClipFolder.DefaultName;
 
     private void UpdateFolder(ClipFolder folder)
@@ -533,29 +554,39 @@ public sealed class ClipStore : IDisposable
     public void PutFolder(ClipFolder folder)
     {
         Exec("""
-            INSERT INTO folders (id, name, label, created, updated, space_id) VALUES ($id, $n, $l, $c, $u, $s)
-            ON CONFLICT(id) DO UPDATE SET name = $n, label = $l, created = $c, updated = $u
+            INSERT INTO folders (id, name, label, created, updated, space_id, parent_id) VALUES ($id, $n, $l, $c, $u, $s, $p)
+            ON CONFLICT(id) DO UPDATE SET name = $n, label = $l, created = $c, updated = $u, parent_id = $p
             """,
             ("$id", SyncId(folder.Id)), ("$n", folder.Name), ("$l", folder.Label), ("$c", ToUnix(folder.CreatedAt)),
-            ("$u", ToUnix(folder.UpdatedAt)), ("$s", folder.SpaceId));
+            ("$u", ToUnix(folder.UpdatedAt)), ("$s", folder.SpaceId), ("$p", folder.ParentId is { } parent ? SyncId(parent) : null));
         Commit();
     }
 
-    /// <summary>The user deleted a folder: its clips move to the root of Saved (still saved), so they're pushed again
-    /// without it. Returns how many moved.</summary>
+    /// <summary>The user deleted a folder: its clips, secrets and subfolders move up to its parent (or the root of
+    /// Saved), so they're pushed again. Returns how many items and folders moved.</summary>
     public int DeleteFolder(ClipFolder folder)
     {
         var moved = 0;
+        var parent = FolderTree(folder.SpaceId).ParentOf(folder.Id);
         using (Batch())
         {
             foreach (var item in ItemsInSpace(folder.SpaceId).Where(i => i.FolderId == folder.Id))
             {
-                item.FolderId = null;
+                item.FolderId = parent;
                 Save(item);
                 moved++;
             }
             moved += Convert.ToInt32(Scalar("SELECT COUNT(*) FROM secret_folders WHERE folder_id = $f", ("$f", SyncId(folder.Id))));
-            Exec("DELETE FROM secret_folders WHERE folder_id = $f", ("$f", SyncId(folder.Id)));
+            if (parent is { } p)
+                Exec("UPDATE secret_folders SET folder_id = $p WHERE folder_id = $f", ("$p", SyncId(p)), ("$f", SyncId(folder.Id)));
+            else
+                Exec("DELETE FROM secret_folders WHERE folder_id = $f", ("$f", SyncId(folder.Id)));
+            foreach (var child in FoldersInSpace(folder.SpaceId).Where(f => f.ParentId == folder.Id))
+            {
+                child.ParentId = parent;
+                UpdateFolder(child);
+                moved++;
+            }
             RemoveFolder(folder.Id);
         }
         return moved;
@@ -633,21 +664,34 @@ public sealed class ClipStore : IDisposable
 
     /// <summary>Share to Group for a folder: a new folder (same name and label) in <paramref name="spaceId"/>, holding
     /// saved copies of the folder's clips. Later changes to either don't reach the other.</summary>
-    public ClipFolder CopyFolderToSpace(ClipFolder folder, string? spaceId)
+    public ClipFolder CopyFolderToSpace(ClipFolder folder, string? spaceId) => CopyFolderTreeToSpace(folder, spaceId).Root;
+
+    /// <summary>Copies a folder and its whole subtree (new ids, the structure kept) with saved copies of their clips
+    /// into <paramref name="spaceId"/>, under <paramref name="parentId"/>. Returns the new top folder and old → new ids.</summary>
+    public (ClipFolder Root, Dictionary<Guid, Guid> Map) CopyFolderTreeToSpace(ClipFolder folder, string? spaceId, Guid? parentId = null)
     {
         using var _ = Batch();
-        var copy = new ClipFolder { Name = folder.Name, Label = folder.Label, SpaceId = spaceId };
-        PutFolder(copy);
-        foreach (var item in ItemsInSpace(folder.SpaceId).Where(i => i.IsPinned && i.FolderId == folder.Id).Reverse())   // oldest first
+        var tree = FolderTree(folder.SpaceId);
+        var map = new Dictionary<Guid, Guid>();
+        var items = ItemsInSpace(folder.SpaceId).Where(i => i.IsPinned && i.FolderId is not null).ToList();
+        ClipFolder Copy(ClipFolder source, Guid? parent)
         {
-            var clip = CopyToSpace(item, spaceId);
-            clip.IsPinned = true;
-            clip.PinnedAt ??= DateTime.UtcNow;
-            clip.FolderId = copy.Id;
-            Save(clip);
-            Commit();
+            var copy = new ClipFolder { Name = source.Name, Label = source.Label, SpaceId = spaceId, ParentId = parent };
+            PutFolder(copy);
+            map[source.Id] = copy.Id;
+            foreach (var item in items.Where(i => i.FolderId == source.Id).Reverse())   // oldest first
+            {
+                var clip = CopyToSpace(item, spaceId);
+                clip.IsPinned = true;
+                clip.PinnedAt ??= DateTime.UtcNow;
+                clip.FolderId = copy.Id;
+                Save(clip);
+                Commit();
+            }
+            foreach (var child in tree.Children(source.Id, source.SpaceId)) Copy(child, copy.Id);
+            return copy;
         }
-        return copy;
+        return (Copy(folder, parentId), map);
     }
 
     // MARK: Spaces (sync)

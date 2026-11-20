@@ -527,6 +527,26 @@ public sealed class AppServices : IPanelHost
         });
     }
 
+    /// <summary>A shared folder tree's secrets: one Windows Hello, then each into its new folder.</summary>
+    public void CopySecretsToFolders(IReadOnlyList<(SecretRef Secret, Guid? FolderId)> secrets, string? spaceId, string reason, string notice) =>
+        _ = CopySecretsToFoldersAsync(secrets, spaceId, reason, notice);
+
+    private async Task CopySecretsToFoldersAsync(IReadOnlyList<(SecretRef Secret, Guid? FolderId)> secrets, string? spaceId, string reason, string notice)
+    {
+        if (secrets.Count == 0 || !await Secrets.AuthenticateAsync(reason)) return;
+        Dispatcher.Invoke(() =>
+        {
+            var copied = 0;
+            foreach (var (secret, folderId) in secrets)
+            {
+                if (Secrets.ReadValue(secret) is not { } value || Secrets.Add(secret.Name, value, spaceId) is not { } copy) continue;
+                if (folderId is { } folder) Store.SetSecretFolder(copy.Id, folder);
+                copied++;
+            }
+            Panel.ShowNotice(copied == secrets.Count ? notice : "Couldn't save to Credential Manager");
+        });
+    }
+
     private void WriteSecretWithAutoClear(string value, int? seconds = null)
     {
         ClipboardIO.WriteSecret(value);

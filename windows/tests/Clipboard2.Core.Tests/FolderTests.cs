@@ -94,11 +94,11 @@ public sealed class FolderTests : IDisposable
         _model.SetFilter(PanelFilter.Labelled);
         Assert.Equal(["[Trip 2]"], Titles());
         _model.Select(_model.Entries[0].Id);
-        Assert.Equal([new PanelAction.OpenFolder(), new PanelAction.RenameFolder(), new PanelAction.SetLabel(), new PanelAction.DeleteFolder()],
+        Assert.Equal([new PanelAction.OpenFolder(), new PanelAction.RenameFolder(), new PanelAction.SetLabel(), new PanelAction.NewFolderInside(), new PanelAction.DeleteFolder()],
             _model.AvailableActions);
         _model.Perform(new PanelAction.DeleteFolder());
 
-        Assert.Equal("Folder deleted · 2 items moved to Saved", _model.Notice);
+        Assert.Equal("Folder deleted · moved 2 items to Saved", _model.Notice);
         Assert.Empty(_store.AllFolders());
         Assert.All(new[] { a, b }, i => Assert.Equal((true, (Guid?)null), (Fresh(i).IsPinned, Fresh(i).FolderId)));
         Assert.Equal(["b", "a"], Titles());

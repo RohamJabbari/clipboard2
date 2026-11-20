@@ -33,7 +33,7 @@ public abstract record PanelEntry
     public sealed record SnippetEntry(Snippet Snippet) : PanelEntry;
     public sealed record SecretEntry(SecretRef Secret) : PanelEntry;
     /// <summary>A folder row in Saved, with the number of saved clips in it.</summary>
-    public sealed record FolderEntry(ClipFolder Folder, int Count) : PanelEntry;
+    public sealed record FolderEntry(ClipFolder Folder, int Count, int Folders = 0) : PanelEntry;
     /// <summary>One of this user's authenticators (owner: it has the seed).</summary>
     public sealed record AuthenticatorEntry(Authenticator Authenticator) : PanelEntry;
     /// <summary>An authenticator shared with this user: codes only.</summary>
@@ -92,7 +92,9 @@ public abstract record PanelAction
     public sealed record MoveTo(Guid FolderId, string FolderName, string? SectionTitle = null) : PanelAction;
     /// <summary>Asks for a name, creates the folder and moves the selection in. <paramref name="Mine"/>: a personal
     /// folder, which group items are copied into.</summary>
-    public sealed record MoveToNewFolder(bool Mine = false, string? SectionTitle = null) : PanelAction;
+    public sealed record MoveToNewFolder(bool Mine = false, string? SectionTitle = null, Guid? ParentId = null) : PanelAction;
+    /// <summary>A new folder inside the selected folder.</summary>
+    public sealed record NewFolderInside : PanelAction;
     /// <summary>Share to Group's second step when the group has folders: where in the group's Saved the copies go
     /// (null: the root).</summary>
     public sealed record ShareInto(string GroupId, string GroupName, Guid? FolderId, string FolderTitle) : PanelAction;
@@ -141,7 +143,7 @@ public abstract record PanelAction
         SendToContact => "Send to Contact",
         MoveTo m => m.SectionTitle ?? "Move to Folder",
         MoveToNewFolder m => m.SectionTitle ?? "Move to Folder",
-        OpenFolder or RenameFolder or DeleteFolder => "Folder",
+        OpenFolder or RenameFolder or DeleteFolder or NewFolderInside => "Folder",
         PasteCode or CopyCode => "Paste",
         ShareAuthenticatorWith => "Share with",
         TransferAuthenticatorTo => "Transfer to",
@@ -169,7 +171,8 @@ public abstract record PanelAction
         MoveToFolder => "Move to Folder…",
         MoveTo m => m.FolderName,
         MoveToNewFolder => "New Folder…",
-        RemoveFromFolder => "Remove from Folder",
+        RemoveFromFolder => "Move to Top Level",
+        NewFolderInside => "New Folder Inside…",
         OpenFolder => "Open",
         RenameFolder => "Rename…",
         DeleteFolder => "Delete Folder",
@@ -217,6 +220,12 @@ public interface IPanelHost
     /// <paramref name="reason"/>. Each copy goes into <paramref name="folderId"/> when given. Shows
     /// <paramref name="notice"/> when done.</summary>
     void CopySecrets(IReadOnlyList<SecretRef> secrets, string? spaceId, Guid? folderId, string reason, string notice);
+    /// <summary>Like <see cref="CopySecrets"/>, each into its own folder (a shared folder tree), with one Windows
+    /// Hello confirmation.</summary>
+    void CopySecretsToFolders(IReadOnlyList<(SecretRef Secret, Guid? FolderId)> secrets, string? spaceId, string reason, string notice)
+    {
+        foreach (var group in secrets.GroupBy(s => s.FolderId)) CopySecrets([.. group.Select(s => s.Secret)], spaceId, group.Key, reason, notice);
+    }
     string? CurrentClipboardText();
     void OpenSettings();
     /// <summary>The folder "Save to ‹folder›" writes to (Settings, or the user's Downloads folder).</summary>
@@ -279,7 +288,11 @@ public sealed class FolderForm
     public ClipFolder? Folder { get; init; }
     public IReadOnlyList<Guid> ItemIds { get; init; } = [];
     public IReadOnlyList<string> SecretIds { get; init; } = [];
+    /// <summary>Folders that move into the new folder (Move to Folder ▸ New Folder… on a folder).</summary>
+    public IReadOnlyList<Guid> FolderIds { get; init; } = [];
     public string? SpaceId { get; init; }
+    /// <summary>Where the new folder goes (null: the top level).</summary>
+    public Guid? ParentId { get; init; }
     public int Count => ItemIds.Count + SecretIds.Count;
     public string Text { get; set; } = ClipFolder.DefaultName;
     public bool IsRename => Folder is not null;
@@ -366,6 +379,7 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
     /// <summary>The folder open in Saved (personal or a group's), or null at Saved's root.</summary>
     public Guid? OpenFolderId { get; private set; }
     private Dictionary<Guid, ClipFolder> _folders = [];
+    private FolderTree _tree = new([]);
     /// <summary>Secret key → the folder it names (<see cref="ClipStore.SecretFolders"/>).</summary>
     private Dictionary<string, Guid> _secretFolders = [];
     /// <summary>In the action menu: Share to Group's second step, picking where in this group's Saved the copies go.</summary>
@@ -533,14 +547,41 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
         Refresh(resetSelection: true);
     }
 
-    /// <summary>Back to the root of Saved, with the folder selected.</summary>
+    /// <summary>Up one level (to the parent, or the root of Saved), with the folder left selected.</summary>
     public void CloseFolder()
     {
         if (OpenFolderId is not { } id) return;
-        OpenFolderId = null;
+        OpenFolderId = _tree.ParentOf(id);
         Refresh(resetSelection: true);
         if (Entries.Any(e => e.Id == "f-" + id)) Select("f-" + id);
     }
+
+    /// <summary>A breadcrumb segment: that folder, or (null) the root of Saved.</summary>
+    public void GoToFolder(Guid? id)
+    {
+        if (id == OpenFolderId) return;
+        if (id is null)
+        {
+            var from = OpenFolderId is { } open ? _tree.Path(open).FirstOrDefault()?.Id : null;
+            OpenFolderId = null;
+            Refresh(resetSelection: true);
+            if (from is { } top && Entries.Any(e => e.Id == "f-" + top)) Select("f-" + top);
+            return;
+        }
+        OpenFolderById(id.Value);
+    }
+
+    /// <summary>The open folder's path from the top level ("Saved › Work › Clients" without "Saved").</summary>
+    public List<ClipFolder> OpenFolderPath => OpenFolderId is { } id ? _tree.Path(id) : [];
+
+    /// <summary>The folder's parent, as it reads (an unknown parent or a cycle reads as the top level).</summary>
+    public ClipFolder? ParentFolder(ClipFolder folder) => _tree.Parent(folder);
+
+    /// <summary>A folder's subfolders in a space, by name (null: its top level).</summary>
+    public List<ClipFolder> FolderChildren(Guid? parent, string? space) => _tree.Children(parent, space);
+
+    /// <summary>"Work › Clients".</summary>
+    public string FolderPathText(Guid id) => _tree.PathText(id);
 
     /// <summary>The folder a clip is in, if this device has it.</summary>
     public ClipFolder? FolderOf(ClipItem item) =>
@@ -559,9 +600,10 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
         _ => null,
     };
 
-    /// <summary>The small caption on an item shown outside its folder (a search from Saved's root, or History).</summary>
+    /// <summary>The small caption on an item shown outside its folder (a search, or History): its path relative to
+    /// the folder that's open.</summary>
     public string? FolderCaption(PanelEntry entry) =>
-        FolderOf(entry) is { } folder && folder.Id != OpenFolderId ? folder.Name : null;
+        FolderOf(entry) is { } folder && folder.Id != OpenFolderId ? _tree.PathText(folder.Id, OpenFolderId) : null;
 
     /// <summary>Folders can hold clips of the personal space and of groups: not contacts' (edits to what they send
     /// stay on this device) nor the selection from another app.</summary>
@@ -577,7 +619,47 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
 
     /// <summary>The folders of a space (null = personal), by name.</summary>
     public List<ClipFolder> FoldersIn(string? space) =>
-        [.. _folders.Values.Where(f => f.SpaceId == space).OrderBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase)];
+        [.. _folders.Values.Where(f => f.SpaceId == space).OrderBy(f => _tree.PathText(f.Id), StringComparer.CurrentCultureIgnoreCase)];
+
+    /// <summary>Whether the server takes this user's changes to a folder (moving, renaming): personal ones, and in a
+    /// group those they made (or haven't pushed yet), or any when they own the group.</summary>
+    public bool CanChangeFolder(ClipFolder folder)
+    {
+        if (folder.SpaceId is not { } space || !_groups.TryGetValue(space, out var group) || group.IsOwner) return true;
+        if (!_authors.TryGetValue((space, ClipStore.SyncId(folder.Id)), out var author) || author is null) return true;
+        return Self?.Invoke() is not { } self || author == self.Uid;
+    }
+
+    /// <summary>Where a folder may go: a folder of its space that isn't itself or below it, within the depth limit
+    /// (null: the top level).</summary>
+    public bool CanMoveFolder(ClipFolder folder, ClipFolder? parent) =>
+        CanChangeFolder(folder) && (parent is null ? _tree.ParentOf(folder.Id) is not null : _tree.CanMove(folder, parent) && _tree.ParentOf(folder.Id) != parent.Id);
+
+    /// <summary>Moves a folder into another (null: the top level), or says why it can't.</summary>
+    public bool MoveFolder(ClipFolder folder, ClipFolder? parent)
+    {
+        if (!CanChangeFolder(folder) || (parent is not null && !_tree.CanMove(folder, parent)) || !store.MoveFolder(folder, parent))
+        {
+            ResetMode();
+            ShowNotice(parent is not null && _tree.IsInSubtree(parent.Id, folder.Id) ? "A folder can't go into itself" : "That folder can't move there");
+            return false;
+        }
+        ResetMode();
+        Refresh();
+        if (Entries.Any(e => e.Id == "f-" + folder.Id)) Select("f-" + folder.Id);
+        ShowNotice(parent is null ? $"Moved “{folder.Name}” to the top level" : $"Moved “{folder.Name}” to “{parent.Name}”");
+        return true;
+    }
+
+    /// <summary>Whether a row dragged onto a folder row or breadcrumb segment (null: the root) may drop there.</summary>
+    public bool CanDrop(string entryId, Guid? folderId)
+    {
+        var target = folderId is { } id ? _folders.GetValueOrDefault(id) : null;
+        if (folderId is not null && target is null) return false;
+        if (Entries.FirstOrDefault(e => e.Id == entryId) is PanelEntry.FolderEntry f)
+            return target is null ? _tree.ParentOf(f.Folder.Id) is not null && CanChangeFolder(f.Folder) : CanMoveFolder(f.Folder, target);
+        return true;
+    }
 
     /// <summary>An item of a sync group: deleting it is "Remove from Group".</summary>
     public bool IsGroupItem(ClipItem item) => item.SpaceId is { } space && _groups.ContainsKey(space);
@@ -607,12 +689,30 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
         IsMultiSelecting ? [.. Entries.Where(e => SelectedIds.Contains(e.Id) && e is PanelEntry.Clip or PanelEntry.SecretEntry)]
         : SelectedEntry is PanelEntry.Clip or PanelEntry.SecretEntry ? [SelectedEntry] : [];
 
+    /// <summary>New Folder Inside: a subfolder of <paramref name="parent"/>, opened there and being renamed.</summary>
+    public void NewFolderInside(ClipFolder parent)
+    {
+        if (!_tree.CanCreateIn(parent.Id))
+        {
+            ShowNotice($"Folders go at most {FolderTree.MaxDepth} levels deep");
+            return;
+        }
+        var folder = store.CreateFolder(ClipFolder.DefaultName, parent.SpaceId, parent.Id);
+        ResetMode();
+        OpenFolderId = parent.Id;
+        Query = "";
+        Refresh();
+        BeginRenameFolder(folder);
+    }
+
     /// <summary>The New Folder button: a folder named "New Folder" in the Saved shown, selected and being renamed.</summary>
     public void CreateFolder()
     {
         if (!IsSavedView) return;
-        var folder = store.CreateFolder(ClipFolder.DefaultName, SavedSpace);
-        OpenFolderId = null;
+        // Inside an open folder, a subfolder there (unless that would be too deep).
+        var parent = OpenFolderId is { } open && _tree.CanCreateIn(open) ? open : (Guid?)null;
+        var folder = store.CreateFolder(ClipFolder.DefaultName, SavedSpace, parent);
+        OpenFolderId = parent;
         Query = "";
         Refresh();
         BeginRenameFolder(folder);
@@ -631,9 +731,19 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
 
     /// <summary>Move to Folder ▸ New Folder…: asks for the name inline, then creates it and moves the clips and
     /// secrets in. <paramref name="mine"/>: a personal folder, which group items are copied into.</summary>
-    public void BeginNewFolder(IReadOnlyList<PanelEntry> entries, bool mine = false)
+    public void BeginNewFolder(IReadOnlyList<PanelEntry> entries, bool mine = false, Guid? parentId = null)
     {
         string? space = null;
+        if (entries is [PanelEntry.FolderEntry moving])
+        {
+            // A folder's Move to Folder ▸ New Folder…: the new folder is made at that level and the folder goes in.
+            FolderForm = new FolderForm { FolderIds = [moving.Folder.Id], SpaceId = moving.Folder.SpaceId, ParentId = parentId };
+            ActionQuery = "";
+            IsPickingFolder = false;
+            Mode = PanelMode.FolderName;
+            Notify();
+            return;
+        }
         if (mine ? entries.Count == 0 || !entries.All(CanUseFolders) : !CommonFolderSpace(entries, out space))
         {
             ShowNotice("Items can only move into folders of their own space");
@@ -644,6 +754,7 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
             ItemIds = [.. entries.OfType<PanelEntry.Clip>().Select(c => c.Item.Id)],
             SecretIds = [.. entries.OfType<PanelEntry.SecretEntry>().Select(k => k.Secret.Id)],
             SpaceId = mine ? null : space,
+            ParentId = parentId,
         };
         ActionQuery = "";
         IsPickingFolder = false;
@@ -662,8 +773,15 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
             Select("f-" + folder.Id);
             return;
         }
-        var created = store.CreateFolder(form.Text, form.SpaceId);
+        var parentOk = form.ParentId is not { } p || _folders.GetValueOrDefault(p) is { } pf && pf.SpaceId == form.SpaceId && _tree.CanCreateIn(p);
+        var created = store.CreateFolder(form.Text, form.SpaceId, parentOk ? form.ParentId : null);
         _folders[created.Id] = created;
+        _tree = new FolderTree(_folders.Values);
+        if (form.FolderIds.Count > 0)
+        {
+            if (_folders.GetValueOrDefault(form.FolderIds[0]) is { } moving) MoveFolder(moving, created);
+            return;
+        }
         List<PanelEntry> entries = [.. form.ItemIds.Select(store.Find).OfType<ClipItem>().Select(i => new PanelEntry.Clip(i)),
             .. form.SecretIds.Select(id => secrets.Secrets.FirstOrDefault(s => s.Id == id)).OfType<SecretRef>().Select(s => new PanelEntry.SecretEntry(s))];
         MoveToFolder(entries, created);
@@ -738,6 +856,13 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
     /// out. Dragging one of several selected rows moves the whole selection.</summary>
     public void DropOnFolder(string entryId, Guid? folderId)
     {
+        if (Entries.FirstOrDefault(e => e.Id == entryId) is PanelEntry.FolderEntry dragged)
+        {
+            // A folder row: nests it (never into itself or below), or moves it up to the top level.
+            if (!CanDrop(entryId, folderId)) return;
+            MoveFolder(dragged.Folder, folderId is { } into ? _folders.GetValueOrDefault(into) : null);
+            return;
+        }
         List<PanelEntry> entries = IsMultiSelecting && SelectedIds.Contains(entryId)
             ? FolderTargets
             : Entries.FirstOrDefault(e => e.Id == entryId) is { } entry && entry is PanelEntry.Clip or PanelEntry.SecretEntry ? [entry] : [];
@@ -753,11 +878,12 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
     /// <summary>Delete Folder: its clips and secrets move to the root of Saved. No confirmation: nothing is lost.</summary>
     public void DeleteFolder(ClipFolder folder)
     {
+        var parent = _tree.Parent(folder);
         var moved = store.DeleteFolder(folder);
-        if (OpenFolderId == folder.Id) OpenFolderId = null;
+        if (OpenFolderId is { } open && _tree.IsInSubtree(open, folder.Id)) OpenFolderId = open == folder.Id ? parent?.Id : open;
         ResetMode();
         Refresh(resetSelection: true);
-        ShowNotice($"Folder deleted · {(moved == 1 ? "1 item" : $"{moved} items")} moved to Saved");
+        ShowNotice($"Folder deleted · moved {(moved == 1 ? "1 item" : $"{moved} items")} to {parent?.Name ?? "Saved"}");
     }
 
     /// <summary>Saves clips without a label. Another member's group item, which the server wouldn't let this user
@@ -778,17 +904,33 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
 
     /// <summary>The Move to Folder picker. One space: its folders (and New Folder…). A group's items also list the
     /// personal folders under "Mine", which save personal copies; items of several spaces list only "Mine".</summary>
-    private List<PanelAction> FolderPickActions() => FolderChoices(FolderTargets);
+    private List<PanelAction> FolderPickActions() =>
+        FolderChoices(!IsMultiSelecting && SelectedEntry is PanelEntry.FolderEntry f ? [f] : FolderTargets);
+
+    /// <summary>The sections of the right-click Move to Folder tree: (title, space, mine). One space: one untitled
+    /// section; a group's items: the group's tree, then "Mine".</summary>
+    public List<(string? Title, string? Space, bool Mine)> FolderMenuSections(IReadOnlyList<PanelEntry> targets)
+    {
+        if (targets is [PanelEntry.FolderEntry f]) return CanChangeFolder(f.Folder) ? [(null, f.Folder.SpaceId, false)] : [];
+        if (targets.Count == 0 || !targets.All(CanUseFolders)) return [];
+        var spaces = targets.Select(SpaceOf).Distinct().ToList();
+        if (spaces is [null]) return [(null, null, false)];
+        if (spaces is [{ } group]) return [(GroupNames.GetValueOrDefault(group, "Group"), group, false), ("Mine", null, true)];
+        return [("Mine", null, true)];
+    }
 
     /// <summary>The Move to Folder choices for <paramref name="targets"/> (see <see cref="FolderPickActions"/>); the
     /// right-click menu lists them too.</summary>
     public List<PanelAction> FolderChoices(IReadOnlyList<PanelEntry> targets)
     {
+        if (targets is [PanelEntry.FolderEntry moving])
+            return [.. FoldersIn(moving.Folder.SpaceId).Where(f => CanMoveFolder(moving.Folder, f))
+                .Select(f => new PanelAction.MoveTo(f.Id, _tree.PathText(f.Id))), new PanelAction.MoveToNewFolder()];
         if (targets.Count == 0 || !targets.All(CanUseFolders)) return [];
         var current = targets.Select(e => FolderOf(e)?.Id).Distinct().ToList() is [{ } only] ? only : (Guid?)null;
         var spaces = targets.Select(SpaceOf).Distinct().ToList();
         IEnumerable<PanelAction> In(string? space, string? section, bool mine) =>
-            [.. FoldersIn(space).Where(f => f.Id != current).Select(f => new PanelAction.MoveTo(f.Id, f.Name, section)),
+            [.. FoldersIn(space).Where(f => f.Id != current).Select(f => new PanelAction.MoveTo(f.Id, _tree.PathText(f.Id), section)),
              new PanelAction.MoveToNewFolder(mine, section)];
         if (spaces is [null]) return [.. In(null, null, false)];
         if (spaces is [{ } group])
@@ -883,6 +1025,7 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
         if (GroupFilter is not null && !GroupNames.ContainsKey(GroupFilter)) GroupFilter = null;
         var group = GroupFilter;
         _folders = store.AllFolders().ToDictionary(f => f.Id);
+        _tree = new FolderTree(_folders.Values);
         _secretFolders = store.SecretFolders();
         var saved = IsSavedView;
         // A folder deleted (here or elsewhere) while open: back to the root.
@@ -908,15 +1051,21 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
             snippets = [.. store.AllSnippets().Where(s => s.SpaceId == space)];
             var counts = clips.Select(c => FolderOf(c)?.Id).Concat(secretList.Select(s => FolderOf(s)?.Id)).OfType<Guid>()
                 .GroupBy(id => id).ToDictionary(g => g.Key, g => g.Count());
+            PanelEntry.FolderEntry Row(ClipFolder f) =>
+                new(f, counts.GetValueOrDefault(f.Id), _tree.Children(f.Id, f.SpaceId).Count);
             if (OpenFolderId is { } open)
             {
-                clips = [.. clips.Where(c => FolderOf(c)?.Id == open)];
-                secretList = [.. secretList.Where(s => FolderOf(s)?.Id == open)];
+                // Its subfolders first; a search covers the whole subtree.
+                bool Inside(Guid? id) => id is { } f && (q.Length == 0 ? f == open : _tree.IsInSubtree(f, open));
+                clips = [.. clips.Where(c => Inside(FolderOf(c)?.Id))];
+                secretList = [.. secretList.Where(s => Inside(FolderOf(s)?.Id))];
                 snippets = [];   // snippets aren't in folders
+                folderRows = q.Length == 0 ? [.. _tree.Children(open, space).Select(Row)]
+                    : [.. FoldersIn(space).Where(f => f.Id != open && _tree.IsInSubtree(f.Id, open)).Select(Row)];
             }
             else
             {
-                folderRows = [.. FoldersIn(space).Select(f => new PanelEntry.FolderEntry(f, counts.GetValueOrDefault(f.Id)))];
+                folderRows = q.Length == 0 ? [.. _tree.Children(null, space).Select(Row)] : [.. FoldersIn(space).Select(Row)];
                 if (q.Length == 0)
                 {
                     clips = [.. clips.Where(c => FolderOf(c) is null)];
@@ -1435,13 +1584,14 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
     /// <summary>Share to Group's second step: the group's root, then its folders.</summary>
     private List<PanelAction> ShareFolderActions(PanelAction.ShareTo share) =>
         [new PanelAction.ShareInto(share.GroupId, share.GroupName, null, "No Folder"),
-         .. FoldersIn(share.GroupId).Select(f => new PanelAction.ShareInto(share.GroupId, share.GroupName, f.Id, f.Name))];
+         .. FoldersIn(share.GroupId).Where(f => _tree.CanCreateIn(f.Id))
+             .Select(f => new PanelAction.ShareInto(share.GroupId, share.GroupName, f.Id, _tree.PathText(f.Id)))];
 
     /// <summary>Whether sharing the selection to <paramref name="groupId"/> can pick one of its folders: the group has
     /// some, and something selected can go in one (clips and secrets; folders and snippets go to the root).</summary>
     public bool CanShareIntoFolder(string groupId) =>
         FoldersIn(groupId).Count > 0 && (IsMultiSelecting ? Entries.Where(e => SelectedIds.Contains(e.Id)) : SelectedEntry is { } e ? [e] : [])
-            .Any(e => e is PanelEntry.Clip or PanelEntry.SecretEntry);
+            .Any(e => e is PanelEntry.Clip or PanelEntry.SecretEntry or PanelEntry.FolderEntry);
 
     private bool CanShare => store.Groups().Count > 0;
 
@@ -1512,6 +1662,12 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
             if (entry is PanelEntry.FolderEntry folderEntry)
             {
                 List<PanelAction> folderActions = [new PanelAction.OpenFolder(), new PanelAction.RenameFolder(), new PanelAction.SetLabel()];
+                if (_tree.CanCreateIn(folderEntry.Folder.Id)) folderActions.Add(new PanelAction.NewFolderInside());
+                if (CanChangeFolder(folderEntry.Folder))
+                {
+                    if (FolderChoices([folderEntry]).OfType<PanelAction.MoveTo>().Any()) folderActions.Add(new PanelAction.MoveToFolder());
+                    if (_tree.ParentOf(folderEntry.Folder.Id) is not null) folderActions.Add(new PanelAction.RemoveFromFolder());
+                }
                 // A group's folder isn't shared on: its clips are already the group's.
                 if (folderEntry.Folder.SpaceId is null && CanShare) folderActions.Add(new PanelAction.ShareToGroup());
                 return [.. folderActions, new PanelAction.DeleteFolder()];
@@ -1611,14 +1767,26 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
             case PanelAction.MoveToFolder:
                 BeginMoveToFolder();
                 return;
+            case PanelAction.MoveTo move when !IsMultiSelecting && SelectedEntry is PanelEntry.FolderEntry movingFolder:
+                if (_folders.GetValueOrDefault(move.FolderId) is { } intoFolder) MoveFolder(movingFolder.Folder, intoFolder);
+                return;
             case PanelAction.MoveTo move:
                 if (_folders.GetValueOrDefault(move.FolderId) is { } target) MoveToFolder(FolderTargets, target);
                 return;
+            case PanelAction.MoveToNewFolder newFolder when !IsMultiSelecting && SelectedEntry is PanelEntry.FolderEntry folderToMove:
+                BeginNewFolder([folderToMove], parentId: newFolder.ParentId);
+                return;
             case PanelAction.MoveToNewFolder newFolder:
-                BeginNewFolder(FolderTargets, newFolder.Mine);
+                BeginNewFolder(FolderTargets, newFolder.Mine, newFolder.ParentId);
+                return;
+            case PanelAction.RemoveFromFolder when !IsMultiSelecting && SelectedEntry is PanelEntry.FolderEntry nested:
+                MoveFolder(nested.Folder, null);
                 return;
             case PanelAction.RemoveFromFolder:
                 MoveToFolder(FolderTargets, null);
+                return;
+            case PanelAction.NewFolderInside when SelectedEntry is PanelEntry.FolderEntry outer:
+                NewFolderInside(outer.Folder);
                 return;
             case PanelAction.ShareTo share when PickingShareFolder is null && CanShareIntoFolder(share.GroupId):
                 // The group has folders: pick where the copies go (the root by default).
@@ -1858,20 +2026,22 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
                 store.CopySnippetToSpace(s.Snippet, groupId);
                 break;
             case PanelEntry.FolderEntry f:
-                // All or nothing, like sharing several items.
-                var inFolder = store.ItemsInSpace(f.Folder.SpaceId).Where(i => i.IsPinned && i.FolderId == f.Folder.Id).ToList();
+                // The whole subtree, all or nothing, like sharing several items.
+                var subtree = _tree.Subtree(f.Folder.Id).Select(x => x.Id).ToHashSet();
+                var inFolder = store.ItemsInSpace(f.Folder.SpaceId).Where(i => i.IsPinned && i.FolderId is { } id && subtree.Contains(id)).ToList();
                 if (inFolder.Select(SyncEngine.GroupShareProblem).FirstOrDefault(p => p is not null) is { } folderProblem)
                 {
                     ResetMode();
                     ShowNotice(folderProblem);
                     return;
                 }
-                var copy = store.CopyFolderToSpace(f.Folder, groupId);
-                // Its secrets are copied too, after Windows Hello, into the new folder.
-                var folderSecrets = secrets.Secrets.Where(s => s.SpaceId == f.Folder.SpaceId && FolderOf(s)?.Id == f.Folder.Id).ToList();
+                var (_, map) = store.CopyFolderTreeToSpace(f.Folder, groupId, folder?.Id);
+                // Its secrets are copied too, after one Windows Hello, into the new folders.
+                var folderSecrets = secrets.Secrets.Where(s => s.SpaceId == f.Folder.SpaceId && FolderOf(s) is { } sf && map.ContainsKey(sf.Id))
+                    .Select(s => (s, (Guid?)map[FolderOf(s)!.Id])).ToList();
                 if (folderSecrets.Count > 0)
                 {
-                    host.CopySecrets(folderSecrets, groupId, copy.Id, $"share the secrets in “{f.Folder.Name}” with {groupName}", $"Shared to “{groupName}”");
+                    host.CopySecretsToFolders(folderSecrets, groupId, $"share the secrets in “{f.Folder.Name}” with {groupName}", $"Shared to {where}");
                     ResetMode();
                     Refresh();
                     return;
@@ -2042,6 +2212,9 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
             case PanelKey.Up: MoveSelection(-1, key.Shift); return true;
             case PanelKey.Down: MoveSelection(1, key.Shift); return true;
             // ←/→ page through the preview; otherwise they move the caret in the search box.
+            case PanelKey.Left when !IsPreviewing && Query.Length == 0 && OpenFolderId is not null:
+                CloseFolder();
+                return true;
             case PanelKey.Left or PanelKey.Right when IsPreviewing:
                 StepPreview(key.Key == PanelKey.Right ? 1 : -1);
                 return true;

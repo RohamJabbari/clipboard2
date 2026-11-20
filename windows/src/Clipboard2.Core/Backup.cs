@@ -251,20 +251,33 @@ public static class Backup
         var folderIds = new Dictionary<Guid, Guid>();
         using (store.Batch())
         {
-            // Folders first: a backup's folder joins a personal one with the same name, or is added (with a new id).
-            var byName = store.FoldersInSpace(null).GroupBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase)
-                .ToDictionary(g => g.Key, g => g.First().Id, StringComparer.CurrentCultureIgnoreCase);
+            // Folders first, parents before their subfolders: a backup's folder joins a personal one with the same name
+            // in the same parent, or is added (with a new id) there.
+            var tree = store.FolderTree(null);
+            var existing = new Dictionary<(Guid? Parent, string Name), Guid>();
+            foreach (var f in tree.All) existing.TryAdd((tree.ParentOf(f.Id), f.Name.ToLowerInvariant()), f.Id);
+            var backupFolders = new Dictionary<Guid, ClipFolder>();
             foreach (var entry in Entries(root, "folders").OfType<JsonObject>())
             {
                 if (!Guid.TryParse(Str(entry, "id"), out var oldId)) continue;
-                if (SyncPayload.Parse(Encoding.UTF8.GetBytes(entry.ToJsonString()), Guid.NewGuid(), null) is not ItemPayload.FolderPayload { Folder: var folder })
-                    continue;
-                if (!byName.TryGetValue(folder.Name, out var id))
+                if (SyncPayload.Parse(Encoding.UTF8.GetBytes(entry.ToJsonString()), oldId, null) is ItemPayload.FolderPayload { Folder: var folder })
+                    backupFolders[oldId] = folder;
+            }
+            var backupTree = new FolderTree(backupFolders.Values);
+            foreach (var folder in backupFolders.Values.OrderBy(f => backupTree.Depth(f.Id)))
+            {
+                Guid? parent = backupTree.ParentOf(folder.Id) is { } oldParent && folderIds.TryGetValue(oldParent, out var newParent) ? newParent : null;
+                var key = (parent, folder.Name.ToLowerInvariant());
+                if (!existing.TryGetValue(key, out var id))
                 {
-                    store.PutFolder(folder);
-                    byName[folder.Name] = id = folder.Id;
+                    var added = new ClipFolder
+                    {
+                        Name = folder.Name, Label = folder.Label, CreatedAt = folder.CreatedAt, UpdatedAt = folder.UpdatedAt, ParentId = parent,
+                    };
+                    store.PutFolder(added);
+                    existing[key] = id = added.Id;
                 }
-                folderIds[oldId] = id;
+                folderIds[folder.Id] = id;
             }
             var hashes = store.ItemsInSpace(null).Select(i => i.ContentHash).ToHashSet();
             foreach (var entry in Entries(root, "clips").OfType<JsonObject>())

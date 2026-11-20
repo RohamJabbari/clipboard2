@@ -128,6 +128,9 @@ public sealed class ClipFolder
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
     /// <summary>Sync group id, or null for the personal space.</summary>
     public string? SpaceId { get; set; }
+    /// <summary>The folder it sits in (same space), or null at the top level. As stored: <see cref="FolderTree"/> says
+    /// how it reads (an unknown parent, a cycle or too deep is the top level).</summary>
+    public Guid? ParentId { get; set; }
 }
 
 /// <summary>A clipboard capture after hashing / image encoding, ready to store.</summary>
