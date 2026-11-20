@@ -383,7 +383,7 @@ private struct GroupSafetySection: View {
                 KeyboardShortcuts.Recorder(for: .sendToGroup)
             } label: {
                 Text("Send selection to default group")
-                Text("Off until you choose a shortcut.")
+                Text("⌥⌘C unless you choose another.")
             }
             Toggle(isOn: $prefs.confirmGroupSends) {
                 Text("Show a preview with Undo")

@@ -100,15 +100,11 @@ final class Preferences {
         static let hasLaunchedBefore = "hasLaunchedBefore"
         static let hasShownPermissions = "hasShownPermissions"
         static let syncDefaultGroupID = "syncDefaultGroupID"
-        static let hasShownSendToGroupWarning = "hasShownSendToGroupWarning"
         static let saveFolder = "saveFolder"
         static let confirmGroupSends = "confirmGroupSends"
         static let blockSensitiveGroupSends = "blockSensitiveGroupSends"
-        static let clearedSendToGroupDefault = "clearedSendToGroupDefault"
-        static let explainSendToGroupChange = "explainSendToGroupChange"
-        static let selectionIcon = "selectionIcon"
+        static let restoredSendToGroupDefault = "restoredSendToGroupDefault"
         static let pasteIcon = "pasteIcon"
-        static let selectionIconHiddenApps = "selectionIconHiddenApps"
         static let pasteIconHiddenApps = "pasteIconHiddenApps"
         static let notificationsEnabled = "notificationsEnabled"
         static let notificationKindsOff = "notificationKindsOff"
@@ -170,9 +166,6 @@ final class Preferences {
 
     /// Group the "send selection" shortcut stores into.
     var syncDefaultGroupID: String? { didSet { defaults.set(syncDefaultGroupID, forKey: Key.syncDefaultGroupID) } }
-    var hasShownSendToGroupWarning: Bool {
-        didSet { defaults.set(hasShownSendToGroupWarning, forKey: Key.hasShownSendToGroupWarning) }
-    }
     /// Where "Save to …" writes items. Stored as a plain path (the app isn't sandboxed).
     var saveFolder: URL { didSet { defaults.set(saveFolder.path, forKey: Key.saveFolder) } }
 
@@ -188,13 +181,10 @@ final class Preferences {
         didSet { defaults.set(blockSensitiveGroupSends, forKey: Key.blockSensitiveGroupSends) }
     }
     /// One-time: ⌥⌘C was the send-to-group default until 1.3; it's opt-in now.
-    var clearedSendToGroupDefault: Bool {
-        didSet { defaults.set(clearedSendToGroupDefault, forKey: Key.clearedSendToGroupDefault) }
+    var restoredSendToGroupDefault: Bool {
+        didSet { defaults.set(restoredSendToGroupDefault, forKey: Key.restoredSendToGroupDefault) }
     }
     /// Set when that cleanup removed a shortcut someone had; they're told once, when signed in.
-    var explainSendToGroupChange: Bool {
-        didSet { defaults.set(explainSendToGroupChange, forKey: Key.explainSendToGroupChange) }
-    }
 
     /// Notifications (Settings → Sync): the master switch, the kinds switched off, muted groups.
     var notificationsEnabled: Bool { didSet { defaults.set(notificationsEnabled, forKey: Key.notificationsEnabled) } }
@@ -275,13 +265,11 @@ final class Preferences {
         hasLaunchedBefore = defaults.bool(forKey: Key.hasLaunchedBefore)
         hasShownPermissions = defaults.bool(forKey: Key.hasShownPermissions)
         syncDefaultGroupID = defaults.string(forKey: Key.syncDefaultGroupID)
-        hasShownSendToGroupWarning = defaults.bool(forKey: Key.hasShownSendToGroupWarning)
         saveFolder = defaults.string(forKey: Key.saveFolder).map { URL(filePath: $0, directoryHint: .isDirectory) }
             ?? Self.defaultSaveFolder
         confirmGroupSends = defaults.bool(forKey: Key.confirmGroupSends)
         blockSensitiveGroupSends = defaults.bool(forKey: Key.blockSensitiveGroupSends)
-        clearedSendToGroupDefault = defaults.bool(forKey: Key.clearedSendToGroupDefault)
-        explainSendToGroupChange = defaults.bool(forKey: Key.explainSendToGroupChange)
+        restoredSendToGroupDefault = defaults.bool(forKey: Key.restoredSendToGroupDefault)
         notificationsEnabled = defaults.bool(forKey: Key.notificationsEnabled)
         notificationKindsOff = Set((defaults.stringArray(forKey: Key.notificationKindsOff) ?? []).compactMap(NotificationKind.init(rawValue:)))
         mutedNotificationGroups = Set(defaults.stringArray(forKey: Key.mutedNotificationGroups) ?? [])

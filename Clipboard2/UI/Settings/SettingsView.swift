@@ -420,7 +420,7 @@ struct ShortcutsSettingsView: View {
 
             Section {
                 shortcut(.sendToGroup, "Send selection to default group",
-                         "Copies what's selected into your default sync group, after a short preview you can undo. Off until you set it.")
+                         "Copies what's selected into your default sync group, after a short preview you can undo. Replaces ⌥⌘C in other apps while you're signed in.")
                 shortcut(.pasteFromGroup, "Paste from default group",
                          "Pastes the newest item a group member sent.")
             } header: {

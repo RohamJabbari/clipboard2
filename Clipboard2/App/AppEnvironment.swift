@@ -8,8 +8,8 @@ extension KeyboardShortcuts.Name {
     static let selectionActions = Self("selectionActions", default: .init(.k, modifiers: [.command, .option]))
     static let captureText = Self("captureText", default: .init(.two, modifiers: [.command, .shift, .option]))
     static let pasteAsText = Self("pasteAsText", default: .init(.v, modifiers: [.command, .shift, .option]))
-    /// No default: one stray ⌥⌘C used to share the selection with a whole group. Opt-in in Settings.
-    static let sendToGroup = Self("sendToGroup")
+    /// Sends wait a few seconds with Undo and hold back anything that looks like a password.
+    static let sendToGroup = Self("sendToGroup", default: .init(.c, modifiers: [.command, .option]))
     static let pasteFromGroup = Self("pasteFromGroup", default: .init(.v, modifiers: [.command, .option]))
 }
 
@@ -148,7 +148,7 @@ final class AppEnvironment {
         snippets.onCommit = { [weak self] in self?.sync.localChange() }
         // Retention only stops tracking items (ClipStore drops their sync metadata itself), so
         // they're never deleted on other devices.
-        clearOldSendToGroupDefault()
+        restoreSendToGroupDefault()
         sync.onSessionChange = { [weak self] active in self?.setSendToGroupShortcut(active: active) }
         sync.onItemSentHere = { device in HUD.show("Sent from \(device)", symbol: "arrow.down.circle.fill") }
         // System notifications; the HUD bubbles for contacts only when they're off or not allowed.
@@ -399,7 +399,7 @@ final class AppEnvironment {
 
     @ObservationIgnored private var sendToGroupRegistered = false
 
-    /// The group shortcuts (send has none by default; paste is ⌥⌘V) take keys other apps use, so
+    /// The group shortcuts (send is ⌥⌘C; paste is ⌥⌘V) take keys other apps use, so
     /// they're registered only while a sync session exists.
     private func setSendToGroupShortcut(active: Bool) {
         guard active != sendToGroupRegistered else { return }
@@ -411,8 +411,6 @@ final class AppEnvironment {
             KeyboardShortcuts.onKeyUp(for: .pasteFromGroup) { [weak self] in
                 self?.pasteFromDefaultGroup()
             }
-            warnAboutSendToGroupShortcutOnce()
-            explainSendToGroupChangeOnce()
         } else {
             KeyboardShortcuts.removeHandler(for: .sendToGroup)
             KeyboardShortcuts.removeHandler(for: .pasteFromGroup)
@@ -559,49 +557,13 @@ final class AppEnvironment {
         }
     }
 
-    /// Until 1.3, ⌥⌘C sent the selection to the group by default, and KeyboardShortcuts stored that
-    /// default for every install. Clear it once; anyone who wants a shortcut records one in Settings.
-    private func clearOldSendToGroupDefault() {
-        guard !prefs.clearedSendToGroupDefault else { return }
-        prefs.clearedSendToGroupDefault = true
-        if KeyboardShortcuts.getShortcut(for: .sendToGroup) == .init(.c, modifiers: [.command, .option]) {
-            KeyboardShortcuts.setShortcut(nil, for: .sendToGroup)
-            prefs.explainSendToGroupChange = prefs.hasShownSendToGroupWarning
-        }
-    }
-
-    /// For people who had been using ⌥⌘C with a group: say once, while signed in, where it went.
-    private func explainSendToGroupChangeOnce() {
-        guard prefs.explainSendToGroupChange else { return }
-        prefs.explainSendToGroupChange = false
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-            let alert = NSAlert()
-            alert.messageText = "⌥⌘C No Longer Sends to Your Group"
-            alert.informativeText = "To keep things from being shared by accident, sending the selection to a group now uses a shortcut you choose, waits a few seconds with Undo, and holds back anything that looks like a password or key.\n\nSet a shortcut in Settings → Sync → Before anything is shared."
-            alert.addButton(withTitle: "Choose a Shortcut…")
-            alert.addButton(withTitle: "Not Now")
-            NSApp.activate()
-            if alert.runModal() == .alertFirstButtonReturn {
-                SettingsOpener.open(tab: .sync)
-            }
-        }
-    }
-
-    /// The ⌥⌘C default replaces a few well-known shortcuts; say so once.
-    private func warnAboutSendToGroupShortcutOnce() {
-        guard !prefs.hasShownSendToGroupWarning else { return }
-        prefs.hasShownSendToGroupWarning = true
-        guard KeyboardShortcuts.getShortcut(for: .sendToGroup) == .init(.c, modifiers: [.command, .option]) else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-            let alert = NSAlert()
-            alert.messageText = "⌥⌘C Now Sends Selected Text to a Sync Group"
-            alert.informativeText = "Clipboard2 uses ⌥⌘C to send the selected text to your default sync group. While you're signed in to sync, this replaces ⌥⌘C in other apps: Chrome's Inspect Elements, Safari's JavaScript Console and Finder's Copy as Pathname.\n\nTo change or clear the shortcut, open Settings → Shortcuts → Send selection to default group."
-            alert.addButton(withTitle: "OK")
-            alert.addButton(withTitle: "Change Shortcut…")
-            NSApp.activate()
-            if alert.runModal() == .alertSecondButtonReturn {
-                SettingsOpener.open(tab: .shortcuts)
-            }
+    /// 1.3–1.9 cleared ⌥⌘C for every install, which KeyboardShortcuts stores as "no shortcut", so
+    /// the default doesn't come back by itself. Put it back once, keeping any shortcut someone chose.
+    private func restoreSendToGroupDefault() {
+        guard !prefs.restoredSendToGroupDefault else { return }
+        prefs.restoredSendToGroupDefault = true
+        if KeyboardShortcuts.getShortcut(for: .sendToGroup) == nil {
+            KeyboardShortcuts.setShortcut(.init(.c, modifiers: [.command, .option]), for: .sendToGroup)
         }
     }
 
