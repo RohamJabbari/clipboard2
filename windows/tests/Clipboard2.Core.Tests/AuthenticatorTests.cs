@@ -208,7 +208,10 @@ public sealed class AuthenticatorTests : IDisposable
     public void SavedListsAuthenticatorsAndSearchFindsThem()
     {
         var (panel, otps, _) = Panel();
-        _store.Pin(_store.Ingest(ProcessedCapture.ForText("older clip"), _now.AddMinutes(-5)));
+        var older = _store.Ingest(ProcessedCapture.ForText("older clip"), _now.AddMinutes(-5));
+        _store.Pin(older);
+        older.PinnedAt = _now.AddMinutes(-5);   // Pin stamps the real clock; this test runs on its own
+        _store.Put(older);
         var a = otps.Add("GitHub", "me@example.com", "JBSWY3DPEHPK3PXP")!;
         panel.SetFilter(PanelFilter.Labelled);
         Assert.Equal(new PanelEntry.AuthenticatorEntry(a).Id, panel.Entries[0].Id);   // newest first
