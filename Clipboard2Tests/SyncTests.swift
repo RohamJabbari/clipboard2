@@ -783,6 +783,107 @@ actor FakeSyncServer {
         spaces[id] = nil
         items[id] = nil
         blobs = blobs.filter { !$0.key.hasPrefix(id + "/") }
+        shares[id] = nil
+    }
+
+    // MARK: Authenticators (PROTOCOL.md → Authenticators)
+
+    struct ShareRecord {
+        var codesUntil: Int64
+        var sealedCodes: Data?
+        var createdAt: Int64
+        var updatedAt: Int64
+    }
+
+    /// Authenticator space id → recipient uid → their batch.
+    private(set) var shares: [String: [String: ShareRecord]] = [:]
+    /// Identity keys of `FakeUser`s (they have no account record).
+    private var identityKeys: [String: Data] = [:]
+    private(set) var userLookups = 0
+
+    func registerIdentity(uid: String, publicKey: Data) { identityKeys[uid] = publicKey }
+
+    private func displayName(_ uid: String) -> String { accountByUID(uid)?.displayName ?? uid }
+
+    /// A contact or someone in a group with them.
+    func related(_ a: String, _ b: String) -> Bool {
+        spaces.values.contains { space in
+            (space.kind == "direct" || space.kind == "group") && space.members.count >= 2
+                && space.members[a] != nil && space.members[b] != nil
+        }
+    }
+
+    func userByID(_ uid: String, caller: String) throws -> RemoteUser {
+        userLookups += 1
+        guard uid != caller, related(uid, caller),
+              let key = identityKeys[uid] ?? accountByUID(uid)?.publicKey else { throw Self.error(404, "not_found") }
+        return RemoteUser(uid: uid, username: accountByUID(uid)?.username, name: displayName(uid), publicKey: key)
+    }
+
+    private func ownedAuthenticator(_ id: String, by uid: String) throws -> Space {
+        guard let space = spaces[id], space.kind == "authenticator" else { throw Self.error(404, "not_found") }
+        guard space.owner == uid else { throw Self.forbidden }
+        return space
+    }
+
+    func createAuthenticator(uid: String, id: String, wrappedKey: Data) throws -> RemoteSpace {
+        guard spaces[id] == nil else { throw Self.error(409, "conflict") }
+        createSpace(id: id, kind: "authenticator", owner: uid, wrappedKey: wrappedKey)
+        guard let space = spaces(for: uid).first(where: { $0.id == id }) else { throw Self.error(404, "not_found") }
+        return space
+    }
+
+    func deleteAuthenticator(uid: String, id: String) throws {
+        _ = try ownedAuthenticator(id, by: uid)
+        dropSpace(id)
+    }
+
+    func authenticatorShares(uid: String, id: String) throws -> [AuthenticatorShare] {
+        _ = try ownedAuthenticator(id, by: uid)
+        return (shares[id] ?? [:]).sorted { $0.key < $1.key }.map { recipient, record in
+            AuthenticatorShare(uid: recipient, username: accountByUID(recipient)?.username, name: displayName(recipient),
+                               codesUntil: record.codesUntil, createdAt: record.createdAt)
+        }
+    }
+
+    func putShare(uid: String, id: String, recipient: String, codesUntil: Int64, sealedCodes: Data) throws {
+        _ = try ownedAuthenticator(id, by: uid)
+        guard recipient != uid else { throw Self.error(400, "invalid") }
+        if shares[id]?[recipient] == nil {
+            guard related(uid, recipient) else { throw Self.forbidden }
+        }
+        guard sealedCodes.count <= 64 * 1024 else { throw Self.error(413, "too_large") }
+        seq += 1
+        let created = shares[id]?[recipient]?.createdAt ?? seq
+        shares[id, default: [:]][recipient] = ShareRecord(codesUntil: codesUntil, sealedCodes: sealedCodes,
+                                                          createdAt: created, updatedAt: seq)
+    }
+
+    func deleteShare(uid: String, id: String, recipient: String) throws {
+        guard let space = spaces[id], space.kind == "authenticator" else { throw Self.error(404, "not_found") }
+        guard space.owner == uid || recipient == uid else { throw Self.forbidden }
+        guard shares[id]?[recipient] != nil else { throw Self.error(404, "not_found") }
+        shares[id]?[recipient] = nil
+    }
+
+    func sharedCodes(uid: String) -> [SharedCodesEntry] {
+        shares.compactMap { id, records -> SharedCodesEntry? in
+            guard let record = records[uid], let space = spaces[id] else { return nil }
+            return SharedCodesEntry(spaceId: id, ownerUid: space.owner, ownerName: displayName(space.owner),
+                                    codesUntil: record.codesUntil, sealedCodes: record.sealedCodes, updatedAt: record.updatedAt)
+        }
+        .sorted { $0.spaceId < $1.spaceId }
+    }
+
+    func transfer(uid: String, id: String, to recipient: String, wrappedKey: Data) throws {
+        var space = try ownedAuthenticator(id, by: uid)
+        guard shares[id]?[recipient] != nil else { throw Self.error(400, "invalid") }
+        space.owner = recipient
+        space.members = [recipient: ("owner", wrappedKey)]
+        spaces[id] = space
+        shares[id]?[recipient] = nil
+        seq += 1
+        shares[id, default: [:]][uid] = ShareRecord(codesUntil: 0, sealedCodes: nil, createdAt: seq, updatedAt: seq)
     }
 
     /// `includeDirect` is `?include=direct`: contacts with both people in them.
@@ -1000,6 +1101,25 @@ nonisolated struct FakeClient: SyncService {
     }
     func deleteContact(spaceId: String) async throws { try await server.deleteContact(uid: try await caller(), spaceId: spaceId) }
 
+    func user(id uid: String) async throws -> RemoteUser { try await server.userByID(uid, caller: try await caller()) }
+    func createAuthenticator(id: String, wrappedKey: Data) async throws -> RemoteSpace {
+        try await server.createAuthenticator(uid: try await caller(), id: id, wrappedKey: wrappedKey)
+    }
+    func deleteAuthenticator(id: String) async throws { try await server.deleteAuthenticator(uid: try await caller(), id: id) }
+    func authenticatorShares(id: String) async throws -> [AuthenticatorShare] {
+        try await server.authenticatorShares(uid: try await caller(), id: id)
+    }
+    func putAuthenticatorShare(id: String, uid: String, codesUntil: Int64, sealedCodes: Data) async throws {
+        try await server.putShare(uid: try await caller(), id: id, recipient: uid, codesUntil: codesUntil, sealedCodes: sealedCodes)
+    }
+    func deleteAuthenticatorShare(id: String, uid: String) async throws {
+        try await server.deleteShare(uid: try await caller(), id: id, recipient: uid)
+    }
+    func sharedCodes() async throws -> [SharedCodesEntry] { await server.sharedCodes(uid: try await caller()) }
+    func transferAuthenticator(id: String, uid: String, wrappedKey: Data) async throws {
+        try await server.transfer(uid: try await caller(), id: id, to: uid, wrappedKey: wrappedKey)
+    }
+
     func changes(spaceId: String, since: Int64, limit: Int, full: Bool) async throws -> ChangesPage {
         _ = try await caller()
         return try await server.changes(space: spaceId, since: since, limit: limit, full: full)
@@ -1081,6 +1201,7 @@ struct FakeUser {
         let key = SyncCrypto.randomBytes(32)
         let wrapped = try SyncCrypto.wrapSpaceKey(key, spaceId: personal, memberUid: uid, memberPublicKey: pub)
         await server.createSpace(id: personal, kind: "personal", owner: uid, wrappedKey: wrapped)
+        await server.registerIdentity(uid: uid, publicKey: pub)
         let token = await server.issueToken(for: uid)
         return FakeUser(identity: SyncIdentity(uid: uid, privateKey: priv, publicKey: pub, personalSpaceId: personal),
                         server: server, token: token)
@@ -1096,6 +1217,7 @@ final class FakeDevice {
     let store: ClipStore
     let snippets: SnippetStore
     let secrets = FakeSecrets()
+    let authenticators = AuthenticatorStore(backing: MemoryAuthenticatorBacking())
     let engine: SyncEngine
 
     init(_ user: FakeUser) throws {
@@ -1106,7 +1228,8 @@ final class FakeDevice {
         snippets = SnippetStore(context: container.mainContext)
         let token = user.token
         engine = SyncEngine(api: FakeClient(server: user.server, token: { token }), identity: user.identity,
-                            context: container.mainContext, store: store, snippets: snippets, secrets: secrets)
+                            context: container.mainContext, store: store, snippets: snippets, secrets: secrets,
+                            authenticators: authenticators)
         // Like the app (SyncAccount.localChange): local commits ask the next tick to upload.
         let engine = self.engine
         let noteChange = { [weak engine] in
@@ -1116,6 +1239,7 @@ final class FakeDevice {
         store.onCommit = noteChange
         snippets.onCommit = noteChange
         secrets.onChange = noteChange
+        authenticators.onChange = noteChange
     }
 
     func texts(inSpace space: String? = nil) -> Set<String> { Set(store.items(inSpace: space).map(\.text)) }

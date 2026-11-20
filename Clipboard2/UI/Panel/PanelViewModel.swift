@@ -48,6 +48,10 @@ enum PanelEntry: Identifiable {
     case secret(SecretRef)
     /// A Saved folder row (Saved tab only).
     case folder(ClipFolder)
+    /// An authenticator: yours, or one shared with you (codes only). Personal Saved, and search.
+    case authenticator(AuthenticatorItem)
+    /// "Add to Authenticator" for a copied link or QR code, at the top of All until added or dismissed.
+    case authenticatorSuggestion(OTPAccount)
 
     var id: String {
         switch self {
@@ -55,7 +59,19 @@ enum PanelEntry: Identifiable {
         case .snippet(let snippet): "s-" + snippet.id.uuidString
         case .secret(let ref): "k-" + ref.id
         case .folder(let folder): "f-" + folder.id.uuidString
+        case .authenticator(let item): "a-" + item.id
+        case .authenticatorSuggestion: "a-suggestion"
         }
+    }
+
+    var authenticator: AuthenticatorItem? {
+        if case .authenticator(let item) = self { return item }
+        return nil
+    }
+
+    var isSuggestion: Bool {
+        if case .authenticatorSuggestion = self { return true }
+        return false
     }
 
     var clip: ClipItem? {
@@ -81,16 +97,18 @@ enum PanelEntry: Identifiable {
         case .snippet(let snippet): snippet.updatedAt
         case .secret(let ref): ref.createdAt ?? .distantPast
         case .folder(let folder): folder.createdAt
+        case .authenticator(let item): item.createdAt
+        case .authenticatorSuggestion: .now
         }
     }
 
-    /// Nil for folders, which can't be put on a quick slot.
+    /// Nil for folders and authenticators, which can't be put on a quick slot.
     var slotTarget: SlotTarget? {
         switch self {
         case .clip(let item): .clip(item.id)
         case .snippet(let snippet): .snippet(snippet.id)
         case .secret(let ref): .secret(ref.id)
-        case .folder: nil
+        case .folder, .authenticator, .authenticatorSuggestion: nil
         }
     }
 }
@@ -106,6 +124,10 @@ enum PanelMode: Equatable {
     case ai
     /// Naming a folder: renaming one, or a new one (which may take the selection with it).
     case folderName
+    /// Adding an authenticator (from a link, a QR code or by hand), or renaming one.
+    case authenticatorForm
+    /// Share…, People… or Transfer Ownership… for an authenticator you own.
+    case authenticatorPeople
 }
 
 enum PanelAction: Identifiable, Hashable {
@@ -139,6 +161,8 @@ enum PanelAction: Identifiable, Hashable {
     case saveToFolder
     case saveToChosenFolder
     case delete
+    /// Rename, Share…, People…, Transfer, Show Secret, Delete or Leave on an authenticator.
+    case authenticator(AuthenticatorAction)
 
     var id: String {
         switch self {
@@ -168,6 +192,7 @@ enum PanelAction: Identifiable, Hashable {
         case .saveToFolder: "saveToFolder"
         case .saveToChosenFolder: "saveToChosenFolder"
         case .delete: "delete"
+        case .authenticator(let action): "authenticator-" + action.rawValue
         }
     }
 
@@ -182,6 +207,7 @@ enum PanelAction: Identifiable, Hashable {
              .removeFromLabelled: "Saved"
         case .openFolder, .renameFolder, .deleteFolder: "Folder"
         case .saveAsSecret, .setLabel, .shareToGroup, .clearSlot, .delete: "Item"
+        case .authenticator: "Authenticator"
         }
     }
 
@@ -215,6 +241,7 @@ enum PanelAction: Identifiable, Hashable {
         case .saveToFolder: "Save to \(folderName)"
         case .saveToChosenFolder: "Save to…"
         case .delete: "Delete"
+        case .authenticator(let action): action.title
         }
     }
 
@@ -246,8 +273,156 @@ enum PanelAction: Identifiable, Hashable {
         case .saveToFolder: "square.and.arrow.down"
         case .saveToChosenFolder: "folder"
         case .delete: "trash"
+        case .authenticator(let action): action.symbol
         }
     }
+
+    /// What the ⌘K menu offers on an authenticator. Owner-only actions are left out of ones shared
+    /// with you (the server would refuse them), and sharing needs a sync account.
+    static func authenticatorActions(for item: AuthenticatorItem, signedIn: Bool, shareCount: Int?) -> [PanelAction] {
+        var actions: [PanelAction] = [.paste, .copy]
+        switch item {
+        case .owned:
+            actions.append(.authenticator(.rename))
+            if signedIn {
+                actions.append(.authenticator(.share))
+                // Unknown (not listed yet) counts as maybe: the form says when there's nobody.
+                if shareCount != 0 {
+                    actions.append(.authenticator(.people))
+                    actions.append(.authenticator(.transfer))
+                }
+            }
+            actions.append(.authenticator(.showSecret))
+            actions.append(.authenticator(.delete))
+        case .shared:
+            if signedIn { actions.append(.authenticator(.leave)) }
+        }
+        return actions
+    }
+}
+
+nonisolated enum AuthenticatorAction: String, Hashable, Sendable {
+    case rename, share, people, transfer, showSecret, delete, leave
+
+    var title: String {
+        switch self {
+        case .rename: "Rename…"
+        case .share: "Share…"
+        case .people: "People…"
+        case .transfer: "Transfer Ownership…"
+        case .showSecret: "Show Secret / QR"
+        case .delete: "Delete Authenticator"
+        case .leave: "Leave"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .rename: "pencil"
+        case .share: "person.badge.plus"
+        case .people: "person.2"
+        case .transfer: "arrow.right.arrow.left"
+        case .showSecret: "qrcode"
+        case .delete: "trash"
+        case .leave: "rectangle.portrait.and.arrow.right"
+        }
+    }
+}
+
+/// Add (from a link, a QR code or typed) or Rename. Only the manual add shows the secret field.
+@Observable
+final class AuthenticatorFormState {
+    enum Purpose: Equatable {
+        /// `account` is set when it came from a link or QR code (its secret is never shown).
+        case add(from: OTPAccount?)
+        case rename(id: String)
+    }
+
+    let purpose: Purpose
+    var issuer: String
+    var account: String
+    var secret = ""
+    var algorithm: OTPAlgorithm
+    var digits: Int
+    var period: Int
+    var showsAdvanced = false
+    var error: String?
+    /// The one-time "keep your important codes on your phone too" note.
+    let showsTip: Bool
+
+    init(purpose: Purpose, showsTip: Bool = false) {
+        self.purpose = purpose
+        self.showsTip = showsTip
+        switch purpose {
+        case .add(let from):
+            issuer = from?.issuer ?? ""
+            account = from?.account ?? ""
+            algorithm = from?.algorithm ?? .sha1
+            digits = from?.digits ?? 6
+            period = from?.period ?? 30
+        case .rename:
+            issuer = ""
+            account = ""
+            algorithm = .sha1
+            digits = 6
+            period = 30
+        }
+    }
+
+    convenience init(renaming authenticator: Authenticator) {
+        self.init(purpose: .rename(id: authenticator.id))
+        issuer = authenticator.issuer
+        account = authenticator.account
+    }
+
+    var isRename: Bool { if case .rename = purpose { true } else { false } }
+    /// Typed by hand: the form asks for the secret.
+    var asksForSecret: Bool { purpose == .add(from: nil) }
+
+    /// The account to add, or an error for the form.
+    struct Problem: Error, Equatable { var message: String }
+
+    func makeAccount() -> Result<OTPAccount, Problem> {
+        guard case .add(let from) = purpose else { return .failure(Problem(message: "")) }
+        let issuer = issuer.trimmingCharacters(in: .whitespacesAndNewlines)
+        let account = account.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !issuer.isEmpty || !account.isEmpty else { return .failure(Problem(message: "Enter an issuer or an account.")) }
+        let secret: String
+        if let from {
+            secret = from.secret
+        } else {
+            guard let normalized = Base32.normalize(self.secret), Base32.decode(normalized)?.isEmpty == false else {
+                return .failure(Problem(message: "That setup key isn't valid. It's the letters A–Z and digits 2–7 the site shows."))
+            }
+            secret = normalized
+        }
+        guard TOTP.digitRange.contains(digits), period > 0 else { return .failure(Problem(message: "Codes need 6 to 8 digits and a period.")) }
+        return .success(OTPAccount(issuer: issuer, account: account, secret: secret, algorithm: algorithm,
+                                   digits: digits, period: period))
+    }
+}
+
+/// Share…, People… and Transfer Ownership… for an authenticator you own, in the panel.
+@Observable
+final class AuthenticatorPeopleState {
+    enum Purpose { case share, people, transfer }
+
+    let purpose: Purpose
+    let authenticator: Authenticator
+    var isLoading = true
+    var isBusy = false
+    var shares: [AuthenticatorShare] = []
+    var candidates: [SharePerson] = []
+    var selection = 0
+    var error: String?
+
+    init(purpose: Purpose, authenticator: Authenticator) {
+        self.purpose = purpose
+        self.authenticator = authenticator
+    }
+
+    /// How many rows Return can act on.
+    var rowCount: Int { purpose == .share ? candidates.count : shares.count }
 }
 
 @Observable
@@ -316,7 +491,8 @@ final class ShareGroupState {
         self.folder = folder
         self.groups = groups
         self.selection = groups.firstIndex { $0.id == defaultGroupID } ?? 0
-        self.sensitiveKind = items.lazy.filter(\.kind.isTextual).compactMap { SensitiveText.detect($0.text) }.first
+        self.sensitiveKind = items.contains(where: \.isConcealed) ? .authenticatorQR
+            : items.lazy.filter(\.kind.isTextual).compactMap { SensitiveText.detect($0.text) }.first
         // A folder is copied as a folder (folders don't nest), so it has no destination.
         self.foldersByGroup = folder == nil ? foldersByGroup : [:]
     }
@@ -504,7 +680,11 @@ final class PanelViewModel {
     /// The focused row (drives the preview and keyboard navigation).
     var selectedID: String? {
         didSet {
-            if selectedID != oldValue { clearPickedFiles() }
+            if selectedID != oldValue {
+                clearPickedFiles()
+                if revealedSecretID != nil { revealedSecretID = nil }
+                if pendingDeleteID != nil { pendingDeleteID = nil }
+            }
             guard !adjustingSelection else { return }
             selectedIDs = selectedID.map { [$0] } ?? []
             anchorID = selectedID
@@ -531,6 +711,16 @@ final class PanelViewModel {
     private(set) var editSecretForm: EditSecretState?
     private(set) var shareForm: ShareGroupState?
     private(set) var folderNameForm: FolderNameState?
+    private(set) var authenticatorForm: AuthenticatorFormState?
+    private(set) var peopleForm: AuthenticatorPeopleState?
+    /// Ticks once a second while the panel is open, for authenticator codes and their rings.
+    @ObservationIgnored let otpClock = OTPClock()
+    /// The authenticator whose secret and QR code are showing (after Touch ID); cleared on any move.
+    private(set) var revealedSecretID: String?
+    /// The authenticator waiting for its inline Delete confirm.
+    private(set) var pendingDeleteID: String?
+    /// Enter waits for the next code when fewer than 3 s are left.
+    @ObservationIgnored private var codeWait: Task<Void, Never>?
     private(set) var aiRun: AIRun?
     /// Transient status line ("Copied", "Not valid JSON", …).
     private(set) var notice: String?
@@ -586,6 +776,7 @@ final class PanelViewModel {
         refresh(resetSelection: true)
         focusToken &+= 1
         openToken &+= 1
+        otpClock.start()
     }
 
     /// Bumped on every open so the list scrolls back to the top.
@@ -600,6 +791,11 @@ final class PanelViewModel {
         selectionItem = nil
         clearPickedFiles()
         resetMode()
+        otpClock.stop()
+        codeWait?.cancel()
+        codeWait = nil
+        revealedSecretID = nil
+        pendingDeleteID = nil
     }
 
     // MARK: Picking files of a multi-file item
@@ -723,6 +919,8 @@ final class PanelViewModel {
         editSecretForm = nil
         shareForm = nil
         folderNameForm = nil
+        authenticatorForm = nil
+        peopleForm = nil
         actionQuery = ""
         actionSelection = 0
         mode = .browse
@@ -752,8 +950,13 @@ final class PanelViewModel {
         var folders: [ClipFolder] = []
         var snippets: [Snippet] = []
         var secrets: [SecretRef] = []
+        var authenticators: [AuthenticatorItem] = []
         folderCaptions = [:]
         let savedView = isSavedView
+        // Personal tools: in your own Saved (not in folders) and in search from All.
+        if savedView ? (savedSpaceID == nil && openFolderID == nil) : (groupFilter == nil && filter == .all && !q.isEmpty) {
+            authenticators = env.authenticators.items
+        }
         if savedView {
             // Saved: everything one space keeps. Folder rows first (by name), then its saved clips,
             // secrets and snippets mixed, newest first; inside a folder only its clips and secrets.
@@ -810,9 +1013,14 @@ final class PanelViewModel {
         var result: [PanelEntry]
         if q.isEmpty && savedView {
             let kept = clips.map(PanelEntry.clip) + secrets.map(PanelEntry.secret) + snippets.map(PanelEntry.snippet)
+                + authenticators.map(PanelEntry.authenticator)
             result = folders.map(PanelEntry.folder) + kept.sorted { $0.savedDate > $1.savedDate }
         } else if q.isEmpty {
             result = clips.map(PanelEntry.clip) + snippets.map(PanelEntry.snippet) + secrets.map(PanelEntry.secret)
+            // A copied authenticator link or QR code: offered once, at the top of All.
+            if groupFilter == nil, filter == .all, let suggestion = env.authenticators.suggestion {
+                result.insert(.authenticatorSuggestion(suggestion), at: 0)
+            }
         } else {
             var scored: [(PanelEntry, Int, Date)] = []
             for folder in folders {
@@ -840,6 +1048,12 @@ final class PanelViewModel {
                 // Only names are searchable — values never leave the keychain for search.
                 if let s = FuzzyMatcher.score(query: q, in: secret.name) {
                     scored.append((.secret(secret), s + 500, secret.createdAt ?? .distantPast))
+                }
+            }
+            for item in authenticators {
+                // Issuer and account only; never the secret.
+                if let s = FuzzyMatcher.score(query: q, in: item.searchText) {
+                    scored.append((.authenticator(item), s + 500, item.createdAt))
                 }
             }
             scored.sort { $0.1 != $1.1 ? $0.1 > $1.1 : $0.2 > $1.2 }
@@ -1084,6 +1298,255 @@ final class PanelViewModel {
             env.pasteSecret(ref, into: target)
         case .folder(let folder):
             openFolder(folder)
+        case .authenticator(let item):
+            if pendingDeleteID == item.id, case .owned(let authenticator) = item {
+                confirmDelete(authenticator)
+            } else {
+                pasteCode(of: item)
+            }
+        case .authenticatorSuggestion(let account):
+            beginAddAuthenticator(from: account)
+        }
+    }
+
+    // MARK: Authenticators
+
+    /// Fewer seconds than this left: Enter waits for the next code.
+    static let nextCodeThreshold: TimeInterval = 3
+
+    /// Pastes the current code into the target app; with under 3 s left, waits for the next one
+    /// ("Next code…") so the site doesn't get one that expires on the way.
+    func pasteCode(of item: AuthenticatorItem) {
+        let now = Date.now
+        guard let current = item.code(at: now) else {
+            NSSound.beep()
+            showNotice("No code right now")
+            return
+        }
+        let target = targetApp
+        let left = Double(item.period) - now.timeIntervalSince1970.truncatingRemainder(dividingBy: Double(item.period))
+        let nextStart = now.addingTimeInterval(left)
+        guard left < Self.nextCodeThreshold, item.code(at: nextStart.addingTimeInterval(0.05)) != nil else {
+            onClose()
+            env.pasteCode(current, into: target)
+            return
+        }
+        showNotice("Next code…")
+        codeWait?.cancel()
+        codeWait = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(left + 0.05))
+            guard let self, !Task.isCancelled, let code = item.code(at: .now) else { return }
+            self.codeWait = nil
+            self.onClose()
+            self.env.pasteCode(code, into: target)
+        }
+    }
+
+    /// Copy Code: transient, cleared after 30 s, never in history.
+    func copyCode(of item: AuthenticatorItem) {
+        guard let code = item.code(at: .now) else {
+            NSSound.beep()
+            showNotice("No code right now")
+            return
+        }
+        env.copyCode(code)
+        onClose()
+    }
+
+    /// The one-off suggestion goes (Esc, or after adding it).
+    func dismissSuggestion() {
+        env.authenticators.suggestion = nil
+        refresh()
+    }
+
+    var hasSeenAuthenticatorTip: Bool {
+        get { UserDefaults.standard.bool(forKey: "authenticatorTipShown") }
+        set { UserDefaults.standard.set(newValue, forKey: "authenticatorTipShown") }
+    }
+
+    /// The add form, from a link or QR code (`account`) or empty for typing the setup key.
+    func beginAddAuthenticator(from account: OTPAccount? = nil) {
+        authenticatorForm = AuthenticatorFormState(purpose: .add(from: account), showsTip: !hasSeenAuthenticatorTip)
+        mode = .authenticatorForm
+    }
+
+    func beginRename(_ authenticator: Authenticator) {
+        selectedID = PanelEntry.authenticator(.owned(authenticator)).id
+        authenticatorForm = AuthenticatorFormState(renaming: authenticator)
+        mode = .authenticatorForm
+    }
+
+    func submitAuthenticatorForm() {
+        guard let form = authenticatorForm else { return }
+        switch form.purpose {
+        case .rename(let id):
+            let issuer = form.issuer.trimmingCharacters(in: .whitespacesAndNewlines)
+            let account = form.account.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !issuer.isEmpty || !account.isEmpty else {
+                form.error = "Enter an issuer or an account."
+                return
+            }
+            env.authenticators.rename(id: id, issuer: issuer, account: account)
+            resetMode()
+            refresh()
+            selectedID = "a-o-" + id
+            showNotice("Renamed")
+        case .add:
+            switch form.makeAccount() {
+            case .failure(let problem):
+                form.error = problem.message
+                NSSound.beep()
+            case .success(let account):
+                guard let added = env.authenticators.add(account) else {
+                    form.error = "Couldn't save to the Keychain."
+                    return
+                }
+                hasSeenAuthenticatorTip = true
+                if env.authenticators.suggestion?.secret == account.secret { env.authenticators.suggestion = nil }
+                resetMode()
+                refresh()
+                let id = PanelEntry.authenticator(.owned(added)).id
+                if entries.contains(where: { $0.id == id }) { selectedID = id }
+                showNotice("Added “\(AuthenticatorItem.owned(added).title)” to Saved")
+            }
+        }
+    }
+
+    /// Show Secret / QR: always asks for Touch ID first.
+    func revealSecret(of authenticator: Authenticator) {
+        Task {
+            let title = AuthenticatorItem.owned(authenticator).title
+            guard await env.secrets.authenticateNow(reason: "show the secret of “\(title)”") else { return }
+            selectedID = PanelEntry.authenticator(.owned(authenticator)).id
+            if mode == .actions { mode = .browse }
+            revealedSecretID = authenticator.id
+        }
+    }
+
+    func hideSecret() { revealedSecretID = nil }
+
+    /// Delete asks inline in the preview first (Return or the button confirms, esc cancels).
+    func askToDelete(_ authenticator: Authenticator) {
+        selectedID = PanelEntry.authenticator(.owned(authenticator)).id
+        if mode == .actions { mode = .browse }
+        pendingDeleteID = authenticator.id
+    }
+
+    func cancelDelete() { pendingDeleteID = nil }
+
+    func confirmDelete(_ authenticator: Authenticator) {
+        let index = selectedIndex
+        pendingDeleteID = nil
+        revealedSecretID = nil
+        env.authenticators.delete(id: authenticator.id)
+        env.sync.syncNow()
+        refresh()
+        if let index, !entries.isEmpty { selectedID = entries[min(index, entries.count - 1)].id }
+        showNotice("Deleted “\(AuthenticatorItem.owned(authenticator).title)”")
+    }
+
+    /// Share…, People… or Transfer Ownership…: loads who it's shared with, then the list.
+    func beginPeople(_ purpose: AuthenticatorPeopleState.Purpose, for authenticator: Authenticator) {
+        guard env.sync.isSignedIn else { return }
+        selectedID = PanelEntry.authenticator(.owned(authenticator)).id
+        let form = AuthenticatorPeopleState(purpose: purpose, authenticator: authenticator)
+        peopleForm = form
+        mode = .authenticatorPeople
+        Task {
+            do {
+                form.shares = try await env.sync.shares(of: authenticator)
+                form.candidates = env.sync.shareCandidates(excluding: Set(form.shares.map(\.uid)))
+            } catch {
+                form.error = error.localizedDescription
+            }
+            form.isLoading = false
+        }
+    }
+
+    func submitPeople(at index: Int? = nil) {
+        guard let form = peopleForm, !form.isBusy, !form.isLoading else { return }
+        let row = index ?? form.selection
+        let title = AuthenticatorItem.owned(form.authenticator).title
+        switch form.purpose {
+        case .share:
+            guard form.candidates.indices.contains(row) else { return }
+            let person = form.candidates[row]
+            form.isBusy = true
+            Task {
+                do {
+                    try await env.sync.share(form.authenticator, with: person)
+                    resetMode()
+                    showNotice("Shared “\(title)” with \(person.name). They get codes, never the secret.")
+                } catch {
+                    form.isBusy = false
+                    form.error = error.localizedDescription
+                }
+            }
+        case .people:
+            guard form.shares.indices.contains(row) else { return }
+            removeShare(form.shares[row])
+        case .transfer:
+            guard form.shares.indices.contains(row) else { return }
+            let share = form.shares[row]
+            form.isBusy = true
+            Task {
+                do {
+                    try await env.sync.transfer(form.authenticator, to: share)
+                    resetMode()
+                    refresh()
+                    showNotice("\(share.name) owns “\(title)” now. You'll get codes like everyone else.")
+                } catch {
+                    form.isBusy = false
+                    form.error = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    func removeShare(_ share: AuthenticatorShare) {
+        guard let form = peopleForm, !form.isBusy else { return }
+        form.isBusy = true
+        Task {
+            do {
+                try await env.sync.removeShare(share, of: form.authenticator)
+                form.shares.removeAll { $0.uid == share.uid }
+                form.selection = min(form.selection, max(0, form.shares.count - 1))
+                form.isBusy = false
+                let until = Date(syncMillis: share.codesUntil)
+                showNotice(until > .now
+                           ? "Removed. Codes they already have work until \(until.formatted(date: .omitted, time: .shortened))."
+                           : "Removed.")
+            } catch {
+                form.isBusy = false
+                form.error = error.localizedDescription
+            }
+        }
+    }
+
+    /// Stops getting codes for one shared with you; it leaves your list.
+    func leave(_ shared: SharedAuthenticator) {
+        Task {
+            do {
+                try await env.sync.leave(shared)
+                if mode == .actions { mode = .browse }
+                refresh()
+                showNotice("Left “\(AuthenticatorItem.shared(shared).title)”")
+            } catch {
+                showNotice(error.localizedDescription)
+            }
+        }
+    }
+
+    func perform(_ action: AuthenticatorAction, on item: AuthenticatorItem) {
+        switch (action, item) {
+        case (.rename, .owned(let a)): beginRename(a)
+        case (.share, .owned(let a)): beginPeople(.share, for: a)
+        case (.people, .owned(let a)): beginPeople(.people, for: a)
+        case (.transfer, .owned(let a)): beginPeople(.transfer, for: a)
+        case (.showSecret, .owned(let a)): revealSecret(of: a)
+        case (.delete, .owned(let a)): askToDelete(a)
+        case (.leave, .shared(let s)): leave(s)
+        default: NSSound.beep()
         }
     }
 
@@ -1100,7 +1563,7 @@ final class PanelViewModel {
         case .clip(let item): labelForm = LabelFormState(target: .clip(item))
         case .secret(let ref): labelForm = LabelFormState(target: .secret(ref))
         case .folder(let folder): labelForm = LabelFormState(target: .folder(folder))
-        case .snippet: return
+        case .snippet, .authenticator, .authenticatorSuggestion: return
         }
         mode = .label
     }
@@ -1623,6 +2086,10 @@ final class PanelViewModel {
             return actions + [.saveToFolder, .saveToChosenFolder, .delete]
         }
         guard let entry = selectedEntry else { return [] }
+        if let item = entry.authenticator {
+            return PanelAction.authenticatorActions(for: item, signedIn: env.sync.isSignedIn, shareCount: shareCount(of: item))
+        }
+        if entry.isSuggestion { return [] }
         if case .folder(let folder) = entry {
             var actions: [PanelAction] = [.openFolder, .renameFolder, .setLabel]
             if folder.spaceID == nil && canShareToGroup { actions.append(.shareToGroup) }
@@ -1646,7 +2113,7 @@ final class PanelViewModel {
                 actions += Transform.allCases.filter { $0 != .plainText }.map(PanelAction.transform)
                 actions += aiActions
                 actions.append(.saveAsSecret)
-            } else if item.kind == .image {
+            } else if item.kind == .image && !item.isConcealed {
                 actions += aiActions.filter { if case .ai(let ai) = $0 { ai.worksOnImages } else { true } }
             }
             actions.append(.setLabel)
@@ -1655,7 +2122,7 @@ final class PanelViewModel {
             actions += PanelAction.sendToDeviceActions(for: item, multiSelecting: false, targets: DeviceTarget.others(in: env.sync))
             actions += sendableContacts.filter { $0.id != item.spaceID }.map(PanelAction.sendToContact)
             actions += [.saveToFolder, .saveToChosenFolder]
-        case .snippet, .folder:
+        case .snippet, .folder, .authenticator, .authenticatorSuggestion:
             break
         case .secret(let ref):
             actions.append(.copy)
@@ -1698,8 +2165,20 @@ final class PanelViewModel {
         return actions
     }
 
+    /// How many people an authenticator you own is shared with: 0 before it's on the server, nil
+    /// while not known yet.
+    func shareCount(of item: AuthenticatorItem) -> Int? {
+        guard let authenticator = item.owned else { return nil }
+        guard let space = authenticator.spaceID else { return 0 }
+        return env.authenticators.shareCounts[space]
+    }
+
     /// An action's title for the current selection.
     func title(for action: PanelAction) -> String {
+        if selectedEntry?.authenticator != nil && !isMultiSelecting {
+            if action == .paste { return "Paste Code" }
+            if action == .copy { return "Copy Code" }
+        }
         if let count = pickedFileCount {
             switch action {
             case .paste: return "Paste \(count.picked) of \(count.total) Files"
@@ -1744,7 +2223,7 @@ final class PanelViewModel {
             .sorted { $0.1 > $1.1 }
             .map(\.0)
         // Anything typed can also be sent as a question or instruction about the selected item.
-        if !isMultiSelecting, let kind = selectedEntry?.clip?.kind, kind.isTextual || kind == .image {
+        if !isMultiSelecting, let clip = selectedEntry?.clip, !clip.isConcealed, clip.kind.isTextual || clip.kind == .image {
             if env.isAIReady {
                 // A sentence or question is meant for the AI, not a filter: offer it first.
                 let looksLikeQuestion = q.contains(" ") || q.hasSuffix("?")
@@ -1762,6 +2241,17 @@ final class PanelViewModel {
             return
         }
         guard let entry = selectedEntry else { return }
+        if let item = entry.authenticator {
+            switch action {
+            case .paste:
+                mode = .browse
+                pasteCode(of: item)
+            case .copy: copyCode(of: item)
+            case .authenticator(let action): perform(action, on: item)
+            default: break
+            }
+            return
+        }
         switch action {
         case .paste:
             activate(entry)
@@ -1772,7 +2262,7 @@ final class PanelViewModel {
             case .clip(let item) where item.isTransient: env.paste.write(text: item.text)
             case .clip(let item): copy(item)
             case .secret(let ref): env.copySecret(ref)
-            case .snippet, .folder: break
+            case .snippet, .folder, .authenticator, .authenticatorSuggestion: break
             }
             onClose()
         case .transform(let transform):
@@ -1860,6 +2350,8 @@ final class PanelViewModel {
         case .delete:
             mode = .browse
             deleteSelection(includingSecrets: true)
+        case .authenticator:
+            break   // handled above
         }
     }
 
@@ -2211,6 +2703,13 @@ final class PanelViewModel {
             return
         case .snippet:
             return   // snippets are edited in Settings
+        case .authenticator(let item):
+            // ⌫ asks first (like ⌘K → Delete); it never deletes one straight away.
+            if includingSecrets, case .owned(let authenticator) = item { askToDelete(authenticator) }
+            return
+        case .authenticatorSuggestion:
+            dismissSuggestion()
+            return
         }
         refresh()
         if !entries.isEmpty {
@@ -2225,10 +2724,28 @@ final class PanelViewModel {
         switch mode {
         case .browse: handleBrowseKey(event)
         case .actions: handleActionKey(event)
-        case .snippetForm, .saveSecret, .label, .editSecret, .folderName: handleFormKey(event)
+        case .snippetForm, .saveSecret, .label, .editSecret, .folderName, .authenticatorForm: handleFormKey(event)
         case .shareToGroup: handleShareKey(event)
         case .ai: handleAIKey(event)
+        case .authenticatorPeople: handlePeopleKey(event)
         }
+    }
+
+    private func handlePeopleKey(_ event: NSEvent) -> Bool {
+        guard let form = peopleForm else { return false }
+        switch event.keyCode {
+        case KeyCode.escape:
+            resetMode()
+        case KeyCode.upArrow:
+            form.selection = max(0, form.selection - 1)
+        case KeyCode.downArrow:
+            form.selection = min(max(0, form.rowCount - 1), form.selection + 1)
+        case KeyCode.returnKey, KeyCode.keypadEnter:
+            submitPeople()
+        default:
+            return false
+        }
+        return true
     }
 
     private func handleBrowseKey(_ event: NSEvent) -> Bool {
@@ -2243,6 +2760,12 @@ final class PanelViewModel {
             // Quick Look closes first, then an open folder; the panel on the next press.
             if isQuickLookOpen() {
                 onQuickLook(false)
+            } else if pendingDeleteID != nil {
+                cancelDelete()
+            } else if revealedSecretID != nil {
+                hideSecret()
+            } else if entries.first?.isSuggestion == true {
+                dismissSuggestion()
             } else if openFolderID != nil {
                 closeFolder()
             } else {
@@ -2355,6 +2878,7 @@ final class PanelViewModel {
             case .label: submitLabel()
             case .folderName: submitFolderName()
             case .editSecret: submitEditSecret()
+            case .authenticatorForm: submitAuthenticatorForm()
             default: submitSnippetForm()
             }
             return true

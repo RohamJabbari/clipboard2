@@ -1,7 +1,7 @@
 import Foundation
 
 nonisolated enum SyncCategory: String, Codable, Sendable, CaseIterable {
-    case history, pinned, snippet, secret, folder
+    case history, pinned, snippet, secret, folder, otp
 
     var isClip: Bool { self == .history || self == .pinned }
 }
@@ -211,6 +211,50 @@ nonisolated struct FolderPayload: Codable, Equatable, Sendable {
     }
 }
 
+/// `type: "otp"`: an authenticator's seed and settings. Only in authenticator spaces, so only the
+/// owner's devices ever read it.
+nonisolated struct OTPPayload: Codable, Equatable, Sendable {
+    var v = 1
+    var type = "otp"
+    var issuer: String
+    var account: String
+    /// Base32, no padding.
+    var secret: String
+    var algorithm: String
+    var digits: Int
+    var period: Int
+    var createdAt: Int64
+    var updatedAt: Int64
+    var rev: Int64?
+
+    init(issuer: String, account: String, secret: String, algorithm: String, digits: Int, period: Int,
+         createdAt: Int64, updatedAt: Int64) {
+        self.issuer = issuer
+        self.account = account
+        self.secret = secret
+        self.algorithm = algorithm
+        self.digits = digits
+        self.period = period
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        v = try c.decodeIfPresent(Int.self, forKey: .v) ?? 1
+        type = try c.decodeIfPresent(String.self, forKey: .type) ?? "otp"
+        issuer = try c.decodeIfPresent(String.self, forKey: .issuer) ?? ""
+        account = try c.decodeIfPresent(String.self, forKey: .account) ?? ""
+        secret = try c.decodeIfPresent(String.self, forKey: .secret) ?? ""
+        algorithm = try c.decodeIfPresent(String.self, forKey: .algorithm) ?? "SHA1"
+        digits = try c.decodeIfPresent(Int.self, forKey: .digits) ?? 6
+        period = try c.decodeIfPresent(Int.self, forKey: .period) ?? 30
+        createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
+        updatedAt = try c.decodeIfPresent(Int64.self, forKey: .updatedAt) ?? createdAt
+        rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
+    }
+}
+
 nonisolated enum SyncPayloadError: Error, Equatable {
     case unknownType(String)
 }
@@ -220,6 +264,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
     case snippet(SnippetPayload)
     case secret(SecretPayload)
     case folder(FolderPayload)
+    case otp(OTPPayload)
 
     nonisolated private struct TypeProbe: Decodable { var type: String? }
 
@@ -230,6 +275,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case "snippet": return .snippet(try decoder.decode(SnippetPayload.self, from: data))
         case "secret": return .secret(try decoder.decode(SecretPayload.self, from: data))
         case "folder": return .folder(try decoder.decode(FolderPayload.self, from: data))
+        case "otp": return .otp(try decoder.decode(OTPPayload.self, from: data))
         case let other: throw SyncPayloadError.unknownType(other ?? "nil")
         }
     }
@@ -244,6 +290,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .snippet(let p): return try encoder.encode(p)
         case .secret(let p): return try encoder.encode(p)
         case .folder(let p): return try encoder.encode(p)
+        case .otp(let p): return try encoder.encode(p)
         }
     }
 
@@ -270,6 +317,9 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .folder(var p):
             p.rev = nil
             return .folder(p)
+        case .otp(var p):
+            p.rev = nil
+            return .otp(p)
         }
     }
 
@@ -279,6 +329,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .snippet(let p): p.rev
         case .secret(let p): p.rev
         case .folder(let p): p.rev
+        case .otp(let p): p.rev
         }
     }
 
@@ -297,6 +348,9 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .folder(var p):
             p.rev = rev
             return .folder(p)
+        case .otp(var p):
+            p.rev = rev
+            return .otp(p)
         }
     }
 
@@ -306,6 +360,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .snippet: .snippet
         case .secret: .secret
         case .folder: .folder
+        case .otp: .otp
         }
     }
 }

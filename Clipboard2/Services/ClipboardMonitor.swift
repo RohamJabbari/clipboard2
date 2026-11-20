@@ -85,6 +85,8 @@ final class ClipboardMonitor {
     @ObservationIgnored var shouldDiscard: ((ProcessedCapture) -> Bool)?
     /// Called with every item a copy saved (sync activity, image text recognition).
     @ObservationIgnored var onCapture: ((ClipItem) -> Void)?
+    /// An `otpauth://` link was copied (it isn't stored).
+    @ObservationIgnored var onAuthenticatorLink: ((String) -> Void)?
 
     init(store: ClipStore, prefs: Preferences, tracker: FrontmostAppTracker, blobs: BlobStore, pasteboard: NSPasteboard = .general) {
         self.store = store
@@ -128,7 +130,8 @@ final class ClipboardMonitor {
         autoreleasepool { captureCurrent() }
     }
 
-    private func captureCurrent() {
+    /// Reads the pasteboard now (the timer does this on every change; tests call it directly).
+    func captureCurrent() {
         let types = pasteboard.types?.map(\.rawValue) ?? []
         let source = tracker.currentSource
         let decision = ClipboardFilter.decide(
@@ -141,6 +144,11 @@ final class ClipboardMonitor {
             return
         }
         guard let raw = PasteboardReader.read(pasteboard, source: source) else { return }
+        // An authenticator link is a secret: never a history item, only an offer to add it.
+        if raw.kind.isTextual, OTPAuthURI.isSecretLink(raw.text) {
+            onAuthenticatorLink?(raw.text)
+            return
+        }
 
         let blobs = self.blobs
         Task { [weak self] in

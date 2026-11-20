@@ -64,6 +64,9 @@ final class ClipItem {
     /// The Saved folder (`ClipFolder.id`) this item is in; only set while `isPinned`. An id with
     /// no folder in the item's space (deleted, or not synced yet) reads as the root of Saved.
     var folderID: UUID?
+    /// An image holding an authenticator QR code (found on this Mac, never synced): it's kept like
+    /// any image but never shared to a group or contact, and never sent to AI.
+    var isConcealed: Bool = false
 
     init(capture: ProcessedCapture, now: Date = .now) {
         id = UUID()

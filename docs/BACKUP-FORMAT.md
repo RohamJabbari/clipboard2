@@ -1,6 +1,6 @@
 # Encrypted backup format (`.clipboard2backup`), version 1
 
-One file holds a user's history, pinned items, snippets and, if they opt in, secrets, encrypted with a
+One file holds a user's history, pinned items, snippets and, if they opt in, secrets and authenticators, encrypted with a
 passphrase. The Mac and Windows apps write and read the same bytes, so a backup made on one opens on the
 other.
 
@@ -44,7 +44,8 @@ UTF-8 JSON, one object:
   "clips":    [ /* ClipPayload + extras, below */ ],
   "snippets": [ /* SnippetPayload + "id" */ ],
   "folders":  [ /* FolderPayload + "id" (1.6+; older readers ignore it) */ ],
-  "secrets":  [ /* SecretPayload + "id" */ ]   // omitted unless the user opted in
+  "secrets":  [ /* SecretPayload + "id" */ ],  // omitted unless the user opted in
+  "authenticators": [ /* OTPPayload + "id" (1.8+) */ ]   // only with secrets; omitted when none
 }
 ```
 
@@ -84,6 +85,22 @@ Only present when the user ticked "Include secrets" and confirmed with Touch ID 
 entry is a secret payload (`"v":1,"type":"secret","name","value","createdAt"`, and `"folder"` like a clip's, 1.7+) plus `"id"`. Personal
 secrets only. The values are in the plaintext, protected only by the passphrase.
 
+### `authenticators`
+
+Added in 1.8. Present only under the same rule as `secrets` (the user ticked "Include secrets" and confirmed
+with Touch ID or Windows Hello), and omitted when there are none. Each entry is an `otp` payload exactly as in
+[sync/PROTOCOL.md → Item payloads](sync/PROTOCOL.md#item-payloads) plus `"id"` (the `otp` item's id):
+
+```json
+{"v":1,"type":"otp","id":"3f0c…","issuer":"GitHub","account":"me@example.com","secret":"JBSWY3DPEHPK3PXP",
+ "algorithm":"SHA1","digits":6,"period":30,"createdAt":1792000000000,"updatedAt":1792000000000}
+```
+
+- `secret` is base32 without padding; `algorithm` is `SHA1`, `SHA256` or `SHA512`; `digits` is 6–8.
+- Writers include **only authenticators the user owns**. Ones shared with them hold codes, not the secret, and
+  aren't exported. The seed is in the plaintext, protected only by the passphrase, like secrets.
+- Sync-only data (the authenticator space, shares) isn't written. `rev` is left out.
+
 ## Import
 
 Import merges into the personal space and never deletes or overwrites anything:
@@ -97,6 +114,11 @@ Import merges into the personal space and never deletes or overwrites anything:
   among `folders` leaves them at the root of Saved. Clips skipped as duplicates keep their current folder.
 - **Snippets:** skipped when one with the same `(name, body)` exists. Otherwise inserted with a new id.
 - **Secrets:** skipped when one with the same `(name, value)` exists. Otherwise added as a new secret.
+- **Authenticators:** skipped when one the user owns has the same `(secret, account)`, or an earlier entry in
+  the same file had it; an entry whose `secret` isn't valid base32 (spaces, lower case and missing padding are
+  forgiven) or whose `digits` is outside 6–8 is reported as not added. Otherwise added as a new **owned**
+  authenticator with a new id (the backup's `id` is informational), keeping `createdAt`; when signed in, sync
+  then creates its authenticator space and pushes it. Imports never create shares.
 - The usual rules then apply: retention (pinned items exempt), and a history item whose text equals a saved
   secret is removed.
 

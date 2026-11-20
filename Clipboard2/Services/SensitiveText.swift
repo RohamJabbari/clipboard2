@@ -7,10 +7,13 @@ import Foundation
 nonisolated enum SensitiveText {
     enum Kind: Sendable, Equatable {
         case privateKey, cardNumber, apiKey, token, code, password
+        /// An image holding an authenticator QR code (never from `detect`, which reads text).
+        case authenticatorQR
 
         /// Completes "This looks like …".
         var description: String {
             switch self {
+            case .authenticatorQR: "an authenticator QR code"
             case .privateKey: "a private key"
             case .cardNumber: "a card number"
             case .apiKey: "an API key"
@@ -23,6 +26,7 @@ nonisolated enum SensitiveText {
         /// Short name for list rows ("Hidden · API key").
         var shortName: String {
             switch self {
+            case .authenticatorQR: "Authenticator QR"
             case .privateKey: "Private key"
             case .cardNumber: "Card number"
             case .apiKey: "API key"
@@ -35,6 +39,7 @@ nonisolated enum SensitiveText {
         /// Mid-sentence name ("Hidden API key").
         var inlineName: String {
             switch self {
+            case .authenticatorQR: "authenticator QR code"
             case .privateKey: "private key"
             case .cardNumber: "card number"
             case .apiKey: "API key"

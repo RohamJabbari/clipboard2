@@ -79,9 +79,12 @@ struct QuickPanelView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear { searchFocused = true }
         .onChange(of: model.focusToken) {
-            searchFocused = ![.actions, .snippetForm, .saveSecret, .label, .editSecret, .shareToGroup, .folderName].contains(model.mode)
+            searchFocused = ![.actions, .snippetForm, .saveSecret, .label, .editSecret, .shareToGroup, .folderName,
+                              .authenticatorForm, .authenticatorPeople].contains(model.mode)
         }
         .onChange(of: env.store.revision) { model.refresh() }
+        .onChange(of: env.authenticators.revision) { model.refresh() }
+        .onChange(of: env.authenticators.suggestion) { model.refresh() }
         .onChange(of: env.snippets.revision) { model.refresh() }
         .onChange(of: env.secrets.revision) { model.refresh() }
     }
@@ -192,6 +195,21 @@ struct QuickPanelView: View {
                                     FolderDropRow(entry: entry, folder: folder, model: model)
                                         .id(entry.id)
                                         .contextMenu { folderContextMenu(folder) }
+                                } else if let item = entry.authenticator {
+                                    AuthenticatorRow(item: item, isSelected: model.isSelected(entry),
+                                                     showsCheckmark: model.isMultiSelecting, query: model.query,
+                                                     shareCount: model.shareCount(of: item), clock: model.otpClock)
+                                        .id(entry.id)
+                                        .onTapGesture { tap(entry) }
+                                        .contextMenu { authenticatorContextMenu(item) }
+                                } else if case .authenticatorSuggestion(let account) = entry {
+                                    AuthenticatorSuggestionRow(account: account, isSelected: model.isSelected(entry))
+                                        .id(entry.id)
+                                        .onTapGesture { tap(entry) }
+                                        .contextMenu {
+                                            Button("Add…") { model.beginAddAuthenticator(from: account) }
+                                            Button("Dismiss") { model.dismissSuggestion() }
+                                        }
                                 } else {
                                     row(for: entry, at: index)
                                 }
@@ -245,6 +263,35 @@ struct QuickPanelView: View {
             .modifier(ClipDragSource(item: entry.clip.flatMap { $0.isTransient ? nil : $0 },
                                      blobs: env.blobs, pickedFiles: model.pickedFileURLs))
             .modifier(SecretDragSource(ref: entry.secret))
+    }
+
+    /// A click selects; a double-click activates (pastes the code, or opens the add form).
+    private func tap(_ entry: PanelEntry) {
+        if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
+            model.activate(entry)
+        } else {
+            model.click(entry)
+        }
+    }
+
+    @ViewBuilder
+    private func authenticatorContextMenu(_ item: AuthenticatorItem) -> some View {
+        let actions = PanelAction.authenticatorActions(for: item, signedIn: env.sync.isSignedIn,
+                                                       shareCount: model.shareCount(of: item))
+        Button("Paste Code") { model.pasteCode(of: item) }
+        Button("Copy Code") { model.copyCode(of: item) }
+        let more = actions.compactMap { action -> AuthenticatorAction? in
+            if case .authenticator(let a) = action { a } else { nil }
+        }
+        if !more.isEmpty { Divider() }
+        ForEach(more, id: \.self) { action in
+            if action == .delete || action == .leave {
+                Divider()
+                Button(action == .delete ? "Delete…" : action.title, role: .destructive) { model.perform(action, on: item) }
+            } else {
+                Button(action.title) { model.perform(action, on: item) }
+            }
+        }
     }
 
     @ViewBuilder
@@ -433,6 +480,14 @@ struct QuickPanelView: View {
             if let form = model.folderNameForm {
                 FolderNameView(form: form) { model.submitFolderName() }
             }
+        case .authenticatorForm:
+            if let form = model.authenticatorForm {
+                AuthenticatorFormView(form: form) { model.submitAuthenticatorForm() }
+            }
+        case .authenticatorPeople:
+            if let form = model.peopleForm {
+                AuthenticatorPeopleView(form: form, model: model)
+            }
         case .ai:
             if let run = model.aiRun {
                 AIResultView(run: run, model: model)
@@ -443,6 +498,11 @@ struct QuickPanelView: View {
             } else if let folder = model.selectedEntry?.folder {
                 FolderPreview(folder: folder, count: model.folderCounts[folder.id] ?? 0, model: model)
                     .id(folder.id)
+            } else if let item = model.selectedEntry?.authenticator {
+                AuthenticatorPreview(item: item, model: model)
+                    .id(item.id)
+            } else if case .authenticatorSuggestion(let account) = model.selectedEntry {
+                AuthenticatorSuggestionPreview(account: account, model: model)
             } else if let entry = model.selectedEntry {
                 PreviewPane(entry: entry, sharing: sharing(for: entry), onEditSecret: model.beginEditSecret,
                             onPasteText: model.pasteText, onSaveAsSecret: model.beginSaveSecret, model: model)
@@ -869,6 +929,7 @@ struct PanelRow: View {
         case .snippet: .snippet
         case .secret: .secret
         case .folder: .folder
+        case .authenticator, .authenticatorSuggestion: .authenticator
         }
     }
 
@@ -887,6 +948,8 @@ struct PanelRow: View {
         case .snippet(let snippet): return snippet.name.isEmpty ? "Untitled Snippet" : snippet.name
         case .secret(let ref): return ref.name
         case .folder(let folder): return folder.name
+        case .authenticator(let item): return item.title
+        case .authenticatorSuggestion: return "Add to Authenticator"
         }
     }
 
@@ -946,6 +1009,8 @@ struct PanelRow: View {
             return "Secret · ••••••••"
         case .folder:
             return folderCount == 1 ? "Folder · 1 item" : "Folder · \(folderCount) items"
+        case .authenticator(let item): return item.subtitle
+        case .authenticatorSuggestion(let account): return account.issuer
         }
     }
 
@@ -961,6 +1026,8 @@ struct PanelRow: View {
         case .folder(let folder):
             return "Folder \(folder.name)" + (folder.label.map { ", label \($0)" } ?? "")
                 + ", \(folderCount) \(folderCount == 1 ? "item" : "items")"
+        case .authenticator(let item): return "Authenticator \(item.title)"
+        case .authenticatorSuggestion: return "Add to Authenticator"
         }
     }
 }
@@ -1005,6 +1072,12 @@ struct HintBar: View {
             case .browse where entry?.folder != nil:
                 hint("⏎", "Open")
                 hint("⌘K", "Actions")
+            case .browse where entry?.authenticator != nil:
+                hint("⏎", "Paste Code")
+                hint("⌘K", "Actions")
+            case .browse where entry?.isSuggestion == true:
+                hint("⏎", "Add")
+                hint("esc", "Dismiss")
             case .browse:
                 hint("⏎", pickedFiles.map { "Paste \($0.picked) of \($0.total) Files" } ?? "Paste")
                 if entry?.clip != nil {
@@ -1021,8 +1094,11 @@ struct HintBar: View {
             case .snippetForm:
                 hint("⇥", "Next Field")
                 hint("⏎", "Paste")
-            case .saveSecret, .label, .editSecret, .folderName:
+            case .saveSecret, .label, .editSecret, .folderName, .authenticatorForm:
                 hint("⏎", "Save")
+            case .authenticatorPeople:
+                hint("↑↓", "Choose")
+                hint("⏎", "Choose")
             case .shareToGroup:
                 hint("↑↓", "Choose")
                 hint("⏎", "Share")

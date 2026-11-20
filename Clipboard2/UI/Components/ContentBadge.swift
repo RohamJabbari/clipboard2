@@ -8,6 +8,7 @@ struct ContentBadge: View {
         case snippet
         case secret
         case folder
+        case authenticator
     }
 
     let kind: Kind
@@ -36,6 +37,8 @@ struct ContentBadge: View {
                 symbol("lock.fill", tint: nil)
             case .folder:
                 symbol("folder.fill", tint: .blue)
+            case .authenticator:
+                symbol("lock.shield.fill", tint: .green)
             }
         }
         .frame(width: size, height: size)

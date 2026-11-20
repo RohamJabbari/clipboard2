@@ -124,6 +124,7 @@ nonisolated enum SyncCrypto {
         static func blob(spaceId: String, blobId: String) -> String { "c2/blob/v1/\(spaceId)/\(blobId)" }
         static func name(spaceId: String) -> String { "c2/name/v1/\(spaceId)" }
         static func invite(spaceId: String) -> String { "c2/invite/v1/\(spaceId)" }
+        static func otpCodes(spaceId: String, recipientUid: String) -> String { "c2/otpcodes/v1/\(spaceId)/\(recipientUid)" }
     }
 
     /// `ephPub ‖ AEAD(wk, SK)` where wk comes from ECDH between a fresh key and the member's key.
@@ -144,6 +145,27 @@ nonisolated enum SyncCrypto {
                       salt: ephPub + myPub, info: "c2/space/v1/\(spaceId)")
         return try open(Data(wrapped.dropFirst(publicKeyLength)), key: wk,
                         aad: AAD.spaceKey(spaceId: spaceId, memberUid: uid))
+    }
+
+    /// An authenticator's code batch for one person (PROTOCOL.md → Authenticators): built like
+    /// `wrapSpaceKey`, with its own HKDF info and AAD, so a batch can't be read as a space key.
+    static func sealCodes(_ codesJSON: Data, spaceId: String, recipientUid: String, recipientPublicKey: Data,
+                          ephemeralPrivateKey: Data? = nil, nonce: Data? = nil) throws -> Data {
+        let ephPriv = ephemeralPrivateKey ?? newPrivateKey()
+        let ephPub = try publicKey(of: ephPriv)
+        let ck = hkdf(try ecdh(privateKey: ephPriv, publicKey: recipientPublicKey),
+                      salt: ephPub + recipientPublicKey, info: "c2/otpcodes/v1/\(spaceId)")
+        return ephPub + (try seal(codesJSON, key: ck, aad: AAD.otpCodes(spaceId: spaceId, recipientUid: recipientUid), nonce: nonce))
+    }
+
+    static func openCodes(_ sealed: Data, spaceId: String, uid: String, privateKey: Data) throws -> Data {
+        guard sealed.count > publicKeyLength else { throw SyncCryptoError.badEnvelope }
+        let ephPub = Data(sealed.prefix(publicKeyLength))
+        let myPub = try publicKey(of: privateKey)
+        let ck = hkdf(try ecdh(privateKey: privateKey, publicKey: ephPub),
+                      salt: ephPub + myPub, info: "c2/otpcodes/v1/\(spaceId)")
+        return try open(Data(sealed.dropFirst(publicKeyLength)), key: ck,
+                        aad: AAD.otpCodes(spaceId: spaceId, recipientUid: uid))
     }
 
     static func itemKey(spaceKey: Data) -> Data { hkdf(spaceKey, info: "c2/item/v1") }

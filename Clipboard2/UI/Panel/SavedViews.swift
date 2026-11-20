@@ -44,14 +44,29 @@ struct SavedHeader: View {
             }
             Spacer(minLength: 4)
             if model.openFolder == nil {
-                Button {
-                    model.beginNewFolder()
-                } label: {
-                    Image(systemName: "folder.badge.plus")
+                if model.savedSpaceID == nil {
+                    // Your own Saved: New Folder, or an authenticator typed by hand.
+                    Menu {
+                        Button("New Folder", systemImage: "folder.badge.plus") { model.beginNewFolder() }
+                        Button("New Authenticator…", systemImage: "lock.shield") { model.beginAddAuthenticator() }
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("New Folder or Authenticator")
+                    .accessibilityLabel("New")
+                } else {
+                    Button {
+                        model.beginNewFolder()
+                    } label: {
+                        Image(systemName: "folder.badge.plus")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("New Folder")
+                    .accessibilityLabel("New Folder")
                 }
-                .buttonStyle(.borderless)
-                .help("New Folder")
-                .accessibilityLabel("New Folder")
             }
         }
         .font(.callout)

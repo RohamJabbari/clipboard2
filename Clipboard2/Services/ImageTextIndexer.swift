@@ -22,6 +22,10 @@ final class ImageTextIndexer {
     var backlogPause: Duration = .seconds(1)
     /// Reads the text in the image file at a URL; replaceable in tests.
     var recognize: @Sendable (URL) async -> String? = { await ImageTextIndexer.recognizeText(at: $0) }
+    /// Finds an authenticator QR code (its `otpauth://` link) in the image file; replaceable in tests.
+    var findAuthenticatorLink: @Sendable (URL) async -> String? = { await OTPQRCode.link(at: $0) }
+    /// A new capture holds an authenticator QR code: the link, to offer adding it.
+    var onAuthenticatorLink: ((String) -> Void)?
 
     init(store: ClipStore, blobs: BlobStore) {
         self.store = store
@@ -104,10 +108,17 @@ final class ImageTextIndexer {
             if Task.isCancelled { return }
             defer { queued.remove(id) }
             guard let item = store.item(withID: id), Self.needsIndexing(item), let file = item.imageFile else { continue }
-            let text = await recognize(blobs.url(for: file))
+            let url = blobs.url(for: file)
+            let text = await recognize(url)
+            let link = await findAuthenticatorLink(url)
             // The item may have been deleted or replaced while Vision was working.
             guard let live = store.item(withID: id), live.imageFile == file, live.imageText == nil else { continue }
             live.imageText = Self.clean(text ?? "")
+            if let link {
+                // An authenticator QR code: concealed, so it isn't shared by accident.
+                live.isConcealed = true
+                if !isBacklog { onAuthenticatorLink?(link) }
+            }
             // Saved directly: the recognised text isn't part of what sync sends, so there's nothing to push.
             do { try store.context.save() } catch {
                 Log.store.error("Saving image text failed: \(error.localizedDescription, privacy: .public)")

@@ -64,4 +64,8 @@ final class SyncSpace {
     /// A contact's space: its `name` is the other person's.
     var isDirect: Bool { kind == "direct" }
     var isOwner: Bool { role == "owner" }
+    /// One authenticator you own (PROTOCOL.md → Authenticators); never listed as a group.
+    var isAuthenticator: Bool { kind == "authenticator" }
+    /// A group: not personal, not a contact, not an authenticator.
+    var isGroup: Bool { !isPersonal && !isDirect && !isAuthenticator }
 }

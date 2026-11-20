@@ -124,14 +124,17 @@ nonisolated struct BackupDocument: Codable, Equatable, Sendable {
     var folders: [BackupFolder]?
     /// Omitted unless the user chose to include secrets.
     var secrets: [BackupSecret]?
+    /// Authenticators you own (1.8+), like secrets: only with "Include secrets", omitted when none.
+    var authenticators: [BackupAuthenticator]?
 
     init(createdAt: Int64, clips: [BackupClip], snippets: [BackupSnippet], folders: [BackupFolder]? = nil,
-         secrets: [BackupSecret]?) {
+         secrets: [BackupSecret]?, authenticators: [BackupAuthenticator]? = nil) {
         self.createdAt = createdAt
         self.clips = clips
         self.snippets = snippets
         self.folders = folders?.isEmpty == true ? nil : folders
         self.secrets = secrets
+        self.authenticators = authenticators?.isEmpty == true ? nil : authenticators
     }
 
     init(from decoder: any Decoder) throws {
@@ -144,6 +147,7 @@ nonisolated struct BackupDocument: Codable, Equatable, Sendable {
         snippets = try c.decodeIfPresent([BackupSnippet].self, forKey: .snippets) ?? []
         folders = try c.decodeIfPresent([BackupFolder].self, forKey: .folders)
         secrets = try c.decodeIfPresent([BackupSecret].self, forKey: .secrets)
+        authenticators = try c.decodeIfPresent([BackupAuthenticator].self, forKey: .authenticators)
     }
 
     func encoded() throws -> Data {
@@ -325,6 +329,57 @@ nonisolated struct BackupSecret: Codable, Equatable, Sendable {
     }
 }
 
+/// An `otp` payload (PROTOCOL.md → Item payloads) plus `id`. The seed is in the plaintext,
+/// protected only by the passphrase, like secrets.
+nonisolated struct BackupAuthenticator: Codable, Equatable, Sendable {
+    var v = 1
+    var type = "otp"
+    var id: String
+    var issuer: String
+    var account: String
+    var secret: String
+    var algorithm: String
+    var digits: Int
+    var period: Int
+    var createdAt: Int64
+    var updatedAt: Int64
+
+    init(_ authenticator: Authenticator) {
+        id = authenticator.id
+        issuer = authenticator.issuer
+        account = authenticator.account
+        secret = authenticator.secret
+        algorithm = authenticator.algorithm.rawValue
+        digits = authenticator.digits
+        period = authenticator.period
+        createdAt = authenticator.createdAt.backupMillis
+        updatedAt = authenticator.updatedAt.backupMillis
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        v = try c.decodeIfPresent(Int.self, forKey: .v) ?? 1
+        type = try c.decodeIfPresent(String.self, forKey: .type) ?? "otp"
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
+        issuer = try c.decodeIfPresent(String.self, forKey: .issuer) ?? ""
+        account = try c.decodeIfPresent(String.self, forKey: .account) ?? ""
+        secret = try c.decodeIfPresent(String.self, forKey: .secret) ?? ""
+        algorithm = try c.decodeIfPresent(String.self, forKey: .algorithm) ?? "SHA1"
+        digits = try c.decodeIfPresent(Int.self, forKey: .digits) ?? 6
+        period = try c.decodeIfPresent(Int.self, forKey: .period) ?? 30
+        createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
+        updatedAt = try c.decodeIfPresent(Int64.self, forKey: .updatedAt) ?? createdAt
+    }
+
+    /// nil when the secret or settings are unusable.
+    var otpAccount: OTPAccount? {
+        guard let secret = Base32.normalize(secret), Base32.decode(secret)?.isEmpty == false,
+              TOTP.digitRange.contains(digits), period > 0 else { return nil }
+        return OTPAccount(issuer: issuer, account: account, secret: secret,
+                          algorithm: OTPAlgorithm(parsing: algorithm) ?? .sha1, digits: digits, period: period)
+    }
+}
+
 nonisolated extension Date {
     /// Unix milliseconds, as in the backup (and sync) format.
     var backupMillis: Int64 { Int64((timeIntervalSince1970 * 1000).rounded()) }
@@ -365,18 +420,22 @@ nonisolated struct BackupContents: Sendable {
     var snippets: [BackupSnippet]
     var folders: [BackupFolder] = []
     var secrets: [BackupSecret]?
+    var authenticators: [BackupAuthenticator]?
 
     var summary: String {
         var parts = [BackupSummary.count(clips.count, "item")]
         parts.append(BackupSummary.count(snippets.count, "snippet"))
         if let secrets { parts.append(BackupSummary.count(secrets.count, "secret")) }
+        if let authenticators, !authenticators.isEmpty { parts.append(BackupSummary.count(authenticators.count, "authenticator")) }
         return BackupSummary.list(parts)
     }
 }
 
 enum BackupExporter {
     /// The personal space only: group items belong to their groups and stay there.
-    static func contents(store: ClipStore, snippets: SnippetStore, secrets: [(ref: SecretRef, value: String)]?) -> BackupContents {
+    /// `authenticators`: the ones you own, only when secrets are included (nil otherwise).
+    static func contents(store: ClipStore, snippets: SnippetStore, secrets: [(ref: SecretRef, value: String)]?,
+                         authenticators: [Authenticator]? = nil) -> BackupContents {
         var clips: [BackupClip] = []
         var files: [Int: (image: URL?, thumb: URL?)] = [:]
         for item in store.items(inSpace: nil) {
@@ -410,7 +469,8 @@ enum BackupExporter {
                 return entry
             }
         }
-        return BackupContents(clips: clips, imageFiles: files, snippets: snippetList, folders: folderList, secrets: secretEntries)
+        return BackupContents(clips: clips, imageFiles: files, snippets: snippetList, folders: folderList, secrets: secretEntries,
+                              authenticators: secrets == nil ? nil : authenticators?.map(BackupAuthenticator.init))
     }
 
     /// Reads the images, encrypts and writes the file atomically. Images that can't be read are
@@ -434,7 +494,8 @@ enum BackupExporter {
             clips.append(clip)
         }
         let document = BackupDocument(createdAt: now.backupMillis, clips: clips, snippets: contents.snippets,
-                                      folders: contents.folders, secrets: contents.secrets)
+                                      folders: contents.folders, secrets: contents.secrets,
+                                      authenticators: contents.authenticators)
         return try BackupCrypto.seal(try document.encoded(), passphrase: passphrase)
     }
 }
@@ -475,9 +536,12 @@ nonisolated struct BackupImportSummary: Equatable, Sendable {
     var secretsAdded = 0
     var secretsSkipped = 0
     var secretsFailed = 0
+    var authenticatorsAdded = 0
+    var authenticatorsSkipped = 0
+    var authenticatorsFailed = 0
 
-    var added: Int { clipsAdded + snippetsAdded + secretsAdded }
-    var skipped: Int { clipsSkipped + snippetsSkipped + secretsSkipped }
+    var added: Int { clipsAdded + snippetsAdded + secretsAdded + authenticatorsAdded }
+    var skipped: Int { clipsSkipped + snippetsSkipped + secretsSkipped + authenticatorsSkipped }
 
     var message: String {
         var lines: [String] = []
@@ -485,12 +549,16 @@ nonisolated struct BackupImportSummary: Equatable, Sendable {
         if clipsAdded > 0 { addedParts.append(BackupSummary.count(clipsAdded, "item")) }
         if snippetsAdded > 0 { addedParts.append(BackupSummary.count(snippetsAdded, "snippet")) }
         if secretsAdded > 0 { addedParts.append(BackupSummary.count(secretsAdded, "secret")) }
+        if authenticatorsAdded > 0 { addedParts.append(BackupSummary.count(authenticatorsAdded, "authenticator")) }
         lines.append(addedParts.isEmpty ? "Nothing new to add." : "Added \(BackupSummary.list(addedParts)).")
         if skipped > 0 { lines.append("\(skipped) already here, so skipped.") }
         if clipsExpired > 0 {
             lines.append("\(BackupSummary.count(clipsExpired, "item")) older than your “Forget items after” setting left out.")
         }
         if clipsUnreadable > 0 { lines.append("\(BackupSummary.count(clipsUnreadable, "item")) couldn't be read.") }
+        if authenticatorsFailed > 0 {
+            lines.append("\(BackupSummary.count(authenticatorsFailed, "authenticator")) couldn't be added.")
+        }
         if secretsFailed > 0 { lines.append("\(BackupSummary.count(secretsFailed, "secret")) couldn't be saved to the Keychain.") }
         return lines.joined(separator: " ")
     }
@@ -522,7 +590,8 @@ enum BackupImporter {
     /// Adds what isn't here yet to the personal space: clips by content hash, snippets by
     /// (name, body), secrets by (name, value). Nothing existing is changed.
     static func merge(_ document: BackupDocument, store: ClipStore, snippets: SnippetStore,
-                      secrets: (any BackupSecretSink)?, maxAge: TimeInterval?, now: Date = .now) -> BackupImportSummary {
+                      secrets: (any BackupSecretSink)?, authenticators: AuthenticatorStore? = nil,
+                      maxAge: TimeInterval?, now: Date = .now) -> BackupImportSummary {
         var summary = BackupImportSummary()
         let folders = mergeFolders(document.folders ?? [], into: store)
         mergeClips(document.clips, into: store, folders: folders, maxAge: maxAge, now: now, summary: &summary)
@@ -530,7 +599,32 @@ enum BackupImporter {
         if let secrets, let incoming = document.secrets {
             mergeSecrets(incoming, into: secrets, folders: folders, summary: &summary)
         }
+        if let authenticators, let incoming = document.authenticators {
+            mergeAuthenticators(incoming, into: authenticators, summary: &summary)
+        }
         return summary
+    }
+
+    /// New ones become yours (sync gives them their own space); one with the same secret and
+    /// account as one here is skipped.
+    private static func mergeAuthenticators(_ incoming: [BackupAuthenticator], into store: AuthenticatorStore,
+                                            summary: inout BackupImportSummary) {
+        var known = Set(store.owned.map { "\($0.secret)|\($0.account)" })
+        for backup in incoming {
+            guard let account = backup.otpAccount else {
+                summary.authenticatorsFailed += 1
+                continue
+            }
+            guard known.insert("\(account.secret)|\(account.account)").inserted else {
+                summary.authenticatorsSkipped += 1
+                continue
+            }
+            if store.add(account, now: backup.createdAt > 0 ? Date(backupMillis: backup.createdAt) : .now) != nil {
+                summary.authenticatorsAdded += 1
+            } else {
+                summary.authenticatorsFailed += 1
+            }
+        }
     }
 
     /// The backup's folders, read first: each joins the personal folder with the same name

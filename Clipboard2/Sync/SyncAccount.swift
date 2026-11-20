@@ -89,6 +89,13 @@ nonisolated struct SyncGroup: Identifiable, Hashable, Sendable {
     var memberCount: Int
 }
 
+/// Someone an authenticator can be shared with: a contact or a member of one of your groups.
+nonisolated struct SharePerson: Identifiable, Hashable, Sendable {
+    var uid: String
+    var name: String
+    var id: String { uid }
+}
+
 /// Someone items can be sent to: a two-person space with no name (PROTOCOL.md → Contacts).
 nonisolated struct SyncContact: Identifiable, Hashable, Sendable {
     /// The direct space's id.
@@ -239,6 +246,7 @@ final class SyncAccount {
     @ObservationIgnored private let store: ClipStore
     @ObservationIgnored private let snippets: SnippetStore
     @ObservationIgnored private let secrets: any SyncSecretSource
+    @ObservationIgnored let authenticators: AuthenticatorStore?
     @ObservationIgnored private let makeService: (@escaping @Sendable () async throws -> String) -> any SyncService
 
     @ObservationIgnored private(set) var engine: SyncEngine?
@@ -272,13 +280,15 @@ final class SyncAccount {
 
     /// `makeService` builds the API client from a token provider (tests pass an in-memory server).
     init(prefs: Preferences, context: ModelContext, store: ClipStore, snippets: SnippetStore,
-         secrets: any SyncSecretSource, credentials: any SyncSessionStore = KeychainSyncSessionStore(),
+         secrets: any SyncSecretSource, authenticators: AuthenticatorStore? = nil,
+         credentials: any SyncSessionStore = KeychainSyncSessionStore(),
          makeService: ((@escaping @Sendable () async throws -> String) -> any SyncService)? = nil) {
         self.prefs = prefs
         self.context = context
         self.store = store
         self.snippets = snippets
         self.secrets = secrets
+        self.authenticators = authenticators
         self.credentials = credentials
         self.makeService = makeService ?? { token in
             SyncAPI(base: SyncConfig.apiBase, transport: URLSessionTransport(), token: token)
@@ -472,7 +482,7 @@ final class SyncAccount {
     private func activate(_ identity: SyncIdentity, adopting keys: [String: Data] = [:], signingIn: Bool = false) {
         self.engine?.stop()
         let engine = SyncEngine(api: makeAPI(), identity: identity, context: context, store: store,
-                                snippets: snippets, secrets: secrets, keyPins: session?.spaceKeyPins ?? [:])
+                                snippets: snippets, secrets: secrets, authenticators: authenticators, keyPins: session?.spaceKeyPins ?? [:])
         engine.deviceId = session?.deviceId
         engine.deviceName = deviceName
         engine.announcesArrivals = !signingIn
@@ -645,7 +655,7 @@ final class SyncAccount {
             // A different account: nothing of the old one may stay.
             engine?.stop()
             engine = nil
-            SyncEngine.wipeLocalState(context: context, store: store, snippets: snippets, secrets: secrets)
+            SyncEngine.wipeLocalState(context: context, store: store, snippets: snippets, secrets: secrets, authenticators: authenticators)
             groups = []
         }
         let sameAccount = previous?.uid == account.uid
@@ -767,7 +777,7 @@ final class SyncAccount {
         pollTask?.cancel()
         engine?.stop()
         engine = nil
-        SyncEngine.wipeLocalState(context: context, store: store, snippets: snippets, secrets: secrets)
+        SyncEngine.wipeLocalState(context: context, store: store, snippets: snippets, secrets: secrets, authenticators: authenticators)
         credentials.clear()
         session = nil
         groups = []
@@ -1051,7 +1061,7 @@ final class SyncAccount {
 
     func loadGroups() {
         let spaces = (try? context.fetch(FetchDescriptor<SyncSpace>(sortBy: [SortDescriptor(\.createdAt)]))) ?? []
-        let loaded = spaces.filter { !$0.isPersonal && !$0.isDirect }.map {
+        let loaded = spaces.filter(\.isGroup).map {
             SyncGroup(id: $0.id, name: $0.name.isEmpty ? "Group" : $0.name, isOwner: $0.isOwner, memberCount: $0.memberCount)
         }
         if loaded != groups { groups = loaded }
@@ -1140,6 +1150,56 @@ final class SyncAccount {
     func delete(_ group: SyncGroup) async throws {
         try await call { try await $0.api.deleteGroup(id: group.id) }
         syncNow()
+    }
+
+    // MARK: Authenticators
+
+    /// People an authenticator can be shared with: your contacts and the members of your groups,
+    /// each once, without you and without `excluding` (those it's already shared with). By name.
+    func shareCandidates(excluding: Set<String>) -> [SharePerson] {
+        Self.shareCandidates(contacts: contacts, groups: groups, memberNames: memberNames, me: session?.uid, excluding: excluding)
+    }
+
+    nonisolated static func shareCandidates(contacts: [SyncContact], groups: [SyncGroup], memberNames: [String: [String: String]],
+                                            me: String?, excluding: Set<String>) -> [SharePerson] {
+        var seen = excluding
+        if let me { seen.insert(me) }
+        var people: [SharePerson] = []
+        for contact in contacts {
+            guard let uid = contact.uid, seen.insert(uid).inserted else { continue }
+            people.append(SharePerson(uid: uid, name: contact.name))
+        }
+        for group in groups {
+            for (uid, name) in (memberNames[group.id] ?? [:]).sorted(by: { $0.key < $1.key }) where seen.insert(uid).inserted {
+                people.append(SharePerson(uid: uid, name: name))
+            }
+        }
+        return people.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    func shares(of authenticator: Authenticator) async throws -> [AuthenticatorShare] {
+        guard let spaceId = authenticator.spaceID else { return [] }
+        return try await call { try await $0.api.authenticatorShares(id: spaceId) }
+    }
+
+    /// Sends them 24 hours of codes at once; your devices keep topping them up.
+    func share(_ authenticator: Authenticator, with person: SharePerson) async throws {
+        try await call { try await $0.share(authenticator, with: person.uid) }
+        syncNow()
+    }
+
+    func removeShare(_ share: AuthenticatorShare, of authenticator: Authenticator) async throws {
+        guard let spaceId = authenticator.spaceID else { return }
+        try await call { try await $0.removeShare(spaceId: spaceId, uid: share.uid) }
+    }
+
+    func transfer(_ authenticator: Authenticator, to share: AuthenticatorShare) async throws {
+        try await call { try await $0.transfer(authenticator, to: share.uid) }
+        syncNow()
+    }
+
+    func leave(_ shared: SharedAuthenticator) async throws {
+        try await call { try await $0.leave(sharedIn: shared.spaceId) }
     }
 
     // MARK: Invites
@@ -1236,7 +1296,7 @@ final class SyncAccount {
             let request: ContactRequest
             do {
                 request = try await engine.api.requestContact(
-                    username: user.username, spaceId: id,
+                    username: user.username ?? name, spaceId: id,
                     wrappedKey: try SyncCrypto.wrapSpaceKey(key, spaceId: id, memberUid: engine.identity.uid,
                                                            memberPublicKey: engine.identity.publicKey),
                     recipientWrappedKey: try SyncCrypto.wrapSpaceKey(key, spaceId: id, memberUid: user.uid,

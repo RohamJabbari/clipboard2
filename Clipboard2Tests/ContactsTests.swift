@@ -10,7 +10,7 @@ struct ContactsAPITests {
         let transport = StubTransport(body: #"{"spaces":[]}"#)
         let api = SyncAPI(base: URL(string: "https://api.example")!, transport: transport) { "T" }
         _ = try await api.spaces()
-        #expect(transport.requests.last?.url?.absoluteString == "https://api.example/v1/spaces?include=direct")
+        #expect(transport.requests.last?.url?.absoluteString == "https://api.example/v1/spaces?include=direct,authenticator")
 
         _ = try? await api.user(named: "Größe_2.0")
         #expect(transport.requests.last?.url?.absoluteString == "https://api.example/v1/users/Gr%C3%B6%C3%9Fe_2.0")

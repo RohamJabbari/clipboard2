@@ -163,7 +163,8 @@ nonisolated struct InviteDetails: Codable, Sendable, Equatable {
 /// `GET /v1/users/:username`: someone a contact request can be sent to.
 nonisolated struct RemoteUser: Codable, Sendable, Equatable {
     var uid: String
-    var username: String
+    /// nil for someone without a username (only from `GET /v1/users/id/:uid`).
+    var username: String?
     var name: String
     var publicKey: Data
 }
@@ -193,9 +194,31 @@ nonisolated struct ContactCode: Codable, Sendable, Equatable, Identifiable {
     var id: String { inviteId }
 }
 
+/// `GET /v1/authenticators/:id/shares`: someone an authenticator you own is shared with.
+nonisolated struct AuthenticatorShare: Codable, Sendable, Equatable, Identifiable {
+    var uid: String
+    var username: String?
+    var name: String
+    /// Unix ms: when the codes they have run out.
+    var codesUntil: Int64
+    var createdAt: Int64
+    var id: String { uid }
+}
+
+/// `GET /v1/shared-codes`: an authenticator shared with you, with the batch sealed to you.
+nonisolated struct SharedCodesEntry: Codable, Sendable, Equatable {
+    var spaceId: String
+    var ownerUid: String
+    var ownerName: String
+    var codesUntil: Int64
+    /// Empty (or absent) until the owner's devices send the first batch, e.g. right after a transfer.
+    var sealedCodes: Data?
+    var updatedAt: Int64
+}
+
 nonisolated struct RemoteSpace: Codable, Sendable, Equatable {
     var id: String
-    var kind: String          // personal | group | direct
+    var kind: String          // personal | group | direct | authenticator
     var role: String          // owner | member
     var ownerUid: String
     var wrappedKey: Data
@@ -399,6 +422,19 @@ nonisolated protocol SyncService: Sendable {
     /// Ends the contact for both people: the space, its items and blobs are deleted.
     func deleteContact(spaceId: String) async throws
 
+    // Authenticators (PROTOCOL.md → Authenticators)
+    /// A contact's or group member's public key; `not_found` (404) for anyone else.
+    func user(id uid: String) async throws -> RemoteUser
+    func createAuthenticator(id: String, wrappedKey: Data) async throws -> RemoteSpace
+    func deleteAuthenticator(id: String) async throws
+    func authenticatorShares(id: String) async throws -> [AuthenticatorShare]
+    /// Creates the share if needed and replaces that person's batch.
+    func putAuthenticatorShare(id: String, uid: String, codesUntil: Int64, sealedCodes: Data) async throws
+    /// The owner removes someone, or the recipient leaves.
+    func deleteAuthenticatorShare(id: String, uid: String) async throws
+    func sharedCodes() async throws -> [SharedCodesEntry]
+    func transferAuthenticator(id: String, uid: String, wrappedKey: Data) async throws
+
     /// `full` while walking a space from 0 after a reset, so passing the purge horizon doesn't reset again.
     func changes(spaceId: String, since: Int64, limit: Int, full: Bool) async throws -> ChangesPage
     func putItem(spaceId: String, itemId: String, _ body: ItemUpload) async throws -> WriteOutcome
@@ -450,6 +486,11 @@ nonisolated struct SyncAPI: SyncService {
     }
     nonisolated private struct ContactCodeBody: Codable { var spaceId: String; var wrappedKey: Data; var inviteId: String; var sealedKey: Data }
     nonisolated private struct ContactCodesBody: Codable { var invites: [ContactCode] }
+    nonisolated private struct AuthenticatorBody: Codable { var id: String; var wrappedKey: Data }
+    nonisolated private struct SharesBody: Codable { var shares: [AuthenticatorShare] }
+    nonisolated private struct ShareBody: Codable { var codesUntil: Int64; var sealedCodes: Data }
+    nonisolated private struct SharedCodesBody: Codable { var shared: [SharedCodesEntry] }
+    nonisolated private struct TransferBody: Codable { var uid: String; var wrappedKey: Data }
 
     // MARK: Auth and account
 
@@ -515,9 +556,10 @@ nonisolated struct SyncAPI: SyncService {
 
     // MARK: Spaces and groups
 
-    /// Contacts are listed only when asked for; older clients would show them as unnamed groups.
+    /// Contacts and authenticators are listed only when asked for; older clients would show them
+    /// as unnamed groups.
     func spaces() async throws -> [RemoteSpace] {
-        try await send("GET", "v1/spaces", query: ["include": "direct"], as: SpacesBody.self).spaces
+        try await send("GET", "v1/spaces", query: ["include": "direct,authenticator"], as: SpacesBody.self).spaces
     }
 
     func createGroup(id: String, encryptedName: Data, wrappedKey: Data) async throws -> RemoteSpace {
@@ -611,6 +653,42 @@ nonisolated struct SyncAPI: SyncService {
 
     func deleteContact(spaceId: String) async throws {
         _ = try await send("DELETE", "v1/contacts/\(spaceId)", as: Empty.self)
+    }
+
+    // MARK: Authenticators
+
+    func user(id uid: String) async throws -> RemoteUser {
+        try await send("GET", "v1/users/id/\(Self.escaped(uid))", as: RemoteUser.self)
+    }
+
+    func createAuthenticator(id: String, wrappedKey: Data) async throws -> RemoteSpace {
+        try await send("POST", "v1/authenticators", body: AuthenticatorBody(id: id, wrappedKey: wrappedKey), as: RemoteSpace.self)
+    }
+
+    func deleteAuthenticator(id: String) async throws {
+        _ = try await send("DELETE", "v1/authenticators/\(Self.escaped(id))", as: Empty.self)
+    }
+
+    func authenticatorShares(id: String) async throws -> [AuthenticatorShare] {
+        try await send("GET", "v1/authenticators/\(Self.escaped(id))/shares", as: SharesBody.self).shares
+    }
+
+    func putAuthenticatorShare(id: String, uid: String, codesUntil: Int64, sealedCodes: Data) async throws {
+        _ = try await send("PUT", "v1/authenticators/\(Self.escaped(id))/shares/\(Self.escaped(uid))",
+                           body: ShareBody(codesUntil: codesUntil, sealedCodes: sealedCodes), as: Empty.self)
+    }
+
+    func deleteAuthenticatorShare(id: String, uid: String) async throws {
+        _ = try await send("DELETE", "v1/authenticators/\(Self.escaped(id))/shares/\(Self.escaped(uid))", as: Empty.self)
+    }
+
+    func sharedCodes() async throws -> [SharedCodesEntry] {
+        try await send("GET", "v1/shared-codes", as: SharedCodesBody.self).shared
+    }
+
+    func transferAuthenticator(id: String, uid: String, wrappedKey: Data) async throws {
+        _ = try await send("POST", "v1/authenticators/\(Self.escaped(id))/transfer",
+                           body: TransferBody(uid: uid, wrappedKey: wrappedKey), as: Empty.self)
     }
 
     // MARK: Items

@@ -34,7 +34,16 @@ final class SyncEngine {
     let store: ClipStore
     let snippets: SnippetStore
     let secrets: any SyncSecretSource
+    /// Authenticators you own (their `otp` items) and the code batches shared with you.
+    let authenticators: AuthenticatorStore?
     var now: () -> Date = { .now }
+    /// Public keys of people authenticators are shared with, by uid (they don't change).
+    private var publicKeys: [String: Data] = [:]
+    /// When each owned authenticator's shares were last listed, by space id.
+    private var lastShareCheck: [String: Date] = [:]
+    /// Shares are listed (and topped up) at most this often per authenticator.
+    static let shareCheckInterval: TimeInterval = 10 * 60
+    private var authenticatorsChanged = false
 
     /// This Mac's session id (from `/v1/sessions`), to recognise items sent to it.
     var deviceId: String?
@@ -130,13 +139,15 @@ final class SyncEngine {
     }
 
     init(api: any SyncService, identity: SyncIdentity, context: ModelContext, store: ClipStore,
-         snippets: SnippetStore, secrets: any SyncSecretSource, keyPins: [String: String] = [:]) {
+         snippets: SnippetStore, secrets: any SyncSecretSource, authenticators: AuthenticatorStore? = nil,
+         keyPins: [String: String] = [:]) {
         self.api = api
         self.identity = identity
         self.context = context
         self.store = store
         self.snippets = snippets
         self.secrets = secrets
+        self.authenticators = authenticators
         self.keyPins = keyPins
     }
 
@@ -208,7 +219,7 @@ final class SyncEngine {
         try checkActive()
         // Groups first, and every download before any upload: a long first upload (or a rate limit
         // while sending it) must never keep new group items from arriving.
-        let spaces = updateSpaces(remote).sorted { !$0.isPersonal && $1.isPersonal }
+        var spaces = updateSpaces(remote).sorted { !$0.isPersonal && $1.isPersonal }
         onSpacesUpdated?()
         indexesMetas = true
         defer {
@@ -222,11 +233,17 @@ final class SyncEngine {
             try await inSpace(space, merging: .quietly) { try await self.pull(space, itemKey: $0) }
             announceArrivals()
         }
+        if authenticators != nil {
+            try await pullSharedCodes()
+            await topUpShares(spaces)
+            quietly { flushSecrets() }
+        }
         let fullPassDue = lastFullPush.map { now().timeIntervalSince($0) > Self.fullPushInterval } ?? true
         guard localChangesPending || fullPassDue || !pendingToDevice.isEmpty else { return }
         // Cleared first, so a change made while uploading is picked up by the next tick.
         localChangesPending = false
         do {
+            spaces += try await createAuthenticatorSpaces()
             for space in spaces {
                 // Duplicates found after the push need one more tick to send their tombstones.
                 try await inSpace(space, merging: .asLocalChange) { try await self.push(space, itemKey: $0); return true }
@@ -283,6 +300,8 @@ final class SyncEngine {
         var result: [SyncSpace] = []
         for space in remote {
             let existing = rows.removeValue(forKey: space.id)
+            // Only the owner is ever in an authenticator space; anything else is dropped here.
+            if space.kind == "authenticator" && (authenticators == nil || space.role != "owner") { continue }
             guard checkKey(of: space) else { continue }
             let row = existing ?? {
                 let row = SyncSpace(id: space.id, kind: space.kind)
@@ -305,6 +324,8 @@ final class SyncEngine {
             }
             if space.isPersonal {
                 row.name = "Personal"
+            } else if space.kind == "authenticator" {
+                row.name = "Authenticator"
             } else if space.isDirect {
                 // No name of its own: it's called after the other person.
                 row.name = space.members?.first { $0.uid != identity.uid }?.name ?? (row.name.isEmpty ? "Contact" : row.name)
@@ -367,7 +388,13 @@ final class SyncEngine {
                 secrets.syncDelete(id: ref.id)
                 secretsChanged = true
             }
+            if space.isAuthenticator, let authenticators {
+                // Deleted on another device, or transferred: the seed goes from this Mac.
+                authenticators.removeAll(inSpace: space.id)
+                authenticatorsChanged = true
+            }
         }
+        lastShareCheck[space.id] = nil
         spaceKeys[space.id] = nil
         checkedWraps[space.id] = nil
         keyMismatches.remove(space.id)
@@ -515,7 +542,259 @@ final class SyncEngine {
             applySecret(secret, remote: remote, spaceId: spaceId, force: force)
         case .folder(let folder):
             applyFolder(folder, remote: remote, spaceId: spaceId, force: force)
+        case .otp(let otp):
+            applyOTP(otp, remote: remote, spaceId: spaceId, force: force)
         }
+    }
+
+    /// Your own authenticator, from another of your devices. Only ever in its authenticator space.
+    private func applyOTP(_ payload: OTPPayload, remote: RemoteItem, spaceId: String, force: Bool) {
+        guard let authenticators, allSpaces().first(where: { $0.id == spaceId })?.isAuthenticator == true else { return }
+        let existing = authenticators.authenticator(withID: remote.id)
+        if !force, let existing, let known = meta(for: remote.id),
+           otpFingerprint(existing) != known.fingerprint,
+           existing.updatedAt.syncMillis > remote.updatedAt {
+            // Renamed here after the server's version: keep ours, the push sends it.
+            known.fingerprint = (try? SyncPayload.otp(payload).fingerprint()) ?? ""
+            known.remoteSeq = remote.seq
+            known.updatedAt = remote.updatedAt
+            return
+        }
+        quietly { authenticators.syncUpsert(id: remote.id, payload: payload, spaceID: spaceId) }
+        authenticatorsChanged = true
+        let fingerprint = Authenticator(id: remote.id, payload: payload, spaceID: spaceId).map(otpFingerprint) ?? ""
+        recordMeta(id: remote.id, spaceId: spaceId, category: .otp, fingerprint: fingerprint,
+                   seq: remote.seq, updatedAt: remote.updatedAt, authorUid: remote.authorUid)
+    }
+
+    private func otpFingerprint(_ authenticator: Authenticator) -> String {
+        var payload = authenticator.payload
+        payload.updatedAt = 0   // the stored time isn't content (writers stamp it)
+        return (try? SyncPayload.otp(payload).fingerprint()) ?? ""
+    }
+
+    // MARK: Authenticators
+
+    /// Creates the space of each authenticator that isn't on the server yet (made here, imported,
+    /// or added while signed out) and returns the new rows, so this tick pushes their items.
+    private func createAuthenticatorSpaces() async throws -> [SyncSpace] {
+        guard let authenticators else { return [] }
+        var created: [SyncSpace] = []
+        for authenticator in authenticators.owned where authenticator.spaceID == nil {
+            try checkActive()
+            do {
+                created.append(try await createSpace(for: authenticator))
+            } catch let error as SyncAPIError where error.isPermanentForItem {
+                Log.sync.notice("Server refused an authenticator: \(error.localizedDescription, privacy: .public)")
+                warn(error)
+                break
+            }
+        }
+        return created
+    }
+
+    private func createSpace(for authenticator: Authenticator) async throws -> SyncSpace {
+        let id = SyncCrypto.newID()
+        let key = SyncCrypto.randomBytes(32)
+        let wrapped = try SyncCrypto.wrapSpaceKey(key, spaceId: id, memberUid: identity.uid, memberPublicKey: identity.publicKey)
+        let remote = try await api.createAuthenticator(id: id, wrappedKey: wrapped)
+        try checkActive()
+        adoptSpaceKey(key, for: id)
+        checkedWraps[id] = remote.wrappedKey
+        quietly {
+            authenticators?.syncSetSpace(id: authenticator.id, spaceID: id)
+            authenticators?.syncDidChange()
+        }
+        let row = SyncSpace(id: id, kind: "authenticator")
+        row.role = "owner"
+        row.ownerUid = identity.uid
+        row.name = "Authenticator"
+        row.memberCount = 1
+        row.createdAt = remote.createdAt
+        row.authorsBackfilled = true
+        context.insert(row)
+        save()
+        return row
+    }
+
+    /// The `otp` item of an authenticator you own; once it's deleted here, the whole authenticator
+    /// (and every share) on the server.
+    private func pushAuthenticator(_ space: SyncSpace, itemKey: Data) async throws {
+        guard space.isOwner, let authenticators else { return }
+        let spaceId = space.id
+        let local = authenticators.owned.filter { $0.spaceID == spaceId }
+        if local.isEmpty {
+            let tracked = metas(inSpace: spaceId)
+            guard !tracked.isEmpty else { return }   // its item hasn't arrived yet
+            do {
+                try await api.deleteAuthenticator(id: spaceId)
+            } catch let error as SyncAPIError where error.status == 404 {
+                // Already gone.
+            }
+            try checkActive()
+            for meta in tracked { context.delete(meta) }
+            save()
+            return
+        }
+        for authenticator in local {
+            let id = authenticator.id
+            let meta = self.meta(for: id)
+            var payload = authenticator.payload
+            let updatedAt = max(authenticator.updatedAt.syncMillis, (meta?.updatedAt ?? 0) + 1)
+            payload.updatedAt = 0
+            guard let fingerprint = try? SyncPayload.otp(payload).fingerprint() else { continue }
+            if let meta, meta.fingerprint == fingerprint { continue }
+            payload.updatedAt = authenticator.updatedAt.syncMillis
+            guard let plaintext = try? SyncPayload.otp(payload).withRev(updatedAt).canonicalJSON() else { continue }
+            let job = PushJob(id: id, category: .otp, sortAt: authenticator.createdAt.syncMillis, updatedAt: updatedAt,
+                              plaintext: plaintext, fingerprint: fingerprint, blobIds: [], rejectKey: fingerprint)
+            guard rejected[id]?.key != fingerprint else { continue }
+            try checkActive()
+            try await send(job, spaceId: spaceId, itemKey: itemKey)
+        }
+    }
+
+    /// `GET /v1/shared-codes`: every authenticator shared with you, its batch opened with your key.
+    /// Ones no longer listed (you left, were removed, or it was deleted) go.
+    private func pullSharedCodes() async throws {
+        guard let authenticators else { return }
+        let entries = try await api.sharedCodes()
+        try checkActive()
+        let known = Dictionary(authenticators.shared.map { ($0.spaceId, $0) }, uniquingKeysWith: { first, _ in first })
+        var result: [SharedAuthenticator] = []
+        for entry in entries {
+            var shared = known[entry.spaceId] ?? SharedAuthenticator(
+                spaceId: entry.spaceId, ownerUid: entry.ownerUid, ownerName: entry.ownerName, codesUntil: entry.codesUntil,
+                updatedAt: 0, batch: nil, issuer: "", account: "", addedAt: now().syncMillis)
+            shared.ownerUid = entry.ownerUid
+            shared.ownerName = entry.ownerName
+            shared.codesUntil = entry.codesUntil
+            if entry.updatedAt != shared.updatedAt || shared.batch == nil {
+                if let sealed = entry.sealedCodes, !sealed.isEmpty {
+                    if let batch = Self.openBatch(sealed, spaceId: entry.spaceId, identity: identity) {
+                        shared.batch = batch
+                        shared.issuer = batch.issuer
+                        shared.account = batch.account
+                    } else {
+                        Log.sync.error("Can't open the codes shared in \(entry.spaceId, privacy: .public)")
+                    }
+                } else {
+                    shared.batch = nil   // e.g. right after a transfer: nothing sent yet
+                }
+                shared.updatedAt = entry.updatedAt
+            }
+            result.append(shared)
+        }
+        if authenticators.syncReplaceShared(result) { authenticatorsChanged = true }
+    }
+
+    nonisolated static func openBatch(_ sealed: Data, spaceId: String, identity: SyncIdentity) -> CodeBatch? {
+        guard let json = try? SyncCrypto.openCodes(sealed, spaceId: spaceId, uid: identity.uid, privateKey: identity.privateKey)
+        else { return nil }
+        return try? JSONDecoder().decode(CodeBatch.self, from: json)
+    }
+
+    /// Lists the shares of each authenticator you own (at most every `shareCheckInterval`) and
+    /// sends a fresh 24 h batch to anyone with fewer than 12 h of codes left. Problems with one
+    /// share don't stop the rest of the tick.
+    private func topUpShares(_ spaces: [SyncSpace]) async {
+        guard let authenticators else { return }
+        var counts = authenticators.shareCounts
+        for space in spaces where space.isAuthenticator && space.isOwner {
+            let spaceId = space.id
+            guard let authenticator = authenticators.owned.first(where: { $0.spaceID == spaceId }) else { continue }
+            if let last = lastShareCheck[spaceId], now().timeIntervalSince(last) < Self.shareCheckInterval { continue }
+            do {
+                let shares = try await api.authenticatorShares(id: spaceId)
+                try checkActive()
+                lastShareCheck[spaceId] = now()
+                counts[spaceId] = shares.count
+                for share in shares where Self.needsTopUp(codesUntil: share.codesUntil, now: now()) {
+                    try await sendCodes(of: authenticator, spaceId: spaceId, to: share.uid)
+                }
+            } catch {
+                Log.sync.notice("Topping up codes failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+        authenticators.setShareCounts(counts)
+    }
+
+    nonisolated static func needsTopUp(codesUntil: Int64, now: Date) -> Bool {
+        Date(syncMillis: codesUntil).timeIntervalSince(now) < CodeBatch.topUpThreshold
+    }
+
+    /// Seals the next 24 h of codes to one person and replaces their batch.
+    func sendCodes(of authenticator: Authenticator, spaceId: String, to uid: String) async throws {
+        let publicKey = try await publicKey(of: uid)
+        guard let batch = CodeBatch.make(for: authenticator, now: now()) else { return }
+        let sealed = try SyncCrypto.sealCodes(try batch.encoded(), spaceId: spaceId, recipientUid: uid,
+                                              recipientPublicKey: publicKey)
+        try await api.putAuthenticatorShare(id: spaceId, uid: uid, codesUntil: batch.until.syncMillis, sealedCodes: sealed)
+    }
+
+    func publicKey(of uid: String) async throws -> Data {
+        if let key = publicKeys[uid] { return key }
+        let key = try await api.user(id: uid).publicKey
+        publicKeys[uid] = key
+        return key
+    }
+
+    /// The authenticator's space, created now if it isn't on the server yet.
+    func ensureSpace(for authenticator: Authenticator) async throws -> String {
+        if let id = authenticator.spaceID { return id }
+        return try await createSpace(for: authenticator).id
+    }
+
+    /// Shares an authenticator: its codes, never its secret.
+    func share(_ authenticator: Authenticator, with uid: String) async throws {
+        let spaceId = try await ensureSpace(for: authenticator)
+        try await sendCodes(of: authenticator, spaceId: spaceId, to: uid)
+        lastShareCheck[spaceId] = nil
+        if let authenticators {
+            var counts = authenticators.shareCounts
+            counts[spaceId, default: 0] += 1
+            authenticators.setShareCounts(counts)
+        }
+    }
+
+    func removeShare(spaceId: String, uid: String) async throws {
+        try await api.deleteAuthenticatorShare(id: spaceId, uid: uid)
+        lastShareCheck[spaceId] = nil
+        if let authenticators, let count = authenticators.shareCounts[spaceId] {
+            var counts = authenticators.shareCounts
+            counts[spaceId] = max(0, count - 1)
+            authenticators.setShareCounts(counts)
+        }
+    }
+
+    /// Stops getting codes for one shared with you.
+    func leave(sharedIn spaceId: String) async throws {
+        do {
+            try await api.deleteAuthenticatorShare(id: spaceId, uid: identity.uid)
+        } catch let error as SyncAPIError where error.status == 404 {
+            // Already gone.
+        }
+        authenticators?.removeShared(spaceId: spaceId)
+    }
+
+    /// Hands the authenticator (with its seed) to someone it's shared with. This Mac drops the
+    /// seed at once; your other devices do when its space disappears. You get codes like everyone else.
+    func transfer(_ authenticator: Authenticator, to uid: String) async throws {
+        guard let spaceId = authenticator.spaceID, let key = spaceKeys[spaceId] else { throw SyncAccountError.missingGroupKey }
+        let publicKey = try await publicKey(of: uid)
+        let wrapped = try SyncCrypto.wrapSpaceKey(key, spaceId: spaceId, memberUid: uid, memberPublicKey: publicKey)
+        try await api.transferAuthenticator(id: spaceId, uid: uid, wrappedKey: wrapped)
+        try checkActive()
+        quietly {
+            if let row = allSpaces().first(where: { $0.id == spaceId }) {
+                removeSpaceLocally(row)
+            } else {
+                authenticators?.removeAll(inSpace: spaceId)
+            }
+            authenticators?.syncDidChange()
+        }
+        authenticatorsChanged = false
+        save()
     }
 
     private func applyClip(_ payload: ClipPayload, remote: RemoteItem, spaceId: String, itemKey: Data, force: Bool) async throws {
@@ -992,6 +1271,10 @@ final class SyncEngine {
     }
 
     private func push(_ space: SyncSpace, itemKey: Data) async throws {
+        if space.isAuthenticator {
+            try await pushAuthenticator(space, itemKey: itemKey)
+            return
+        }
         let spaceId = space.id
         // Deletions first: a full quota or a rate limit while uploading must never hold them back.
         try await pushDeletions(spaceId: spaceId, itemKey: itemKey)
@@ -1275,8 +1558,11 @@ final class SyncEngine {
     }
 
     static func groupShareProblem(_ item: ClipItem) -> String? {
-        item.kind == .file ? groupShareProblem(fileURLs: item.fileURLs) : nil
+        if item.isConcealed { return concealedShareProblem }
+        return item.kind == .file ? groupShareProblem(fileURLs: item.fileURLs) : nil
     }
+
+    static let concealedShareProblem = "This image holds an authenticator QR code, so it isn't shared. Add it to Authenticator and share codes instead."
 
     /// A file of a file clip whose contents sync. A folder is uploaded as its archive.
     struct UploadableFile {
@@ -1434,6 +1720,8 @@ final class SyncEngine {
         case .folder:
             guard let uuid = UUID(uuidString: meta.localId) else { return false }
             return store.folder(withID: uuid) != nil
+        case .otp:
+            return authenticators?.authenticator(withID: meta.localId) != nil
         case nil:
             return false
         }
@@ -1447,6 +1735,7 @@ final class SyncEngine {
         ids.formUnion(allSnippets.map { $0.id.uuidString.lowercased() })
         ids.formUnion(store.allFolders().map { $0.id.uuidString.lowercased() })
         ids.formUnion(secrets.syncSecrets.map { $0.id.lowercased() })
+        ids.formUnion((authenticators?.owned ?? []).map(\.id))
         return ids
     }
 
@@ -1461,6 +1750,10 @@ final class SyncEngine {
         if let ref = secret(withID: id) {
             secrets.syncDelete(id: ref.id)
             secretsChanged = true
+        }
+        if let authenticators, authenticators.authenticator(withID: id) != nil {
+            authenticators.syncDelete(id: id)
+            authenticatorsChanged = true
         }
     }
 
@@ -1488,6 +1781,10 @@ final class SyncEngine {
     }
 
     private func flushSecrets() {
+        if authenticatorsChanged {
+            authenticatorsChanged = false
+            authenticators?.syncDidChange()
+        }
         guard secretsChanged else { return }
         secretsChanged = false
         secrets.syncDidChange()
@@ -1549,7 +1846,8 @@ final class SyncEngine {
 
     /// Deletes group data, sync metadata and cursors. Personal history stays.
     static func wipeLocalState(context: ModelContext, store: ClipStore, snippets: SnippetStore,
-                               secrets: any SyncSecretSource) {
+                               secrets: any SyncSecretSource, authenticators: AuthenticatorStore? = nil) {
+        authenticators?.detachForSignOut()
         let spaces = (try? context.fetch(FetchDescriptor<SyncSpace>())) ?? []
         var groupIDs = Set(spaces.filter { !$0.isPersonal }.map(\.id))
         groupIDs.formUnion(store.allItems().compactMap(\.spaceID))

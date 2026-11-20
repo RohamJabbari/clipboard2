@@ -32,6 +32,7 @@ final class AppEnvironment {
     let snippets: SnippetStore
     let secrets: SecretStore
     let slots: QuickSlots
+    let authenticators: AuthenticatorStore
     let sync: SyncAccount
     let claudeAccount = SubscriptionAccount(cli: .claude)
     let chatGPTAccount = SubscriptionAccount(cli: .codex)
@@ -73,11 +74,14 @@ final class AppEnvironment {
         snippets = SnippetStore(context: container.mainContext)
         secrets = SecretStore(prefs: prefs)
         slots = QuickSlots(defaults: .standard, store: store, snippets: snippets, secrets: secrets)
-        sync = SyncAccount(prefs: prefs, context: container.mainContext, store: store, snippets: snippets, secrets: secrets)
+        // Tests never touch the login keychain's authenticators.
+        authenticators = AuthenticatorStore(backing: Self.isRunningTests ? MemoryAuthenticatorBacking() : KeychainAuthenticatorBacking())
+        sync = SyncAccount(prefs: prefs, context: container.mainContext, store: store, snippets: snippets, secrets: secrets,
+                           authenticators: authenticators)
     }
 
     /// Every persisted model (the newest store version); tests build in-memory containers from it.
-    static let schema = Schema(versionedSchema: StoreSchemaV3.self)
+    static let schema = Schema(versionedSchema: StoreSchemaV4.self)
 
     /// Opens the store with the migration plan. Stores from before the versioned schema (older
     /// than 1.3.0) match no version, so they get the automatic lightweight migration they always
@@ -121,12 +125,15 @@ final class AppEnvironment {
         updates.start()
         monitor.shouldDiscard = { [weak self] capture in
             guard let self, capture.kind.isTextual else { return false }
-            return self.secrets.valueHashes.contains(capture.hash)
+            return OTPAuthURI.isSecretLink(capture.text) || self.secrets.valueHashes.contains(capture.hash)
         }
         monitor.onCapture = { [weak self] item in
             self?.sync.reportActivity()
             self?.imageText.enqueue(item)
         }
+        monitor.onAuthenticatorLink = { [weak self] link in self?.authenticatorLinkFound(link, inImage: false) }
+        imageText.onAuthenticatorLink = { [weak self] link in self?.authenticatorLinkFound(link, inImage: true) }
+        authenticators.onChange = { [weak self] in self?.sync.localChange() }
         paste.onPaste = { [weak self] in self?.sync.reportActivity() }
         secrets.onChange = { [weak self] in
             guard let self else { return }
@@ -333,6 +340,37 @@ final class AppEnvironment {
             guard let value = await secrets.reveal(ref, reason: "copy “\(ref.name)”") else { return }
             paste.writeSecret(value, clearAfter: prefs.secretClearSeconds)
         }
+    }
+
+    // MARK: Authenticators
+
+    /// A copied `otpauth://` link or a QR code in a copied image: offered as Add to Authenticator
+    /// at the top of All (never stored as history).
+    func authenticatorLinkFound(_ link: String, inImage: Bool) {
+        switch OTPAuthURI.parse(link) {
+        case .success(let account):
+            if authenticators.owned.contains(where: { $0.secret == account.secret && $0.account == account.account }) {
+                HUD.show("Already in your authenticators", symbol: "checkmark.shield.fill")
+                return
+            }
+            authenticators.suggestion = account
+            HUD.show(inImage ? "Authenticator QR code found" : "Authenticator link copied", symbol: "lock.shield.fill",
+                     duration: .seconds(2.5))
+        case .failure(let error):
+            HUD.show(error.message, symbol: "exclamationmark.shield.fill", duration: .seconds(3.5))
+        }
+    }
+
+    /// The code goes out marked concealed and transient (no clipboard manager records it) and is
+    /// cleared again after 30 s, like a secret.
+    static let codeClearSeconds = 30
+
+    func pasteCode(_ code: String, into target: NSRunningApplication?) {
+        paste.pasteSecret(code, into: target ?? appTracker.targetApp, clearAfter: Self.codeClearSeconds)
+    }
+
+    func copyCode(_ code: String) {
+        paste.writeSecret(code, clearAfter: Self.codeClearSeconds)
     }
 
     // MARK: Actions on selected text (⌥⌘K and Services menu)
@@ -673,8 +711,8 @@ final class AppEnvironment {
             }
         case .secret(let ref):
             pasteSecret(ref, into: target)
-        case .folder:
-            NSSound.beep()   // slots never hold folders
+        case .folder, .authenticator, .authenticatorSuggestion:
+            NSSound.beep()   // slots never hold folders or authenticators
         }
     }
 

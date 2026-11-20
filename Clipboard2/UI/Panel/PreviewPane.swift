@@ -65,8 +65,8 @@ struct PreviewPane: View {
             TextPreviewView(text: snippet.body, placeholders: true)
         case .secret(let ref):
             SecretPreviewView(ref: ref, onEdit: onEditSecret.map { edit in { edit(ref) } })
-        case .folder:
-            EmptyView()   // folders have their own preview (FolderPreview)
+        case .folder, .authenticator, .authenticatorSuggestion:
+            EmptyView()   // these have their own previews (FolderPreview, AuthenticatorPreview)
         }
     }
 
@@ -149,6 +149,10 @@ struct PreviewPane: View {
                 }
             case .folder(let folder):
                 row("Folder", folder.name)
+            case .authenticator(let item):
+                row("Authenticator", item.title)
+            case .authenticatorSuggestion:
+                row("Authenticator", "Not added yet")
             }
         }
         .font(.caption)

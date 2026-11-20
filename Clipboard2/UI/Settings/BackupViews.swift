@@ -160,7 +160,9 @@ struct ExportBackupSheet: View {
                     .compactMap { ref in SecretVault.value(id: ref.id).map { (ref: ref, value: $0) } }
             }
             guard let url = chooseDestination() else { return }
-            let contents = BackupExporter.contents(store: env.store, snippets: env.snippets, secrets: secrets)
+            // Only the authenticators you own (ones shared with you hold codes, not secrets).
+            let contents = BackupExporter.contents(store: env.store, snippets: env.snippets, secrets: secrets,
+                                                   authenticators: env.authenticators.owned)
             phase = .working
             do {
                 try await BackupExporter.write(contents, passphrase: passphrase, to: url)
@@ -263,7 +265,7 @@ struct ImportBackupSheet: View {
                 let document = try await BackupImporter.read(from: url, passphrase: passphrase)
                 let sink: (any BackupSecretSink)? = (document.secrets?.isEmpty == false) ? env.secrets : nil
                 summary = BackupImporter.merge(document, store: env.store, snippets: env.snippets,
-                                               secrets: sink, maxAge: env.prefs.maxAge)
+                                               secrets: sink, authenticators: env.authenticators, maxAge: env.prefs.maxAge)
                 self.passphrase = ""
             } catch {
                 self.error = error.localizedDescription
