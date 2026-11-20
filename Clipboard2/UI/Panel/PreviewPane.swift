@@ -104,11 +104,11 @@ struct PreviewPane: View {
         Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 5) {
             switch entry {
             case .clip(let item):
-                if let label = item.label {
+                if let model {
+                    DetailLabelRow(entry: entry, label: item.label, model: model)
+                    DetailFolderRow(entry: entry, model: model)
+                } else if let label = item.label {
                     row("Label", label)
-                }
-                if let folder = model?.folder(of: item) {
-                    row("Folder", folder.name)
                 }
                 if let source = item.source {
                     GridRow {
@@ -143,6 +143,11 @@ struct PreviewPane: View {
                 row("Snippet", snippet.name)
                 if !snippet.keyword.isEmpty { row("Keyword", snippet.keyword) }
             case .secret(let ref):
+                if let model {
+                    // A secret's label is its name.
+                    DetailLabelRow(entry: entry, label: ref.name, model: model)
+                    DetailFolderRow(entry: entry, model: model)
+                }
                 row("Stored in", "Keychain")
                 if let created = ref.createdAt {
                     row("Added", created.formatted(date: .abbreviated, time: .shortened))
@@ -798,6 +803,7 @@ struct SecretPreviewView: View {
 struct MultiSelectionPreview: View {
     let clips: [ClipItem]
     let totalSelected: Int
+    var model: PanelViewModel?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -807,6 +813,11 @@ struct MultiSelectionPreview: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                if let model {
+                    selectionRows(model)
+                        .font(.caption)
+                        .padding(.top, 6)
+                }
             }
             .padding(14)
             Divider()
@@ -825,6 +836,40 @@ struct MultiSelectionPreview: View {
                 .padding(14)
             }
         }
+    }
+
+    /// Label and Folder for the whole selection, like a single item's details.
+    @ViewBuilder
+    private func selectionRows(_ model: PanelViewModel) -> some View {
+        let secrets = model.selectedSecrets
+        let labelable = clips.contains { model.canLabel(.clip($0)) }
+        let movable = model.canPickFolder(clips: clips.filter { !$0.isTransient }, secrets: secrets)
+        if labelable || movable {
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 5) {
+                if labelable {
+                    GridRow {
+                        Text("Label").foregroundStyle(.secondary)
+                        Button("＋ Label \(clips.count) items") { model.beginLabelSelection() }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.tint)
+                            .help("⌘L")
+                    }
+                }
+                if movable {
+                    GridRow {
+                        Text("Folder").foregroundStyle(.secondary)
+                        FolderChip(path: commonFolderPath(model)) { model.beginFolderPicker() }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The folder they're all in, if it's one.
+    private func commonFolderPath(_ model: PanelViewModel) -> String? {
+        let paths = Set(clips.map { model.folderPath(of: .clip($0)) } + model.selectedSecrets.map { model.folderPath(of: .secret($0)) })
+        guard paths.count == 1, let only = paths.first else { return nil }
+        return only
     }
 
     private var summary: String {

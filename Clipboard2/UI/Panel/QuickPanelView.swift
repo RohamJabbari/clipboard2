@@ -70,6 +70,7 @@ struct QuickPanelView: View {
                     selectionCount: model.isMultiSelecting ? model.selectedClips.count : nil,
                     pickedFiles: model.pickedFileCount,
                     canQuickLook: model.canQuickLook,
+                    canLabel: model.selectedEntry.map(model.canLabel) ?? false,
                     updateVersion: env.updates.readyVersion,
                     syncIndicator: env.sync.indicator,
                     onUpdate: { env.updates.installNow() },
@@ -80,7 +81,7 @@ struct QuickPanelView: View {
         .onAppear { searchFocused = true }
         .onChange(of: model.focusToken) {
             searchFocused = ![.actions, .snippetForm, .saveSecret, .label, .editSecret, .shareToGroup, .folderName,
-                              .authenticatorForm, .authenticatorPeople].contains(model.mode)
+                              .authenticatorForm, .authenticatorPeople, .folderPicker, .addItems].contains(model.mode)
         }
         .onChange(of: env.store.revision) { model.refresh() }
         .onChange(of: env.authenticators.revision) { model.refresh() }
@@ -501,13 +502,21 @@ struct QuickPanelView: View {
             if let form = model.peopleForm {
                 AuthenticatorPeopleView(form: form, model: model)
             }
+        case .folderPicker:
+            if let form = model.folderPicker {
+                FolderPickerView(form: form, model: model)
+            }
+        case .addItems:
+            if let form = model.addItemsForm {
+                AddItemsView(form: form) { model.submitAddItems() }
+            }
         case .ai:
             if let run = model.aiRun {
                 AIResultView(run: run, model: model)
             }
         case .browse:
             if model.isMultiSelecting {
-                MultiSelectionPreview(clips: model.selectedClips, totalSelected: model.selectedIDs.count)
+                MultiSelectionPreview(clips: model.selectedClips, totalSelected: model.selectedIDs.count, model: model)
             } else if let folder = model.selectedEntry?.folder {
                 FolderPreview(folder: folder, count: model.folderCounts[folder.id] ?? 0, model: model)
                     .id(folder.id)
@@ -1062,6 +1071,8 @@ struct HintBar: View {
     var pickedFiles: (picked: Int, total: Int)?
     /// The selection can be shown in Quick Look (⌘Y).
     var canQuickLook = false
+    /// The selection can be labelled (⌘L).
+    var canLabel = false
     /// A downloaded update waiting for a relaunch: shown quietly at the trailing end.
     var updateVersion: String?
     /// Sync state, shown as a dot and a few words at the trailing end while signed in.
@@ -1083,6 +1094,7 @@ struct HintBar: View {
                 hint("⏎", "Paste \(selectionCount ?? 0) Items")
                 hint("⌥⏎", "Plain Text")
                 hint("⌘K", "Actions")
+                hint("⌘L", "Label")
                 hint("⌫", "Delete")
             case .browse where entry?.folder != nil:
                 hint("⏎", "Open")
@@ -1102,6 +1114,8 @@ struct HintBar: View {
                     hint("⌘K", "Actions")
                     if canQuickLook { hint("⌘Y", "Preview") }
                     if canEditText { hint("⌘E", "Edit") }
+                    // Only when there's room for it (the notice and tips share the bar).
+                    if canLabel && !canEditText && notice == nil { hint("⌘L", "Label") }
                 }
             case .actions:
                 hint("↑↓", "Choose")
@@ -1111,9 +1125,13 @@ struct HintBar: View {
                 hint("⏎", "Paste")
             case .saveSecret, .label, .editSecret, .folderName, .authenticatorForm:
                 hint("⏎", "Save")
-            case .authenticatorPeople:
+            case .authenticatorPeople, .folderPicker:
                 hint("↑↓", "Choose")
                 hint("⏎", "Choose")
+            case .addItems:
+                hint("↑↓", "Choose")
+                hint("space", "Tick")
+                hint("⏎", "Add")
             case .shareToGroup:
                 hint("↑↓", "Choose")
                 hint("⏎", "Share")

@@ -76,6 +76,12 @@ private struct ActionRow: View {
             Text(title)
                 .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
             Spacer()
+            if let shortcut = action.shortcutHint {
+                Text(shortcut)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(isSelected ? AnyShapeStyle(.white.opacity(0.8)) : AnyShapeStyle(.tertiary))
+                    .accessibilityLabel("Shortcut \(shortcut)")
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)

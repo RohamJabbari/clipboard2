@@ -30,13 +30,21 @@ struct SavedHeader: View {
     @ViewBuilder
     private var newMenu: some View {
         let inFolder = model.openFolder != nil
+        Button {
+            model.beginAddItems()
+        } label: {
+            Image(systemName: "plus")
+        }
+        .buttonStyle(.borderless)
+        .help("Add from clipboard history")
+        .accessibilityLabel("Add Items")
         if model.savedSpaceID == nil && !inFolder {
             // Your own Saved: New Folder, or an authenticator typed by hand.
             Menu {
                 Button("New Folder", systemImage: "folder.badge.plus") { model.beginNewFolder() }
                 Button("New Authenticator…", systemImage: "lock.shield") { model.beginAddAuthenticator() }
             } label: {
-                Image(systemName: "plus")
+                Image(systemName: "folder.badge.plus")
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
@@ -254,6 +262,7 @@ struct FolderPreview: View {
             Spacer(minLength: 0)
             Divider()
             Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 5) {
+                DetailLabelRow(entry: .folder(folder), label: folder.label, model: model)
                 GridRow {
                     Text("Created").foregroundStyle(.secondary)
                     Text(folder.createdAt.formatted(date: .abbreviated, time: .shortened))

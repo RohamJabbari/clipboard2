@@ -128,6 +128,10 @@ enum PanelMode: Equatable {
     case authenticatorForm
     /// Share…, People… or Transfer Ownership… for an authenticator you own.
     case authenticatorPeople
+    /// The Folder row's picker (⌘⇧M).
+    case folderPicker
+    /// Add Items in the Saved header.
+    case addItems
 }
 
 enum PanelAction: Identifiable, Hashable {
@@ -287,6 +291,15 @@ enum PanelAction: Identifiable, Hashable {
         case .saveToChosenFolder: "folder"
         case .delete: "trash"
         case .authenticator(let action): action.symbol
+        }
+    }
+
+    /// The keyboard shortcut shown next to the action in the ⌘K list.
+    var shortcutHint: String? {
+        switch self {
+        case .setLabel: "⌘L"
+        case .quickLook: "⌘Y"
+        default: nil
         }
     }
 
@@ -539,6 +552,8 @@ final class LabelFormState {
         case clip(ClipItem)
         case secret(SecretRef)
         case folder(ClipFolder)
+        /// Several selected clips get the same label (⌘L on a selection).
+        case clips([ClipItem])
     }
 
     let target: Target
@@ -550,6 +565,10 @@ final class LabelFormState {
         case .clip(let item): text = item.label ?? ""
         case .secret(let ref): text = ref.name
         case .folder(let folder): text = folder.label ?? ""
+        case .clips(let items):
+            // Their shared label, if they all have the same one.
+            let labels = Set(items.map { $0.label ?? "" })
+            text = labels.count == 1 ? labels.first ?? "" : ""
         }
     }
 
@@ -558,6 +577,7 @@ final class LabelFormState {
         case .clip(let item): item.preview.isEmpty ? item.kind.displayName : item.preview
         case .secret: "••••••••"
         case .folder(let folder): folder.name
+        case .clips(let items): "\(items.count) items"
         }
     }
 
@@ -569,6 +589,99 @@ final class LabelFormState {
     var isFolder: Bool {
         if case .folder = target { return true }
         return false
+    }
+}
+
+/// The Folder row's picker: the items' space as a tree (plus "Mine" for a group's items), the top
+/// level and New Folder… at each level. ↑↓ choose, Return picks.
+@Observable
+final class FolderPickerState {
+    struct Row: Identifiable, Equatable {
+        enum Kind: Equatable {
+            case topLevel
+            case folder(ClipFolder)
+            /// A new folder at that level (nil: top level), the items move into it.
+            case newFolder(parent: ClipFolder?, personal: Bool)
+        }
+        var id: String
+        var title: String
+        var level: Int
+        var kind: Kind
+        /// Section heading shown above it ("Team", "Mine").
+        var section: String?
+
+        static func == (a: Row, b: Row) -> Bool { a.id == b.id }
+    }
+
+    let clips: [ClipItem]
+    let secrets: [SecretRef]
+    let rows: [Row]
+    var selection = 0
+
+    init(clips: [ClipItem], secrets: [SecretRef], menu: PanelViewModel.FolderMenu, groupFolders: [ClipFolder],
+         personalFolders: [ClipFolder]) {
+        self.clips = clips
+        self.secrets = secrets
+        var rows: [Row] = []
+        func tree(_ folders: [ClipFolder], allowed: Set<UUID>?, personal: Bool, section: String?, prefix: String) {
+            let byID = Dictionary(folders.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let tree = FolderTree(folders)
+            var first = true
+            for (node, level) in tree.flattened() {
+                guard let folder = byID[node.id], allowed?.contains(node.id) ?? true else { continue }
+                rows.append(Row(id: prefix + node.id.uuidString, title: node.name, level: level, kind: .folder(folder),
+                                section: first ? section : nil))
+                first = false
+            }
+            rows.append(Row(id: prefix + "new", title: "New Folder…", level: 0, kind: .newFolder(parent: nil, personal: personal),
+                            section: first ? section : nil))
+        }
+        if let group = menu.group {
+            rows.append(Row(id: "top", title: "Top Level of \(group.name)", level: 0, kind: .topLevel, section: group.name))
+            tree(groupFolders, allowed: nil, personal: false, section: nil, prefix: "g-")
+            tree(personalFolders, allowed: nil, personal: true, section: "Mine", prefix: "m-")
+        } else if menu.copiesToPersonal {
+            tree(personalFolders, allowed: nil, personal: true, section: "Mine", prefix: "m-")
+        } else {
+            rows.append(Row(id: "top", title: "Top Level", level: 0, kind: .topLevel))
+            tree(personalFolders, allowed: nil, personal: false, section: nil, prefix: "m-")
+        }
+        self.rows = rows
+    }
+
+    var count: Int { clips.count + secrets.count }
+}
+
+/// Add Items in the Saved header: recent unsaved history of this space, checked to save here.
+@Observable
+final class AddItemsState {
+    let candidates: [ClipItem]
+    /// The open folder they go into; nil: the top level of Saved.
+    let folder: ClipFolder?
+    var query = "" { didSet { if query != oldValue { selection = 0 } } }
+    var checked: Set<UUID> = []
+    var selection = 0
+
+    init(candidates: [ClipItem], folder: ClipFolder?) {
+        self.candidates = candidates
+        self.folder = folder
+    }
+
+    /// The candidates matching the search, newest first.
+    var shown: [ClipItem] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return candidates }
+        return candidates.filter { FuzzyMatcher.score(query: q, in: $0.searchableText) != nil }
+    }
+
+    func toggle(_ item: ClipItem) {
+        if checked.contains(item.id) { checked.remove(item.id) } else { checked.insert(item.id) }
+    }
+
+    func toggleSelected() {
+        let items = shown
+        guard items.indices.contains(selection) else { return }
+        toggle(items[selection])
     }
 }
 
@@ -762,6 +875,8 @@ final class PanelViewModel {
     private(set) var folderNameForm: FolderNameState?
     private(set) var authenticatorForm: AuthenticatorFormState?
     private(set) var peopleForm: AuthenticatorPeopleState?
+    private(set) var folderPicker: FolderPickerState?
+    private(set) var addItemsForm: AddItemsState?
     /// Ticks once a second while the panel is open, for authenticator codes and their rings.
     @ObservationIgnored let otpClock = OTPClock()
     /// The authenticator whose secret and QR code are showing (after Touch ID); cleared on any move.
@@ -970,6 +1085,8 @@ final class PanelViewModel {
         folderNameForm = nil
         authenticatorForm = nil
         peopleForm = nil
+        folderPicker = nil
+        addItemsForm = nil
         actionQuery = ""
         actionSelection = 0
         mode = .browse
@@ -1641,11 +1758,131 @@ final class PanelViewModel {
             let name = form.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty else { return }
             env.secrets.rename(ref, to: name)
+        case .clips(let items):
+            for item in items {
+                env.store.setLabel(form.text, for: item, keepPinned: env.slots.slot(for: .clip(item.id)) != nil)
+            }
+            let cleared = form.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            showNotice(cleared ? "Labels removed from \(items.count) items" : "Labelled \(items.count) items")
         }
         let id = selectedID
         resetMode()
         refresh()
         selectedID = id
+    }
+
+    // MARK: Label and Folder rows (preview details)
+
+    /// Labelling is offered where the server would accept it: never on selected text from
+    /// another app, nor on a group item someone else wrote (unless you own the group). A
+    /// contact's items keep their local-only labels.
+    func canLabel(_ entry: PanelEntry) -> Bool {
+        switch entry {
+        case .clip(let item): !item.isTransient && env.sync.canChange(item)
+        case .secret(let ref): env.sync.canChange(itemID: ref.id, spaceID: ref.spaceID)
+        case .folder(let folder): canChangeFolder(folder)
+        case .snippet, .authenticator, .authenticatorSuggestion: false
+        }
+    }
+
+    /// ⌘L: Label… for the selected row, or one label for every selected clip.
+    func beginLabelSelection() {
+        if isMultiSelecting {
+            let clips = selectedClips.filter { canLabel(.clip($0)) }
+            guard !clips.isEmpty else {
+                NSSound.beep()
+                return
+            }
+            labelForm = LabelFormState(target: .clips(clips))
+            mode = .label
+            return
+        }
+        guard let entry = selectedEntry, canLabel(entry) else {
+            NSSound.beep()
+            return
+        }
+        beginLabel(entry)
+    }
+
+    /// Where the Folder row's items can go: clips and secrets that may use folders (and that
+    /// this account may move, for a group's).
+    func canPickFolder(clips: [ClipItem], secrets: [SecretRef]) -> Bool {
+        folderMenu(for: clips, secrets: secrets) != nil
+    }
+
+    /// The Folder row's path for one item: "Saved › Work › Clients", or nil when it isn't in one.
+    func folderPath(of entry: PanelEntry) -> String? {
+        let folder: ClipFolder?
+        switch entry {
+        case .clip(let item): folder = self.folder(of: item)
+        case .secret(let ref): folder = self.folder(of: ref)
+        default: folder = nil
+        }
+        return folder.map { "Saved › " + folderPathName($0) }
+    }
+
+    /// ⌘⇧M and the Folder row: the inline folder picker for the selection.
+    func beginFolderPicker() {
+        let (clips, secrets) = isMultiSelecting ? (selectedClips.filter { !$0.isTransient }, selectedSecrets)
+            : (selectedEntry?.clip.flatMap { $0.isTransient ? nil : [$0] } ?? [], selectedEntry?.secret.map { [$0] } ?? [])
+        guard let menu = folderMenu(for: clips, secrets: secrets) else {
+            NSSound.beep()
+            return
+        }
+        folderPicker = FolderPickerState(clips: clips, secrets: secrets, menu: menu,
+                                         groupFolders: menu.group.map { env.store.folders(inSpace: $0.id) } ?? [],
+                                         personalFolders: env.store.folders(inSpace: nil))
+        mode = .folderPicker
+    }
+
+    /// A row of the folder picker: into a folder, or (nil) the top level of the items' own Saved.
+    func pick(_ row: FolderPickerState.Row) {
+        guard let form = folderPicker else { return }
+        switch row.kind {
+        case .topLevel:
+            resetMode()
+            let unsaved = form.clips.filter { !$0.isPinned && env.sync.canChange($0) }
+            if !unsaved.isEmpty { env.store.addToSaved(unsaved) }
+            let inFolders = (form.clips.filter { folder(of: $0) != nil }, form.secrets.filter { folder(of: $0) != nil })
+            if !inFolders.0.isEmpty || !inFolders.1.isEmpty {
+                removeFromFolder(inFolders.0, secrets: inFolders.1)
+            } else {
+                refresh()
+                showNotice(unsaved.isEmpty ? "Already at the top level" : "Added to Saved")
+            }
+        case .folder(let folder):
+            resetMode()
+            place(form.clips, secrets: form.secrets, in: folder)
+        case .newFolder(let parent, let personal):
+            resetMode()
+            beginNewFolder(moving: form.clips, secrets: form.secrets, personal: personal, parent: parent)
+        }
+    }
+
+    // MARK: Add Items (Saved header)
+
+    /// The inline picker of recent history to save here (into the open folder, if any).
+    func beginAddItems() {
+        guard isSavedView else { return }
+        let space = savedSpaceID
+        let candidates = env.store.items(inSpace: space).filter { !$0.isPinned && env.sync.canChange($0) }
+        addItemsForm = AddItemsState(candidates: candidates, folder: openFolder)
+        mode = .addItems
+    }
+
+    func submitAddItems() {
+        guard let form = addItemsForm else { return }
+        let chosen = form.candidates.filter { form.checked.contains($0.id) }
+        guard !chosen.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        resetMode()
+        env.store.addToSaved(chosen)
+        if let folder = form.folder { env.store.move(chosen, to: folder) }
+        refresh()
+        let place = form.folder.map(\.name) ?? "Saved"
+        showNotice(chosen.count == 1 ? "Added 1 item to \(place)" : "Added \(chosen.count) items to \(place)")
     }
 
     func beginEditSecret(_ ref: SecretRef) {
@@ -2173,6 +2410,7 @@ final class PanelViewModel {
                 actions.append(.copy)
             }
             if canQuickLook { actions.append(.quickLook) }
+            if clips.contains(where: { canLabel(.clip($0)) }) { actions.append(.setLabel) }
             actions += savedActions(for: clips)
             if canShareToGroup { actions.append(.shareToGroup) }
             actions += sendToContactActions
@@ -2184,7 +2422,8 @@ final class PanelViewModel {
         }
         if entry.isSuggestion { return [] }
         if case .folder(let folder) = entry {
-            var actions: [PanelAction] = [.openFolder, .renameFolder, .setLabel]
+            var actions: [PanelAction] = [.openFolder, .renameFolder]
+            if canLabel(entry) { actions.append(.setLabel) }
             if canChangeFolder(folder) {
                 if FolderTree(env.store.folders(inSpace: folder.spaceID)).canCreate(in: folder.id) { actions.append(.newSubfolder) }
                 actions += folderTargets(forMoving: folder).map(PanelAction.moveFolder)
@@ -2214,7 +2453,7 @@ final class PanelViewModel {
             } else if item.kind == .image && !item.isConcealed {
                 actions += aiActions.filter { if case .ai(let ai) = $0 { ai.worksOnImages } else { true } }
             }
-            actions.append(.setLabel)
+            if canLabel(entry) { actions.append(.setLabel) }
             actions += savedActions(for: [item])
             if canShareToGroup { actions.append(.shareToGroup) }
             actions += PanelAction.sendToDeviceActions(for: item, multiSelecting: false, targets: DeviceTarget.others(in: env.sync))
@@ -2224,7 +2463,7 @@ final class PanelViewModel {
             break
         case .secret(let ref):
             actions.append(.copy)
-            actions.append(.setLabel)
+            if canLabel(entry) { actions.append(.setLabel) }
             actions += savedActions(for: [], secrets: [ref])
             if canShareToGroup && env.sync.groups.contains(where: { $0.id != ref.spaceID }) { actions.append(.shareToGroup) }
         }
@@ -2465,6 +2704,8 @@ final class PanelViewModel {
         let clips = selectedClips
         let secrets = selectedSecrets
         switch action {
+        case .setLabel:
+            beginLabelSelection()
         case .paste:
             pasteSelection()
         case .pastePlain:
@@ -2914,7 +3155,46 @@ final class PanelViewModel {
         case .shareToGroup: handleShareKey(event)
         case .ai: handleAIKey(event)
         case .authenticatorPeople: handlePeopleKey(event)
+        case .folderPicker: handlePickerKey(event)
+        case .addItems: handleAddItemsKey(event)
         }
+    }
+
+    private func handlePickerKey(_ event: NSEvent) -> Bool {
+        guard let form = folderPicker else { return false }
+        switch event.keyCode {
+        case KeyCode.escape:
+            resetMode()
+        case KeyCode.upArrow:
+            form.selection = max(0, form.selection - 1)
+        case KeyCode.downArrow:
+            form.selection = min(max(0, form.rows.count - 1), form.selection + 1)
+        case KeyCode.returnKey, KeyCode.keypadEnter:
+            if form.rows.indices.contains(form.selection) { pick(form.rows[form.selection]) }
+        default:
+            return false
+        }
+        return true
+    }
+
+    /// The search field keeps typing; ↑↓ move, space toggles, Return adds, esc cancels.
+    private func handleAddItemsKey(_ event: NSEvent) -> Bool {
+        guard let form = addItemsForm else { return false }
+        switch event.keyCode {
+        case KeyCode.escape:
+            resetMode()
+        case KeyCode.upArrow:
+            form.selection = max(0, form.selection - 1)
+        case KeyCode.downArrow:
+            form.selection = min(max(0, form.shown.count - 1), form.selection + 1)
+        case KeyCode.returnKey, KeyCode.keypadEnter:
+            submitAddItems()
+        case KeyCode.space:
+            form.toggleSelected()
+        default:
+            return false
+        }
+        return true
     }
 
     private func handlePeopleKey(_ event: NSEvent) -> Bool {
@@ -3023,6 +3303,12 @@ final class PanelViewModel {
             case "e":
                 beginEditing()
                 return true
+            case "l" where !shift:
+                beginLabelSelection()
+                return true
+            case "m" where shift:
+                beginFolderPicker()
+                return true
             case "y":
                 toggleQuickLook()
                 return true
@@ -3126,6 +3412,7 @@ final class PanelViewModel {
 nonisolated enum KeyCode {
     static let returnKey: UInt16 = 36
     static let tab: UInt16 = 48
+    static let space: UInt16 = 49
     static let delete: UInt16 = 51
     static let escape: UInt16 = 53
     static let keypadEnter: UInt16 = 76
