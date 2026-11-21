@@ -69,4 +69,9 @@ export const config = () => ({
   dbName: process.env.DB_NAME ?? "clipboard2-db",
   dbPoolMax: int("DB_POOL_MAX", 4),
   bucket: process.env.BUCKET ?? "clipboard2",
+  // Self-hosting: with BLOB_DIR set, blobs are kept on disk and served by this API (diskStorage.ts)
+  // instead of a Cloud Storage bucket. PUBLIC_URL is the address clients reach the API at.
+  blobDir: process.env.BLOB_DIR,
+  publicUrl: process.env.PUBLIC_URL,
+  blobSigningKey: process.env.BLOB_SIGNING_KEY,
 });
