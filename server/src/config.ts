@@ -29,6 +29,7 @@ export interface Limits {
   authenticatorsPerUser: number;
   sharedAuthenticatorsPerUser: number;
   sharesPerAuthenticator: number;
+  trustedProxyHops: number;
   scryptConcurrency: number;
   scryptQueue: number;
 }
@@ -57,6 +58,7 @@ export const limits = (): Limits => ({
   authenticatorsPerUser: int("LIMIT_AUTHENTICATORS_PER_USER", 200),
   sharedAuthenticatorsPerUser: int("LIMIT_SHARED_AUTHENTICATORS_PER_USER", 200),
   sharesPerAuthenticator: int("LIMIT_SHARES_PER_AUTHENTICATOR", 20),
+  trustedProxyHops: int("TRUSTED_PROXY_HOPS", 1),
   scryptConcurrency: int("SCRYPT_CONCURRENCY", 2),
   scryptQueue: int("SCRYPT_QUEUE", 8),
 });

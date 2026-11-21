@@ -25,7 +25,7 @@ gone. Both apps say so at sign-up.
 
 | What | Value |
 |---|---|
-| API base | `https://origin.tail9bf9d6.ts.net:7090` (overridable in a debug setting) |
+| API base | `https://origin.tail9bf9d6.ts.net/clipboard2` (overridable in a debug setting) |
 
 ## Cryptography
 

@@ -314,11 +314,12 @@ export function buildApp(deps: Deps): FastifyInstance {
         ...(deps.logStream ? { stream: deps.logStream } : {}),
       }
     : false;
-  // Base64 adds a third; leave room for the JSON envelope. Cloud Run's front end is exactly one hop:
-  // trust the socket peer only, so the client IP is the last X-Forwarded-For entry and anything a
+  // Base64 adds a third; leave room for the JSON envelope. Cloud Run's front end is exactly one hop
+  // (TRUSTED_PROXY_HOPS, default 1; the origin server has two, its gateway and Tailscale Funnel):
+  // trust only those, so the client IP is the last X-Forwarded-For entry and anything a
   // client put before it is ignored. (A function, because Fastify 5.12 treats `trustProxy: 1` as
   // "trust nothing".)
-  const app = Fastify({ logger, bodyLimit: Math.ceil(limits.itemBytes * 1.4) + 64 * 1024, trustProxy: (_address: string, hop: number) => hop < 1 });
+  const app = Fastify({ logger, bodyLimit: Math.ceil(limits.itemBytes * 1.4) + 64 * 1024, trustProxy: (_address: string, hop: number) => hop < limits.trustedProxyHops });
   const requests = new RateLimiter(limits.requestsPerMinute);
   const inviteLookups = new RateLimiter(limits.invitesPerMinute);
 
