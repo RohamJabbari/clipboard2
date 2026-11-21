@@ -1,8 +1,11 @@
 APP_NAME   := Clipboard2
+# This branch builds a separate test flavour that talks to the origin server.
+PRODUCT    := clipboard2-test
+BUNDLE_ID  := at.softmaze.Clippy.test
 PROJECT    := $(APP_NAME).xcodeproj
 SCHEME     := $(APP_NAME)
 DERIVED    := build
-RELEASE_APP := $(DERIVED)/Build/Products/Release/$(APP_NAME).app
+RELEASE_APP := $(DERIVED)/Build/Products/Release/$(PRODUCT).app
 INSTALL_DIR := /Applications
 
 .PHONY: all generate build debug test install run icon pkg release windows-test windows-release server-test server-deploy clean
@@ -32,14 +35,13 @@ test: generate
 		-derivedDataPath $(DERIVED) -destination 'platform=macOS' test -quiet
 
 install: build
-	@osascript -e 'tell application id "at.softmaze.Clippy" to quit' >/dev/null 2>&1 || true
+	@osascript -e 'tell application id "$(BUNDLE_ID)" to quit' >/dev/null 2>&1 || true
 	@sleep 1
-	@pkill -x $(APP_NAME) >/dev/null 2>&1 || true
-	@pkill -x Clippy >/dev/null 2>&1 || true
-	rm -rf "$(INSTALL_DIR)/$(APP_NAME).app" "$(INSTALL_DIR)/Clippy.app"
+	@pkill -x $(PRODUCT) >/dev/null 2>&1 || true
+	rm -rf "$(INSTALL_DIR)/$(PRODUCT).app"
 	cp -R "$(RELEASE_APP)" "$(INSTALL_DIR)/"
-	codesign --verify --strict "$(INSTALL_DIR)/$(APP_NAME).app"
-	open "$(INSTALL_DIR)/$(APP_NAME).app"
+	codesign --verify --strict "$(INSTALL_DIR)/$(PRODUCT).app"
+	open "$(INSTALL_DIR)/$(PRODUCT).app"
 
 run: install
 

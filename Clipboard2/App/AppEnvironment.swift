@@ -685,7 +685,8 @@ final class AppEnvironment {
     }
 
     func handle(url: URL) {
-        guard url.scheme == "clipboard2" || url.scheme == "clippy" else { return }
+        // "clipboard2test" is this build flavour's own scheme, so links don't land in the released app.
+        guard ["clipboard2", "clippy", "clipboard2test"].contains(url.scheme) else { return }
         switch url.host() {
         case "settings":
             // clipboard2://settings?tab=history opens a specific tab.

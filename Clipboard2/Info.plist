@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Clipboard2</string>
+	<string>clipboard2-test</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -13,7 +13,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Clipboard2</string>
+	<string>clipboard2-test</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -22,11 +22,10 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>at.softmaze.Clippy</string>
+			<string>at.softmaze.Clippy.test</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>clipboard2</string>
-				<string>clippy</string>
+				<string>clipboard2test</string>
 			</array>
 		</dict>
 	</array>
@@ -46,12 +45,12 @@
 			<key>NSMenuItem</key>
 			<dict>
 				<key>default</key>
-				<string>Clipboard2 Actions…</string>
+				<string>clipboard2-test Actions…</string>
 			</dict>
 			<key>NSMessage</key>
 			<string>clippyActions</string>
 			<key>NSPortName</key>
-			<string>Clipboard2</string>
+			<string>clipboard2-test</string>
 			<key>NSRequiredContext</key>
 			<dict/>
 			<key>NSSendTypes</key>
@@ -64,12 +63,12 @@
 			<key>NSMenuItem</key>
 			<dict>
 				<key>default</key>
-				<string>Paste Text from Clipboard Image</string>
+				<string>Paste Text from Clipboard Image (test)</string>
 			</dict>
 			<key>NSMessage</key>
 			<string>pasteTextFromImage</string>
 			<key>NSPortName</key>
-			<string>Clipboard2</string>
+			<string>clipboard2-test</string>
 			<key>NSRequiredContext</key>
 			<dict/>
 			<key>NSReturnTypes</key>
@@ -80,13 +79,13 @@
 		</dict>
 	</array>
 	<key>SUAllowsAutomaticUpdates</key>
-	<true/>
+	<false/>
 	<key>SUAutomaticallyUpdate</key>
-	<true/>
+	<false/>
 	<key>SUEnableAutomaticChecks</key>
-	<true/>
+	<false/>
 	<key>SUFeedURL</key>
-	<string>https://raw.githubusercontent.com/RohamJabbari/clipboard2-macOS/main/appcast.xml</string>
+	<string>https://localhost/clipboard2-test-has-no-updates</string>
 	<key>SUPublicEDKey</key>
 	<string>EYXl4+z6FlFfMyGuKf4+WHXcB3c8WHA6ThmEj4pPwwI=</string>
 	<key>SUScheduledCheckInterval</key>

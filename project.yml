@@ -38,8 +38,8 @@ targets:
     info:
       path: Clipboard2/Info.plist
       properties:
-        CFBundleDisplayName: Clipboard2
-        CFBundleName: Clipboard2
+        CFBundleDisplayName: clipboard2-test
+        CFBundleName: clipboard2-test
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSUIElement: true
@@ -47,8 +47,8 @@ targets:
         LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
         NSHumanReadableCopyright: "© 2026 Softmaze Solutions GmbH"
         CFBundleURLTypes:
-          - CFBundleURLName: at.softmaze.Clippy
-            CFBundleURLSchemes: [clipboard2, clippy]
+          - CFBundleURLName: at.softmaze.Clippy.test
+            CFBundleURLSchemes: [clipboard2test]
         UTExportedTypeDeclarations:
           # Encrypted backups (docs/BACKUP-FORMAT.md).
           - UTTypeIdentifier: at.softmaze.clippy.backup
@@ -60,26 +60,27 @@ targets:
           - UTTypeIdentifier: at.softmaze.clippy.clip-reference
             UTTypeDescription: Clipboard2 Item
             UTTypeConformsTo: [public.data]
-        # Sparkle: hourly update checks against the appcast in the GitHub repo.
-        SUFeedURL: https://raw.githubusercontent.com/RohamJabbari/clipboard2-macOS/main/appcast.xml
+        # Sparkle is switched off in this flavour: the released feed would replace this
+        # test build with the released app. The feed address is a deliberate dead end.
+        SUFeedURL: https://localhost/clipboard2-test-has-no-updates
         SUPublicEDKey: EYXl4+z6FlFfMyGuKf4+WHXcB3c8WHA6ThmEj4pPwwI=
-        SUEnableAutomaticChecks: true
+        SUEnableAutomaticChecks: false
         SUScheduledCheckInterval: 3600
-        SUAllowsAutomaticUpdates: true
+        SUAllowsAutomaticUpdates: false
         # Updates download quietly and install on quit (Settings → General → Updates).
-        SUAutomaticallyUpdate: true
+        SUAutomaticallyUpdate: false
         SUVerifyUpdateBeforeExtraction: true
         NSServices:
           - NSMenuItem:
-              default: Clipboard2 Actions…
+              default: clipboard2-test Actions…
             NSMessage: clippyActions
-            NSPortName: Clipboard2
+            NSPortName: clipboard2-test
             NSSendTypes: [public.utf8-plain-text, NSStringPboardType]
             NSRequiredContext: {}
           - NSMenuItem:
-              default: Paste Text from Clipboard Image
+              default: Paste Text from Clipboard Image (test)
             NSMessage: pasteTextFromImage
-            NSPortName: Clipboard2
+            NSPortName: clipboard2-test
             NSReturnTypes: [public.utf8-plain-text, NSStringPboardType]
             NSRequiredContext: {}
     entitlements:
@@ -88,14 +89,18 @@ targets:
         com.apple.security.app-sandbox: false
     settings:
       base:
-        PRODUCT_NAME: Clipboard2
-        PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy
+        # A separate app: its own name, bundle id, data folder and keychain entries, so it
+        # installs next to the released Clipboard2 without touching it.
+        PRODUCT_NAME: clipboard2-test
+        # The Swift module keeps its name: code and tests refer to `Clipboard2.`.
+        PRODUCT_MODULE_NAME: Clipboard2
+        PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.test
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ENABLE_APP_SANDBOX: NO
         COMBINE_HIDPI_IMAGES: YES
       configs:
         Debug:
-          PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.debug
+          PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.test.debug
         Release:
           # Notarization rejects the debugger entitlement Xcode injects by default.
           CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO

@@ -2,7 +2,8 @@ import Foundation
 
 /// Where sync talks to and the limits it plans around (docs/sync/PROTOCOL.md).
 nonisolated enum SyncConfig {
-    static let defaultAPIBase = URL(string: "https://clipboard2-api-120641536104.europe-west1.run.app")!
+    /// The self-hosted API on the origin server (branch origin-server). Tailnet only.
+    static let defaultAPIBase = URL(string: "https://origin.tail9bf9d6.ts.net:7090")!
 
     /// Debug builds can point at a local server: `defaults write <bundle id> syncAPIBase http://localhost:8080`.
     static var apiBase: URL {

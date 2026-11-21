@@ -3,7 +3,7 @@ namespace Clipboard2.Core.Sync;
 /// <summary>Endpoints and keys for cloud sync (docs/sync/PROTOCOL.md → Endpoints).</summary>
 public static class SyncConfig
 {
-    public const string DefaultApiBaseUrl = "https://clipboard2-api-120641536104.europe-west1.run.app";
+    public const string DefaultApiBaseUrl = "https://origin.tail9bf9d6.ts.net:7090";
 
     /// <summary>The settings override (debug) wins over the built-in base URL.</summary>
     public static string ApiBaseUrl(Settings settings) =>
