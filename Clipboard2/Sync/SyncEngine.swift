@@ -55,6 +55,9 @@ final class SyncEngine {
     var onPinsChanged: (([String: String]) -> Void)?
     /// The space list was refreshed (start of every tick), so groups show before items arrive.
     var onSpacesUpdated: (() -> Void)?
+    /// Every space has been pulled; authenticator codes and uploads come after. Notifications go
+    /// out here, so they don't wait seconds behind the items they're about.
+    var onPulled: (() -> Void)?
     /// Clips whose image or files are downloading, newest first. Called when one starts or ends,
     /// and every 150 ms while any is running.
     var onDownloadsChanged: (([IncomingDownload]) -> Void)?
@@ -233,6 +236,7 @@ final class SyncEngine {
             try await inSpace(space, merging: .quietly) { try await self.pull(space, itemKey: $0) }
             announceArrivals()
         }
+        if !isStopped { onPulled?() }
         if authenticators != nil {
             try await pullSharedCodes()
             await topUpShares(spaces)

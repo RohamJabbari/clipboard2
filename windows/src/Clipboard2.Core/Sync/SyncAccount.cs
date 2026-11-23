@@ -1089,13 +1089,11 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
                 if (_engine is not { } engine) break;
                 if (!_accountFresh) await RefreshAccountAsync(ct);
                 if (!_devicesFresh) await RefreshDevicesQuietlyAsync(ct);
+                engine.Pulled = pulled => ReportActivity(engine, pulled);
                 var report = await engine.TickAsync(ct);
                 await RefreshContactsAsync(force: false, ct);
-                if (_engine == engine && Uid is { } self)
-                {
-                    var found = Activity.Observe(Snapshot(self, _seenRequests is null ? null : IncomingRequests), report.Arrivals);
-                    if (found.Count > 0) Notifications?.Invoke(found);
-                }
+                // Again, for what the rest of the tick changed (contact requests, authenticators).
+                ReportActivity(engine, report);
                 LastSync = _now();
                 _offline = false;
                 RetryAfter = null;
@@ -1181,6 +1179,15 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
     // MARK: Internals
 
     /// <summary>What <see cref="Activity"/> compares: the spaces as stored, pending requests and authenticators.</summary>
+    /// <summary>Compares with the last look and raises notifications; the report's arrivals are used up.</summary>
+    private void ReportActivity(SyncEngine engine, SyncReport report)
+    {
+        if (_engine != engine || Uid is not { } self) return;
+        var found = Activity.Observe(Snapshot(self, _seenRequests is null ? null : IncomingRequests), [.. report.Arrivals]);
+        report.Arrivals.Clear();
+        if (found.Count > 0) Notifications?.Invoke(found);
+    }
+
     private SyncSnapshot Snapshot(string self, IReadOnlyList<ContactRequest>? requests) =>
         new(self, _store.SyncSpaces(), requests, [.. Authenticators.Shared], [.. Authenticators.All]);
 

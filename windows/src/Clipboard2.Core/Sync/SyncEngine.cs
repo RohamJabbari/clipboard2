@@ -186,6 +186,10 @@ public sealed partial class SyncEngine
 
     // MARK: Tick
 
+    /// <summary>Every space has been pulled; pushes and authenticator codes come after. Notifications go out here, so
+    /// they don't wait seconds behind the items they're about.</summary>
+    public Action<SyncReport>? Pulled { get; set; }
+
     public async Task<SyncReport> TickAsync(CancellationToken ct = default)
     {
         var report = new SyncReport();
@@ -199,6 +203,7 @@ public sealed partial class SyncEngine
             ct.ThrowIfCancellationRequested();
             await PullAsync(space, report, ct);
         }
+        Pulled?.Invoke(report);
         // Authenticators added here (or while signed out) get their space before the pushes.
         await CreatePendingAuthenticatorsAsync(report, ct);
         spaces = _spaces.Values.OrderBy(s => s.IsPersonal).ToList();

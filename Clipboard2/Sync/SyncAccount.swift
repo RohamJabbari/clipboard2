@@ -526,6 +526,11 @@ final class SyncAccount {
         engine.onDownloadsChanged = { [weak self] in self?.downloads = $0 }
         engine.onSentToThisDevice = { [weak self] _, from in self?.onItemSentHere?(from ?? "another device") }
         engine.onArrivals = { [weak self] in self?.announce($0) }
+        engine.onPulled = { [weak self, weak engine] in
+            guard let self, let engine, self.engine === engine else { return }
+            // The end of the tick reports again, for what the rest of it changes (authenticators).
+            self.reportToNotifications(recordOnly: !engine.announcesArrivals)
+        }
         for (space, key) in keys { engine.adoptSpaceKey(key, for: space) }
         self.engine = engine
         backoffUntil = nil
