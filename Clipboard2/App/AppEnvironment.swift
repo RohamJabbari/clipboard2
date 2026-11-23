@@ -84,7 +84,7 @@ final class AppEnvironment {
     }
 
     /// Every persisted model (the newest store version); tests build in-memory containers from it.
-    static let schema = Schema(versionedSchema: StoreSchemaV4.self)
+    static let schema = Schema(versionedSchema: StoreSchemaV5.self)
 
     /// Opens the store with the migration plan. Stores from before the versioned schema (older
     /// than 1.3.0) match no version, so they get the automatic lightweight migration they always
@@ -484,6 +484,11 @@ final class AppEnvironment {
     func sendSelectionToGroup() {
         guard sync.isSignedIn, let group = sync.defaultGroup else {
             SettingsOpener.open(tab: .sync)
+            return
+        }
+        guard group.canSend else {
+            NSSound.beep()
+            HUD.show("You can't send to \(group.name)", symbol: "person.2.slash", duration: .seconds(2.5))
             return
         }
         guard AXPermission.isTrusted else {
