@@ -347,8 +347,19 @@ struct QuickPanelView: View {
             if model.canShareToGroup {
                 Menu("Share to Group") {
                     ForEach(env.sync.groups) { group in
-                        Button(group.name) { model.share([item], to: group) }
-                            .disabled(item.spaceID == group.id)
+                        // A group with folders is a submenu: the group itself, then its folder tree.
+                        let folders = env.store.folders(inSpace: group.id)
+                        if folders.isEmpty || item.spaceID == group.id {
+                            Button(group.name) { model.share([item], to: group) }
+                                .disabled(item.spaceID == group.id)
+                        } else {
+                            Menu(group.name) {
+                                Button(group.name) { model.share([item], to: group) }
+                                Divider()
+                                FolderMoveMenu(folders: folders, parent: nil,
+                                               onPick: { model.share([item], to: group, folder: $0) }, onNew: nil)
+                            }
+                        }
                     }
                 }
             }
