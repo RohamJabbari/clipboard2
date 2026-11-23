@@ -167,6 +167,7 @@ Pinning or unpinning changes the category, and the category is part of the AAD, 
 | `unauthenticated` | 401: missing, unknown, revoked or expired session |
 | `invalid_credentials` | 401 |
 | `forbidden` | 403 |
+| `send_not_allowed` | 403: the caller lacks [Send](#member-access) in this group |
 | `invite_required` | 403: sign-up without `signupCode` or `groupInviteId` |
 | `invite_invalid` | 403: that sign-up code or group invite is unknown, used or expired |
 | `not_found` | 404 |
@@ -231,16 +232,40 @@ Account = {"uid","email","kdf":{"alg":"pbkdf2-sha256","salt","iterations"},
 | `POST /v1/groups` `{id, encryptedName, wrappedKey}` | `201 Space`. The caller becomes owner; `wrappedKey` is SK wrapped to the caller. |
 | `PATCH /v1/groups/:id` `{encryptedName}` | `204`, owner only |
 | `DELETE /v1/groups/:id` | `204`, owner only. Removes all items, blobs and invites. |
-| `GET /v1/groups/:id/members` | `{members: [{uid, username, name, role}]}`, members only, owner first. `username` may be `null`; `name` is as in `Space.members`. No emails. |
+| `GET /v1/groups/:id/members` | `{members: [Member]}`, members only, owner first. `username` may be `null`; `name` is as in `Space.members`. No emails. |
+| `PATCH /v1/groups/:id/members/:uid` `{canSend?, canSeeSecrets?}` | `200 Member`, the member as the members list shows it. Owner only (`403 forbidden`). At least one field (`400 invalid`); the owner's own row can't change (`400 invalid`); unknown member `404`. See [Member access](#member-access). |
 | `DELETE /v1/groups/:id/members/:uid` | `204`. The owner can remove others; a member can remove themselves (leave). The owner can't leave and has to delete the group instead. |
 
 ```jsonc
 Space = {"id","kind":"personal|group|direct|authenticator","role":"owner|member","ownerUid",
          "wrappedKey","encryptedName":null|"<b64>","memberCount",
-         "members":[{"uid","name"}],"createdAt"}
+         "members":[{"uid","name"}],"canSend","canSeeSecrets","createdAt"}
+Member = {"uid","username":null|"<name>","name","role":"owner|member","canSend","canSeeSecrets"}
 ```
 
 - **`members`:** everyone in the space, owner first (a personal space lists only the caller). `name` is the username, or the email's part before `@` if there is none. Clients show it next to items by matching `authorUid`.
+- **`canSend`, `canSeeSecrets`:** the caller's own [access](#member-access). Only on `group` spaces; absent on the other kinds.
+
+#### Member access
+
+Each group member has two booleans, both `true` by default (and for everyone who joined before 1.10):
+
+- **Send** (`canSend`): may add and change items and upload blobs.
+- **Secrets** (`canSeeSecrets`): receives the group's `secret` items and may write or delete them.
+
+The owner always has both; only the owner changes them (`PATCH /v1/groups/:id/members/:uid`). Personal,
+direct and authenticator spaces ignore them. The server enforces:
+
+| Route | Without Send | Without Secrets |
+|---|---|---|
+| `GET /v1/spaces/:id/changes` | unchanged | `secret` rows are left out entirely, tombstones included |
+| `PUT /v1/spaces/:id/items/:itemId` | `403 send_not_allowed`, for new items and changes alike | `403 forbidden` when the body or the stored item (tombstones included) is `secret` |
+| `DELETE /v1/spaces/:id/items/:itemId` | allowed (the usual author/owner rule) | `403 forbidden` for a `secret` item, tombstones included |
+| `POST /v1/spaces/:id/blobs` | `403 send_not_allowed` | unchanged |
+
+`send_not_allowed` is checked before `forbidden`. When Secrets is turned back on, rows the feed skipped
+are behind the client's cursor, so the client resets that space's cursor to `0` to fetch them.
+Revoking Secrets doesn't rotate the space key: a device that already decrypted a secret could keep it.
 
 ### Invites
 
@@ -377,7 +402,7 @@ Deleting an account deletes the authenticators it owns and the shares to it.
 | `PUT /v1/spaces/:id/items/:itemId` `{category, sortAt, updatedAt, ciphertext, blobIds}` | `200 {seq, trimmed: [itemId]}` or `409 {error: "conflict", current: Item}` |
 | `DELETE /v1/spaces/:id/items/:itemId?updatedAt=<ms>` | `200 {seq}`, idempotent. Writes a `user` tombstone and deletes the item's blobs. Returns `409 {current}` if the live item has a newer `updatedAt`. |
 
-**Changes:** `nextSince` is the highest `seq` returned. `since=0` returns the full current state. Each item's `seq` is a server-global, strictly increasing number that is assigned again on every change.
+**Changes:** `nextSince` is the highest `seq` returned. In a group, a caller without [Secrets](#member-access) never gets `secret` rows, tombstones included. `since=0` returns the full current state. Each item's `seq` is a server-global, strictly increasing number that is assigned again on every change.
 - Within a space, `seq` order is commit order: every item write locks the space row before taking a `seq`, so a cursor never moves past a change that becomes visible later.
 - The purge horizon and the page are read in one REPEATABLE READ snapshot.
 
@@ -390,7 +415,9 @@ Deleting an account deletes the authenticators it owns and the shares to it.
 - `sortAt` or `updatedAt` more than 10 minutes ahead of the server's clock → `400 clock_skew`.
 - In a group, an existing item (tombstones included) may be overwritten or deleted only by its
   author (`authorUid`) or the group owner; anyone else gets `403 forbidden`. Creating new items is
-  open to every member. Deleting an item that is already a `user` tombstone stays an idempotent `200`.
+  open to every member with Send. Deleting an item that is already a `user` tombstone stays an idempotent `200`.
+- In a group, [member access](#member-access) applies: `403 send_not_allowed` for any `PUT` without Send,
+  `403 forbidden` for a `secret` item without Secrets.
 - The writer becomes the item's `authorUid`.
 
 ```jsonc
@@ -414,6 +441,7 @@ Item = {"id","category":"history|pinned|snippet|secret|folder|otp","seq","sortAt
 - **`ifGenerationMatch: true`** (current clients always send it): the signed PUT also requires `x-goog-if-generation-match: 0`, which is in `headers`, so the URL can create the object but never overwrite one.
 - Asking again for your own pending blob (same size) returns a fresh URL. Once an item references the blob, no URL is issued again: `409 conflict`.
 - A blob no item references 24 hours after registration may be garbage-collected.
+- In a group, registering a blob needs [Send](#member-access): `403 send_not_allowed` otherwise.
 
 ### Limits
 
@@ -442,7 +470,7 @@ Item = {"id","category":"history|pinned|snippet|secret|folder|otp","seq","sortAt
 - the scrypt of `authKey`
 - KDF salt and iterations
 - session hashes, device names and last use
-- group membership and roles, and who is whose contact (including pending requests)
+- group membership, roles and member access, and who is whose contact (including pending requests)
 - who an authenticator is shared with, each batch's size, `codesUntil` and upload time
 - invite ids and expiry
 - sign-up code hashes, who made and used each, and expiry

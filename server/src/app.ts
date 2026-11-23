@@ -119,6 +119,9 @@ const authenticatorBody = z.object({ id: uuid, wrappedKey: sealed });
 /** A day of codes is ~30 KB of JSON at 30 s; 128 KiB fits 8 digits at a 15 s period (~63 KB) twice over. */
 const codesBody = z.object({ codesUntil: millis, sealedCodes: b64(128 * 1024).refine((b) => b.length > 0, "empty") });
 const transferBody = z.object({ uid: uuid, wrappedKey: sealed });
+const memberAccessBody = z
+  .object({ canSend: z.boolean().optional(), canSeeSecrets: z.boolean().optional() })
+  .refine((b) => b.canSend !== undefined || b.canSeeSecrets !== undefined, "canSend or canSeeSecrets");
 /** Batches cover 24 h from the current step; an hour of slack for clocks and slow uploads. */
 const MAX_CODES_AHEAD_MS = 25 * 60 * 60 * 1000;
 /**
@@ -176,9 +179,16 @@ type Queryable = Pick<pg.PoolClient, "query">;
  * `/changes` cursor can never pass a seq that commits later. NO KEY UPDATE rather than UPDATE so
  * FK checks (blob and member inserts) aren't blocked by it.
  */
-async function roleIn(db: Queryable, spaceId: string, uid: string, lock = false): Promise<{ role: string; kind: string } | null> {
-  const { rows } = await db.query<{ role: string; kind: string }>(
-    `SELECT m.role, s.kind FROM space_members m JOIN spaces s ON s.id = m.space_id
+interface Membership {
+  role: string;
+  kind: string;
+  can_send: boolean;
+  can_see_secrets: boolean;
+}
+
+async function roleIn(db: Queryable, spaceId: string, uid: string, lock = false): Promise<Membership | null> {
+  const { rows } = await db.query<Membership>(
+    `SELECT m.role, s.kind, m.can_send, m.can_see_secrets FROM space_members m JOIN spaces s ON s.id = m.space_id
      WHERE m.space_id = $1 AND m.uid = $2${lock ? " FOR NO KEY UPDATE OF s" : ""}`,
     [spaceId, uid],
   );
@@ -253,6 +263,13 @@ const isShared = (kind: string) => kind !== "personal";
 
 /** Who a pair of uids is, in the order direct_pairs stores them. */
 const orderedPair = (a: string, b: string): [string, string] => (a < b ? [a, b] : [b, a]);
+
+/** Member access (Send) applies to groups only; contacts, personal spaces and authenticators are unchanged. */
+const canSend = (m: Membership) => m.kind !== "group" || m.can_send;
+/** Member access (Secrets) applies to groups only. */
+const canSeeSecrets = (m: Membership) => m.kind !== "group" || m.can_see_secrets;
+const sendNotAllowed = () => new ApiError(403, "send_not_allowed", "You can't send to this group");
+const noSecrets = () => forbidden("You can't see this group's secrets");
 
 /** In a group, an existing item (tombstones included) may be overwritten or deleted only by its author or the group owner. In a direct space either member may. */
 function requireItemWriter(membership: { role: string; kind: string }, item: ItemRow, uid: string) {
@@ -775,6 +792,19 @@ export function buildApp(deps: Deps): FastifyInstance {
 
   // MARK: Spaces and groups
 
+  // No emails: members see each other's username, or the email's local part as in Space.members.
+  type MemberRow = { uid: string; username: string | null; name: string; role: string; can_send: boolean; can_see_secrets: boolean };
+  const MEMBER_SELECT = `SELECT m.uid, u.username, COALESCE(u.username, split_part(u.email, '@', 1)) AS name, m.role, m.can_send, m.can_see_secrets
+    FROM space_members m JOIN users u ON u.uid = m.uid WHERE m.space_id = $1`;
+  const memberJson = (r: MemberRow) => ({
+    uid: r.uid,
+    username: r.username,
+    name: r.name,
+    role: r.role,
+    canSend: r.can_send,
+    canSeeSecrets: r.can_see_secrets,
+  });
+
   const spaceJson = (r: {
     id: string;
     kind: string;
@@ -784,6 +814,8 @@ export function buildApp(deps: Deps): FastifyInstance {
     encrypted_name: Buffer | null;
     member_count: number;
     members: { uid: string; name: string }[];
+    can_send: boolean;
+    can_see_secrets: boolean;
     created_at: Date;
   }) => ({
     id: r.id,
@@ -794,11 +826,13 @@ export function buildApp(deps: Deps): FastifyInstance {
     encryptedName: r.encrypted_name ? r.encrypted_name.toString("base64") : null,
     memberCount: Number(r.member_count),
     members: r.members,
+    // The caller's own access; only groups have it.
+    ...(r.kind === "group" ? { canSend: r.can_send, canSeeSecrets: r.can_see_secrets } : {}),
     createdAt: r.created_at.getTime(),
   });
 
   // members: display name is the username, else the email's local part. Owner first, then by join order.
-  const SPACE_SELECT = `SELECT s.id, s.kind, m.role, s.owner_uid, m.wrapped_key, s.encrypted_name, s.created_at,
+  const SPACE_SELECT = `SELECT s.id, s.kind, m.role, s.owner_uid, m.wrapped_key, s.encrypted_name, s.created_at, m.can_send, m.can_see_secrets,
       (SELECT count(*) FROM space_members x WHERE x.space_id = s.id) AS member_count,
       (SELECT COALESCE(json_agg(json_build_object('uid', x.uid, 'name', COALESCE(u.username, split_part(u.email, '@', 1)))
                                 ORDER BY x.role DESC, x.added_at, x.uid), '[]'::json)
@@ -863,13 +897,27 @@ export function buildApp(deps: Deps): FastifyInstance {
     const id = uuid.parse(request.params.id);
     const membership = await requireMember(pool, id, request.caller.uid);
     if (membership.kind !== "group") throw notFound();
-    // No emails: members see each other's username, or the email's local part as in Space.members.
-    const { rows } = await pool.query<{ uid: string; username: string | null; name: string; role: string }>(
-      `SELECT m.uid, u.username, COALESCE(u.username, split_part(u.email, '@', 1)) AS name, m.role
-       FROM space_members m JOIN users u ON u.uid = m.uid WHERE m.space_id = $1 ORDER BY m.role DESC, m.added_at, m.uid`,
-      [id],
-    );
-    return { members: rows };
+    const { rows } = await pool.query<MemberRow>(`${MEMBER_SELECT} ORDER BY m.role DESC, m.added_at, m.uid`, [id]);
+    return { members: rows.map(memberJson) };
+  });
+
+  app.patch<{ Params: { id: string; uid: string } }>("/v1/groups/:id/members/:uid", async (request) => {
+    const id = uuid.parse(request.params.id);
+    const target = request.params.uid;
+    const body = memberAccessBody.parse(request.body);
+    return tx(pool, async (db) => {
+      await requireGroupOwner(db, id, request.caller.uid);
+      const found = await db.query<{ role: string }>("SELECT role FROM space_members WHERE space_id = $1 AND uid = $2 FOR UPDATE", [id, target]);
+      if (!found.rows[0]) throw notFound();
+      if (found.rows[0].role === "owner") throw new ApiError(400, "invalid", "The owner always has full access");
+      await db.query(
+        `UPDATE space_members SET can_send = COALESCE($3, can_send), can_see_secrets = COALESCE($4, can_see_secrets)
+         WHERE space_id = $1 AND uid = $2`,
+        [id, target, body.canSend ?? null, body.canSeeSecrets ?? null],
+      );
+      const { rows } = await db.query<MemberRow>(`${MEMBER_SELECT} AND m.uid = $2`, [id, target]);
+      return memberJson(rows[0]!);
+    });
   });
 
   // MARK: Invites
@@ -1369,7 +1417,10 @@ export function buildApp(deps: Deps): FastifyInstance {
   app.get<{ Params: { id: string } }>("/v1/spaces/:id/changes", async (request) => {
     const id = uuid.parse(request.params.id);
     const query = changesQuery.parse(request.query);
-    requireAuthenticatorOwner(await requireMember(pool, id, request.caller.uid));
+    const membership = await requireMember(pool, id, request.caller.uid);
+    requireAuthenticatorOwner(membership);
+    // Without Secrets a group's secrets don't exist for the caller: no rows, not even tombstones.
+    const hideSecrets = !canSeeSecrets(membership);
     await purgeTombstones(id);
     // One snapshot for the horizon and the page, so a purge in between can't hide tombstones from this cursor.
     return tx(pool, async (db) => {
@@ -1378,11 +1429,9 @@ export function buildApp(deps: Deps): FastifyInstance {
       if (!query.full && query.since > 0 && query.since < (space.rows[0]?.purged_seq ?? 0)) {
         return { items: [], nextSince: 0, hasMore: false, resetRequired: true };
       }
-      const { rows } = await db.query<ItemRow>(`SELECT ${ITEM_COLUMNS} FROM items WHERE space_id = $1 AND seq > $2 ORDER BY seq LIMIT $3`, [
-        id,
-        query.since,
-        query.limit + 1,
-      ]);
+      const { rows } = await db.query<ItemRow>(`SELECT ${ITEM_COLUMNS} FROM items WHERE space_id = $1 AND seq > $2 AND NOT ($4 AND category = 'secret') ORDER BY seq LIMIT $3`,
+        [id, query.since, query.limit + 1, hideSecrets],
+      );
       const hasMore = rows.length > query.limit;
       const page = rows.slice(0, query.limit);
       return { items: page.map(itemJson), nextSince: page.at(-1)?.seq ?? query.since, hasMore, resetRequired: false };
@@ -1402,6 +1451,8 @@ export function buildApp(deps: Deps): FastifyInstance {
     const outcome = await tx(pool, async (db) => {
       const membership = await requireMember(db, spaceId, uid, true);
       requireAuthenticatorOwner(membership);
+      if (!canSend(membership)) throw sendNotAllowed();
+      if (body.category === "secret" && !canSeeSecrets(membership)) throw noSecrets();
       // An authenticator holds its `otp` item and nothing else; `otp` lives nowhere else.
       if ((membership.kind === "authenticator") !== (body.category === "otp")) {
         throw new ApiError(400, "invalid", "otp items go in authenticators, and authenticators hold only otp items");
@@ -1409,6 +1460,7 @@ export function buildApp(deps: Deps): FastifyInstance {
       await requireContactEstablished(db, spaceId, membership);
       const { rows: current } = await db.query<ItemRow>(`SELECT ${ITEM_COLUMNS} FROM items WHERE space_id = $1 AND id = $2 FOR UPDATE`, [spaceId, itemId]);
       const existing = current[0];
+      if (existing?.category === "secret" && !canSeeSecrets(membership)) throw noSecrets();
       if (existing) requireItemWriter(membership, existing, uid);
       if (existing && existing.updated_at > body.updatedAt) return { conflict: existing };
 
@@ -1512,6 +1564,8 @@ export function buildApp(deps: Deps): FastifyInstance {
       const { rows } = await db.query<ItemRow>(`SELECT ${ITEM_COLUMNS} FROM items WHERE space_id = $1 AND id = $2 FOR UPDATE`, [spaceId, itemId]);
       const existing = rows[0];
       if (!existing) return { seq: 0, paths: [] as string[] };
+      // Before the idempotent no-op below, so not even a secret's tombstone is touched without Secrets.
+      if (existing.category === "secret" && !canSeeSecrets(membership)) throw noSecrets();
       // Deleting what's already deleted changes nothing, so it stays idempotent for everyone.
       if (existing.deleted === "user") return { seq: existing.seq, paths: [] as string[] };
       requireItemWriter(membership, existing, request.caller.uid);
@@ -1559,6 +1613,7 @@ export function buildApp(deps: Deps): FastifyInstance {
     await tx(pool, async (db) => {
       const membership = await requireMember(db, spaceId, uid, true);
       if (membership.kind === "authenticator") throw forbidden("Authenticators have no blobs");
+      if (!canSend(membership)) throw sendNotAllowed();
       await requireContactEstablished(db, spaceId, membership);
       const { rows } = await db.query<{ size: number; owner_uid: string | null }>("SELECT size, owner_uid FROM blobs WHERE space_id = $1 AND id = $2", [
         spaceId,

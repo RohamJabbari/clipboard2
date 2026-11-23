@@ -50,7 +50,7 @@ beforeAll(async () => {
   await embedded.start();
   await embedded.createDatabase("c2test");
   pool = new pg.Pool({ connectionString: `postgres://postgres:postgres@localhost:${port}/c2test`, max: 4 });
-  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql", "003_hardening.sql", "004_contacts.sql", "005_folders.sql", "006_authenticators.sql"]);
+  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql", "003_hardening.sql", "004_contacts.sql", "005_folders.sql", "006_authenticators.sql", "007_member_access.sql"]);
   expect(await migrate(pool)).toEqual([]);
 }, 120_000);
 
@@ -541,8 +541,8 @@ describe("usernames", () => {
     await invite(alice, group, bob);
     const res = await call(bob, "GET", `/v1/groups/${group.id}/members`);
     expect(res.body.members).toEqual([
-      { uid: alice.uid, username: "Alice", name: "Alice", role: "owner" },
-      { uid: bob.uid, username: null, name: bob.email.split("@")[0], role: "member" },
+      { uid: alice.uid, username: "Alice", name: "Alice", role: "owner", canSend: true, canSeeSecrets: true },
+      { uid: bob.uid, username: null, name: bob.email.split("@")[0], role: "member", canSend: true, canSeeSecrets: true },
     ]);
     expect(JSON.stringify(res.body)).not.toContain("@");
   });
@@ -2077,6 +2077,131 @@ describe("authenticators", () => {
     expect(items).toHaveLength(1);
     expect(items[0].deleted).toBeNull();
     expect((await call(bob, "GET", `/v1/authenticators/${auth.id}/shares`)).body.shares).toEqual([]);
+  });
+});
+
+describe("member access", () => {
+  const setAccess = (owner: TestUser, groupId: string, uid: string, body: object) => call(owner, "PATCH", `/v1/groups/${groupId}/members/${uid}`, body);
+  const groupEntry = async (user: TestUser, groupId: string) =>
+    (await call(user, "GET", "/v1/spaces")).body.spaces.find((s: { id: string }) => s.id === groupId);
+
+  it("lets only the owner change a member's access, never the owner's own", async () => {
+    const alice = await signUp("alice");
+    const bob = await signUp("bob");
+    const carol = await signUp("carol");
+    const group = await createGroup(alice);
+    await invite(alice, group, bob);
+    await invite(alice, group, carol);
+
+    expect(await groupEntry(bob, group.id)).toMatchObject({ canSend: true, canSeeSecrets: true });
+    const changed = await setAccess(alice, group.id, bob.uid, { canSend: false });
+    expect(changed.status).toBe(200);
+    expect(changed.body).toEqual({ uid: bob.uid, username: null, name: bob.email.split("@")[0], role: "member", canSend: false, canSeeSecrets: true });
+    expect((await setAccess(alice, group.id, bob.uid, { canSeeSecrets: false })).body).toMatchObject({ canSend: false, canSeeSecrets: false });
+    expect(await groupEntry(bob, group.id)).toMatchObject({ canSend: false, canSeeSecrets: false });
+    expect(await groupEntry(alice, group.id)).toMatchObject({ canSend: true, canSeeSecrets: true });
+    const members = (await call(carol, "GET", `/v1/groups/${group.id}/members`)).body.members;
+    expect(members.map((m: { canSend: boolean; canSeeSecrets: boolean }) => [m.canSend, m.canSeeSecrets])).toEqual([
+      [true, true],
+      [false, false],
+      [true, true],
+    ]);
+
+    const byMember = await setAccess(carol, group.id, bob.uid, { canSend: true });
+    expect(byMember.status).toBe(403);
+    expect(byMember.body.error).toBe("forbidden");
+    expect((await setAccess(bob, group.id, bob.uid, { canSend: true })).status).toBe(403);
+    expect((await setAccess(alice, group.id, alice.uid, { canSend: false })).status).toBe(400);
+    expect((await setAccess(alice, group.id, bob.uid, {})).status).toBe(400);
+    expect((await setAccess(alice, group.id, bob.uid, { canSend: "no" })).status).toBe(400);
+    expect((await setAccess(alice, group.id, randomUUID(), { canSend: false })).status).toBe(404);
+    const outsider = await signUp("dave");
+    expect((await setAccess(outsider, group.id, bob.uid, { canSend: true })).status).toBe(404);
+    // Personal spaces aren't groups.
+    expect((await setAccess(alice, alice.personalSpaceId, alice.uid, { canSend: false })).status).toBe(404);
+    // Only groups carry the flags in the spaces list.
+    expect(await groupEntry(alice, alice.personalSpaceId)).not.toHaveProperty("canSend");
+  });
+
+  it("without Send refuses new items, changes and blob uploads, but still allows deleting your own items", async () => {
+    const alice = await signUp("alice");
+    const bob = await signUp("bob");
+    const group = await createGroup(alice);
+    await invite(alice, group, bob);
+    const own = await putItem(bob, group.id, group.sk, { category: "pinned" });
+    expect(own.status).toBe(200);
+    const theirs = await putItem(alice, group.id, group.sk, { category: "pinned" });
+    await setAccess(alice, group.id, bob.uid, { canSend: false });
+
+    const fresh = await putItem(bob, group.id, group.sk);
+    expect(fresh.status).toBe(403);
+    expect(fresh.body.error).toBe("send_not_allowed");
+    const change = await putItem(bob, group.id, group.sk, { id: own.id, category: "pinned" });
+    expect(change.status).toBe(403);
+    expect(change.body.error).toBe("send_not_allowed");
+    const blob = await call(bob, "POST", `/v1/spaces/${group.id}/blobs`, { id: randomUUID(), size: 10 });
+    expect(blob.status).toBe(403);
+    expect(blob.body.error).toBe("send_not_allowed");
+
+    // Reading still works, and the existing author/owner rule decides deletes.
+    expect((await call(bob, "GET", `/v1/spaces/${group.id}/changes?since=0`)).body.items).toHaveLength(2);
+    expect((await call(bob, "DELETE", `/v1/spaces/${group.id}/items/${theirs.id}?updatedAt=${Date.now()}`)).status).toBe(403);
+    expect((await call(bob, "DELETE", `/v1/spaces/${group.id}/items/${own.id}?updatedAt=${Date.now()}`)).status).toBe(200);
+
+    await setAccess(alice, group.id, bob.uid, { canSend: true });
+    expect((await putItem(bob, group.id, group.sk)).status).toBe(200);
+  });
+
+  it("without Secrets hides secrets and their tombstones and refuses to touch them", async () => {
+    const alice = await signUp("alice");
+    const bob = await signUp("bob");
+    const group = await createGroup(alice);
+    await invite(alice, group, bob);
+    const plain = await putItem(alice, group.id, group.sk, { category: "pinned" });
+    const secret = await putItem(alice, group.id, group.sk, { category: "secret" });
+    const gone = await putItem(bob, group.id, group.sk, { category: "secret" });
+    expect((await call(bob, "DELETE", `/v1/spaces/${group.id}/items/${gone.id}?updatedAt=${Date.now()}`)).status).toBe(200);
+    await setAccess(alice, group.id, bob.uid, { canSeeSecrets: false });
+
+    const feed = (await call(bob, "GET", `/v1/spaces/${group.id}/changes?since=0`)).body;
+    expect(feed.items.map((i: { id: string }) => i.id)).toEqual([plain.id]);
+    expect(feed.hasMore).toBe(false);
+    // Paging past filtered rows still works.
+    const paged = (await call(bob, "GET", `/v1/spaces/${group.id}/changes?since=0&limit=1`)).body;
+    expect(paged.items.map((i: { id: string }) => i.id)).toEqual([plain.id]);
+    expect((await call(bob, "GET", `/v1/spaces/${group.id}/changes?since=${paged.nextSince}`)).body.items).toEqual([]);
+    // The owner still sees all three.
+    expect((await call(alice, "GET", `/v1/spaces/${group.id}/changes?since=0`)).body.items).toHaveLength(3);
+
+    const create = await putItem(bob, group.id, group.sk, { category: "secret" });
+    expect(create.status).toBe(403);
+    expect(create.body.error).toBe("forbidden");
+    // Turning someone else's item into a secret, or a secret into something else, is refused too.
+    const own = await putItem(bob, group.id, group.sk, { category: "pinned" });
+    expect(own.status).toBe(200);
+    expect((await putItem(bob, group.id, group.sk, { id: own.id, category: "secret" })).body.error).toBe("forbidden");
+    expect((await putItem(bob, group.id, group.sk, { id: gone.id, category: "pinned" })).body.error).toBe("forbidden");
+    const del = await call(bob, "DELETE", `/v1/spaces/${group.id}/items/${gone.id}?updatedAt=${Date.now()}`);
+    expect(del.status).toBe(403);
+    expect(del.body.error).toBe("forbidden");
+    expect((await call(bob, "DELETE", `/v1/spaces/${group.id}/items/${secret.id}?updatedAt=${Date.now()}`)).status).toBe(403);
+
+    // Without Send as well, a secret write reports send_not_allowed first.
+    await setAccess(alice, group.id, bob.uid, { canSend: false });
+    expect((await putItem(bob, group.id, group.sk, { category: "secret" })).body.error).toBe("send_not_allowed");
+
+    await setAccess(alice, group.id, bob.uid, { canSeeSecrets: true });
+    expect((await call(bob, "GET", `/v1/spaces/${group.id}/changes?since=0`)).body.items).toHaveLength(4);
+  });
+
+  it("leaves personal spaces alone even if their row says otherwise", async () => {
+    const alice = await signUp("alice");
+    await pool.query("UPDATE space_members SET can_send = false, can_see_secrets = false WHERE uid = $1", [alice.uid]);
+    const secret = await putItem(alice, alice.personalSpaceId, alice.personalKey, { category: "secret" });
+    expect(secret.status).toBe(200);
+    expect((await call(alice, "POST", `/v1/spaces/${alice.personalSpaceId}/blobs`, { id: randomUUID(), size: 10 })).status).toBe(200);
+    expect((await call(alice, "GET", `/v1/spaces/${alice.personalSpaceId}/changes?since=0`)).body.items).toHaveLength(1);
+    expect((await call(alice, "DELETE", `/v1/spaces/${alice.personalSpaceId}/items/${secret.id}?updatedAt=${Date.now()}`)).status).toBe(200);
   });
 });
 
