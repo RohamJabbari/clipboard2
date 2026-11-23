@@ -1926,6 +1926,7 @@ final class PanelViewModel {
     func beginAddItems() {
         guard isSavedView else { return }
         let space = savedSpaceID
+        guard env.sync.canSend(to: space) else { return refuseSend(to: space) }
         let candidates = env.store.items(inSpace: space).filter { !$0.isPinned && env.sync.canChange($0) }
         addItemsForm = AddItemsState(candidates: candidates, folder: openFolder)
         mode = .addItems
@@ -2008,18 +2009,36 @@ final class PanelViewModel {
 
     // MARK: Share to group
 
-    var canShareToGroup: Bool { env.sync.isSignedIn && !env.sync.groups.isEmpty }
+    /// Share to Group is offered while there's a group this account may send to.
+    var canShareToGroup: Bool { env.sync.isSignedIn && !shareGroups.isEmpty }
+
+    /// Where items can be shared: groups with Send.
+    var shareGroups: [SyncGroup] { env.sync.sendableGroups }
+
+    /// Where a secret can be shared: groups with Send and Secrets, other than its own.
+    func shareGroups(for ref: SecretRef) -> [SyncGroup] {
+        shareGroups.filter { $0.canSeeSecrets && $0.id != ref.spaceID }
+    }
+
+    /// Whether the open view (a group's list or Saved) takes new things from this account.
+    var canAddHere: Bool { env.sync.canSend(to: isSavedView ? savedSpaceID : groupFilter) }
+
+    /// "You can't send to ‹Group›", for a write the group refuses.
+    func refuseSend(to spaceID: String?) {
+        NSSound.beep()
+        showNotice("You can't send to \(env.sync.groupName(for: spaceID) ?? "this group")")
+    }
 
     func beginShare(_ items: [ClipItem]) {
         guard canShareToGroup, !items.isEmpty else { return }
-        shareForm = ShareGroupState(items: items, groups: env.sync.groups, defaultGroupID: env.prefs.syncDefaultGroupID,
+        shareForm = ShareGroupState(items: items, groups: shareGroups, defaultGroupID: env.prefs.syncDefaultGroupID,
                                     foldersByGroup: groupFolders)
         mode = .shareToGroup
     }
 
     /// Every group's folders, for the share form's destination.
     private var groupFolders: [String: [ClipFolder]] {
-        Dictionary(env.sync.groups.map { ($0.id, treeOrderedFolders(inSpace: $0.id)) }, uniquingKeysWith: { first, _ in first })
+        Dictionary(shareGroups.map { ($0.id, treeOrderedFolders(inSpace: $0.id)) }, uniquingKeysWith: { first, _ in first })
     }
 
     func submitShare() {
@@ -2042,7 +2061,7 @@ final class PanelViewModel {
     func beginShareFolder(_ folder: ClipFolder) {
         guard canShareToGroup, folder.spaceID == nil else { return }
         selectedID = PanelEntry.folder(folder).id
-        shareForm = ShareGroupState(items: subtreeItems(of: folder), folder: folder, groups: env.sync.groups,
+        shareForm = ShareGroupState(items: subtreeItems(of: folder), folder: folder, groups: shareGroups,
                                     defaultGroupID: env.prefs.syncDefaultGroupID, foldersByGroup: groupFolders)
         mode = .shareToGroup
     }
@@ -2058,13 +2077,17 @@ final class PanelViewModel {
     /// folders) or at its top level. Yours stays as it is; later changes don't follow. Secrets
     /// are read after one Touch ID.
     func share(_ folder: ClipFolder, to group: SyncGroup, parent: ClipFolder? = nil) {
+        guard env.sync.canSend(to: group.id) else { return refuseSend(to: group.id) }
         let items = subtreeItems(of: folder)
         if let problem = items.lazy.compactMap(SyncEngine.groupShareProblem).first {
             refuseGroupShare(problem)
             return
         }
         let folderIDs = folderTree(of: folder).subtree(of: folder.id)
-        let secrets = env.secrets.secrets.filter { $0.spaceID == folder.spaceID && $0.folderID.map(folderIDs.contains) == true }
+        // A group whose secrets this account can't see takes the folder without them.
+        let secrets = !env.sync.canSeeSecrets(in: group.id) ? [] : env.secrets.secrets.filter {
+            $0.spaceID == folder.spaceID && $0.folderID.map(folderIDs.contains) == true
+        }
         let finish = { [self] (values: [(SecretRef, String)]) in
             var copies: [UUID: UUID] = [:]
             env.store.shareCopy(of: folder, toSpace: group.id, parent: parent.flatMap { $0.spaceID == group.id ? $0 : nil }) { original, copy in
@@ -2088,7 +2111,7 @@ final class PanelViewModel {
     }
 
     func beginShareSecret(_ ref: SecretRef) {
-        let groups = env.sync.groups.filter { $0.id != ref.spaceID }
+        let groups = shareGroups(for: ref)
         guard canShareToGroup, !groups.isEmpty else { return }
         selectedID = PanelEntry.secret(ref).id
         shareForm = ShareGroupState(secret: ref, groups: groups, defaultGroupID: env.prefs.syncDefaultGroupID,
@@ -2099,6 +2122,7 @@ final class PanelViewModel {
     /// Stores a copy of the secret in the group's space (in one of its folders, if given). Yours
     /// stays as it is; later edits don't follow.
     func shareSecret(_ ref: SecretRef, value: String, to group: SyncGroup, folder: ClipFolder? = nil) {
+        guard env.sync.canSend(to: group.id), env.sync.canSeeSecrets(in: group.id) else { return refuseSend(to: group.id) }
         let folder = folder?.spaceID == group.id ? folder : nil
         let existing = env.secrets.secrets.first {
             $0.spaceID == group.id && $0.name == ref.name && SecretVault.value(id: $0.id) == value
@@ -2122,6 +2146,7 @@ final class PanelViewModel {
     /// Copies items into a group's space with new ids (selected text from another app is stored
     /// there); with `folder` (one of the group's), the copies go in it.
     func share(_ items: [ClipItem], to group: SyncGroup, folder: ClipFolder? = nil) {
+        guard env.sync.canSend(to: group.id) else { return refuseSend(to: group.id) }
         if let problem = items.lazy.compactMap(SyncEngine.groupShareProblem).first {
             refuseGroupShare(problem)
             return
@@ -2347,9 +2372,14 @@ final class PanelViewModel {
     /// was part of one) to that group.
     @discardableResult
     func dropClip(id: UUID, onGroup groupID: String) -> Bool {
-        guard canShareToGroup, let group = env.sync.groups.first(where: { $0.id == groupID }),
+        guard env.sync.isSignedIn, let group = env.sync.groups.first(where: { $0.id == groupID }),
               let item = env.store.item(withID: id)
         else { return false }
+        guard group.canSend else {
+            onDropFinished()
+            refuseSend(to: group.id)
+            return false
+        }
         let dragged = PanelEntry.clip(item).id
         let items = isMultiSelecting && selectedIDs.contains(dragged) ? selectedClips : [item]
         let toShare = items.filter { $0.spaceID != group.id }
@@ -2423,9 +2453,14 @@ final class PanelViewModel {
     /// A secret dragged onto a group chip: shared there after Touch ID.
     @discardableResult
     func dropSecret(id: String, onGroup groupID: String) -> Bool {
-        guard canShareToGroup, let group = env.sync.groups.first(where: { $0.id == groupID }),
+        guard env.sync.isSignedIn, let group = env.sync.groups.first(where: { $0.id == groupID }),
               let ref = env.secrets.secrets.first(where: { $0.id == id })
         else { return false }
+        guard group.canSend, group.canSeeSecrets else {
+            onDropFinished()
+            refuseSend(to: group.id)
+            return false
+        }
         onDropFinished()
         guard ref.spaceID != group.id else {
             showNotice("Already in \(group.name)")
@@ -2447,6 +2482,7 @@ final class PanelViewModel {
         let group = target.flatMap { id in env.sync.groups.first { $0.id == id } }
         if target != nil && group == nil { return }
         onDropFinished()
+        if let group, !group.canSend { return refuseSend(to: group.id) }
         if group != nil, let problem = SyncEngine.groupShareProblem(fileURLs: files) {
             refuseGroupShare(problem)
             return
@@ -2558,7 +2594,7 @@ final class PanelViewModel {
             actions.append(.copy)
             if canLabel(entry) { actions.append(.setLabel) }
             actions += savedActions(for: [], secrets: [ref])
-            if canShareToGroup && env.sync.groups.contains(where: { $0.id != ref.spaceID }) { actions.append(.shareToGroup) }
+            if canShareToGroup && !shareGroups(for: ref).isEmpty { actions.append(.shareToGroup) }
             if canSendToContact(ref) { actions += contactSendActions(excludingSpace: ref.spaceID) }
         }
         if let target = entry.slotTarget, let slot = env.slots.slot(for: target) {
@@ -3011,6 +3047,10 @@ final class PanelViewModel {
     func moveFolder(_ folder: ClipFolder, under target: ClipFolder?) -> Bool {
         if mode == .actions { mode = .browse }
         guard canMoveFolder(folder.id, under: target?.id), env.store.moveFolder(folder, under: target) else {
+            if !env.sync.canSend(to: folder.spaceID) {
+                refuseSend(to: folder.spaceID)
+                return false
+            }
             NSSound.beep()
             showNotice(canChangeFolder(folder) ? "Can't move “\(folder.name)” there" : "Only its author or the group's owner can move it")
             return false
@@ -3061,6 +3101,7 @@ final class PanelViewModel {
         guard !movingClips.isEmpty || !movingSecrets.isEmpty || !copyingClips.isEmpty || !copyingSecrets.isEmpty else {
             NSSound.beep()
             let refused = clips.contains { $0.spaceID == folder.spaceID } || secrets.contains { $0.spaceID == folder.spaceID }
+            if refused && !env.sync.canSend(to: folder.spaceID) { return refuseSend(to: folder.spaceID) }
             showNotice(refused ? "Only its author or the group's owner can move it"
                        : "Only items from the same place can go in “\(folder.name)”")
             return
@@ -3143,6 +3184,7 @@ final class PanelViewModel {
         let space = personal ? nil : clips.first?.spaceID ?? secrets.first?.spaceID ?? (clips.isEmpty && secrets.isEmpty ? savedSpaceID : nil)
         if clips.isEmpty && secrets.isEmpty {
             guard space == nil || isGroupSpace(space) else { return }
+            guard env.sync.canSend(to: space) else { return refuseSend(to: space) }
         } else {
             guard let menu = folderMenu(for: clips, secrets: secrets) else { return }
             // Into a group's new folder only when its items may be moved there.

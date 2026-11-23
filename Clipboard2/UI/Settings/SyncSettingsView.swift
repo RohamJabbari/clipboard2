@@ -436,6 +436,16 @@ private struct GroupManageSheet: View {
                             Text(member.displayName)
                             Spacer()
                             Text(member.role == "owner" ? "Owner" : "Member").font(.caption).foregroundStyle(.secondary)
+                            if member.role != "owner" && (group.isOwner || member.uid == sync.uid) {
+                                AccessPill(title: "Send", isOn: member.sendAllowed, editable: group.isOwner,
+                                           help: member.sendAllowed ? "Can add items to the group" : "Can't add items to the group") {
+                                    setAccess(of: member, canSend: !member.sendAllowed)
+                                }
+                                AccessPill(title: "Secrets", isOn: member.secretsAllowed, editable: group.isOwner,
+                                           help: member.secretsAllowed ? "Can see the group's secrets" : "Can't see the group's secrets") {
+                                    setAccess(of: member, canSeeSecrets: !member.secretsAllowed)
+                                }
+                            }
                             if group.isOwner && member.role != "owner" {
                                 Button {
                                     run {
@@ -449,6 +459,9 @@ private struct GroupManageSheet: View {
                                 .accessibilityLabel("Remove \(member.displayName)")
                             }
                         }
+                    }
+                    if !group.isOwner, let note = ownAccessNote {
+                        Text(note).font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 if group.isOwner {
@@ -538,6 +551,42 @@ private struct GroupManageSheet: View {
         }
     }
 
+    /// What a member can't do in this group, from their own row.
+    private var ownAccessNote: String? {
+        guard let me = members.first(where: { $0.uid == sync.uid }) else { return nil }
+        switch (me.sendAllowed, me.secretsAllowed) {
+        case (true, true): return nil
+        case (false, true): return "You can't send to this group."
+        case (true, false): return "You can't see this group's secrets."
+        case (false, false): return "You can't send to this group or see its secrets."
+        }
+    }
+
+    /// Flips one switch at once (no confirm); on failure it flips back with a notice.
+    private func setAccess(of member: RemoteMember, canSend: Bool? = nil, canSeeSecrets: Bool? = nil) {
+        guard let index = members.firstIndex(where: { $0.uid == member.uid }) else { return }
+        let before = members[index]
+        if let canSend { members[index].canSend = canSend }
+        if let canSeeSecrets { members[index].canSeeSecrets = canSeeSecrets }
+        error = nil
+        info = nil
+        Task {
+            do {
+                let updated = try await sync.setAccess(of: member, in: group, canSend: canSend, canSeeSecrets: canSeeSecrets)
+                if let i = members.firstIndex(where: { $0.uid == member.uid }) {
+                    // Older fields the server left out keep what was just set.
+                    var merged = updated
+                    merged.canSend = updated.canSend ?? members[i].canSend
+                    merged.canSeeSecrets = updated.canSeeSecrets ?? members[i].canSeeSecrets
+                    members[i] = merged
+                }
+            } catch {
+                if let i = members.firstIndex(where: { $0.uid == member.uid }) { members[i] = before }
+                self.error = "Couldn't change \(member.displayName)'s access: \(error.localizedDescription)"
+            }
+        }
+    }
+
     private func loadMembers() async {
         loading = true
         do {
@@ -568,6 +617,32 @@ private struct GroupManageSheet: View {
             }
             busy = false
         }
+    }
+}
+
+/// A small on/off pill for one member permission. Read-only unless `editable`.
+private struct AccessPill: View {
+    let title: String
+    let isOn: Bool
+    let editable: Bool
+    let help: String
+    let toggle: () -> Void
+
+    var body: some View {
+        Button(action: toggle) {
+            Label(title, systemImage: isOn ? "checkmark" : "xmark")
+                .font(.caption)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .foregroundStyle(isOn ? Color.accentColor : Color.secondary)
+                .background(Capsule().fill(isOn ? Color.accentColor.opacity(0.15) : Color.secondary.opacity(0.12)))
+        }
+        .buttonStyle(.plain)
+        .disabled(!editable)
+        .help(help)
+        .accessibilityLabel(title)
+        .accessibilityValue(isOn ? "On" : "Off")
+        .accessibilityAddTraits(editable ? .isButton : [])
     }
 }
 

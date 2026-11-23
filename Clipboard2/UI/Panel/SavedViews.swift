@@ -18,7 +18,8 @@ struct SavedHeader: View {
                 }
             }
             Spacer(minLength: 4)
-            newMenu
+            // A group this account can't send to takes nothing new (it still reads and pastes).
+            if model.canAddHere { newMenu }
         }
         .font(.callout)
         .lineLimit(1)
