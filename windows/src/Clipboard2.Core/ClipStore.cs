@@ -74,7 +74,7 @@ public sealed class ClipStore : IDisposable
     }
 
     /// <summary>Schema version stored in <c>PRAGMA user_version</c>. v0 is the original, unversioned schema.</summary>
-    public const int SchemaVersion = 7;
+    public const int SchemaVersion = 8;
 
     public int UserVersion => Convert.ToInt32(Scalar("PRAGMA user_version"));
 
@@ -150,6 +150,15 @@ public sealed class ClipStore : IDisposable
             {
                 // v7: folders in folders. Null = top level; an id this device doesn't have reads as top level too.
                 Exec("ALTER TABLE folders ADD COLUMN parent_id TEXT;");
+            }
+            if (version < 8)
+            {
+                // v8: member access. This user's own Send and Secrets in each group as the server last said; both on
+                // until it says otherwise (and with servers that don't know them).
+                Exec("""
+                    ALTER TABLE sync_spaces ADD COLUMN can_send INTEGER NOT NULL DEFAULT 1;
+                    ALTER TABLE sync_spaces ADD COLUMN can_see_secrets INTEGER NOT NULL DEFAULT 1;
+                    """);
             }
             Exec($"PRAGMA user_version = {SchemaVersion}");
             Exec("COMMIT");
@@ -874,6 +883,10 @@ public sealed class ClipStore : IDisposable
         ("$u", meta.UpdatedAt), ("$t", meta.Trimmed ? 1 : 0), ("$b", meta.Blobs is { Count: > 0 } b ? JsonSerializer.Serialize(b) : null),
         ("$a", meta.AuthorUid));
 
+    /// <summary>Forgets what the server has of one category in a space (its secrets, when they stop being delivered).</summary>
+    public void DeleteSyncMetas(string spaceId, string category) =>
+        Exec("DELETE FROM sync_meta WHERE space_id = $s AND category = $c", ("$s", spaceId), ("$c", category));
+
     public void DeleteSyncMeta(string spaceId, string localId) =>
         Exec("DELETE FROM sync_meta WHERE space_id = $s AND local_id = $id", ("$s", spaceId), ("$id", localId));
 
@@ -945,12 +958,12 @@ public sealed class ClipStore : IDisposable
     public List<SpaceRecord> SyncSpaces()
     {
         using var cmd = _db.CreateCommand();
-        cmd.CommandText = "SELECT id, kind, role, name, owner_uid, member_count, members FROM sync_spaces";
+        cmd.CommandText = "SELECT id, kind, role, name, owner_uid, member_count, members, can_send, can_see_secrets FROM sync_spaces";
         using var r = cmd.ExecuteReader();
         var list = new List<SpaceRecord>();
         while (r.Read())
             list.Add(new SpaceRecord(r.GetString(0), r.GetString(1), r.GetString(2), r.IsDBNull(3) ? null : r.GetString(3), r.GetString(4), r.GetInt32(5),
-                r.IsDBNull(6) ? null : JsonSerializer.Deserialize<Dictionary<string, string>>(r.GetString(6))));
+                r.IsDBNull(6) ? null : JsonSerializer.Deserialize<Dictionary<string, string>>(r.GetString(6)), r.GetInt64(7) != 0, r.GetInt64(8) != 0));
         return list.OrderBy(s => s.IsGroup).ThenBy(s => s.IsDirect).ThenBy(s => s.DisplayName, StringComparer.CurrentCultureIgnoreCase).ToList();
     }
 
@@ -968,9 +981,12 @@ public sealed class ClipStore : IDisposable
         if (current.Count == list.Count && list.All(current.Contains)) return;
         Exec("DELETE FROM sync_spaces");
         foreach (var s in list)
-            Exec("INSERT INTO sync_spaces (id, kind, role, name, owner_uid, member_count, members) VALUES ($id, $k, $r, $n, $o, $m, $mm)",
+            Exec("""
+                INSERT INTO sync_spaces (id, kind, role, name, owner_uid, member_count, members, can_send, can_see_secrets)
+                VALUES ($id, $k, $r, $n, $o, $m, $mm, $cs, $ck)
+                """,
                 ("$id", s.Id), ("$k", s.Kind), ("$r", s.Role), ("$n", s.Name), ("$o", s.OwnerUid), ("$m", s.MemberCount),
-                ("$mm", s.Members is null ? null : JsonSerializer.Serialize(s.Members)));
+                ("$mm", s.Members is null ? null : JsonSerializer.Serialize(s.Members)), ("$cs", s.CanSend ? 1 : 0), ("$ck", s.CanSeeSecrets ? 1 : 0));
         Commit();
     }
 
