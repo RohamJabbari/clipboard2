@@ -338,7 +338,9 @@ public sealed partial class QuickPanelWindow : Window
     {
         var groupId = chip.GroupId;
         chip.AllowDrop = true;
-        bool Accepts(IDataObject data) => data.GetDataPresent(EntryFormat) || DroppedFiles(data).Count > 0 || DroppedText(data) is not null;
+        // A group whose owner turned this user's Send off takes no drops.
+        bool Accepts(IDataObject data) => Model.CanSendTo(groupId)
+            && (data.GetDataPresent(EntryFormat) || DroppedFiles(data).Count > 0 || DroppedText(data) is not null);
         chip.DragEnter += (_, e) =>
         {
             if (!Accepts(e.Data)) return;
@@ -356,6 +358,12 @@ public sealed partial class QuickPanelWindow : Window
             e.Handled = true;
             chip.BorderThickness = new Thickness(0);
             var groupName = chip.GroupName;
+            if (!Model.CanSendTo(groupId))
+            {
+                ReactivateAfterDrop();
+                Model.ShowNotice($"You can't send to {groupName}");
+                return;
+            }
             if (e.Data.GetData(EntryFormat) is string id)
             {
                 // Dragging one of several selected items shares the whole selection, to the group's root.
@@ -425,7 +433,8 @@ public sealed partial class QuickPanelWindow : Window
         newFolder.MouseLeftButtonUp += (_, _) => Model.CreateFolder();
         AutomationName(newFolder, "New Folder");
         DockPanel.SetDock(newFolder, Dock.Right);
-        bar.Children.Add(newFolder);
+        // A group this user can't send to is only read: no New Folder (nor Add Items).
+        if (Model.CanCreateFolder) bar.Children.Add(newFolder);
         if (Model.CanAddItems)
         {
             var addItems = new Border { Padding = new Thickness(6, 2, 6, 2), CornerRadius = new CornerRadius(6), Cursor = Cursors.Hand, Background = Brushes.Transparent, ToolTip = "Add from clipboard history" };
@@ -986,9 +995,13 @@ public sealed partial class QuickPanelWindow : Window
         if (entry is PanelEntry.FolderEntry f)
         {
             menu.Items.Add(Item("Open", () => Model.Activate(entry)));
-            menu.Items.Add(Item("Rename…", () => Model.BeginRenameFolder(f.Folder)));
-            menu.Items.Add(Item(f.Folder.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
-            menu.Items.Add(Item("New Folder Inside…", () => Model.NewFolderInside(f.Folder)));
+            // A group's folder can't change without Send.
+            if (Model.CanSendTo(f.Folder.SpaceId))
+            {
+                menu.Items.Add(Item("Rename…", () => Model.BeginRenameFolder(f.Folder)));
+                menu.Items.Add(Item(f.Folder.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
+                menu.Items.Add(Item("New Folder Inside…", () => Model.NewFolderInside(f.Folder)));
+            }
             if (Model.FolderMenuSections([entry]).Count > 0) menu.Items.Add(MoveToFolderMenu(entry, Focus));
             if (Model.ParentFolder(f.Folder) is not null && Model.CanChangeFolder(f.Folder))
                 menu.Items.Add(Item("Move to Top Level", () => Model.MoveFolder(f.Folder, null)));
@@ -1130,7 +1143,9 @@ public sealed partial class QuickPanelWindow : Window
             PanelEntry.SecretEntry k => k.Secret.SpaceId,
             _ => null,
         };
-        var groups = Model.GroupNames.Where(g => g.Key != own).OrderBy(g => g.Value, StringComparer.CurrentCultureIgnoreCase).ToList();
+        // Only groups this user can send to; a secret only to those whose secrets they get.
+        var groups = Model.GroupNames.Where(g => g.Key != own && Model.CanSendTo(g.Key) && (entry is not PanelEntry.SecretEntry || Model.CanSeeSecretsIn(g.Key)))
+            .OrderBy(g => g.Value, StringComparer.CurrentCultureIgnoreCase).ToList();
         if (groups.Count == 0) return null;
         var menu = new MenuItem { Header = "Share to Group" };
         foreach (var (id, name) in groups)
