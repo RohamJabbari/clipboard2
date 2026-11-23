@@ -247,8 +247,10 @@ struct ShareToGroupView: View {
                     }
                     .contentShape(Rectangle())
                     .onTapGesture {
+                        // A group with folders is picked first, so its "Into" menu can be used.
+                        let hasFolders = !(form.foldersByGroup[group.id] ?? []).isEmpty
                         form.selection = index
-                        onSubmit()
+                        if !hasFolders || selected { onSubmit() }
                     }
                     .accessibilityElement(children: .combine)
                     .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
