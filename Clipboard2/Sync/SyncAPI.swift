@@ -228,6 +228,9 @@ nonisolated struct RemoteSpace: Codable, Sendable, Equatable {
     var createdAt: Int64
     /// Who is in the space, to show who copied an item (absent on servers without usernames).
     var members: [MemberName]?
+    /// Your own access in a group (PROTOCOL.md → Member access). Absent on older servers: allowed.
+    var canSend: Bool?
+    var canSeeSecrets: Bool?
 
     var isPersonal: Bool { kind == "personal" }
     /// A contact: two people, no name.
@@ -248,7 +251,13 @@ nonisolated struct RemoteMember: Codable, Sendable, Equatable, Identifiable {
     var role: String
     var username: String?
     var name: String?
+    /// The member's access; absent on older servers (allowed).
+    var canSend: Bool?
+    var canSeeSecrets: Bool?
     var id: String { uid }
+
+    var sendAllowed: Bool { canSend ?? true }
+    var secretsAllowed: Bool { canSeeSecrets ?? true }
 
     var displayName: String { username ?? name ?? email.map { String($0.prefix { $0 != "@" }) } ?? "Member" }
 }
@@ -339,7 +348,7 @@ nonisolated enum SyncAPIError: LocalizedError, Equatable {
     /// Retrying the same item write won't help (too big, over quota, rejected, clock off, or
     /// someone else's item in a group). `forbidden` on a read means the space is gone instead.
     var isPermanentForItem: Bool {
-        ["too_large", "quota_exceeded", "invalid", "clock_skew", "forbidden"].contains(code ?? "")
+        ["too_large", "quota_exceeded", "invalid", "clock_skew", "forbidden", "send_not_allowed"].contains(code ?? "")
     }
 
     var errorDescription: String? {
@@ -360,6 +369,7 @@ nonisolated enum SyncAPIError: LocalizedError, Equatable {
             case "invalid_credentials": "Wrong email or password."
             case "unauthenticated": "Your sync session ended. Enter your password again."
             case "clock_skew": "Your clock is off, so sync can't save changes. Turn on “Set time and date automatically” in System Settings → General → Date & Time."
+            case "send_not_allowed": "You can't send to this group. Ask its owner to let you."
             case "forbidden": "Only the person who shared an item, or the group's owner, can change or delete it."
             case "invite_required": "Sign-up needs an invite code. Ask someone who uses Clipboard2 Sync for one."
             case "invite_invalid": "This invite code is unknown, already used or expired. Ask for a new one."
@@ -399,6 +409,8 @@ nonisolated protocol SyncService: Sendable {
     func deleteGroup(id: String) async throws
     func members(groupId: String) async throws -> [RemoteMember]
     func removeMember(groupId: String, uid: String) async throws
+    /// Owner only: a member's Send and Secrets access (nil leaves it as it is).
+    func setMemberAccess(groupId: String, uid: String, canSend: Bool?, canSeeSecrets: Bool?) async throws -> RemoteMember
 
     // Invites
     func createInvite(groupId: String, inviteId: String, sealedKey: Data) async throws
@@ -467,6 +479,7 @@ nonisolated struct SyncAPI: SyncService {
     nonisolated private struct Empty: Codable {}
     nonisolated private struct SpacesBody: Codable { var spaces: [RemoteSpace] }
     nonisolated private struct MembersBody: Codable { var members: [RemoteMember] }
+    nonisolated private struct AccessBody: Codable { var canSend: Bool?; var canSeeSecrets: Bool? }
     nonisolated private struct SavedBody: Codable { var seq: Int64; var trimmed: [String]? }
     nonisolated private struct ConflictBody: Codable { var current: RemoteItem }
     nonisolated private struct ErrorBody: Codable { var error: String?; var message: String?; var scope: String?; var retryAfter: Int? }
@@ -583,6 +596,12 @@ nonisolated struct SyncAPI: SyncService {
     func removeMember(groupId: String, uid: String) async throws {
         let escaped = uid.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? uid
         _ = try await send("DELETE", "v1/groups/\(groupId)/members/\(escaped)", as: Empty.self)
+    }
+
+    func setMemberAccess(groupId: String, uid: String, canSend: Bool?, canSeeSecrets: Bool?) async throws -> RemoteMember {
+        let escaped = uid.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? uid
+        return try await send("PATCH", "v1/groups/\(groupId)/members/\(escaped)",
+                              body: AccessBody(canSend: canSend, canSeeSecrets: canSeeSecrets), as: RemoteMember.self)
     }
 
     // MARK: Invites

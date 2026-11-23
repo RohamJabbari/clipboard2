@@ -54,6 +54,9 @@ final class SyncSpace {
     /// an interrupted one resumes instead of starting over or forgetting what it saw.
     var resyncing = false
     var resyncSeen: [String] = []
+    /// Your own access in a group (always true elsewhere, and on servers that don't say).
+    var canSend = true
+    var canSeeSecrets = true
 
     init(id: String, kind: String) {
         self.id = id

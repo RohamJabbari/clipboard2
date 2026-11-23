@@ -87,6 +87,10 @@ nonisolated struct SyncGroup: Identifiable, Hashable, Sendable {
     var name: String
     var isOwner: Bool
     var memberCount: Int
+    /// Your own access (PROTOCOL.md → Member access): Send adds anything to the group, Secrets
+    /// sees its secrets. The owner always has both.
+    var canSend = true
+    var canSeeSecrets = true
 }
 
 /// Someone an authenticator can be shared with: a contact or a member of one of your groups.
@@ -312,6 +316,8 @@ final class SyncAccount {
     }
 
     var email: String? { session?.email }
+    /// This account's uid while signed in.
+    var uid: String? { myUID }
 
     var isWorking: Bool {
         if case .working = state { return true }
@@ -334,6 +340,21 @@ final class SyncAccount {
     var defaultGroup: SyncGroup? {
         guard let id = prefs.syncDefaultGroupID else { return nil }
         return groups.first { $0.id == id }
+    }
+
+    /// Groups this account may add things to: the targets of Share to Group, drops and ⌥⌘C.
+    var sendableGroups: [SyncGroup] { groups.filter(\.canSend) }
+
+    /// Whether this account may add to or change things in a space: always outside groups.
+    func canSend(to spaceID: String?) -> Bool {
+        guard let spaceID, let group = groups.first(where: { $0.id == spaceID }) else { return true }
+        return group.canSend
+    }
+
+    /// Whether this account sees a space's secrets: always outside groups.
+    func canSeeSecrets(in spaceID: String?) -> Bool {
+        guard let spaceID, let group = groups.first(where: { $0.id == spaceID }) else { return true }
+        return group.canSeeSecrets
     }
 
     func groupName(for spaceID: String?) -> String? {
@@ -380,6 +401,7 @@ final class SyncAccount {
     func canChange(itemID: String, spaceID: String?) -> Bool {
         guard let spaceID, let group = groups.first(where: { $0.id == spaceID }) else { return true }
         if group.isOwner { return true }
+        guard group.canSend else { return false }
         guard let author = author(ofItemID: itemID) else { return true }
         return author == myUID
     }
@@ -393,11 +415,11 @@ final class SyncAccount {
 
     /// Tests: pretend to be `uid` in these groups, with these item authors (id → uid).
     func setUpForTesting(groups: [SyncGroup], uid: String?, authors: [String: String], contacts: [SyncContact] = [],
-                         requests: ContactRequests = ContactRequests()) {
+                         requests: ContactRequests = ContactRequests(), signedIn: Bool = false) {
         self.groups = groups
         self.contacts = contacts
         contactRequests = requests
-        testSignedIn = !contacts.isEmpty || !requests.incoming.isEmpty || !requests.outgoing.isEmpty
+        testSignedIn = signedIn || !contacts.isEmpty || !requests.incoming.isEmpty || !requests.outgoing.isEmpty
         testUID = uid
         for (id, author) in authors { self.authors[id.lowercased()] = .some(author) }
     }
@@ -1108,7 +1130,8 @@ final class SyncAccount {
     func loadGroups() {
         let spaces = (try? context.fetch(FetchDescriptor<SyncSpace>(sortBy: [SortDescriptor(\.createdAt)]))) ?? []
         let loaded = spaces.filter(\.isGroup).map {
-            SyncGroup(id: $0.id, name: $0.name.isEmpty ? "Group" : $0.name, isOwner: $0.isOwner, memberCount: $0.memberCount)
+            SyncGroup(id: $0.id, name: $0.name.isEmpty ? "Group" : $0.name, isOwner: $0.isOwner, memberCount: $0.memberCount,
+                      canSend: $0.isOwner || $0.canSend, canSeeSecrets: $0.isOwner || $0.canSeeSecrets)
         }
         if loaded != groups { groups = loaded }
         let me = session?.uid
@@ -1182,6 +1205,15 @@ final class SyncAccount {
 
     func members(of group: SyncGroup) async throws -> [RemoteMember] {
         try await call { try await $0.api.members(groupId: group.id) }
+    }
+
+    /// Owner only: turns a member's Send or Secrets on or off (nil leaves it). Returns the member
+    /// as the server now has them.
+    func setAccess(of member: RemoteMember, in group: SyncGroup, canSend: Bool? = nil,
+                   canSeeSecrets: Bool? = nil) async throws -> RemoteMember {
+        try await call {
+            try await $0.api.setMemberAccess(groupId: group.id, uid: member.uid, canSend: canSend, canSeeSecrets: canSeeSecrets)
+        }
     }
 
     func remove(_ member: RemoteMember, from group: SyncGroup) async throws {
@@ -1569,7 +1601,8 @@ final class SyncAccount {
         for space in spaces {
             if space.isGroup {
                 snapshot.groups[space.id] = .init(name: space.name.isEmpty ? "Group" : space.name, isOwner: space.isOwner,
-                                                  members: space.memberNames)
+                                                  members: space.memberNames, canSend: space.canSend,
+                                                  canSeeSecrets: space.canSeeSecrets)
             } else if space.isDirect {
                 snapshot.contacts[space.id] = .init(name: space.name.isEmpty ? "Contact" : space.name, ownedByMe: space.ownerUid == me)
             } else if space.isAuthenticator {

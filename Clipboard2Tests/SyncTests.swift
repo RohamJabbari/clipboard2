@@ -434,6 +434,53 @@ actor FakeSyncServer {
     private(set) var registrations = 0
 
     func setListsMembers(_ value: Bool) { listsMembers = value }
+
+    // Member access (PROTOCOL.md → Member access).
+    /// "space uid" → the member's (Send, Secrets); absent: both on.
+    private var access: [String: (send: Bool, secrets: Bool)] = [:]
+    /// false behaves like a server from before member access: no `canSend` / `canSeeSecrets` anywhere.
+    private(set) var reportsAccess = true
+    private(set) var accessChanges = 0
+
+    func setReportsAccess(_ value: Bool) { reportsAccess = value }
+
+    private func accessKey(_ space: String, _ uid: String) -> String { space + " " + uid }
+
+    /// A member's access; the owner (and anyone outside groups) always has both.
+    func access(space: String, uid: String) -> (send: Bool, secrets: Bool) {
+        guard let group = spaces[space], group.kind == "group", group.owner != uid else { return (true, true) }
+        return access[accessKey(space, uid)] ?? (true, true)
+    }
+
+    /// `PATCH /v1/groups/:id/members/:uid`: owner only, never the owner's own row.
+    func setAccess(caller: String, space: String, uid: String, canSend: Bool?, canSeeSecrets: Bool?) throws -> RemoteMember {
+        guard let group = spaces[space], group.kind == "group", group.members[caller] != nil else { throw Self.error(404, "not_found") }
+        guard group.owner == caller else { throw Self.forbidden }
+        guard group.members[uid] != nil else { throw Self.error(404, "not_found") }
+        guard uid != group.owner else { throw Self.error(400, "invalid", "The owner's access can't be changed") }
+        var current = access(space: space, uid: uid)
+        if let canSend { current.send = canSend }
+        if let canSeeSecrets { current.secrets = canSeeSecrets }
+        access[accessKey(space, uid)] = current
+        accessChanges += 1
+        guard let member = try members(caller: caller, space: space).first(where: { $0.uid == uid }) else {
+            throw Self.error(404, "not_found")
+        }
+        return member
+    }
+
+    /// `GET /v1/groups/:id/members`.
+    func members(caller: String, space: String) throws -> [RemoteMember] {
+        guard let group = spaces[space], group.members[caller] != nil else { throw Self.error(404, "not_found") }
+        return group.members.keys.sorted().map { uid in
+            let rights = access(space: space, uid: uid)
+            return RemoteMember(uid: uid, email: nil, role: group.members[uid]?.role ?? "member", username: accountByUID(uid)?.username,
+                                name: accountByUID(uid)?.displayName ?? uid,
+                                canSend: reportsAccess ? rights.send : nil, canSeeSecrets: reportsAccess ? rights.secrets : nil)
+        }
+    }
+
+    private static let sendNotAllowed = SyncAPIError.server(status: 403, code: "send_not_allowed", message: "", retryAfter: nil)
     func setRequireInvites(_ value: Bool) { requireInvites = value }
     func setChecksClock(_ value: Bool) { checksClock = value }
     func refuse(_ id: String, with error: SyncAPIError) { refusals[id] = error }
@@ -899,15 +946,18 @@ actor FakeSyncServer {
             let names = space.members.keys.sorted().compactMap { uid in
                 accounts.values.first { $0.uid == uid }.map { MemberName(uid: uid, name: $0.displayName) }
             }
+            let rights = access(space: space.id, uid: uid)
+            let reports = reportsAccess && space.kind == "group"
             return RemoteSpace(id: space.id, kind: space.kind, role: member.role, ownerUid: space.owner,
                                wrappedKey: member.wrappedKey, encryptedName: space.encryptedName,
                                memberCount: space.members.count, createdAt: space.createdAt,
-                               members: listsMembers ? names : nil)
+                               members: listsMembers ? names : nil,
+                               canSend: reports ? rights.send : nil, canSeeSecrets: reports ? rights.secrets : nil)
         }
         .sorted { $0.createdAt < $1.createdAt }
     }
 
-    func changes(space: String, since: Int64, limit: Int, full: Bool = false) throws -> ChangesPage {
+    func changes(space: String, since: Int64, limit: Int, full: Bool = false, uid: String? = nil) throws -> ChangesPage {
         if resetNext.contains(space) && since > 0 && !full {
             resetNext.remove(space)
             return ChangesPage(items: [], nextSince: since, hasMore: false, resetRequired: true)
@@ -916,7 +966,10 @@ actor FakeSyncServer {
             failChangesAfterReset = nil
             throw error
         }
-        let all = (items[space] ?? [:]).values.filter { $0.seq > since }.sorted { $0.seq < $1.seq }
+        // Without Secrets, a group's secrets are left out entirely (not even tombstones).
+        let hidesSecrets = uid.map { !access(space: space, uid: $0).secrets } ?? false
+        let all = (items[space] ?? [:]).values.filter { $0.seq > since && !(hidesSecrets && $0.category == "secret") }
+            .sorted { $0.seq < $1.seq }
         let page = Array(all.prefix(limit))
         return ChangesPage(items: page, nextSince: page.last?.seq ?? since, hasMore: all.count > limit, resetRequired: false)
     }
@@ -928,6 +981,9 @@ actor FakeSyncServer {
         putAttempts[id, default: 0] += 1
         if rateLimited { throw Self.rateLimit }
         if let refusal = refusals[id] { throw refusal }
+        let rights = access(space: space, uid: uid)
+        if !rights.send { throw Self.sendNotAllowed }
+        if !rights.secrets && (body.category == "secret" || items[space]?[id]?.category == "secret") { throw Self.forbidden }
         try checkClock(body.updatedAt, sortAt: body.sortAt)
         try checkMayOverwrite(space: space, id: id, uid: uid)
         if let existing = items[space]?[id], existing.updatedAt > body.updatedAt { return .conflict(existing) }
@@ -953,6 +1009,7 @@ actor FakeSyncServer {
 
     func delete(space: String, id: String, updatedAt: Int64, uid: String) throws -> WriteOutcome {
         deleteRequests.append(id)
+        if !access(space: space, uid: uid).secrets && items[space]?[id]?.category == "secret" { throw Self.forbidden }
         try checkClock(updatedAt)
         try checkMayOverwrite(space: space, id: id, uid: uid)
         guard let existing = items[space]?[id] else { return .saved(seq: 0, trimmed: []) }
@@ -974,7 +1031,8 @@ actor FakeSyncServer {
         items[space]?[id] = item
     }
 
-    func register(space: String, blob: String) -> BlobUploadTicket {
+    func register(space: String, blob: String, uid: String? = nil) throws -> BlobUploadTicket {
+        if let uid, !access(space: space, uid: uid).send { throw Self.sendNotAllowed }
         registrations += 1
         registered.insert("\(space)/\(blob)")
         return BlobUploadTicket(url: URL(string: "fake://\(space)/\(blob)")!, method: "PUT", headers: [:], expiresAt: nil)
@@ -1066,7 +1124,12 @@ nonisolated struct FakeClient: SyncService {
     }
     func renameGroup(id: String, encryptedName: Data) async throws { await server.rename(space: id, encryptedName: encryptedName) }
     func deleteGroup(id: String) async throws {}
-    func members(groupId: String) async throws -> [RemoteMember] { [] }
+    func members(groupId: String) async throws -> [RemoteMember] {
+        try await server.members(caller: try await caller(), space: groupId)
+    }
+    func setMemberAccess(groupId: String, uid: String, canSend: Bool?, canSeeSecrets: Bool?) async throws -> RemoteMember {
+        try await server.setAccess(caller: try await caller(), space: groupId, uid: uid, canSend: canSend, canSeeSecrets: canSeeSecrets)
+    }
     func removeMember(groupId: String, uid: String) async throws { await server.removeMember(space: groupId, uid: uid) }
 
     func createInvite(groupId: String, inviteId: String, sealedKey: Data) async throws {
@@ -1126,8 +1189,8 @@ nonisolated struct FakeClient: SyncService {
     }
 
     func changes(spaceId: String, since: Int64, limit: Int, full: Bool) async throws -> ChangesPage {
-        _ = try await caller()
-        return try await server.changes(space: spaceId, since: since, limit: limit, full: full)
+        let uid = try await caller()
+        return try await server.changes(space: spaceId, since: since, limit: limit, full: full, uid: uid)
     }
     func putItem(spaceId: String, itemId: String, _ body: ItemUpload) async throws -> WriteOutcome {
         try await server.put(space: spaceId, id: itemId, body: body, uid: try await caller())
@@ -1136,8 +1199,8 @@ nonisolated struct FakeClient: SyncService {
         try await server.delete(space: spaceId, id: itemId, updatedAt: updatedAt, uid: try await caller())
     }
     func registerBlob(spaceId: String, blobId: String, size: Int) async throws -> BlobUploadTicket {
-        _ = try await caller()
-        return await server.register(space: spaceId, blob: blobId)
+        let uid = try await caller()
+        return try await server.register(space: spaceId, blob: blobId, uid: uid)
     }
     func uploadBlob(_ ticket: BlobUploadTicket, data: Data) async throws {
         try Task.checkCancellation()

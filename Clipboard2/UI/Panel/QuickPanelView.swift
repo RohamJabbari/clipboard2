@@ -310,7 +310,7 @@ struct QuickPanelView: View {
             Button("Edit…") { model.beginEditSecret(ref) }
             Button("Rename…") { model.beginLabel(entry) }
             folderMenuItems(for: entry)
-            if model.canShareToGroup, env.sync.groups.contains(where: { $0.id != ref.spaceID }) {
+            if model.canShareToGroup, !model.shareGroups(for: ref).isEmpty {
                 Button("Share to Group…") { model.beginShareSecret(ref) }
             }
             if model.canSendToContact(ref) {
@@ -346,7 +346,7 @@ struct QuickPanelView: View {
             }
             if model.canShareToGroup {
                 Menu("Share to Group") {
-                    ForEach(env.sync.groups) { group in
+                    ForEach(model.shareGroups) { group in
                         // A group with folders is a submenu: the group itself, then its folder tree.
                         let folders = env.store.folders(inSpace: group.id)
                         if folders.isEmpty || item.spaceID == group.id {

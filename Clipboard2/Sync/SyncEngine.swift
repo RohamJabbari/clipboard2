@@ -126,6 +126,9 @@ final class SyncEngine {
     /// Refusals from the current tick worth showing.
     private(set) var warnings: [String] = []
     private var secretsChanged = false
+    /// Groups whose secrets this account may not see (PROTOCOL.md → Member access): none are
+    /// kept here, and any the server still sends are ignored.
+    private var secretsHidden: Set<String> = []
     private var applyingDepth = 0
     /// Set on sign-out: a tick still in flight stops at its next await instead of touching
     /// models that were just deleted.
@@ -323,6 +326,7 @@ final class SyncEngine {
                 if !space.isPersonal { row.since = 0 }
                 row.authorsBackfilled = true
             }
+            applyAccess(of: space, to: row, isNew: existing == nil)
             if let members = space.members {
                 row.memberNames = Dictionary(members.map { ($0.uid, $0.name) }, uniquingKeysWith: { first, _ in first })
             }
@@ -345,6 +349,47 @@ final class SyncEngine {
         }
         save()
         return result.sorted { $0.isPersonal && !$1.isPersonal }
+    }
+
+    /// Your own Send and Secrets access in a group (missing on older servers: allowed). Losing
+    /// Secrets drops the group's secrets from this Mac; getting it back pulls the group again
+    /// from the start, since the server left its secrets out until now.
+    private func applyAccess(of space: RemoteSpace, to row: SyncSpace, isNew: Bool) {
+        let isGroup = space.kind == "group"
+        let canSend = !isGroup || (space.canSend ?? true)
+        let canSeeSecrets = !isGroup || (space.canSeeSecrets ?? true)
+        if row.canSend != canSend {
+            row.canSend = canSend
+            // What waited while Send was off goes out now.
+            if canSend { localChangesPending = true }
+        }
+        if canSeeSecrets {
+            if !row.canSeeSecrets {
+                row.canSeeSecrets = true
+                if !isNew {
+                    Log.sync.info("Secrets of space \(space.id, privacy: .public) are visible again; pulling it anew")
+                    row.since = 0
+                }
+            }
+            secretsHidden.remove(space.id)
+        } else {
+            if row.canSeeSecrets { row.canSeeSecrets = false }
+            // Once per session (and right when it's taken away): reading the Keychain every tick isn't needed.
+            if secretsHidden.insert(space.id).inserted { quietly { dropSecrets(inSpace: space.id) } }
+        }
+    }
+
+    /// Removes a group's secrets, and what sync knew about them, from this Mac (never from the
+    /// server: without their records nothing is pushed as deleted).
+    private func dropSecrets(inSpace spaceId: String) {
+        for meta in metas(inSpace: spaceId) where meta.category == SyncCategory.secret.rawValue {
+            context.delete(meta)
+            metaIndex?[meta.localId] = nil
+        }
+        for ref in secrets.syncSecrets where ref.spaceID == spaceId {
+            secrets.syncDelete(id: ref.id)
+            secretsChanged = true
+        }
     }
 
     /// Unwraps a space's key the first time and whenever its wrap changes, and holds it to the
@@ -399,6 +444,7 @@ final class SyncEngine {
             }
         }
         lastShareCheck[space.id] = nil
+        secretsHidden.remove(space.id)
         spaceKeys[space.id] = nil
         checkedWraps[space.id] = nil
         keyMismatches.remove(space.id)
@@ -511,6 +557,8 @@ final class SyncEngine {
         }
 
         guard let ciphertext = remote.ciphertext, let category = SyncCategory(rawValue: remote.category) else { return }
+        // Not for this account (a server that still sends them): never stored here.
+        if category == .secret && secretsHidden.contains(spaceId) { return }
         let payload: SyncPayload
         do {
             let plaintext = try await Self.open(ciphertext, key: itemKey,
@@ -1290,6 +1338,10 @@ final class SyncEngine {
         let spaceId = space.id
         // Deletions first: a full quota or a rate limit while uploading must never hold them back.
         try await pushDeletions(spaceId: spaceId, itemKey: itemKey)
+        // Without Send, a member may still delete their own items but add or change nothing;
+        // local changes wait here until Send is back.
+        guard space.canSend else { return }
+        let hidesSecrets = !space.canSeeSecrets
 
         let localSpace = localSpaceID(spaceId)
         var metaByID: [String: SyncMeta] = [:]
@@ -1339,7 +1391,7 @@ final class SyncEngine {
             if let job = makeJob(id: id, payload: payload, meta: metaByID[id], sortAt: snippet.updatedAt.syncMillis,
                                  updatedAt: snippet.updatedAt.syncMillis) { jobs.append(job) }
         }
-        for ref in secrets.syncSecrets where ref.spaceID == localSpace {
+        for ref in secrets.syncSecrets where ref.spaceID == localSpace && !hidesSecrets {
             let id = ref.id.lowercased()
             let meta = metaByID[id]
             if theirs(meta) { continue }
@@ -1533,7 +1585,7 @@ final class SyncEngine {
             rejected[job.id] = Rejection(key: job.rejectKey, quota: quota, message: quota ? error.errorDescription : nil)
             switch error.code {
             case "clock_skew": clockSkew = true
-            case "forbidden": warn(error)
+            case "forbidden", "send_not_allowed": warn(error)
             default: break
             }
         }
