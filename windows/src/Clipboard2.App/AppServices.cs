@@ -675,6 +675,12 @@ public sealed class AppServices : IPanelHost
             OpenSettings("Sync");
             return;
         }
+        // The group's owner turned this user's Send off: reading and pasting still work, sending doesn't.
+        if (!group.CanSend)
+        {
+            Hud.ShowMessage(Tracker.TargetWindow, Glyphs.Cancel, SyncAccount.CantSendMessage(group));
+            return;
+        }
         var source = Tracker.AppFor(Tracker.TargetWindow);
         var raw = await CopySelectionCaptureAsync(source);
         var capture = raw is null ? null : await CaptureProcessor.ProcessAsync(raw, Store.Blobs);
@@ -699,6 +705,11 @@ public sealed class AppServices : IPanelHost
     /// <summary>Shares a history item to a group from outside the panel, or says why it can't be.</summary>
     public void ShareToGroup(ClipItem item, SpaceRecord group)
     {
+        if (!group.CanSend)
+        {
+            Hud.ShowMessage(Tracker.TargetWindow, Glyphs.Cancel, SyncAccount.CantSendMessage(group));
+            return;
+        }
         if (SyncEngine.GroupShareProblem(item) is { } problem)
         {
             ShowGroupShareProblem(group.DisplayName, problem);
@@ -944,7 +955,7 @@ public sealed class AppServices : IPanelHost
     /// <summary>Files dropped on the panel's list (into history) or on a group chip (shared to that group).</summary>
     public ClipItem? AddDroppedFiles(IReadOnlyList<string> paths, string? spaceId = null)
     {
-        if (paths.Count == 0) return null;
+        if (paths.Count == 0 || !CanSendTo(spaceId)) return null;
         var item = Store.Ingest(ProcessedCapture.ForFiles(paths), spaceId: spaceId);
         Sync.ReportActivity();
         return item;
@@ -954,11 +965,14 @@ public sealed class AppServices : IPanelHost
     public ClipItem? AddDroppedText(string text, string? spaceId = null)
     {
         var capture = ProcessedCapture.ForText(text);
-        if (string.IsNullOrWhiteSpace(text) || Secrets.ValueHashes.Contains(capture.Hash) || !CaptureFilter.ShouldStore(capture)) return null;
+        if (string.IsNullOrWhiteSpace(text) || Secrets.ValueHashes.Contains(capture.Hash) || !CaptureFilter.ShouldStore(capture) || !CanSendTo(spaceId)) return null;
         var item = Store.Ingest(capture, spaceId: spaceId);
         Sync.ReportActivity();
         return item;
     }
+
+    /// <summary>Whether this user may add to a space: anything but a group whose owner turned their Send off.</summary>
+    public bool CanSendTo(string? spaceId) => spaceId is null || Store.Groups().FirstOrDefault(g => g.Id == spaceId) is not { CanSend: false };
 
     // MARK: AI
 

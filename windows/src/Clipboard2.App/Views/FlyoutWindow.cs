@@ -217,7 +217,7 @@ public sealed class FlyoutWindow : Window
             }));
         }
         menu.Items.Add(slots);
-        var groups = _services.Store.Groups().Where(g => g.Id != item.SpaceId).ToList();
+        var groups = _services.Store.Groups().Where(g => g.Id != item.SpaceId && g.CanSend).ToList();
         if (groups.Count > 0)
         {
             var share = new MenuItem { Header = "Share to Group" };

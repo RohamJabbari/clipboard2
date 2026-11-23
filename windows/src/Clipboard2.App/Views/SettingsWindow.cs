@@ -1012,7 +1012,8 @@ public sealed partial class SettingsWindow : Window
             var id = group.Id;
             var name = group.DisplayName;
             var controls = new StackPanel { Orientation = Orientation.Horizontal };
-            controls.Children.Add(Fluent.Label($"{(group.IsOwner ? "Owner" : "Member")} · {group.MemberCount} {(group.MemberCount == 1 ? "member" : "members")}  ", 12, Fluent.Secondary));
+            var access = (group.CanSend ? "" : " · can't send") + (group.CanSeeSecrets ? "" : " · no secrets");
+            controls.Children.Add(Fluent.Label($"{(group.IsOwner ? "Owner" : "Member")}{access} · {group.MemberCount} {(group.MemberCount == 1 ? "member" : "members")}  ", 12, Fluent.Secondary));
             controls.Children.Add(Action("Members…", () => ShowMembers(group)));
             if (group.IsOwner)
             {
@@ -1384,6 +1385,40 @@ public sealed partial class SettingsWindow : Window
         list.Children.Add(Fluent.Label("Loading…", 13, Fluent.Secondary));
         window.Content = list;
         window.Show();
+        // Why a Send or Secrets change didn't take (the pill is back as it was).
+        var notice = Fluent.Label("", 12, Brushes.OrangeRed, wrap: true);
+        notice.Visibility = Visibility.Collapsed;
+
+        // Send and Secrets (docs/features/member-access.md): the owner flips them on a member's row at once, without a
+        // confirmation; a member sees their own, read-only.
+        UIElement AccessPill(string title, string tip, bool on, Func<bool, Task<string?>>? change)
+        {
+            var pill = new System.Windows.Controls.Primitives.ToggleButton
+            {
+                Content = title, IsChecked = on, Margin = new Thickness(6, 0, 0, 0), Padding = new Thickness(10, 2, 10, 2),
+                MinWidth = 0, VerticalAlignment = VerticalAlignment.Center, FontSize = 12, ToolTip = tip,
+            };
+            System.Windows.Automation.AutomationProperties.SetName(pill, title);
+            if (change is null)
+            {
+                pill.IsHitTestVisible = false;
+                pill.Focusable = false;
+                return pill;
+            }
+            pill.Click += async (_, _) =>
+            {
+                var wanted = pill.IsChecked == true;
+                pill.IsEnabled = false;
+                notice.Visibility = Visibility.Collapsed;
+                var error = await change(wanted);
+                pill.IsEnabled = true;
+                if (error is null) return;
+                pill.IsChecked = !wanted;   // a programmatic change doesn't raise Click
+                notice.Text = error;
+                notice.Visibility = Visibility.Visible;
+            };
+            return pill;
+        }
 
         async Task Fill()
         {
@@ -1392,10 +1427,11 @@ public sealed partial class SettingsWindow : Window
             foreach (var member in members)
             {
                 var row = new DockPanel { LastChildFill = false, MinHeight = 32 };
-                row.Children.Add(Fluent.Label(member.Name + (member.Role == "owner" ? "  (owner)" : "") + (member.Uid == sync.Uid ? "  — you" : ""), 13));
-                if (group.IsOwner && member.Role != "owner")
+                var mine = member.Uid == sync.Uid;
+                row.Children.Add(Fluent.Label(member.Name + (member.IsOwner ? "  (owner)" : "") + (mine ? "  — you" : ""), 13));
+                var uid = member.Uid;
+                if (group.IsOwner && !member.IsOwner)
                 {
-                    var uid = member.Uid;
                     var remove = Action("Remove", async () =>
                     {
                         if (MessageBox.Show(window, $"Remove {member.Name} from the group? They keep anything they already copied.", "Remove Member",
@@ -1406,9 +1442,25 @@ public sealed partial class SettingsWindow : Window
                     DockPanel.SetDock(remove, Dock.Right);
                     row.Children.Add(remove);
                 }
+                if (!member.IsOwner && (group.IsOwner || mine))
+                {
+                    Func<bool, Task<string?>>? Change(bool send) => group.IsOwner
+                        ? async on => (send ? await sync.SetMemberAccessAsync(group.Id, uid, canSend: on)
+                                            : await sync.SetMemberAccessAsync(group.Id, uid, canSeeSecrets: on)).Error
+                        : null;
+                    var secretsPill = AccessPill("Secrets", "Can see the group's secrets", member.CanSeeSecrets, Change(send: false));
+                    var sendPill = AccessPill("Send", "Can add items, folders and secrets to the group", member.CanSend, Change(send: true));
+                    DockPanel.SetDock(secretsPill, Dock.Right);
+                    DockPanel.SetDock(sendPill, Dock.Right);
+                    row.Children.Add(secretsPill);
+                    row.Children.Add(sendPill);
+                }
                 list.Children.Add(row);
+                if (mine && !member.IsOwner && !member.CanSend)
+                    list.Children.Add(Fluent.Label("You can't send to this group", 12, Fluent.Secondary));
             }
             if (members.Count == 0) list.Children.Add(Fluent.Label(sync.Error ?? "No members found.", 13, Fluent.Secondary, wrap: true));
+            list.Children.Add(notice);
 
             if (group.IsOwner)
             {
@@ -1433,8 +1485,9 @@ public sealed partial class SettingsWindow : Window
                 if (invites.Count == 0) list.Children.Add(Fluent.Label("None.", 12, Fluent.Secondary));
             }
             list.Children.Add(new Border { Height = 10 });
-            list.Children.Add(Fluent.Label("Members can read and add items. Removing someone ends their access on the server; " +
-                "the group key isn't rotated.", 12, Fluent.Secondary, wrap: true));
+            list.Children.Add(Fluent.Label("Members can read and add items. Send lets a member add to the group; Secrets lets them see " +
+                "its secrets. Removing someone (or their Secrets) ends their access on the server, but the group key isn't rotated: " +
+                "change sensitive secrets afterwards.", 12, Fluent.Secondary, wrap: true));
         }
         await Fill();
     }
