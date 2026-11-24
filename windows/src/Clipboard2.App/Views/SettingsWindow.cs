@@ -161,7 +161,7 @@ public sealed partial class SettingsWindow : Window
 
     private static TextBlock Hint(string text)
     {
-        var t = Fluent.Label(text, 12, Fluent.Secondary, wrap: true);
+        var t = Fluent.Label(KeyLabels.Prose(text), 12, Fluent.Secondary, wrap: true);   // Strg on German keyboards
         t.Margin = new Thickness(2, -10, 0, 16);
         return t;
     }
@@ -227,7 +227,7 @@ public sealed partial class SettingsWindow : Window
             var slot = n;
             var title = SlotTitle(slot) ?? $"Empty — falls back to row {slot}";
             var row = new DockPanel { LastChildFill = true, MinHeight = 32 };
-            var label = Fluent.Label($"Ctrl+{slot}", 13, null, FontWeights.SemiBold);
+            var label = Fluent.Label(KeyLabels.Show($"Ctrl+{slot}"), 13, null, FontWeights.SemiBold);
             label.Width = 60;
             row.Children.Add(label);
             var box = new HotkeyBox(_services.Hotkeys, S.Hotkeys.GetValueOrDefault(Hotkey.Slot(slot)));
@@ -250,7 +250,7 @@ public sealed partial class SettingsWindow : Window
         page.Children.Add(Header("Right-click menu"));
         page.Children.Add(Card(
             Row($"Open Clipboard2's menu with {S.ContextMenuModifier}+right-click", Toggle(S.ContextMenuEnabled, on => { S.ContextMenuEnabled = on; Save(); ContextMenuService.Shared?.Update(); })),
-            Row("Modifier", Choice(Enum.GetValues<ContextMenuModifier>(), S.ContextMenuModifier, m => m == ContextMenuModifier.Control ? "Ctrl" : "Alt",
+            Row("Modifier", Choice(Enum.GetValues<ContextMenuModifier>(), S.ContextMenuModifier, m => KeyLabels.Show(m == ContextMenuModifier.Control ? "Ctrl" : "Alt"),
                 m => { S.ContextMenuModifier = m; Save(); }))));
         page.Children.Add(Hint("Works in every app: Clipboard2's actions plus Cut, Copy, Paste, Select All (and File Explorer items in Explorer). “Show app menu” opens the app's own menu. Plain right-clicks are never changed."));
 
@@ -495,7 +495,7 @@ public sealed partial class SettingsWindow : Window
             var actions = new StackPanel { Orientation = Orientation.Horizontal };
             actions.Children.Add(value);
             if (_services.Slots.SlotFor(SlotTarget.ForSecret(secret.Id)) is { } slot)
-                actions.Children.Add(Fluent.Label($"Ctrl+{slot}  ", 12, Fluent.Accent));
+                actions.Children.Add(Fluent.Label(KeyLabels.Show($"Ctrl+{slot}") + "  ", 12, Fluent.Accent));
             actions.Children.Add(Action("Show", async () =>
             {
                 if (value.Text.StartsWith('•'))
@@ -521,7 +521,7 @@ public sealed partial class SettingsWindow : Window
             }));
             rows.Add(Row(secret.Name, actions));
         }
-        if (rows.Count == 0) rows.Add(Fluent.Label("No secrets yet. Add one below, or select a copied password in the quick panel and choose Ctrl+K → Save as Secret.", 13, Fluent.Secondary, wrap: true));
+        if (rows.Count == 0) rows.Add(Fluent.Label(KeyLabels.Prose("No secrets yet. Add one below, or select a copied password in the quick panel and choose Ctrl+K → Save as Secret."), 13, Fluent.Secondary, wrap: true));
         page.Children.Add(Card([.. rows]));
         page.Children.Add(Hint("Values are stored in Windows Credential Manager — never in history, never sent to AI or transforms. With Sync on, they're end-to-end encrypted on this PC before upload; the server can't read them."));
 
@@ -1056,7 +1056,7 @@ public sealed partial class SettingsWindow : Window
         page.Children.Add(Card([.. groupRows]));
         if (groups.Count > 0)
         {
-            var hotkey = S.Hotkeys.GetValueOrDefault(Hotkey.SendToGroup) is { Length: > 0 } combo ? combo : "the Send to group shortcut";
+            var hotkey = S.Hotkeys.GetValueOrDefault(Hotkey.SendToGroup) is { Length: > 0 } combo ? KeyCombo.Display(combo) : "the Send to group shortcut";
             page.Children.Add(Card(Row("Default group", Choice(groups, sync.DefaultGroup ?? groups[0], g => g.DisplayName, g => sync.SetDefaultGroup(g.Id)))));
             page.Children.Add(Hint($"Select text anywhere and press {hotkey} to send it to the default group. Share any item with Ctrl+K → Share to Group, or right-click it."));
         }

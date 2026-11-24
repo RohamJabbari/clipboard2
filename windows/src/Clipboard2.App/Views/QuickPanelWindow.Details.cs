@@ -69,16 +69,16 @@ public sealed partial class QuickPanelWindow
         {
             void Edit() { Model.Select(entry.Id); Model.BeginLabel(entry); }
             UIElement content = PanelModel.LabelText(entry) is { } label
-                ? Chip(Glyphs.Tag, label, entry is PanelEntry.SecretEntry ? "Rename (Ctrl+L)" : "Edit the label (Ctrl+L)", Edit, accent: true)
-                : AddButton("Add label", "Ctrl+L", Edit);
+                ? Chip(Glyphs.Tag, label, entry is PanelEntry.SecretEntry ? $"Rename ({KeyLabels.Show("Ctrl+L")})" : $"Edit the label ({KeyLabels.Show("Ctrl+L")})", Edit, accent: true)
+                : AddButton("Add label", KeyLabels.Show("Ctrl+L"), Edit);
             stack.Children.Add(DetailRow(entry is PanelEntry.SecretEntry ? "Name" : "Label", content));
         }
         if (entry is PanelEntry.Clip or PanelEntry.SecretEntry && Model.SelectedEntry?.Id == entry.Id && Model.CanMoveSelection)
         {
             void Move() { Model.Select(entry.Id); Model.BeginMoveSelection(); }
             UIElement content = Model.FolderLocation(entry) is { } path
-                ? Chip(Glyphs.Folder, path, "Move to another folder (Ctrl+Shift+M)", Move, accent: false)
-                : AddButton("Move to folder", "Ctrl+Shift+M", Move);
+                ? Chip(Glyphs.Folder, path, $"Move to another folder ({KeyLabels.Show("Ctrl+Shift+M")})", Move, accent: false)
+                : AddButton("Move to folder", KeyLabels.Show("Ctrl+Shift+M"), Move);
             stack.Children.Add(DetailRow("Folder", content));
         }
     }
@@ -88,7 +88,7 @@ public sealed partial class QuickPanelWindow
     {
         if (!Model.CanMoveSelection) return;
         UIElement content = Model.CommonFolderLocation is { } path
-            ? Chip(Glyphs.Folder, path, "Move them to another folder (Ctrl+Shift+M)", Model.BeginMoveSelection, accent: false)
+            ? Chip(Glyphs.Folder, path, $"Move them to another folder ({KeyLabels.Show("Ctrl+Shift+M")})", Model.BeginMoveSelection, accent: false)
             : AddButton("Move to folder", "Ctrl+Shift+M", Model.BeginMoveSelection);
         var row = DetailRow("Folder", content);
         row.Margin = new Thickness(0, 10, 0, 0);

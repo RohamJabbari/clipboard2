@@ -140,12 +140,12 @@ public sealed class ContextMenuService : IDisposable
         var menu = new ContextMenu();
         MenuItem Item(string header, string glyph, Action action, string? gesture = null, bool enabled = true)
         {
-            var item = new MenuItem { Header = header, Icon = Glyphs.Icon(glyph, 14), InputGestureText = gesture ?? "", IsEnabled = enabled };
+            var item = new MenuItem { Header = header, Icon = Glyphs.Icon(glyph, 14), InputGestureText = gesture is null ? "" : KeyLabels.Show(gesture), IsEnabled = enabled };
             item.Click += (_, _) => action();
             return item;
         }
         // Every global shortcut is listed with its keys, as a reminder.
-        string? ShortcutFor(string hotkey) => _services.Settings.Hotkeys.TryGetValue(hotkey, out var combo) && combo.Length > 0 ? combo : null;
+        string? ShortcutFor(string hotkey) => _services.Settings.Hotkeys.TryGetValue(hotkey, out var combo) && combo.Length > 0 ? KeyCombo.Display(combo) : null;
         var heading = new MenuItem { Header = "Clipboard2", IsEnabled = false, FontWeight = FontWeights.SemiBold };
         menu.Items.Add(heading);
         menu.Items.Add(Item("Search Clipboard2…", Glyphs.Search, () => Do(() => { _services.ShowPanel(); return Task.CompletedTask; }), ShortcutFor(Hotkey.QuickPanel)));

@@ -138,9 +138,9 @@ public abstract record PanelAction
     /// <summary>The key that does it, shown next to its title.</summary>
     public string? Shortcut => this switch
     {
-        SetLabel => "Ctrl+L",
-        MoveToFolder => "Ctrl+Shift+M",
-        Preview => "Ctrl+Y",
+        SetLabel => KeyLabels.Show("Ctrl+L"),
+        MoveToFolder => KeyLabels.Show("Ctrl+Shift+M"),
+        Preview => KeyLabels.Show("Ctrl+Y"),
         _ => null,
     };
 
@@ -175,7 +175,7 @@ public abstract record PanelAction
         SaveAsSecret => "Save as Secret…",
         SetLabel => "Label…",
         SetUpAI => "Set Up AI…",
-        ClearSlot c => $"Remove from Quick Slot Ctrl+{c.Slot}",
+        ClearSlot c => $"Remove from Quick Slot {KeyLabels.Show($"Ctrl+{c.Slot}")}",
         AddToSaved => "Add to Saved",
         SaveCopy => "Save a Copy",
         ShareInto s => s.FolderTitle,
@@ -1477,7 +1477,7 @@ public sealed partial class PanelModel(ClipStore store, Settings settings, Quick
         if (entry is PanelEntry.Clip { Item.IsPinned: false } clip) store.TogglePin(clip.Item);
         slots.Assign(entry.SlotTarget, slot);
         Refresh();
-        ShowNotice($"Assigned to Ctrl+{slot}");
+        ShowNotice($"Assigned to {KeyLabels.Show($"Ctrl+{slot}")}");
     }
 
     // MARK: Activation

@@ -133,6 +133,7 @@ public sealed class AppServices : IPanelHost
 
     public void Start(bool background)
     {
+        KeyNames.Refresh(Native.GetForegroundWindow());
         ApplyAppearance();
         _listener.Changed += OnClipboardChanged;
         RemoveSecretCopies();
@@ -183,11 +184,11 @@ public sealed class AppServices : IPanelHost
             Settings.HasLaunchedBefore = true;
             Settings.Save();
             StartupRegistration.SetEnabled(Settings.LaunchAtLogin);
-            _tray.ShowBalloon("Clipboard2 is running", "Press Ctrl+Shift+V to open your clipboard history. Click the tray icon for more.");
+            _tray.ShowBalloon("Clipboard2 is running", $"Press {KeyCombo.Display(Settings.Hotkeys.GetValueOrDefault(Hotkey.QuickPanel))} to open your clipboard history. Click the tray icon for more.");
         }
         else if (!background)
         {
-            _tray.ShowBalloon("Clipboard2 is running", $"Press {Settings.Hotkeys[Hotkey.QuickPanel]} to open it.");
+            _tray.ShowBalloon("Clipboard2 is running", $"Press {KeyCombo.Display(Settings.Hotkeys[Hotkey.QuickPanel])} to open it.");
         }
     }
 
@@ -346,6 +347,7 @@ public sealed class AppServices : IPanelHost
     public void ShowPanel()
     {
         _panelTarget = Tracker.TargetWindow;
+        KeyNames.Refresh(_panelTarget);   // shortcut names as printed on the keyboard in use (Strg on German ones)
         Panel.PrepareForOpen(Tracker.AppFor(_panelTarget));
         PanelWindow.ShowNear(_panelTarget);
         Sync.SetPanelOpen(true);   // syncs once, then polls every 3 s while open
@@ -376,6 +378,7 @@ public sealed class AppServices : IPanelHost
     {
         Dispatcher.BeginInvoke(() =>
         {
+            KeyNames.Refresh(Native.GetForegroundWindow());
             if (_settingsWindow is null || !_settingsWindow.IsLoaded)
             {
                 _settingsWindow = new SettingsWindow(this);
@@ -751,7 +754,7 @@ public sealed class AppServices : IPanelHost
         if (_hudNotices.Count == 0) return;
         var notices = _hudNotices.ToList();
         _hudNotices.Clear();
-        var hotkey = Settings.Hotkeys.GetValueOrDefault(Hotkey.QuickPanel);
+        var hotkey = KeyCombo.Display(Settings.Hotkeys.GetValueOrDefault(Hotkey.QuickPanel));
         if (notices.All(n => n.Target is NotificationTarget.People))
         {
             var first = notices[0];
@@ -859,7 +862,7 @@ public sealed class AppServices : IPanelHost
         if (Tracker.TargetWindow != target)
         {
             Copy(item);
-            Hud.ShowMessage(target, Glyphs.Check, "Ready — press Ctrl+V to paste");
+            Hud.ShowMessage(target, Glyphs.Check, $"Ready — press {KeyLabels.Show("Ctrl+V")} to paste");
             return;
         }
         Hud.HideHud();

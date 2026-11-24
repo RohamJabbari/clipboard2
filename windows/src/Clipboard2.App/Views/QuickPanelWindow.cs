@@ -754,7 +754,7 @@ public sealed partial class QuickPanelWindow : Window
                 var empty = new StackPanel { Margin = new Thickness(20, 60, 20, 0), HorizontalAlignment = HorizontalAlignment.Center };
                 var inbox = Model.Filter == PanelFilter.Inbox && Model.GroupFilter is null;
                 var (emptyTitle, emptyHint) = Model.Query.Length > 0 ? ("No matches", "Try fewer letters or another filter.")
-                    : Model.OpenFolderId is not null ? ("This folder is empty", "Drag items here, or use Move to Folder in Ctrl+K.")
+                    : Model.OpenFolderId is not null ? ("This folder is empty", $"Drag items here, or use Move to Folder in {KeyLabels.Show("Ctrl+K")}.")
                     : Model.IsSavedView ? ("Nothing saved yet", "Label an item or use Add to Saved to keep it. Secrets and snippets are kept here too.")
                     : inbox ? ("Your Inbox is empty", "What your contacts send you appears here.")
                     : ("Nothing here yet", "Items appear as you copy them.");
@@ -919,7 +919,7 @@ public sealed partial class QuickPanelWindow : Window
         {
             var badge = new Border
             {
-                Child = Fluent.Label($"Ctrl+{shortcut.Number}", 11, selected ? Fluent.AccentText : (shortcut.IsSlot ? Fluent.Accent : Fluent.Tertiary),
+                Child = Fluent.Label(KeyLabels.Show($"Ctrl+{shortcut.Number}"), 11, selected ? Fluent.AccentText : (shortcut.IsSlot ? Fluent.Accent : Fluent.Tertiary),
                     shortcut.IsSlot ? FontWeights.SemiBold : FontWeights.Normal),
                 Padding = new Thickness(shortcut.IsSlot ? 5 : 0, 1, shortcut.IsSlot ? 5 : 0, 1),
                 CornerRadius = new CornerRadius(4),
@@ -1022,7 +1022,7 @@ public sealed partial class QuickPanelWindow : Window
         for (var n = QuickSlots.First; n <= QuickSlots.Last; n++)
         {
             var slot = n;
-            slots.Items.Add(Item($"Ctrl+{slot}", () => { Model.Select(entry.Id); Model.AssignSelection(slot); }));
+            slots.Items.Add(Item(KeyLabels.Show($"Ctrl+{slot}"), () => { Model.Select(entry.Id); Model.AssignSelection(slot); }));
         }
         menu.Items.Add(slots);
         if (ShareMenu(entry, Focus) is { } share) menu.Items.Add(share);
@@ -1053,7 +1053,7 @@ public sealed partial class QuickPanelWindow : Window
                     Focus();   // right-clicking one of several selected items previews them all
                     Model.OpenPreview();
                 });
-                preview.InputGestureText = "Ctrl+Y";
+                preview.InputGestureText = KeyLabels.Show("Ctrl+Y");
                 menu.Items.Add(preview);
             }
             menu.Items.Add(Item(item.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
@@ -1813,8 +1813,8 @@ public sealed partial class QuickPanelWindow : Window
             return b;
         }
         if (run.Error?.NeedsSettings == true) _aiButtons.Children.Add(Make("Open Settings…", () => { _services.ClosePanel(); _services.OpenSettings("AI"); }, true, ""));
-        if (!Model.IsSelectionMode) _aiButtons.Children.Add(Make("Replace Item", Model.ReplaceItemWithAIOutput, run.IsFinished, "Ctrl+R"));
-        _aiButtons.Children.Add(Make("Copy", Model.CopyAIOutput, run.Output.Length > 0, "Ctrl+C"));
+        if (!Model.IsSelectionMode) _aiButtons.Children.Add(Make("Replace Item", Model.ReplaceItemWithAIOutput, run.IsFinished, KeyLabels.Show("Ctrl+R")));
+        _aiButtons.Children.Add(Make("Copy", Model.CopyAIOutput, run.Output.Length > 0, KeyLabels.Show("Ctrl+C")));
         _aiButtons.Children.Add(Make(Model.IsSelectionMode ? "Replace Selection" : "Paste", Model.PasteAIOutput, run.IsFinished, "Enter"));
     }
 
@@ -1822,7 +1822,7 @@ public sealed partial class QuickPanelWindow : Window
     {
         _notice.Text = Model.Notice ?? "";
         _syncStatus.Update();
-        _hints.Text = Model.Mode switch
+        _hints.Text = KeyLabels.Hints(Model.Mode switch
         {
             PanelMode.Browse when Model.ShowsPeople => Model.SelectedPerson switch
             {
@@ -1857,6 +1857,6 @@ public sealed partial class QuickPanelWindow : Window
             PanelMode.Actions => "↑↓ Choose    Enter Run    Esc Back",
             PanelMode.AI => "Enter Paste    Ctrl+C Copy    Ctrl+R Replace Item    Esc Back",
             _ => "Enter Save    Esc Back",
-        };
+        });
     }
 }

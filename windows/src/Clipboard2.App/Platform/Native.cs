@@ -23,6 +23,14 @@ public static partial class Native
 
     // MARK: Windows & focus
 
+    // MARK: Keyboard layout
+
+    public const uint MAPVK_VK_TO_VSC = 0, MAPVK_VK_TO_CHAR = 2;
+    [DllImport("user32.dll")] public static extern IntPtr GetKeyboardLayout(uint threadId);
+    [DllImport("user32.dll")] public static extern IntPtr ActivateKeyboardLayout(IntPtr layout, uint flags);
+    [DllImport("user32.dll")] public static extern uint MapVirtualKeyEx(uint code, uint mapType, IntPtr layout);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetKeyNameText(int lParam, StringBuilder buffer, int size);
+
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);

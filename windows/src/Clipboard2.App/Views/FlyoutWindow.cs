@@ -210,7 +210,7 @@ public sealed class FlyoutWindow : Window
         for (var n = QuickSlots.First; n <= QuickSlots.Last; n++)
         {
             var slot = n;
-            slots.Items.Add(Item($"Ctrl+{slot}", () =>
+            slots.Items.Add(Item(KeyLabels.Show($"Ctrl+{slot}"), () =>
             {
                 if (!item.IsPinned) _services.Store.TogglePin(item);
                 _services.Slots.Assign(SlotTarget.ForClip(item.Id), slot);
