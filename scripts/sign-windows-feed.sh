@@ -69,7 +69,14 @@ if [[ $WAIT == 1 ]]; then
     sleep 10
   done
   [[ -n "$RUN" ]] || { echo "✗ No GitHub build found for $TAG."; exit 1; }
-  gh run watch "$RUN" -R "$REPO" --exit-status >/dev/null || { echo "✗ The GitHub build failed: gh run view $RUN -R $REPO"; exit 1; }
+  # gh run watch also gives up on a passing GitHub API error (a 502), so the run's own result decides.
+  until gh run watch "$RUN" -R "$REPO" --exit-status >/dev/null 2>&1; do
+    case "$(gh run view "$RUN" -R "$REPO" --json status,conclusion -q '.status + "/" + .conclusion' 2>/dev/null)" in
+      completed/success) break ;;
+      completed/*) echo "✗ The GitHub build failed: gh run view $RUN -R $REPO"; exit 1 ;;
+      *) sleep 10 ;;   # still running, or GitHub didn't answer: watch again
+    esac
+  done
 fi
 
 WORK=$(mktemp -d)
