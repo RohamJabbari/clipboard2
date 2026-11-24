@@ -133,6 +133,10 @@ public sealed class AppServices : IPanelHost
 
     public void Start(bool background)
     {
+        // Our windows are Window subclasses, which the Fluent theme's implicit Window style doesn't reach: without
+        // this their text inherits the Win32 system text colour, which can be white on a light window.
+        EventManager.RegisterClassHandler(typeof(Window), FrameworkElement.LoadedEvent, new RoutedEventHandler((sender, _) =>
+            ((Window)sender).SetResourceReference(System.Windows.Controls.Control.ForegroundProperty, "TextFillColorPrimaryBrush")));
         KeyNames.Refresh(Native.GetForegroundWindow());
         ApplyAppearance();
         _listener.Changed += OnClipboardChanged;
@@ -237,13 +241,27 @@ public sealed class AppServices : IPanelHost
 
     public void ApplyAppearance()
     {
-        Application.Current.ThemeMode = Settings.Appearance switch
+        // "System" is resolved here rather than left to WPF, so the theme and our own brushes (Fluent.IsDark)
+        // always agree; a change in Windows' setting re-applies it.
+        var dark = Settings.Appearance switch
         {
-            AppearanceMode.Light => ThemeMode.Light,
-            AppearanceMode.Dark => ThemeMode.Dark,
-            _ => ThemeMode.System,
+            AppearanceMode.Light => false,
+            AppearanceMode.Dark => true,
+            _ => Fluent.SystemUsesDarkTheme(),
         };
+        Application.Current.ThemeMode = dark ? ThemeMode.Dark : ThemeMode.Light;
+        if (!_watchingSystemTheme)
+        {
+            _watchingSystemTheme = true;
+            Microsoft.Win32.SystemEvents.UserPreferenceChanged += (_, e) =>
+            {
+                if (e.Category == Microsoft.Win32.UserPreferenceCategory.General && Settings.Appearance == AppearanceMode.System)
+                    Dispatcher.BeginInvoke(ApplyAppearance);
+            };
+        }
     }
+
+    private bool _watchingSystemTheme;
 
     public void RunMaintenance()
     {

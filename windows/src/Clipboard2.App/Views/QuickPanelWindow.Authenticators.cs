@@ -93,7 +93,7 @@ public sealed partial class QuickPanelWindow
             Text = text is null ? "––– –––" : Totp.Grouped(text),
             FontFamily = new FontFamily("Cascadia Mono, Consolas"), FontSize = size, FontWeight = FontWeights.SemiBold,
             VerticalAlignment = VerticalAlignment.Center,
-            Foreground = selected ? Fluent.AccentText : text is null ? Fluent.Tertiary : (Brush)Application.Current.Resources[SystemColors.ControlTextBrushKey],
+            Foreground = selected ? Fluent.AccentText : text is null ? Fluent.Tertiary : Fluent.Primary,
         };
         var ring = new CountdownRing(detail ? 22 : 14, selected ? Fluent.Subtle : Fluent.Separator, selected ? Fluent.AccentText : Fluent.Accent)
         {

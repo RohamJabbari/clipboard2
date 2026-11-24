@@ -103,6 +103,16 @@ public sealed partial class QuickPanelWindow : Window
         content.Children.Add(_detail);
 
         var footer = new DockPanel { Margin = new Thickness(16, 7, 16, 8) };
+        // The search row and the footer move the panel, as a title bar would (the box and buttons keep their clicks).
+        foreach (var handle in new Panel[] { searchRow, footer })
+        {
+            handle.Background = Brushes.Transparent;   // hit-testable empty space
+            handle.MouseLeftButtonDown += (_, e) =>
+            {
+                if (e.ButtonState != MouseButtonState.Pressed) return;
+                try { DragMove(); } catch (InvalidOperationException) { }
+            };
+        }
         _syncStatus = new SyncStatusBadge(services.Sync);
         DockPanel.SetDock(_notice, Dock.Right);
         DockPanel.SetDock(_syncStatus, Dock.Right);
@@ -1384,7 +1394,7 @@ public sealed partial class QuickPanelWindow : Window
             row.Background = picked ? Fluent.Accent : Brushes.Transparent;
             check.Text = picked ? "\uE73A" : "\uE739";
             check.Foreground = picked ? Fluent.AccentText : Fluent.Tertiary;
-            name.Foreground = picked ? Fluent.AccentText : (Brush)Application.Current.Resources[SystemColors.ControlTextBrushKey];
+            name.Foreground = picked ? Fluent.AccentText : Fluent.Primary;
             folder.Foreground = picked ? Fluent.AccentText : Fluent.Secondary;
             AutomationName(row, System.IO.Path.GetFileName(path) + (picked ? ", picked" : ""));
         }
