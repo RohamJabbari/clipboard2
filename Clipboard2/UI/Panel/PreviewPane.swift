@@ -64,7 +64,12 @@ struct PreviewPane: View {
         case .snippet(let snippet):
             TextPreviewView(text: snippet.body, placeholders: true)
         case .secret(let ref):
-            SecretPreviewView(ref: ref, onEdit: onEditSecret.map { edit in { edit(ref) } })
+            if ref.isPassword {
+                PasswordPreview(ref: ref, onEdit: onEditSecret.map { edit in { edit(ref) } },
+                                onUse: { model?.noteAuthUse(entry) })
+            } else {
+                SecretPreviewView(ref: ref, onEdit: onEditSecret.map { edit in { edit(ref) } })
+            }
         case .folder, .authenticator, .authenticatorSuggestion:
             EmptyView()   // these have their own previews (FolderPreview, AuthenticatorPreview)
         }

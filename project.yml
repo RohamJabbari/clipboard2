@@ -35,6 +35,11 @@ targets:
     platform: macOS
     sources:
       - path: Clipboard2
+        excludes:
+          - Resources/PublicSuffixList.dat
+      # Trimmed public suffix list for grouping Auth by site (AuthSources.swift).
+      - path: Clipboard2/Resources/PublicSuffixList.dat
+        buildPhase: resources
     info:
       path: Clipboard2/Info.plist
       properties:

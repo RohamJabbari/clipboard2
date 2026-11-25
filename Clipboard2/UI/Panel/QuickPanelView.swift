@@ -222,6 +222,8 @@ struct QuickPanelView: View {
                             ForEach(Array(model.entries.enumerated()), id: \.element.id) { index, entry in
                                 if let title = model.sectionStarts[entry.id] {
                                     SectionHeading(title: title, isFirst: index == 0)
+                                } else if let heading = model.authSourceStarts[entry.id] {
+                                    AuthSourceHeader(heading: heading, isFirst: index == 0)
                                 }
                                 if let folder = entry.folder {
                                     FolderDropRow(entry: entry, folder: folder, model: model)
@@ -1032,7 +1034,7 @@ struct PanelRow: View {
             if item.label == nil, let hiddenKind { return SensitiveText.masked(item.text, kind: hiddenKind) }
             return item.displayTitle
         case .snippet(let snippet): return snippet.name.isEmpty ? "Untitled Snippet" : snippet.name
-        case .secret(let ref): return ref.name
+        case .secret(let ref): return ref.username ?? ref.name
         case .folder(let folder): return folder.name
         case .authenticator(let item): return item.title
         case .authenticatorSuggestion: return "Add to Authenticator"
@@ -1091,8 +1093,10 @@ struct PanelRow: View {
             return [item.sourceAppName, item.lastCopiedAt.shortRelative].compactMap { $0 }.joined(separator: " · ")
         case .snippet(let snippet):
             return snippet.keyword.isEmpty ? "Snippet" : "Snippet · \(snippet.keyword)"
-        case .secret:
-            return "Secret · ••••••••"
+        case .secret(let ref):
+            // A password shows its username as the title; its name goes here.
+            if ref.username != nil { return "\(ref.name) · ••••••••" }
+            return ref.isPassword ? "Password · ••••••••" : "Secret · ••••••••"
         case .folder:
             return FolderCaption.text(folders: subfolderCount, items: folderCount)
         case .authenticator(let item): return item.subtitle
@@ -1108,7 +1112,9 @@ struct PanelRow: View {
             }
             return item.accessibilityDescription
         case .snippet(let snippet): return "Snippet \(snippet.name)"
-        case .secret(let ref): return "Secret \(ref.name)"
+        case .secret(let ref):
+            if ref.isPassword { return "Password \(ref.name)" + (ref.username.map { ", \($0)" } ?? "") }
+            return "Secret \(ref.name)"
         case .folder(let folder):
             return "Folder \(folder.name)" + (folder.label.map { ", label \($0)" } ?? "")
                 + ", " + FolderCaption.text(folders: subfolderCount, items: folderCount)

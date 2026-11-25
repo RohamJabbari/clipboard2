@@ -50,7 +50,7 @@ struct SavedHeader: View {
     }
 }
 
-/// Above the Auth list: what it holds, and New Authenticator.
+/// Above the Auth list: what it holds, and + → New Password… / New Secret… / New Authenticator….
 struct AuthHeader: View {
     let model: PanelViewModel
 
@@ -61,14 +61,18 @@ struct AuthHeader: View {
                 .fontWeight(.semibold)
                 .padding(.horizontal, 5)
             Spacer(minLength: 4)
-            Button {
-                model.beginAddAuthenticator()
+            Menu {
+                Button("New Password…") { model.beginNewPassword() }
+                Button("New Secret…") { model.beginNewSecret() }
+                Button("New Authenticator…") { model.beginAddAuthenticator() }
             } label: {
                 Image(systemName: "plus")
             }
-            .buttonStyle(.borderless)
-            .help("New Authenticator…")
-            .accessibilityLabel("New Authenticator")
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("New Password, Secret or Authenticator")
+            .accessibilityLabel("New")
         }
         .font(.callout)
         .lineLimit(1)

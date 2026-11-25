@@ -1,0 +1,533 @@
+// Clipboard2: a trimmed copy of the Public Suffix List (https://publicsuffix.org/list/),
+// Mozilla Public License 2.0. Only multi-label suffixes are listed: every single-label TLD is
+// covered by the list's default rule ("*"). Format as upstream: one rule per line, "*." wildcards,
+// "!" exceptions, "//" comments.
+
+// ===BEGIN ICANN DOMAINS===
+
+// ae
+co.ae
+net.ae
+org.ae
+ac.ae
+gov.ae
+sch.ae
+
+// ar
+com.ar
+edu.ar
+gob.ar
+gov.ar
+int.ar
+net.ar
+org.ar
+tur.ar
+
+// at
+ac.at
+co.at
+gv.at
+or.at
+sth.ac.at
+
+// au
+com.au
+net.au
+org.au
+edu.au
+gov.au
+asn.au
+id.au
+csiro.au
+
+// bd
+*.bd
+
+// be
+ac.be
+
+// br
+adm.br
+art.br
+blog.br
+com.br
+dev.br
+eco.br
+edu.br
+eng.br
+gov.br
+ind.br
+inf.br
+log.br
+net.br
+org.br
+tec.br
+tv.br
+
+// ca
+ab.ca
+bc.ca
+mb.ca
+nb.ca
+nf.ca
+nl.ca
+ns.ca
+nt.ca
+nu.ca
+on.ca
+pe.ca
+qc.ca
+sk.ca
+yk.ca
+gc.ca
+
+// ch
+// (none)
+
+// ck
+*.ck
+!www.ck
+
+// cl
+co.cl
+gob.cl
+gov.cl
+mil.cl
+
+// cn
+ac.cn
+com.cn
+edu.cn
+gov.cn
+net.cn
+org.cn
+mil.cn
+
+// co
+arts.co
+com.co
+edu.co
+firm.co
+gov.co
+info.co
+int.co
+mil.co
+net.co
+nom.co
+org.co
+rec.co
+web.co
+
+// cy
+ac.cy
+biz.cy
+com.cy
+gov.cy
+net.cy
+org.cy
+
+// eg
+com.eg
+edu.eg
+eun.eg
+gov.eg
+mil.eg
+name.eg
+net.eg
+org.eg
+sci.eg
+
+// er
+*.er
+
+// es
+com.es
+nom.es
+org.es
+gob.es
+edu.es
+
+// fk
+*.fk
+
+// fr
+asso.fr
+com.fr
+gouv.fr
+nom.fr
+prd.fr
+tm.fr
+
+// gr
+com.gr
+edu.gr
+net.gr
+org.gr
+gov.gr
+
+// hk
+com.hk
+edu.hk
+gov.hk
+idv.hk
+net.hk
+org.hk
+
+// id
+ac.id
+biz.id
+co.id
+go.id
+mil.id
+my.id
+net.id
+or.id
+sch.id
+web.id
+
+// il
+ac.il
+co.il
+gov.il
+idf.il
+k12.il
+muni.il
+net.il
+org.il
+
+// in
+co.in
+firm.in
+net.in
+org.in
+gen.in
+ind.in
+ac.in
+edu.in
+res.in
+gov.in
+mil.in
+
+// it
+gov.it
+edu.it
+
+// jm
+*.jm
+
+// jp
+ac.jp
+ad.jp
+co.jp
+ed.jp
+go.jp
+gr.jp
+lg.jp
+ne.jp
+or.jp
+
+// ke
+ac.ke
+co.ke
+go.ke
+info.ke
+me.ke
+mobi.ke
+ne.ke
+or.ke
+sc.ke
+
+// kr
+ac.kr
+co.kr
+es.kr
+go.kr
+hs.kr
+kg.kr
+mil.kr
+ms.kr
+ne.kr
+or.kr
+pe.kr
+re.kr
+sc.kr
+
+// mm
+*.mm
+
+// mt
+com.mt
+edu.mt
+net.mt
+org.mt
+
+// mx
+com.mx
+org.mx
+gob.mx
+edu.mx
+net.mx
+
+// my
+biz.my
+com.my
+edu.my
+gov.my
+mil.my
+name.my
+net.my
+org.my
+
+// ng
+com.ng
+edu.ng
+gov.ng
+i.ng
+mil.ng
+mobi.ng
+name.ng
+net.ng
+org.ng
+sch.ng
+
+// np
+*.np
+
+// nz
+ac.nz
+co.nz
+cri.nz
+geek.nz
+gen.nz
+govt.nz
+health.nz
+iwi.nz
+kiwi.nz
+maori.nz
+mil.nz
+net.nz
+org.nz
+parliament.nz
+school.nz
+
+// pe
+edu.pe
+gob.pe
+nom.pe
+mil.pe
+org.pe
+com.pe
+net.pe
+
+// pg
+*.pg
+
+// ph
+com.ph
+net.ph
+org.ph
+gov.ph
+edu.ph
+ngo.ph
+mil.ph
+i.ph
+
+// pk
+com.pk
+net.pk
+edu.pk
+org.pk
+fam.pk
+biz.pk
+web.pk
+gov.pk
+gob.pk
+gok.pk
+gon.pk
+gop.pk
+gos.pk
+info.pk
+
+// pl
+com.pl
+net.pl
+org.pl
+info.pl
+waw.pl
+gov.pl
+biz.pl
+edu.pl
+
+// pt
+com.pt
+edu.pt
+gov.pt
+int.pt
+net.pt
+nome.pt
+org.pt
+publ.pt
+
+// sa
+com.sa
+net.sa
+org.sa
+gov.sa
+med.sa
+pub.sa
+edu.sa
+sch.sa
+
+// sg
+com.sg
+net.sg
+org.sg
+gov.sg
+edu.sg
+per.sg
+
+// th
+ac.th
+co.th
+go.th
+in.th
+mi.th
+net.th
+or.th
+
+// tr
+av.tr
+bbs.tr
+bel.tr
+biz.tr
+com.tr
+dr.tr
+edu.tr
+gen.tr
+gov.tr
+info.tr
+k12.tr
+kep.tr
+mil.tr
+name.tr
+net.tr
+org.tr
+pol.tr
+tel.tr
+tv.tr
+web.tr
+
+// tw
+edu.tw
+gov.tw
+mil.tw
+com.tw
+net.tw
+org.tw
+idv.tw
+game.tw
+ebiz.tw
+club.tw
+
+// ua
+com.ua
+edu.ua
+gov.ua
+in.ua
+net.ua
+org.ua
+
+// uk
+ac.uk
+co.uk
+gov.uk
+ltd.uk
+me.uk
+net.uk
+nhs.uk
+org.uk
+plc.uk
+police.uk
+*.sch.uk
+
+// us
+dni.us
+fed.us
+isa.us
+kids.us
+nsn.us
+
+// uy
+com.uy
+edu.uy
+gub.uy
+mil.uy
+net.uy
+org.uy
+
+// ve
+co.ve
+com.ve
+edu.ve
+gob.ve
+gov.ve
+info.ve
+mil.ve
+net.ve
+org.ve
+web.ve
+
+// vn
+ac.vn
+biz.vn
+com.vn
+edu.vn
+gov.vn
+health.vn
+info.vn
+int.vn
+name.vn
+net.vn
+org.vn
+pro.vn
+
+// za
+ac.za
+co.za
+edu.za
+gov.za
+law.za
+mil.za
+net.za
+nom.za
+org.za
+school.za
+web.za
+
+// ===END ICANN DOMAINS===
+// ===BEGIN PRIVATE DOMAINS===
+
+appspot.com
+azurewebsites.net
+blogspot.com
+cloudfront.net
+elasticbeanstalk.com
+firebaseapp.com
+fly.dev
+github.io
+githubusercontent.com
+gitlab.io
+glitch.me
+herokuapp.com
+myshopify.com
+netlify.app
+ngrok.io
+ngrok-free.app
+onrender.com
+pages.dev
+s3.amazonaws.com
+vercel.app
+web.app
+workers.dev
+
+// ===END PRIVATE DOMAINS===

@@ -286,6 +286,12 @@ struct AuthenticatorPreview: View {
             switch item {
             case .owned(let authenticator):
                 GridRow { Text("Owner").foregroundStyle(.secondary); Text("You") }
+                if !authenticator.urls.isEmpty {
+                    GridRow {
+                        Text("Website").foregroundStyle(.secondary)
+                        Text(authenticator.urls.joined(separator: ", ")).lineLimit(2).textSelection(.enabled)
+                    }
+                }
                 GridRow {
                     Text("People").foregroundStyle(.secondary)
                     Text(peopleText(model.shareCount(of: item)))
@@ -430,7 +436,7 @@ struct AuthenticatorFormView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label(form.isRename ? "Rename Authenticator" : "New Authenticator", systemImage: "lock.shield")
+            Label(form.isRename ? "Edit Authenticator" : "New Authenticator", systemImage: "lock.shield")
                 .font(.headline)
             if form.showsTip {
                 Label("Keep your most important 2FA codes on your phone too. Clipboard2 is convenient, but it puts the password and the code in one place.",
@@ -443,6 +449,7 @@ struct AuthenticatorFormView: View {
                 TextField("Issuer", text: $form.issuer, prompt: Text("e.g. GitHub"))
                     .focused($focus, equals: .issuer)
                 TextField("Account", text: $form.account, prompt: Text("e.g. me@example.com"))
+                TextField("Website", text: $form.website, prompt: Text("Optional, e.g. github.com"))
                 if form.asksForSecret {
                     TextField("Setup key", text: $form.secret, prompt: Text("Base32, e.g. JBSW Y3DP EHPK 3PXP"))
                         .font(.body.monospaced())

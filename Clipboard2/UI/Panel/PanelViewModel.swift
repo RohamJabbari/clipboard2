@@ -369,7 +369,7 @@ nonisolated enum AuthenticatorAction: String, Hashable, Sendable {
 
     var title: String {
         switch self {
-        case .rename: "Rename…"
+        case .rename: "Edit…"
         case .share: "Share…"
         case .people: "People…"
         case .transfer: "Transfer Ownership…"
@@ -404,6 +404,8 @@ final class AuthenticatorFormState {
     let purpose: Purpose
     var issuer: String
     var account: String
+    /// Edit → Website: the site(s) it's for, comma-separated; they pick its source in Auth.
+    var website = ""
     var secret = ""
     var algorithm: OTPAlgorithm
     var digits: Int
@@ -436,6 +438,12 @@ final class AuthenticatorFormState {
         self.init(purpose: .rename(id: authenticator.id))
         issuer = authenticator.issuer
         account = authenticator.account
+        website = authenticator.urls.joined(separator: ", ")
+    }
+
+    /// The sites typed into Website.
+    var websites: [String] {
+        SecretExtras.cleanURLs(website.split(whereSeparator: { $0 == "," || $0 == " " || $0.isNewline }).map(String.init))
     }
 
     var isRename: Bool { if case .rename = purpose { true } else { false } }
@@ -518,20 +526,91 @@ final class SaveSecretState {
     }
 }
 
-/// Name and value of a secret, filled in after Touch ID. The value lives only as long as the form.
+/// New Password…, New Secret… and Edit on either: name, value, and a password's sites, username
+/// and notes. An existing one is filled in after Touch ID; the value lives only as long as the form.
 @Observable
 final class EditSecretState {
-    let ref: SecretRef
+    enum Kind: Equatable { case password, secret }
+
+    /// Nil while it's new.
+    let ref: SecretRef?
+    let kind: Kind
     let originalValue: String
+    let originalNotes: String
     var name: String
     var value: String
+    var username: String
+    /// One row per site; an empty last row is where the next one is typed.
+    var sites: [String]
+    var notes: String
+    var showsGeneratorOptions = false
+    var generator = PasswordGenerator.Options()
+    var error: String?
 
-    init(ref: SecretRef, value: String) {
+    init(ref: SecretRef, value: String, notes: String? = nil) {
         self.ref = ref
-        self.originalValue = value
-        self.name = ref.name
+        kind = ref.isPassword ? .password : .secret
+        originalValue = value
+        originalNotes = notes ?? ""
+        name = ref.name
         self.value = value
+        username = ref.username ?? ""
+        sites = ref.urls.isEmpty ? [""] : ref.urls
+        self.notes = notes ?? ""
     }
+
+    init(new kind: Kind) {
+        ref = nil
+        self.kind = kind
+        originalValue = ""
+        originalNotes = ""
+        name = ""
+        value = ""
+        username = ""
+        sites = [""]
+        notes = ""
+    }
+
+    var isNew: Bool { ref == nil }
+
+    var title: String {
+        switch (isNew, kind) {
+        case (true, .password): "New Password"
+        case (true, .secret): "New Secret"
+        case (false, .password): "Edit Password"
+        case (false, .secret): "Edit Secret"
+        }
+    }
+
+    /// A new secret asks only for a name and a value; everything else shows sites and username.
+    var showsPasswordFields: Bool { kind == .password || !isNew }
+
+    var cleanSites: [String] { SecretExtras.cleanURLs(sites) }
+
+    func addSite() {
+        if sites.last?.trimmingCharacters(in: .whitespaces).isEmpty != true { sites.append("") }
+    }
+
+    func removeSite(at index: Int) {
+        guard sites.indices.contains(index) else { return }
+        sites.remove(at: index)
+        if sites.isEmpty { sites = [""] }
+    }
+
+    func generate() {
+        value = PasswordGenerator.generate(generator)
+    }
+
+    /// The name to save under: as typed, or for a password its site, else its username.
+    var resolvedName: String {
+        let typed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !typed.isEmpty || !showsPasswordFields { return typed }
+        if let site = cleanSites.first { return AuthSource.domain(ofSite: site) ?? site }
+        let user = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        return user.isEmpty ? (kind == .password ? "Password" : "") : user
+    }
+
+    var canSave: Bool { !resolvedName.isEmpty && !value.isEmpty }
 }
 
 /// Picks the sync group that the selected items are copied into.
@@ -903,6 +982,8 @@ final class PanelViewModel {
     private(set) var entries: [PanelEntry] = []
     /// Date headings ("Today", "Yesterday"…) keyed by the first row under each; empty while searching.
     private(set) var sectionStarts: [String: String] = [:]
+    /// Auth's source headings, keyed by the first row under each (nil source: "No website"); empty while searching.
+    private(set) var authSourceStarts: [String: AuthSourceHeading] = [:]
     /// ⌘ is down: every row shows its ⌘-number, not just the selected one.
     var isCommandHeld = false
     /// Which tip the hint bar shows; moves on with every open.
@@ -1335,9 +1416,16 @@ final class PanelViewModel {
         // Groups without a group to show (none yet) lists nothing.
 
         var result: [PanelEntry]
+        var authStarts: [String: AuthSourceHeading] = [:]
         if q.isEmpty && authView {
-            result = secrets.map(PanelEntry.secret) + authenticators.map(PanelEntry.authenticator)
-            result.sort { Self.authTitle($0).localizedStandardCompare(Self.authTitle($1)) == .orderedAscending }
+            // Grouped by source, the most recently used first; "No website" last.
+            let groups = Self.authGroups(secrets: secrets, authenticators: authenticators,
+                                         lastUsed: AuthSourceUsage.shared.lastUsed)
+            result = []
+            for group in groups {
+                if let first = group.items.first { authStarts[first.id] = AuthSourceHeading(source: group.source) }
+                result += group.items
+            }
         } else if q.isEmpty && savedView {
             let kept = clips.map(PanelEntry.clip) + secrets.map(PanelEntry.secret) + snippets.map(PanelEntry.snippet)
                 + authenticators.map(PanelEntry.authenticator)
@@ -1376,14 +1464,14 @@ final class PanelViewModel {
                 }
             }
             for secret in secrets {
-                // Only names are searchable — values never leave the keychain for search.
-                if let s = FuzzyMatcher.score(query: q, in: secret.name) {
+                // Names, usernames and sites only — values never leave the keychain for search.
+                if let s = FuzzyMatcher.score(query: q, in: Self.authSearchText(secret)) {
                     scored.append((.secret(secret), s + 500, secret.createdAt ?? .distantPast))
                 }
             }
             for item in authenticators {
-                // Issuer and account only; never the secret.
-                if let s = FuzzyMatcher.score(query: q, in: item.searchText) {
+                // Issuer, account and sites only; never the secret.
+                if let s = FuzzyMatcher.score(query: q, in: Self.authSearchText(item)) {
                     scored.append((.authenticator(item), s + 500, item.createdAt))
                 }
             }
@@ -1392,6 +1480,7 @@ final class PanelViewModel {
         }
 
         entries = Array(result.prefix(Self.maxEntries))
+        authSourceStarts = authStarts
         sectionStarts = q.isEmpty && !authView ? Self.dateSections(entries, date: savedView ? { $0.folder == nil ? $0.savedDate : nil }
                                                                          : { $0.clip?.lastCopiedAt ?? $0.secret?.createdAt }) : [:]
         if resetSelection || !userMovedSelection || !entries.contains(where: { $0.id == selectedID }) {
@@ -1409,13 +1498,44 @@ final class PanelViewModel {
         return (secrets, env.authenticators.items)
     }
 
-    /// Auth sorts by name.
+    /// Auth's rows by source (docs/features/auth-autofill.md → Sources).
+    static func authGroups(secrets: [SecretRef], authenticators: [AuthenticatorItem],
+                           lastUsed: [String: Date]) -> [AuthSourceGroup<PanelEntry>] {
+        let entries = secrets.map(PanelEntry.secret) + authenticators.map(PanelEntry.authenticator)
+        return AuthSourceGrouping.group(entries, source: authSource(of:), title: authTitle, lastUsed: lastUsed)
+    }
+
+    /// The source a row in Auth sits under.
+    static func authSource(of entry: PanelEntry) -> AuthSource? {
+        switch entry {
+        case .secret(let ref): AuthSource.of(ref)
+        case .authenticator(let item): AuthSource.of(item)
+        default: nil
+        }
+    }
+
+    /// Within a source: a password by its username, a secret by its name, an authenticator by its title.
     private static func authTitle(_ entry: PanelEntry) -> String {
         switch entry {
-        case .secret(let ref): ref.name
+        case .secret(let ref): ref.username ?? ref.name
         case .authenticator(let item): item.title
         default: ""
         }
+    }
+
+    /// What search sees of a secret or password: never its value or notes.
+    static func authSearchText(_ ref: SecretRef) -> String {
+        ([ref.name, ref.username ?? "", AuthSource.of(ref)?.name ?? ""] + ref.urls).joined(separator: " ")
+    }
+
+    /// What search sees of an authenticator: never its secret or codes.
+    static func authSearchText(_ item: AuthenticatorItem) -> String {
+        ([item.searchText, AuthSource.of(item)?.name ?? ""] + item.urls).joined(separator: " ")
+    }
+
+    /// Pasting or copying from a source moves it to the top of Auth.
+    func noteAuthUse(_ entry: PanelEntry) {
+        AuthSourceUsage.shared.record(Self.authSource(of: entry))
     }
 
     /// Today, Yesterday, This Week, Earlier: the first row of each, in list (newest-first) order.
@@ -1654,6 +1774,7 @@ final class PanelViewModel {
             }
         case .secret(let ref):
             let target = targetApp
+            noteAuthUse(entry)
             onClose()
             env.pasteSecret(ref, into: target)
         case .folder(let folder):
@@ -1683,6 +1804,7 @@ final class PanelViewModel {
             showNotice("No code right now")
             return
         }
+        noteAuthUse(.authenticator(item))
         let target = targetApp
         let left = Double(item.period) - now.timeIntervalSince1970.truncatingRemainder(dividingBy: Double(item.period))
         let nextStart = now.addingTimeInterval(left)
@@ -1709,6 +1831,7 @@ final class PanelViewModel {
             showNotice("No code right now")
             return
         }
+        noteAuthUse(.authenticator(item))
         env.copyCode(code)
         onClose()
     }
@@ -1746,18 +1869,18 @@ final class PanelViewModel {
                 form.error = "Enter an issuer or an account."
                 return
             }
-            env.authenticators.rename(id: id, issuer: issuer, account: account)
+            env.authenticators.rename(id: id, issuer: issuer, account: account, urls: form.websites)
             resetMode()
             refresh()
             selectedID = "a-o-" + id
-            showNotice("Renamed")
+            showNotice("Saved")
         case .add:
             switch form.makeAccount() {
             case .failure(let problem):
                 form.error = problem.message
                 NSSound.beep()
             case .success(let account):
-                guard let added = env.authenticators.add(account) else {
+                guard let added = env.authenticators.add(account, urls: form.websites) else {
                     form.error = "Couldn't save to the Keychain."
                     return
                 }
@@ -2084,20 +2207,50 @@ final class PanelViewModel {
 
     /// Opens the edit form once the value has been unlocked.
     func showEditSecret(_ ref: SecretRef, value: String) {
-        editSecretForm = EditSecretState(ref: ref, value: value)
+        editSecretForm = EditSecretState(ref: ref, value: value, notes: env.secrets.notes(of: ref))
+        mode = .editSecret
+    }
+
+    /// Auth's + menu: New Password… / New Secret…, in the right pane.
+    func beginNewPassword() {
+        editSecretForm = EditSecretState(new: .password)
+        mode = .editSecret
+    }
+
+    func beginNewSecret() {
+        editSecretForm = EditSecretState(new: .secret)
         mode = .editSecret
     }
 
     func submitEditSecret() {
         guard let form = editSecretForm else { return }
-        let name = form.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, !form.value.isEmpty else { return }
-        if name != form.ref.name { env.secrets.rename(form.ref, to: name) }
-        if form.value != form.originalValue { env.secrets.setValue(form.value, for: form.ref) }
-        let id = selectedID
+        let name = form.resolvedName
+        guard form.canSave else {
+            form.error = !form.value.isEmpty ? "Enter a name." : form.kind == .password ? "Enter a password." : "Enter a value."
+            return
+        }
+        let username = SecretExtras.cleanUsername(form.username)
+        let notes = form.notes.isEmpty ? nil : form.notes
+        let savedID: String
+        if let ref = form.ref {
+            let notesChanged = form.notes != form.originalNotes
+            env.secrets.update(ref, name: name != ref.name ? name : nil,
+                               value: form.value != form.originalValue ? form.value : nil,
+                               username: .some(username), urls: form.cleanSites,
+                               notes: notesChanged ? .some(notes) : nil)
+            savedID = ref.id
+        } else {
+            guard let added = env.secrets.add(name: name, value: form.value, username: username, urls: form.cleanSites,
+                                              notes: notes) else {
+                form.error = "Couldn't save to the Keychain."
+                return
+            }
+            savedID = added.id
+        }
         resetMode()
         refresh()
-        selectedID = id
+        let id = "k-" + savedID
+        if entries.contains(where: { $0.id == id }) { selectedID = id }
         showNotice("Saved “\(name)”")
     }
 
@@ -2857,7 +3010,9 @@ final class PanelViewModel {
             switch entry {
             case .clip(let item) where item.isTransient: env.paste.write(text: item.text)
             case .clip(let item): copy(item)
-            case .secret(let ref): env.copySecret(ref)
+            case .secret(let ref):
+                noteAuthUse(entry)
+                env.copySecret(ref)
             case .snippet, .folder, .authenticator, .authenticatorSuggestion: break
             }
             onClose()
