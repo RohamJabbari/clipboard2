@@ -267,12 +267,13 @@ final class KeychainAuthenticatorBacking: AuthenticatorBacking {
     nonisolated static let ownedService = (Bundle.main.bundleIdentifier ?? "at.softmaze.Clippy") + ".authenticators"
     nonisolated static let sharedService = (Bundle.main.bundleIdentifier ?? "at.softmaze.Clippy") + ".sharedcodes"
 
+    /// Attributes of all items first, then each one's value: the login (file-based) Keychain refuses
+    /// kSecReturnData together with kSecMatchLimitAll (errSecParam), which left every list empty.
     private func all(service: String) -> [(account: String, generic: String?, data: Data)] {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecReturnAttributes: true,
-            kSecReturnData: true,
             kSecMatchLimit: kSecMatchLimitAll,
         ]
         var result: CFTypeRef?
@@ -280,10 +281,23 @@ final class KeychainAuthenticatorBacking: AuthenticatorBacking {
               let items = result as? [[String: Any]] else { return [] }
         return items.compactMap { attrs in
             guard let account = attrs[kSecAttrAccount as String] as? String,
-                  let data = attrs[kSecValueData as String] as? Data else { return nil }
+                  let data = value(service: service, account: account) else { return nil }
             let generic = (attrs[kSecAttrGeneric as String] as? Data).map { String(decoding: $0, as: UTF8.self) }
             return (account, generic?.isEmpty == false ? generic : nil, data)
         }
+    }
+
+    private func value(service: String, account: String) -> Data? {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+            kSecReturnData: true,
+            kSecMatchLimit: kSecMatchLimitOne,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
+        return result as? Data
     }
 
     private func write(service: String, account: String, label: String, data: Data, generic: String?) -> Bool {
