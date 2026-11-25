@@ -18,13 +18,17 @@ struct PanelKeyboardTests {
     }
 
     @Test func tabCyclesFiltersBothWays() {
-        model.filter = .all
+        model.filter = .copies
         #expect(model.handleKeyDown(key(KeyCode.tab, "\t")))
         #expect(model.filter == .labelled)
+        #expect(model.handleKeyDown(key(KeyCode.tab, "\t")))
+        #expect(model.filter == .auth)
         #expect(model.handleKeyDown(key(KeyCode.tab, "\t", flags: .shift)))
-        #expect(model.filter == .all)
         #expect(model.handleKeyDown(key(KeyCode.tab, "\t", flags: .shift)))
-        #expect(model.filter == .thisApp)
+        #expect(model.filter == .copies)
+        #expect(model.handleKeyDown(key(KeyCode.tab, "\t", flags: .shift)))
+        #expect(model.filter == (env.sync.isSignedIn ? .groups : .auth))
+        model.filter = .copies
     }
 
     @Test func escapeCloses() {
@@ -147,6 +151,7 @@ struct PanelKeyboardTests {
         #expect(actions.contains(.ai(.fixGrammar)))
         #expect(actions.contains(.transform(.uppercase)))
         #expect(!actions.contains(.delete) && !actions.contains(.removeFromLabelled) && !actions.contains(.setLabel))
+        #expect(!actions.contains(.save))
         #expect(env.store.count() == before)       // never written to history
 
         var closed = false
@@ -155,7 +160,7 @@ struct PanelKeyboardTests {
         #expect(closed)
     }
 
-    @Test func labelsAreTheOnlyWayToKeepItems() {
+    @Test func saveIsTheWayToKeepItems() {
         let plain = env.store.ingest(.text("keep-plain \(UUID())"))
         let legacy = env.store.ingest(.text("keep-legacy \(UUID())"))
         env.store.togglePin(legacy)                      // pinned before labels replaced pins
@@ -164,7 +169,7 @@ struct PanelKeyboardTests {
         model.refresh(resetSelection: true)
 
         model.selectedID = PanelEntry.clip(plain).id
-        #expect(model.availableActions.contains(.setLabel))
+        #expect(model.availableActions.contains(.save) && !model.availableActions.contains(.setLabel))
         #expect(!model.availableActions.contains(.removeFromLabelled))
         #expect(!model.availableActions.map(\.id).contains("pin"))
 

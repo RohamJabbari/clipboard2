@@ -38,7 +38,7 @@ nonisolated enum NotificationTarget: Codable, Equatable, Hashable, Sendable {
     case people(requestSpaceId: String?)
     /// Contacts → Inbox, with this entry (if any) selected.
     case inbox(entryID: String?)
-    /// Saved, with this authenticator selected.
+    /// Auth, with this authenticator selected.
     case authenticator(spaceId: String)
 
     /// Round trip through a notification's `userInfo`.

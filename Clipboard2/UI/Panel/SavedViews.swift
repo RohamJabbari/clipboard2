@@ -39,29 +39,42 @@ struct SavedHeader: View {
         .buttonStyle(.borderless)
         .help("Add from clipboard history")
         .accessibilityLabel("Add Items")
-        if model.savedSpaceID == nil && !inFolder {
-            // Your own Saved: New Folder, or an authenticator typed by hand.
-            Menu {
-                Button("New Folder", systemImage: "folder.badge.plus") { model.beginNewFolder() }
-                Button("New Authenticator…", systemImage: "lock.shield") { model.beginAddAuthenticator() }
-            } label: {
-                Image(systemName: "folder.badge.plus")
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .help("New Folder or Authenticator")
-            .accessibilityLabel("New")
-        } else {
+        Button {
+            model.beginNewFolder()
+        } label: {
+            Image(systemName: "folder.badge.plus")
+        }
+        .buttonStyle(.borderless)
+        .help(inFolder ? "New Folder Inside" : "New Folder")
+        .accessibilityLabel(inFolder ? "New Folder Inside" : "New Folder")
+    }
+}
+
+/// Above the Auth list: what it holds, and New Authenticator.
+struct AuthHeader: View {
+    let model: PanelViewModel
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Label("Auth", systemImage: "key.fill")
+                .labelStyle(.titleAndIcon)
+                .fontWeight(.semibold)
+                .padding(.horizontal, 5)
+            Spacer(minLength: 4)
             Button {
-                model.beginNewFolder()
+                model.beginAddAuthenticator()
             } label: {
-                Image(systemName: "folder.badge.plus")
+                Image(systemName: "plus")
             }
             .buttonStyle(.borderless)
-            .help(inFolder ? "New Folder Inside" : "New Folder")
-            .accessibilityLabel(inFolder ? "New Folder Inside" : "New Folder")
+            .help("New Authenticator…")
+            .accessibilityLabel("New Authenticator")
         }
+        .font(.callout)
+        .lineLimit(1)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -147,8 +160,8 @@ struct FolderNameView: View {
             Label(form.isRename ? "Rename Folder" : "New Folder", systemImage: form.isRename ? "folder" : "folder.badge.plus")
                 .font(.headline)
             Text(form.isRename ? "Folders sort by name in Saved."
-                 : form.movingCount == 0 ? (form.parent.map { "A folder inside “\($0.name)”. Drag items onto it, or use Move to Folder." }
-                                            ?? "A folder in Saved. Drag items onto it, or use Move to Folder.")
+                 : form.movingCount == 0 ? (form.parent.map { "A folder inside “\($0.name)”. Drag items onto it, or use Save…." }
+                                            ?? "A folder in Saved. Drag items onto it, or use Save….")
                  : form.copies ? "A folder in your Saved. Copies of the selected group items go into it; the group's stay as they are."
                  : form.movingCount == 1 ? "The selected item moves into it and stays saved."
                  : "The \(form.movingCount) selected items move into it and stay saved.")

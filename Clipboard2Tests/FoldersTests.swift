@@ -451,21 +451,25 @@ struct FolderPanelTests {
         #expect(model.openFolder == nil)
     }
 
-    @Test func moveToNewFolderAndDeleteFolderFromThePanel() {
+    @Test func saveIntoANewFolderAndDeleteFolderFromThePanel() {
         let tag = UUID().uuidString
         let a = env.store.ingest(.text("newfolder-a \(tag)"))
         let b = env.store.ingest(.text("newfolder-b \(tag)"))
         defer { [a, b].forEach(env.store.delete) }
         model.query = tag
         model.selectAll()
-        #expect(model.availableActions.contains(.addToSaved))
-        #expect(model.availableActions.contains(.moveToNewFolder))
+        #expect(model.availableActions.contains(.save))
+        #expect(!model.availableActions.contains(.addToSaved) && !model.availableActions.contains(.moveToNewFolder))
 
-        model.perform(.moveToNewFolder)
-        #expect(model.mode == .folderName)
-        model.folderNameForm?.name = "Batch \(tag)"
+        // Save… → New Folder under My folders: named inline, created and picked; Return saves.
+        model.perform(.save)
+        #expect(model.mode == .save)
+        model.beginSaveFormFolder(.mine)
+        model.saveForm?.newFolderName = "Batch \(tag)"
         #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
         let folder = try? #require(env.store.folders(inSpace: nil).first { $0.name == "Batch \(tag)" })
+        #expect(model.mode == .save && model.saveForm?.destination == .mine(folder?.id))
+        #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
         #expect(a.isPinned && a.folderID == folder?.id && b.folderID == folder?.id)
 
         model.query = ""
