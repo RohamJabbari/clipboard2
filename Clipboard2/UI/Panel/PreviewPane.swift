@@ -49,7 +49,7 @@ struct PreviewPane: View {
                     ImagePreviewView(item: item)
                     if let text = item.imageText, !text.isEmpty {
                         Divider()
-                        ImageTextView(text: text, onCopy: model.map { model in { model.copyImageText(text) } })
+                        ImageTextView(text: text, onCopy: model.map { model in { model.copyImageText(text) } }, model: model)
                     }
                 }
             case .file:
@@ -74,7 +74,7 @@ struct PreviewPane: View {
     private func textContent(_ item: ClipItem) -> some View {
         switch ClipContentCache.content(of: item) {
         case .plain:
-            TextPreviewView(text: item.text)
+            TextPreviewView(text: item.text, model: model)
         case .color(let color):
             ColorPreview(color: color, onPasteText: onPasteText)
         case .link(let url):
@@ -228,6 +228,8 @@ struct TextPreviewView: View {
     let text: String
     /// Snippets: `{name}` fields are shown as tokens.
     var placeholders = false
+    /// Receives the selected part of the text (Return and ⌘C use just that).
+    var model: PanelViewModel?
     static let displayLimit = 20_000
 
     /// Short single lines read better large and centred in the pane.
@@ -235,16 +237,19 @@ struct TextPreviewView: View {
 
     var body: some View {
         if isShort && !placeholders {
-            Text(text)
-                .font(.system(size: 28, weight: .medium))
-                .textSelection(.enabled)
-                .multilineTextAlignment(.leading)
+            SelectableText(text: text, font: .systemFont(ofSize: 28, weight: .medium), model: model)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 .padding(20)
-                .accessibilityLabel("Preview")
+        } else if !placeholders {
+            ScrollView {
+                SelectableText(text: displayed, font: .systemFont(ofSize: 15), lineSpacing: 3, model: model)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(16)
+            }
+            .accessibilityLabel("Preview")
         } else {
             ScrollView {
-                Text(placeholders ? Self.withPlaceholders(displayed) : AttributedString(displayed))
+                Text(Self.withPlaceholders(displayed))
                     .font(.system(size: 15))
                     .lineSpacing(3)
                     .textSelection(.enabled)
@@ -609,6 +614,8 @@ struct ImageTextView: View {
     let text: String
     /// Copies the recognised text (the header's Copy button); hidden when nil.
     var onCopy: (() -> Void)?
+    /// Receives the selected words (Return pastes and ⌘C copies just those).
+    var model: PanelViewModel?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -646,9 +653,7 @@ struct ImageTextView: View {
     private static let maxHeight: CGFloat = 110
 
     private func textBlock(_ text: String) -> some View {
-        Text(text)
-            .font(.callout)
-            .textSelection(.enabled)
+        SelectableText(text: text, font: .preferredFont(forTextStyle: .callout), model: model)
             .frame(maxWidth: .infinity, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
     }

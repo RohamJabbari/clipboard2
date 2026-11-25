@@ -329,10 +329,13 @@ struct AppearanceSettingsView: View {
                     Hint(prefs.panelOrigin.summary)
                 }
                 .padding(.vertical, 4)
-                Picker("Size", selection: $prefs.panelSize) {
-                    ForEach(PanelSize.allCases) { Text($0.title).tag($0) }
+                LabeledContent {
+                    Button("Reset Position") { prefs.resetPanelPositions() }
+                        .disabled(prefs.panelPositions.isEmpty)
+                } label: {
+                    Text("Position")
+                    Text("Drag the panel by its top bar to move it; drag an edge to resize.")
                 }
-                .pickerStyle(.segmented)
                 LabeledContent {
                     Button("Try It") { env.showQuickPanel() }
                 } label: {

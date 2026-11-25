@@ -100,7 +100,13 @@ nonisolated struct PanelGeometry: Equatable, Sendable {
         x = min(max(x, visible.minX + 8), visible.maxX - 8 - w)
         y = min(max(y, visible.minY + 8), visible.maxY - 8 - h)
         let panel = CGRect(x: x.rounded(), y: y.rounded(), width: w.rounded(), height: h.rounded())
+        return make(origin: origin, frame: panel, visible: visible)
+    }
 
+    /// For a panel resting at `frame` (a remembered or dragged place): it still emerges from the
+    /// origin's screen edge.
+    static func make(origin: PanelOrigin, frame panel: CGRect, visible: CGRect) -> PanelGeometry {
+        let w = panel.width, h = panel.height
         let offset: CGVector
         switch origin {
         case .center: offset = .zero
@@ -156,6 +162,12 @@ nonisolated struct PanelGeometry: Equatable, Sendable {
     /// The panel's frame inside the window.
     var panelInWindow: CGRect {
         panel.offsetBy(dx: -window.minX, dy: -window.minY)
+    }
+
+    /// The window at rest: just the panel and its shadow. The travel path is only needed while
+    /// it moves, and an oversized window couldn't be dragged up to the menu bar.
+    var restingWindow: CGRect {
+        panel.insetBy(dx: -Self.shadowMargin, dy: -Self.shadowMargin).integral
     }
 
     private func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat { a + (b - a) * t }

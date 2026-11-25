@@ -85,6 +85,8 @@ final class Preferences {
         static let appearance = "appearance"
         static let panelSize = "panelSize"
         static let panelOrigin = "panelOrigin"
+        static let panelFrameSize = "panelFrameSize"
+        static let panelPositions = "panelPositions"
         static let ignoredApps = "ignoredApps"
         static let appTransforms = "appTransforms"
         static let claudeModel = "claudeModel"          // legacy, migrated into aiModels
@@ -138,7 +140,23 @@ final class Preferences {
     var maxAgeMinutes: Int { didSet { defaults.set(maxAgeMinutes, forKey: Key.maxAgeMinutes) } }
     var isPaused: Bool { didSet { defaults.set(isPaused, forKey: Key.isPaused) } }
     var appearance: AppearanceMode { didSet { defaults.set(appearance.rawValue, forKey: Key.appearance) } }
-    var panelSize: PanelSize { didSet { defaults.set(panelSize.rawValue, forKey: Key.panelSize) } }
+    /// The old Small/Regular/Large setting, if the user ever picked one: it only seeds the
+    /// panel's first size.
+    @ObservationIgnored let panelSizeSeed: CGSize?
+    /// The panel's size once the user resized it (clamped again on a smaller screen).
+    var panelFrameSize: CGSize? {
+        didSet {
+            if let size = panelFrameSize {
+                defaults.set([Double(size.width), Double(size.height)], forKey: Key.panelFrameSize)
+            } else {
+                defaults.removeObject(forKey: Key.panelFrameSize)
+            }
+        }
+    }
+    /// Where the user moved the panel, per screen: its top-left corner in screen points.
+    private(set) var panelPositions: [String: CGPoint] {
+        didSet { defaults.set(panelPositions.mapValues { [Double($0.x), Double($0.y)] }, forKey: Key.panelPositions) }
+    }
     var panelOrigin: PanelOrigin { didSet { defaults.set(panelOrigin.rawValue, forKey: Key.panelOrigin) } }
     /// The icon beside text selected in other apps.
     /// The paste icon in the corner of the focused text field in other apps.
@@ -219,7 +237,6 @@ final class Preferences {
             Key.maxItems: 500,
             Key.isPaused: false,
             Key.appearance: AppearanceMode.system.rawValue,
-            Key.panelSize: PanelSize.regular.rawValue,
             Key.panelOrigin: PanelOrigin.top.rawValue,
             Key.aiProvider: AIProviderKind.claudeCode.rawValue,
             Key.customBaseURL: AIProviderKind.custom.defaultBaseURL,
@@ -243,7 +260,14 @@ final class Preferences {
         }
         isPaused = defaults.bool(forKey: Key.isPaused)
         appearance = AppearanceMode(rawValue: defaults.string(forKey: Key.appearance) ?? "") ?? .system
-        panelSize = PanelSize(rawValue: defaults.string(forKey: Key.panelSize) ?? "") ?? .regular
+        panelSizeSeed = PanelSize(rawValue: defaults.string(forKey: Key.panelSize) ?? "")?.size
+        if let size = defaults.array(forKey: Key.panelFrameSize) as? [Double], size.count == 2 {
+            panelFrameSize = CGSize(width: size[0], height: size[1])
+        } else {
+            panelFrameSize = nil
+        }
+        panelPositions = (defaults.dictionary(forKey: Key.panelPositions) as? [String: [Double]] ?? [:])
+            .compactMapValues { $0.count == 2 ? CGPoint(x: $0[0], y: $0[1]) : nil }
         panelOrigin = PanelOrigin(rawValue: defaults.string(forKey: Key.panelOrigin) ?? "") ?? .top
         pasteIcon = defaults.bool(forKey: Key.pasteIcon)
         pasteIconHiddenApps = Self.load([AppRef].self, defaults, Key.pasteIconHiddenApps) ?? []
@@ -291,6 +315,17 @@ final class Preferences {
     }
 
     var ignoredBundleIDs: Set<String> { Set(ignoredApps.map(\.bundleID)) }
+
+    func panelPosition(forScreen key: String) -> CGPoint? { panelPositions[key] }
+
+    func setPanelPosition(_ topLeft: CGPoint, forScreen key: String) {
+        if panelPositions[key] != topLeft { panelPositions[key] = topLeft }
+    }
+
+    /// Settings → Reset Position: the panel opens where its origin setting puts it again.
+    func resetPanelPositions() {
+        panelPositions = [:]
+    }
 
     func defaultTransform(for bundleID: String?) -> Transform? {
         guard let bundleID else { return nil }

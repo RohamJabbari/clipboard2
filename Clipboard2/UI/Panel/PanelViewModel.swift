@@ -859,6 +859,7 @@ final class PanelViewModel {
         didSet {
             if selectedID != oldValue {
                 clearPickedFiles()
+                if previewSelection != nil { previewSelection = nil }
                 if revealedSecretID != nil { revealedSecretID = nil }
                 if pendingDeleteID != nil { pendingDeleteID = nil }
             }
@@ -991,6 +992,7 @@ final class PanelViewModel {
         flushEditor?()
         isEditingText = false
         selectionItem = nil
+        previewSelection = nil
         clearPickedFiles()
         resetMode()
         otpClock.stop()
@@ -1102,14 +1104,60 @@ final class PanelViewModel {
         case KeyCode.escape:
             endEditing()
             return true
+        // With text selected in the editor, Return (or ⌘Return) pastes just that.
+        case KeyCode.returnKey where previewSelection != nil && !flags.contains(.shift) && !flags.contains(.option),
+             KeyCode.keypadEnter where previewSelection != nil:
+            flushEditor?()
+            pastePreviewSelection()
+            return true
         case KeyCode.returnKey where flags.contains(.command), KeyCode.keypadEnter where flags.contains(.command):
             flushEditor?()
             isEditingText = false
             activate(selectedEntry, transform: flags.contains(.option) ? .plainText : nil)
             return true
         default:
+            // ⌘C copies the selection as plain text, without a new history item.
+            if flags == .command, event.charactersIgnoringModifiers?.lowercased() == "c", previewSelection != nil {
+                copyPreviewSelection()
+                return true
+            }
             return false
         }
+    }
+
+    // MARK: Part of a text
+
+    /// Text selected in the preview pane (an item's text, or the words in an image): Return
+    /// and ⌘C use just this. Cleared when the row changes or the user clicks elsewhere.
+    var previewSelection: String?
+
+    /// Pastes the preview's selection as plain text. The clip stays as it is, and no history
+    /// item is added (the write is marked as our own).
+    func pastePreviewSelection() {
+        guard let text = previewSelection, !text.isEmpty else { return }
+        pasteText(text)
+    }
+
+    func copyPreviewSelection() {
+        guard let text = previewSelection, !text.isEmpty else { return }
+        env.paste.write(text: text)
+        showNotice("Copied selection")
+    }
+
+    // MARK: Keep Open
+
+    /// Kept open: the panel stays up after pasting, on focus loss, esc and ⇧⌘V. Not remembered.
+    var isPinned = false
+
+    /// Kept open, pastes go to whichever app the user was last in.
+    func retarget(_ app: NSRunningApplication?) {
+        guard let app, app.processIdentifier != targetApp?.processIdentifier else { return }
+        targetApp = app
+        refresh()
+    }
+
+    func focusSearch() {
+        focusToken &+= 1
     }
 
     func resetMode() {
@@ -2332,16 +2380,14 @@ final class PanelViewModel {
 
     /// Something in the selection can be shown in Quick Look (⌘Y).
     var canQuickLook: Bool {
-        quickLookEntries.contains { entry in
-            entry.clip.map { !$0.isTransient } == true && quickLookFiles.canPreview(entry)
-        }
+        quickLookEntries.contains(where: quickLookFiles.canPreview)
     }
 
     /// What Quick Look shows for the selection: every selected item, and only the picked files
-    /// of a multi-file item.
+    /// of a multi-file item. Text, links and colours (a selection from another app too) are
+    /// written to temporary files.
     func quickLookURLs() -> [URL] {
-        let entries = quickLookEntries.filter { $0.clip?.isTransient == false }
-        return quickLookFiles.urls(for: entries) { self.pickedFileURLs(for: $0) ?? $0.fileURLs }
+        quickLookFiles.urls(for: quickLookEntries) { self.pickedFileURLs(for: $0) ?? $0.fileURLs }
     }
 
     /// ⌘Y: opens Quick Look on the selection, or closes it.
@@ -3376,8 +3422,10 @@ final class PanelViewModel {
                 dismissSuggestion()
             } else if openFolderID != nil {
                 closeFolder()
-            } else {
-                onClose()
+            } else if previewSelection != nil {
+                previewSelection = nil
+            } else if !isPinned {
+                onClose()   // kept open, esc at the top level does nothing
             }
             return true
         case KeyCode.leftArrow where openFolderID != nil && query.isEmpty && !command && !shift:
@@ -3399,7 +3447,9 @@ final class PanelViewModel {
             moveSelection(by: 8, extending: shift)
             return true
         case KeyCode.returnKey, KeyCode.keypadEnter:
-            if isMultiSelecting {
+            if previewSelection != nil && !isMultiSelecting {
+                pastePreviewSelection()
+            } else if isMultiSelecting {
                 pasteSelection(transform: option ? .plainText : nil)
             } else {
                 activate(selectedEntry, transform: option ? .plainText : nil)
@@ -3434,6 +3484,9 @@ final class PanelViewModel {
                 return true
             }
             switch chars {
+            case "c" where previewSelection != nil && !shift && !option:
+                copyPreviewSelection()
+                return true
             case "a":
                 // With an empty search field ⌘A selects every row; otherwise it selects the text.
                 guard query.isEmpty else { return false }

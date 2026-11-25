@@ -8,6 +8,8 @@ struct QuickPanelView: View {
     @FocusState private var searchFocused: Bool
     /// Files from Finder hovering over the list.
     @State private var listDropTargeted = false
+    /// The panel's width as laid out (it's resizable); the list and preview share it.
+    @State private var panelWidth: CGFloat = 780
 
     /// Tells the user a drop here adds to history.
     @ViewBuilder
@@ -42,6 +44,7 @@ struct QuickPanelView: View {
                         thisAppName: model.targetRef?.name, dropModel: model)
                 .padding(.horizontal, 14)
                 .padding(.bottom, 10)
+                .background(WindowDragArea())   // the chip row moves the panel too
             Hairline()
             HStack(spacing: 0) {
                 VStack(spacing: 0) {
@@ -66,6 +69,7 @@ struct QuickPanelView: View {
             Hairline()
             HintBar(entry: model.selectedEntry, mode: model.mode, notice: model.notice,
                     isEditingText: model.isEditingText,
+                    hasTextSelection: model.previewSelection != nil,
                     canEditText: model.selectedEntry?.clip.map(model.isEditable) ?? false,
                     inFolder: model.openFolder != nil,
                     selectionCount: model.isMultiSelecting ? model.selectedClips.count : nil,
@@ -80,6 +84,7 @@ struct QuickPanelView: View {
                     people: model.showsPeople)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { panelWidth = $0 }
         .onAppear { searchFocused = true }
         .onChange(of: model.focusToken) {
             searchFocused = ![.actions, .snippetForm, .saveSecret, .label, .editSecret, .shareToGroup, .folderName,
@@ -96,7 +101,7 @@ struct QuickPanelView: View {
     }
 
     private var listWidth: CGFloat {
-        env.prefs.panelSize.size.width * 0.44
+        PanelLayout.listWidth(panelWidth: panelWidth)
     }
 
     /// One rotates into the hint bar on every open, with the user's own shortcuts.
@@ -130,6 +135,15 @@ struct QuickPanelView: View {
 
     private var searchBar: some View {
         HStack(spacing: 12) {
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 13, weight: .semibold))
+                .rotationEffect(.degrees(90))
+                .foregroundStyle(.tertiary)
+                .frame(width: 14, height: 24)
+                .overlay(WindowDragArea())
+                .help("Drag to move")
+                .accessibilityHidden(true)
+                .padding(.trailing, -4)
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 18, weight: .medium))
                 .foregroundStyle(.secondary)
@@ -160,10 +174,12 @@ struct QuickPanelView: View {
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("Pastes into \(target.name)")
             }
+            KeepOpenButton(isPinned: $model.isPinned)
         }
         .padding(.horizontal, 18)
         .padding(.top, 16)
         .padding(.bottom, 12)
+        .background(WindowDragArea())   // drag the top bar (not the field or buttons) to move
     }
 
     // MARK: List
@@ -1102,6 +1118,8 @@ struct HintBar: View {
     let mode: PanelMode
     let notice: String?
     var isEditingText = false
+    /// Text is selected in the preview: Return pastes just that.
+    var hasTextSelection = false
     var canEditText = false
     /// A Saved folder is open: esc goes back to the root.
     var inFolder = false
@@ -1130,6 +1148,10 @@ struct HintBar: View {
                 hint("⏎", "Send… / Accept")
                 hint("⌘N", "Add Contact")
                 hint("⌫", "Remove")
+            case .browse where hasTextSelection && selectionCount == nil:
+                hint("⏎", "Paste Selection")
+                hint("⌘C", "Copy")
+                hint("esc", isEditingText ? "Done" : "Clear")
             case .browse where isEditingText:
                 hint("esc", "Done")
                 hint("⌘⏎", "Paste")
