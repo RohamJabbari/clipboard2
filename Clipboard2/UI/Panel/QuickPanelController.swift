@@ -567,6 +567,14 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         // The Touch ID / password sheet steals focus; that isn't the user leaving the panel.
         if env.secrets.isAuthenticating || model.isChoosingFolder { return }
         guard isVisible else { return }
+        // Just after a password prompt, macOS hands focus back to the app underneath: take it back.
+        if let ended = env.secrets.authenticationEndedAt, Date.now.timeIntervalSince(ended) < 2 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                guard let self, let panel = self.panel, self.isVisible, !panel.isKeyWindow else { return }
+                panel.makeKeyAndOrderFront(nil)
+            }
+            return
+        }
         // Quick Look taking key isn't the user leaving the panel; leaving both of them is.
         if quickLook.isVisible {
             closeIfFocusLeft()

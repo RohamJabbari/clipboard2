@@ -135,6 +135,9 @@ final class SecretStore {
     @ObservationIgnored private let prefs: Preferences
     /// True while the Touch ID / password sheet is up, so the quick panel doesn't close under it.
     @ObservationIgnored private(set) var isAuthenticating = false
+    /// When the last Touch ID / password prompt closed. macOS gives focus back to the previous app a
+    /// moment after a password prompt, which mustn't close the panel that asked.
+    @ObservationIgnored private(set) var authenticationEndedAt: Date?
 
     nonisolated static let authenticationEnded = Notification.Name("at.softmaze.Clipboard2.authenticationEnded")
 
@@ -257,6 +260,7 @@ final class SecretStore {
         isAuthenticating = true
         defer {
             isAuthenticating = false
+            authenticationEndedAt = .now
             NotificationCenter.default.post(name: Self.authenticationEnded, object: self)
         }
         do {
