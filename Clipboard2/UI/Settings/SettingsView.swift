@@ -4,7 +4,7 @@ import KeyboardShortcuts
 /// Settings, grouped by what people come here to do:
 /// General (is it working, startup, updates), History (what's kept and for how long, what's
 /// never recorded), Appearance (theme and the quick panel), Shortcuts (every key and the
-/// right-click menu), Snippets, Secrets, Actions (AI and paste transforms), Sync.
+/// right-click menu), Snippets, Auth (secrets, passwords, import), Actions (AI and paste transforms), Sync.
 struct SettingsView: View {
     @AppStorage(SettingsTab.storageKey) private var stored = SettingsTab.general.rawValue
 
@@ -29,7 +29,7 @@ struct SettingsView: View {
                 .tabItem { Label("Snippets", systemImage: "text.badge.star") }
                 .tag(SettingsTab.snippets)
             SecretsSettingsView()
-                .tabItem { Label("Secrets", systemImage: "key") }
+                .tabItem { Label("Auth", systemImage: "key") }
                 .tag(SettingsTab.secrets)
             ActionsSettingsView()
                 .tabItem { Label("Actions", systemImage: "wand.and.stars") }
