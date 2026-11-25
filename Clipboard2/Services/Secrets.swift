@@ -14,13 +14,80 @@ nonisolated struct SecretRef: Identifiable, Hashable, Sendable {
     /// The Saved folder (`ClipFolder.id`) it's in. An id with no folder in its space (deleted, or
     /// not synced yet) reads as the root of Saved.
     var folderID: UUID? = nil
+    /// A password's username (nil for a plain secret, or a password without one).
+    var username: String? = nil
+    /// A password's sites, as typed or imported (`https://accounts.google.com`, `google.com`).
+    var urls: [String] = []
+    /// Short hash of the notes, if any (the notes themselves live in a Keychain item of their own).
+    var notesStamp: String? = nil
+
+    /// A secret with a site or a username is a password.
+    var isPassword: Bool { username?.isEmpty == false || !urls.isEmpty }
+}
+
+/// What a secret holds besides its name and value, kept in the item's description attribute as
+/// JSON. Plain secrets keep the original "Clipboard2 secret" description, so their items are
+/// unchanged (and older builds, which never read the description, keep working).
+nonisolated struct SecretExtras: Codable, Equatable, Sendable {
+    var username: String?
+    var urls: [String]?
+    /// Short hash of the notes: changes the item (and its modification date) when only the notes do.
+    var notes: String?
+
+    static let plainDescription = "Clipboard2 secret"
+
+    var isEmpty: Bool { username == nil && urls == nil && notes == nil }
+
+    /// The description attribute for these extras.
+    var descriptionValue: String {
+        guard !isEmpty else { return Self.plainDescription }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return (try? encoder.encode(self)).map { String(decoding: $0, as: UTF8.self) } ?? Self.plainDescription
+    }
+
+    /// Anything that isn't a JSON object (the plain description, or nothing) reads as no extras.
+    init(descriptionValue: String?) {
+        guard let descriptionValue, descriptionValue.hasPrefix("{"),
+              let decoded = try? JSONDecoder().decode(SecretExtras.self, from: Data(descriptionValue.utf8))
+        else { self.init(); return }
+        self.init(username: decoded.username, urls: decoded.urls, notes: decoded.notes)
+    }
+
+    init(username: String? = nil, urls: [String]? = nil, notes: String? = nil) {
+        self.username = Self.cleanUsername(username)
+        let sites = Self.cleanURLs(urls ?? [])
+        self.urls = sites.isEmpty ? nil : sites
+        self.notes = notes?.isEmpty == true ? nil : notes
+    }
+
+    static func cleanUsername(_ username: String?) -> String? {
+        let trimmed = username?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
+    }
+
+    /// Trimmed, empty ones dropped, duplicates (ignoring case) removed, order kept.
+    static func cleanURLs(_ urls: [String]) -> [String] {
+        var seen = Set<String>()
+        return urls.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seen.insert($0.lowercased()).inserted }
+    }
+
+    static func notesStamp(_ notes: String?) -> String? {
+        guard let notes, !notes.isEmpty else { return nil }
+        return String(SyncCrypto.sha256Hex(Data(notes.utf8)).prefix(12))
+    }
 }
 
 /// Secret values live only in the login keychain (one generic-password item each). Names are
 /// stored as the item label so listing never needs to touch the values; a sync group id, if
-/// any, as the generic attribute; the Saved folder, if any, as the comment.
+/// any, as the generic attribute; the Saved folder, if any, as the comment; a password's username
+/// and sites as JSON in the description (`SecretExtras`). Notes get an item of their own in
+/// `notesService` (same account), so they're encrypted like the value.
+/// TODO(auth-autofill phase 3): move to the data-protection Keychain in the shared access group.
 nonisolated enum SecretVault {
     static let service = (Bundle.main.bundleIdentifier ?? "at.softmaze.Clippy") + ".secrets"
+    static let notesService = (Bundle.main.bundleIdentifier ?? "at.softmaze.Clippy") + ".secretnotes"
 
     static func list() -> [SecretRef] {
         let query: [CFString: Any] = [
@@ -36,13 +103,17 @@ nonisolated enum SecretVault {
         return items.compactMap { attrs in
             guard let account = attrs[kSecAttrAccount as String] as? String else { return nil }
             let space = (attrs[kSecAttrGeneric as String] as? Data).map { String(decoding: $0, as: UTF8.self) }
+            let extras = SecretExtras(descriptionValue: attrs[kSecAttrDescription as String] as? String)
             return SecretRef(
                 id: account,
                 name: attrs[kSecAttrLabel as String] as? String ?? "Untitled",
                 createdAt: attrs[kSecAttrCreationDate as String] as? Date,
                 spaceID: space?.isEmpty == false ? space : nil,
                 updatedAt: attrs[kSecAttrModificationDate as String] as? Date,
-                folderID: (attrs[kSecAttrComment as String] as? String).flatMap(UUID.init(uuidString:))
+                folderID: (attrs[kSecAttrComment as String] as? String).flatMap(UUID.init(uuidString:)),
+                username: extras.username,
+                urls: extras.urls ?? [],
+                notesStamp: extras.notes
             )
         }
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -51,30 +122,77 @@ nonisolated enum SecretVault {
     /// `id` is given for secrets that arrive through sync.
     @discardableResult
     static func add(name: String, value: String, id: String = UUID().uuidString, spaceID: String? = nil,
-                    folderID: UUID? = nil) -> SecretRef? {
+                    folderID: UUID? = nil, username: String? = nil, urls: [String] = [], notes: String? = nil) -> SecretRef? {
+        let extras = SecretExtras(username: username, urls: urls, notes: SecretExtras.notesStamp(notes))
         var attributes: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: id,
             kSecAttrLabel: name,
-            kSecAttrDescription: "Clipboard2 secret",
+            kSecAttrDescription: extras.descriptionValue,
             kSecValueData: Data(value.utf8),
         ]
         if let spaceID { attributes[kSecAttrGeneric] = Data(spaceID.utf8) }
         if let folderID { attributes[kSecAttrComment] = folderID.uuidString.lowercased() }
         guard SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess else { return nil }
-        return SecretRef(id: id, name: name, createdAt: .now, spaceID: spaceID, updatedAt: .now, folderID: folderID)
+        writeNotes(notes, id: id)
+        return SecretRef(id: id, name: name, createdAt: .now, spaceID: spaceID, updatedAt: .now, folderID: folderID,
+                         username: extras.username, urls: extras.urls ?? [], notesStamp: extras.notes)
     }
 
-    /// `folder` sets the Saved folder: `.some(nil)` takes the secret out of its folder.
+    /// `folder` sets the Saved folder: `.some(nil)` takes the secret out of its folder. `username`,
+    /// `urls` and `notes` replace what's there when given (`.some(nil)` and `[]` clear them).
     @discardableResult
-    static func update(id: String, name: String? = nil, value: String? = nil, folder: UUID?? = nil) -> Bool {
+    static func update(id: String, name: String? = nil, value: String? = nil, folder: UUID?? = nil,
+                       username: String?? = nil, urls: [String]? = nil, notes: String?? = nil) -> Bool {
         var changes: [CFString: Any] = [:]
         if let name { changes[kSecAttrLabel] = name }
         if let value { changes[kSecValueData] = Data(value.utf8) }
         if let folder { changes[kSecAttrComment] = folder?.uuidString.lowercased() ?? "" }
+        if username != nil || urls != nil || notes != nil {
+            let current = extras(id: id)
+            let extras = SecretExtras(username: username ?? current.username, urls: urls ?? current.urls,
+                                      notes: notes.map(SecretExtras.notesStamp) ?? current.notes)
+            if extras != current { changes[kSecAttrDescription] = extras.descriptionValue }
+            if let notes, SecretExtras.notesStamp(notes) != current.notes { writeNotes(notes, id: id) }
+        }
         guard !changes.isEmpty else { return true }
         return SecItemUpdate(baseQuery(id) as CFDictionary, changes as CFDictionary) == errSecSuccess
+    }
+
+    /// The username, sites and notes stamp, without the value.
+    static func extras(id: String) -> SecretExtras {
+        var query = baseQuery(id)
+        query[kSecReturnAttributes] = true
+        query[kSecMatchLimit] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let attrs = result as? [String: Any] else { return SecretExtras() }
+        return SecretExtras(descriptionValue: attrs[kSecAttrDescription as String] as? String)
+    }
+
+    static func notes(id: String) -> String? {
+        let query: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: notesService,
+                                      kSecAttrAccount: id, kSecReturnData: true, kSecMatchLimit: kSecMatchLimitOne]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess, let data = result as? Data,
+              let text = String(data: data, encoding: .utf8), !text.isEmpty else { return nil }
+        return text
+    }
+
+    private static func writeNotes(_ notes: String?, id: String) {
+        let base: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: notesService, kSecAttrAccount: id]
+        guard let notes, !notes.isEmpty else {
+            SecItemDelete(base as CFDictionary)
+            return
+        }
+        let data = Data(notes.utf8)
+        if SecItemUpdate(base as CFDictionary, [kSecValueData: data] as CFDictionary) == errSecItemNotFound {
+            var add = base
+            add[kSecValueData] = data
+            add[kSecAttrLabel] = "Clipboard2 notes"
+            SecItemAdd(add as CFDictionary, nil)
+        }
     }
 
     static func value(id: String) -> String? {
@@ -90,6 +208,7 @@ nonisolated enum SecretVault {
 
     static func delete(id: String) {
         SecItemDelete(baseQuery(id) as CFDictionary)
+        writeNotes(nil, id: id)
     }
 
     private static func baseQuery(_ id: String) -> [CFString: Any] {
@@ -163,10 +282,26 @@ final class SecretStore {
     }
 
     @discardableResult
-    func add(name: String, value: String, spaceID: String? = nil, folderID: UUID? = nil) -> SecretRef? {
-        let ref = SecretVault.add(name: name, value: value, spaceID: spaceID, folderID: folderID)
+    func add(name: String, value: String, spaceID: String? = nil, folderID: UUID? = nil,
+             username: String? = nil, urls: [String] = [], notes: String? = nil) -> SecretRef? {
+        let ref = SecretVault.add(name: name, value: value, spaceID: spaceID, folderID: folderID,
+                                  username: username, urls: urls, notes: notes)
         reload()
         return ref
+    }
+
+    /// Edit on a password or secret: everything given replaces what's there.
+    @discardableResult
+    func update(_ ref: SecretRef, name: String? = nil, value: String? = nil, username: String?? = nil,
+                urls: [String]? = nil, notes: String?? = nil) -> Bool {
+        let ok = SecretVault.update(id: ref.id, name: name, value: value, username: username, urls: urls, notes: notes)
+        reload()
+        return ok
+    }
+
+    /// A password's notes (they're in the Keychain like the value; ask for Touch ID before showing them).
+    func notes(of ref: SecretRef) -> String? {
+        ref.notesStamp == nil ? nil : SecretVault.notes(id: ref.id)
     }
 
     /// Moves secrets into a Saved folder, or (nil) out to the root of Saved. Only the ones whose

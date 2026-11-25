@@ -156,18 +156,29 @@ nonisolated struct SecretPayload: Codable, Equatable, Sendable {
     var createdAt: Int64
     /// The id of the Saved folder (a `folder` item) the secret is in, like a clip's.
     var folder: String?
+    /// A password's username (1.11+). Omitted when empty, so plain secrets keep their fingerprints.
+    var username: String?
+    /// A password's sites (1.11+). Omitted when empty.
+    var urls: [String]?
+    /// A password's notes (1.11+). Omitted when empty.
+    var notes: String?
     var rev: Int64?
 
-    init(name: String, value: String, createdAt: Int64, folder: String? = nil) {
+    init(name: String, value: String, createdAt: Int64, folder: String? = nil, username: String? = nil,
+         urls: [String]? = nil, notes: String? = nil) {
         self.name = name
         self.value = value
         self.createdAt = createdAt
         self.folder = folder
+        self.username = SecretExtras.cleanUsername(username)
+        let sites = SecretExtras.cleanURLs(urls ?? [])
+        self.urls = sites.isEmpty ? nil : sites
+        self.notes = notes?.isEmpty == true ? nil : notes
     }
 
-    init(ref: SecretRef, value: String, now: Date = .now) {
+    init(ref: SecretRef, value: String, notes: String? = nil, now: Date = .now) {
         self.init(name: ref.name, value: value, createdAt: (ref.createdAt ?? now).syncMillis,
-                  folder: ref.folderID?.uuidString.lowercased())
+                  folder: ref.folderID?.uuidString.lowercased(), username: ref.username, urls: ref.urls, notes: notes)
     }
 
     init(from decoder: any Decoder) throws {
@@ -178,6 +189,9 @@ nonisolated struct SecretPayload: Codable, Equatable, Sendable {
         value = try c.decodeIfPresent(String.self, forKey: .value) ?? ""
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
         folder = try c.decodeIfPresent(String.self, forKey: .folder)
+        username = try? c.decodeIfPresent(String.self, forKey: .username)
+        urls = try? c.decodeIfPresent([String].self, forKey: .urls)
+        notes = try? c.decodeIfPresent(String.self, forKey: .notes)
         rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
     }
 }
@@ -230,10 +244,14 @@ nonisolated struct OTPPayload: Codable, Equatable, Sendable {
     var period: Int
     var createdAt: Int64
     var updatedAt: Int64
+    /// The sites the user set (Edit → Website, 1.11+). Omitted when empty.
+    var urls: [String]?
     var rev: Int64?
 
     init(issuer: String, account: String, secret: String, algorithm: String, digits: Int, period: Int,
-         createdAt: Int64, updatedAt: Int64) {
+         createdAt: Int64, updatedAt: Int64, urls: [String]? = nil) {
+        let sites = SecretExtras.cleanURLs(urls ?? [])
+        self.urls = sites.isEmpty ? nil : sites
         self.issuer = issuer
         self.account = account
         self.secret = secret
@@ -256,6 +274,7 @@ nonisolated struct OTPPayload: Codable, Equatable, Sendable {
         period = try c.decodeIfPresent(Int.self, forKey: .period) ?? 30
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
         updatedAt = try c.decodeIfPresent(Int64.self, forKey: .updatedAt) ?? createdAt
+        urls = try? c.decodeIfPresent([String].self, forKey: .urls)
         rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
     }
 }

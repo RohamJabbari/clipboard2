@@ -45,6 +45,7 @@ Build in phases; each phase ships on its own:
   - Both are part of the fingerprint.
   - Unknown-field rules: older clients must keep fields they don't know when they rewrite a payload. Check the Windows client before shipping: if it drops them, a Windows edit would wipe `username` and `urls`. In that case, ship Windows 1.10.x preserving unknown fields first.
 - Storage moves from the login Keychain to the **data protection Keychain** in a shared access group, `XWTH2647FF.at.softmaze.Clippy.shared`, so the autofill extension (phase 3) can read it.
+  - **TODO: moved to phase 3.** It needs provisioning profiles we don't have yet; phase 1 keeps the login Keychain (username and sites in the item's description, notes in a second item).
   - Migrate once at launch: copy, verify, then delete the old items.
   - Keep reading the old location if the copy failed.
 - Member access is unchanged: groups without Secrets access never see passwords either.

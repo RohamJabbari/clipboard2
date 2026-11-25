@@ -128,11 +128,21 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
 // type "snippet"
 {"v":1,"type":"snippet","name":"…","keyword":"…","body":"…","createdAt":0,"updatedAt":0}
 // type "secret"
-{"v":1,"type":"secret","name":"…","value":"…","createdAt":0,"folder":"<folder item id>"}
+{"v":1,"type":"secret","name":"…","value":"…","createdAt":0,"folder":"<folder item id>",
+ "username":"me@example.com","urls":["https://accounts.google.com","youtube.com"],"notes":"…"}
 // type "otp" (category "otp", only in authenticator spaces; never sent to anyone but the owner)
 {"v":1,"type":"otp","issuer":"GitHub","account":"me@example.com","secret":"<base32, no padding>",
- "algorithm":"SHA1|SHA256|SHA512","digits":6,"period":30,"createdAt":0,"updatedAt":0}
+ "algorithm":"SHA1|SHA256|SHA512","digits":6,"period":30,"createdAt":0,"updatedAt":0,
+ "urls":["github.com"]}
 ```
+
+- **Passwords (1.11+):** a password is a `secret` with a site or a username. All three fields are optional and omitted when empty, so plain secrets keep their bytes and fingerprints:
+  - `username`: string, trimmed.
+  - `urls`: the sites, as typed or imported (a full URL or a bare host), trimmed, empty ones and case-insensitive duplicates dropped, order kept. The first one picks the password's source in Auth (its registrable domain).
+  - `notes`: free text.
+- **Authenticator sites (1.11+):** `urls` on `otp`, same rules; set with Edit → Website. Optional, omitted when empty.
+- These fields are content: they're part of the fingerprint like every other field.
+- **Unknown fields:** readers ignore them, but a client that rewrites a payload must keep the fields it doesn't know. Clients up to 1.10 (Mac and Windows) rebuild the payload from the fields they know, so editing a password there wipes its `username`, `urls` and `notes` (and an authenticator's `urls`).
 
 - **Images:** the PNG and its thumbnail are uploaded as two encrypted blobs. Their ids are listed in the payload and in `blobIds`.
 - **Rich text that won't fit:** if `rtf` + `html` push the ciphertext past the item limit, drop them and sync the item as `text`.

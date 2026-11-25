@@ -1227,25 +1227,33 @@ final class FakeSecrets: SyncSecretSource {
     var values: [String: String] = [:] { didSet { onChange?() } }
 
     var syncSecrets: [SecretRef] { Array(refs.values) }
+    var notes: [String: String] = [:] { didSet { onChange?() } }
+
     func syncValue(id: String) -> String? { values[id] }
-    func syncUpsert(id: String, name: String, value: String, spaceID: String?, folderID: UUID?) {
+    func syncNotes(id: String) -> String? { notes[id] }
+    func syncUpsert(id: String, name: String, value: String, spaceID: String?, folderID: UUID?,
+                    username: String?, urls: [String], notes: String?) {
         let created = refs[id]?.createdAt ?? Date(timeIntervalSince1970: 1_000)
         refs[id] = SecretRef(id: id, name: name, createdAt: created, spaceID: refs[id]?.spaceID ?? spaceID, updatedAt: .now,
-                             folderID: folderID)
+                             folderID: folderID, username: username, urls: urls, notesStamp: SecretExtras.notesStamp(notes))
         values[id] = value
+        self.notes[id] = notes
     }
     func syncDelete(id: String) {
         refs[id] = nil
         values[id] = nil
+        notes[id] = nil
     }
     func syncDidChange() {}
 
     @discardableResult
-    func add(name: String, value: String, spaceID: String? = nil, folderID: UUID? = nil) -> String {
+    func add(name: String, value: String, spaceID: String? = nil, folderID: UUID? = nil,
+             username: String? = nil, urls: [String] = [], notes: String? = nil) -> String {
         let id = UUID().uuidString
         refs[id] = SecretRef(id: id, name: name, createdAt: Date(timeIntervalSince1970: 1_000), spaceID: spaceID, updatedAt: .now,
-                             folderID: folderID)
+                             folderID: folderID, username: username, urls: urls, notesStamp: SecretExtras.notesStamp(notes))
         values[id] = value
+        if let notes { self.notes[id] = notes }
         return id
     }
 

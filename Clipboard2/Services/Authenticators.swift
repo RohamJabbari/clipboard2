@@ -23,6 +23,8 @@ nonisolated struct Authenticator: Identifiable, Hashable, Sendable {
     var updatedAt: Date
     /// The authenticator space; nil until it's been created on the server (or while signed out).
     var spaceID: String?
+    /// Sites set with Edit → Website; they pick its source in Auth over the issuer.
+    var urls: [String] = []
 
     init(id: String = SyncCrypto.newID(), account: OTPAccount, createdAt: Date = .now, spaceID: String? = nil) {
         self.id = id
@@ -51,11 +53,12 @@ nonisolated struct Authenticator: Identifiable, Hashable, Sendable {
         createdAt = Date(syncMillis: payload.createdAt)
         updatedAt = Date(syncMillis: payload.updatedAt)
         self.spaceID = spaceID
+        urls = SecretExtras.cleanURLs(payload.urls ?? [])
     }
 
     var payload: OTPPayload {
         OTPPayload(issuer: issuer, account: account, secret: secret, algorithm: algorithm.rawValue, digits: digits,
-                   period: period, createdAt: createdAt.syncMillis, updatedAt: updatedAt.syncMillis)
+                   period: period, createdAt: createdAt.syncMillis, updatedAt: updatedAt.syncMillis, urls: urls)
     }
 
     var otpAccount: OTPAccount {
@@ -246,6 +249,9 @@ nonisolated enum AuthenticatorItem: Identifiable, Hashable, Sendable {
     }
 
     var searchText: String { issuer + " " + account }
+
+    /// Sites the owner set (Edit → Website); shared ones have none (their source comes from the issuer).
+    var urls: [String] { owned?.urls ?? [] }
 }
 
 // MARK: - Storage
@@ -404,19 +410,21 @@ final class AuthenticatorStore {
     // MARK: Local changes
 
     @discardableResult
-    func add(_ account: OTPAccount, now: Date = .now) -> Authenticator? {
-        let authenticator = Authenticator(account: account, createdAt: now)
+    func add(_ account: OTPAccount, urls: [String] = [], now: Date = .now) -> Authenticator? {
+        var authenticator = Authenticator(account: account, createdAt: now)
+        authenticator.urls = SecretExtras.cleanURLs(urls)
         guard backing.saveOwned(authenticator) else { return nil }
         if suggestion?.secret == account.secret { suggestion = nil }
         changed()
         return authenticator
     }
 
-    /// Edits issuer and account (the owner's Rename).
-    func rename(id: String, issuer: String, account: String, now: Date = .now) {
+    /// Edits issuer, account and (when given) the sites: the owner's Edit.
+    func rename(id: String, issuer: String, account: String, urls: [String]? = nil, now: Date = .now) {
         guard var authenticator = authenticator(withID: id) else { return }
         authenticator.issuer = issuer
         authenticator.account = account
+        if let urls { authenticator.urls = SecretExtras.cleanURLs(urls) }
         authenticator.updatedAt = max(now, authenticator.updatedAt.addingTimeInterval(0.001))
         backing.saveOwned(authenticator)
         changed()

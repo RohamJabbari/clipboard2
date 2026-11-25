@@ -9,8 +9,11 @@ protocol SyncSecretSource: AnyObject {
     /// Fresh from the store (not a cached list), with `spaceID` and `updatedAt`.
     var syncSecrets: [SecretRef] { get }
     func syncValue(id: String) -> String?
-    /// Creates the secret with this id, or replaces its name, value and Saved folder.
-    func syncUpsert(id: String, name: String, value: String, spaceID: String?, folderID: UUID?)
+    /// A password's notes (nil when it has none).
+    func syncNotes(id: String) -> String?
+    /// Creates the secret with this id, or replaces its name, value, Saved folder, username, sites and notes.
+    func syncUpsert(id: String, name: String, value: String, spaceID: String?, folderID: UUID?,
+                    username: String?, urls: [String], notes: String?)
     func syncDelete(id: String)
     /// Called once after a batch of upserts and deletes.
     func syncDidChange()
@@ -1142,7 +1145,8 @@ final class SyncEngine {
         quietly {
             // Kept even when that folder isn't here (yet): the secret shows at the root until it is.
             secrets.syncUpsert(id: existing?.id ?? remote.id, name: received.name, value: received.value,
-                               spaceID: localSpaceID(spaceId), folderID: received.folder.flatMap(UUID.init(uuidString:)))
+                               spaceID: localSpaceID(spaceId), folderID: received.folder.flatMap(UUID.init(uuidString:)),
+                               username: received.username, urls: received.urls ?? [], notes: received.notes)
         }
         secretsChanged = true
         let ref = secret(withID: remote.id)
@@ -1399,7 +1403,7 @@ final class SyncEngine {
             // Unchanged since it was last synced: don't read the Keychain to find out.
             if let meta, let stamp, !meta.localStamp.isEmpty, meta.localStamp == stamp { continue }
             guard let value = secrets.syncValue(id: ref.id) else { continue }
-            let payload = SyncPayload.secret(SecretPayload(ref: ref, value: value))
+            let payload = SyncPayload.secret(SecretPayload(ref: ref, value: value, notes: secrets.syncNotes(id: ref.id)))
             let updatedAt = max(ref.updatedAt?.syncMillis ?? nowMs, (meta?.updatedAt ?? 0) + 1)
             if let job = makeJob(id: id, payload: payload, meta: meta, sortAt: (ref.createdAt ?? .now).syncMillis,
                                  updatedAt: updatedAt, localStamp: stamp) { jobs.append(job) }
@@ -1750,8 +1754,12 @@ final class SyncEngine {
     private static func secretStamp(_ ref: SecretRef) -> String? {
         guard let updated = ref.updatedAt else { return nil }
         // The folder joins only when set, so secrets outside folders keep the stamps they had.
-        let fields = [ref.name, "\(updated.syncMillis)", "\(ref.createdAt?.syncMillis ?? 0)", ref.spaceID ?? ""]
-            + (ref.folderID.map { [$0.uuidString.lowercased()] } ?? [])
+        var fields: [String] = [ref.name, "\(updated.syncMillis)", "\(ref.createdAt?.syncMillis ?? 0)", ref.spaceID ?? ""]
+        if let folder = ref.folderID { fields.append(folder.uuidString.lowercased()) }
+        // A password's fields join only when set, likewise.
+        if ref.isPassword || ref.notesStamp != nil {
+            fields += [ref.username ?? "", ref.urls.joined(separator: "\u{1E}"), ref.notesStamp ?? ""]
+        }
         return SyncCrypto.sha256Hex(Data(fields.joined(separator: "\u{1F}").utf8))
     }
 
@@ -1765,7 +1773,7 @@ final class SyncEngine {
 
     private func secretFingerprint(_ ref: SecretRef) -> String? {
         guard let value = secrets.syncValue(id: ref.id) else { return nil }
-        return try? SyncPayload.secret(SecretPayload(ref: ref, value: value)).fingerprint()
+        return try? SyncPayload.secret(SecretPayload(ref: ref, value: value, notes: secrets.syncNotes(id: ref.id))).fingerprint()
     }
 
     // MARK: Local state

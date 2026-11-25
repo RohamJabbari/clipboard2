@@ -1664,12 +1664,17 @@ extension SecretStore: SyncSecretSource {
 
     func syncValue(id: String) -> String? { SecretVault.value(id: id) }
 
-    func syncUpsert(id: String, name: String, value: String, spaceID: String?, folderID: UUID?) {
+    func syncNotes(id: String) -> String? { SecretVault.notes(id: id) }
+
+    func syncUpsert(id: String, name: String, value: String, spaceID: String?, folderID: UUID?,
+                    username: String?, urls: [String], notes: String?) {
         if let existing = SecretVault.list().first(where: { $0.id.lowercased() == id.lowercased() }) {
             SecretVault.update(id: existing.id, name: name, value: value,
-                               folder: existing.folderID == folderID ? nil : .some(folderID))
+                               folder: existing.folderID == folderID ? nil : .some(folderID),
+                               username: .some(username), urls: urls, notes: .some(notes))
         } else {
-            SecretVault.add(name: name, value: value, id: id, spaceID: spaceID, folderID: folderID)
+            SecretVault.add(name: name, value: value, id: id, spaceID: spaceID, folderID: folderID,
+                            username: username, urls: urls, notes: notes)
         }
     }
 
