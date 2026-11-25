@@ -7,6 +7,7 @@ internal sealed class FakeVault : ISecretVault
 {
     private readonly List<SecretRef> _secrets = [];
     private readonly Dictionary<string, string> _values = [];
+    private readonly Dictionary<string, string> _extras = [];
     public IReadOnlyList<SecretRef> Secrets => _secrets;
     public IReadOnlySet<string> ValueHashes => _values.Values.Select(ContentHasher.HashText).ToHashSet();
     public event Action? Changed;
@@ -20,15 +21,17 @@ internal sealed class FakeVault : ISecretVault
     }
     public void Rename(SecretRef secret, string name) { _secrets[_secrets.FindIndex(s => s.Id == secret.Id)] = secret with { Name = name }; }
     public void SetValue(SecretRef secret, string value) => _values[secret.Id] = value;
-    public void Delete(SecretRef secret) { _secrets.RemoveAll(s => s.Id == secret.Id); _values.Remove(secret.Id); }
+    public void Delete(SecretRef secret) { _secrets.RemoveAll(s => s.Id == secret.Id); _values.Remove(secret.Id); _extras.Remove(secret.Id); }
     public string? Value(string id) => _values.GetValueOrDefault(id);
     public string? ReadValue(SecretRef secret) => _values.GetValueOrDefault(secret.Id);
-    public void Put(Guid id, string name, string value, string? spaceId)
+    public string? ReadExtras(SecretRef secret) => _extras.GetValueOrDefault(secret.Id);
+    public void Put(Guid id, string name, string value, string? spaceId, string? extras)
     {
         var key = id.ToString();
         _secrets.RemoveAll(s => s.Id == key);
         _secrets.Add(new SecretRef(key, name, DateTime.UtcNow, spaceId));
         _values[key] = value;
+        if (extras is null) _extras.Remove(key); else _extras[key] = extras;
         Changed?.Invoke();
     }
 }

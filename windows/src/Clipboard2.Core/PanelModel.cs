@@ -276,8 +276,11 @@ public interface ISecretVault
     void Delete(SecretRef secret);
     /// <summary>The value without asking the user — for sync only, never for pasting.</summary>
     string? ReadValue(SecretRef secret);
-    /// <summary>Creates or replaces a secret with a known id (a synced secret).</summary>
-    void Put(Guid id, string name, string value, string? spaceId);
+    /// <summary>Creates or replaces a secret with a known id (a synced secret). <paramref name="extras"/>: its payload
+    /// fields this client doesn't manage (username, urls, notes, …), kept protected like the value; null removes them.</summary>
+    void Put(Guid id, string name, string value, string? spaceId, string? extras);
+    /// <summary>A synced secret's kept payload fields (<see cref="Put"/>), for sync only; null when it has none.</summary>
+    string? ReadExtras(SecretRef secret);
     event Action? Changed;
 }
 

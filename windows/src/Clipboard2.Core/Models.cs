@@ -66,6 +66,9 @@ public sealed class ClipItem
     /// <summary>Images: text recognised on this PC (local only, never synced). Null until the image has been read;
     /// empty when it has no text.</summary>
     public string? OcrText { get; set; }
+    /// <summary>Payload fields synced by other clients that this one doesn't manage (a compact JSON object, or null),
+    /// written back unchanged on every push (<see cref="Sync.SyncPayload.ExtrasOf"/>).</summary>
+    public string? Extras { get; set; }
 
     public AppRef? Source => SourceId is null ? null : new AppRef(SourceId, SourceName ?? SourceId);
 
@@ -114,6 +117,9 @@ public sealed class Snippet
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
     /// <summary>Sync group id, or null for the personal space.</summary>
     public string? SpaceId { get; set; }
+    /// <summary>Payload fields synced by other clients that this one doesn't manage (a compact JSON object, or null),
+    /// written back unchanged on every push (<see cref="Sync.SyncPayload.ExtrasOf"/>).</summary>
+    public string? Extras { get; set; }
 }
 
 /// <summary>A folder in Saved: groups saved clips of one space (personal or a group), one level deep. Unrelated to
@@ -131,6 +137,9 @@ public sealed class ClipFolder
     /// <summary>The folder it sits in (same space), or null at the top level. As stored: <see cref="FolderTree"/> says
     /// how it reads (an unknown parent, a cycle or too deep is the top level).</summary>
     public Guid? ParentId { get; set; }
+    /// <summary>Payload fields synced by other clients that this one doesn't manage (a compact JSON object, or null),
+    /// written back unchanged on every push (<see cref="Sync.SyncPayload.ExtrasOf"/>).</summary>
+    public string? Extras { get; set; }
 }
 
 /// <summary>A clipboard capture after hashing / image encoding, ready to store.</summary>
