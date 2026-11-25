@@ -842,17 +842,24 @@ struct MultiSelectionPreview: View {
     @ViewBuilder
     private func selectionRows(_ model: PanelViewModel) -> some View {
         let secrets = model.selectedSecrets
-        let labelable = clips.contains { model.canLabel(.clip($0)) }
-        let movable = model.canPickFolder(clips: clips.filter { !$0.isTransient }, secrets: secrets)
-        if labelable || movable {
+        // Clips only: Save… moves them all; with secrets in it, the folder picker.
+        let savable = secrets.isEmpty && model.canSave(clips)
+        let movable = !secrets.isEmpty && model.canPickFolder(clips: clips.filter { !$0.isTransient }, secrets: secrets)
+        if savable || movable {
             Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 5) {
-                if labelable {
+                if savable {
                     GridRow {
-                        Text("Label").foregroundStyle(.secondary)
-                        Button("＋ Label \(clips.count) items") { model.beginLabelSelection() }
+                        Text("Saved").foregroundStyle(.secondary)
+                        Button("＋ Save \(clips.count) items…") { model.beginSaveSelection() }
                             .buttonStyle(.plain)
                             .foregroundStyle(.tint)
-                            .help("⌘L")
+                            .help("⌘S")
+                    }
+                }
+                if savable, let path = commonFolderPath(model) {
+                    GridRow {
+                        Text("Folder").foregroundStyle(.secondary)
+                        Text(path).lineLimit(1)
                     }
                 }
                 if movable {

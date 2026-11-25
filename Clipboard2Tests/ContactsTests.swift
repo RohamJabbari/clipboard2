@@ -344,6 +344,6 @@ struct ContactsTests {
         #expect(PanelAction.sendToContact(contact).title(folderName: "Downloads") == "Send to sam")
         #expect(PanelAction.sendToContact(contact).section(aiName: "AI") == "Send")
         #expect(!PanelFilter.chips.contains(.inbox))
-        #expect(PanelFilter.chips(showsContacts: true).last == .inbox)
+        #expect(PanelFilter.chips(showsContacts: true).suffix(2) == [.inbox, .groups])
     }
 }

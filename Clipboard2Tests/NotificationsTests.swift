@@ -473,10 +473,10 @@ struct ContactsPanelTests {
         defer { env.sync.tearDownTesting() }
         model.groupFilter = nil
         model.contactsShowPeople = false
-        model.filter = .all
+        model.filter = .copies
 
-        // Contacts shows while signed in; ⇥ walks Inbox, then People.
-        #expect(model.filterStops.prefix(5) == [.chip(.all), .chip(.labelled), .chip(.thisApp), .chip(.inbox), .people])
+        // Contacts and Groups show while signed in; ⇥ walks Inbox, then People.
+        #expect(model.filterStops == [.chip(.copies), .chip(.labelled), .chip(.auth), .chip(.inbox), .people, .chip(.groups)])
         model.select(.chip(.inbox))
         #expect(!model.showsPeople && model.arrivalPlaceShown == .inbox)
         #expect(model.handleKeyDown(key(KeyCode.tab, "\t")))
@@ -505,12 +505,12 @@ struct ContactsPanelTests {
         model.resetMode()
 
         // A notification click opens People with the request selected, or the Inbox.
-        model.select(.chip(.all))
+        model.select(.chip(.copies))
         model.reveal(.people(requestSpaceId: request.spaceId))
         #expect(model.showsPeople && model.peopleSelectionID == "in-" + request.spaceId)
         model.reveal(.inbox(entryID: nil))
         #expect(model.filter == .inbox && !model.showsPeople)
-        model.select(.chip(.all))
+        model.select(.chip(.copies))
     }
 
     @Test func sendToOneContactAndToSeveral() {

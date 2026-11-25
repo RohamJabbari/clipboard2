@@ -19,7 +19,7 @@ struct DetailRowsTests {
                          characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code)!
     }
 
-    @Test func commandLLabelsTheSelectionOrEveryClipInIt() {
+    @Test func commandSAndLOpenSaveForTheSelectionOrEveryClipInIt() {
         let tag = UUID().uuidString
         let a = env.store.ingest(.text("one \(tag)"))
         let b = env.store.ingest(.text("two \(tag)"))
@@ -30,21 +30,26 @@ struct DetailRowsTests {
         model.query = tag
         model.selectedID = PanelEntry.clip(a).id
         #expect(model.handleKeyDown(key(37, "l", flags: .command)))
-        #expect(model.mode == .label)
-        model.labelForm?.text = "First \(tag)"
-        model.submitLabel()
-        #expect(a.label == "First \(tag)" && a.isPinned)
+        #expect(model.mode == .save && model.saveForm?.label == "one \(tag)")
+        model.resetMode()
+        #expect(model.handleKeyDown(key(1, "s", flags: .command)))
+        #expect(model.mode == .save && model.saveForm?.showsLabel == true)
+        model.saveForm?.label = "First \(tag)"
+        #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
+        #expect(a.label == "First \(tag)" && a.isPinned && a.folderID == nil)
+        #expect(model.notice == "Saved to Saved")
 
         model.query = tag
         model.selectAll()
         #expect(model.isMultiSelecting)
-        #expect(model.availableActions.contains(.setLabel))
-        #expect(PanelAction.setLabel.shortcutHint == "⌘L")
-        #expect(model.handleKeyDown(key(37, "l", flags: .command)))
-        model.labelForm?.text = "Both \(tag)"
-        model.submitLabel()
-        #expect(a.label == "Both \(tag)" && b.label == "Both \(tag)")
-        #expect(model.notice == "Labelled 2 items")
+        #expect(model.availableActions.contains(.save) && !model.availableActions.contains(.setLabel))
+        #expect(PanelAction.save.shortcutHint == "⌘S")
+        #expect(model.handleKeyDown(key(1, "s", flags: .command)))
+        // Several items: no label field, they all just move.
+        #expect(model.saveForm?.showsLabel == false && model.saveForm?.clips.count == 2)
+        model.submitSave()
+        #expect(a.label == "First \(tag)" && b.label == nil && a.isPinned && b.isPinned)
+        #expect(model.notice == "Saved 2 items to Saved")
     }
 
     @Test func labellingIsHiddenWhereTheServerWouldRefuseIt() {
@@ -77,7 +82,11 @@ struct DetailRowsTests {
         model.query = tag
         model.selectedID = PanelEntry.clip(item).id
         #expect(model.folderPath(of: .clip(item)) == nil)
+        // ⌘⇧M on clips opens Save…; the picker stays for secrets.
         #expect(model.handleKeyDown(key(46, "m", flags: [.command, .shift])))
+        #expect(model.mode == .save)
+        model.resetMode()
+        model.beginFolderPicker()
         #expect(model.mode == .folderPicker)
         let form = try #require(model.folderPicker)
         #expect(form.rows.first?.kind == .topLevel)
