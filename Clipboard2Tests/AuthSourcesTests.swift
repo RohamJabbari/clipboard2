@@ -26,8 +26,9 @@ struct PublicSuffixTests {
     }
 
     @Test func wildcardsAndExceptions() {
-        #expect(list.publicSuffix(of: "foo.example.bd") == "example.bd")
-        #expect(list.registrableDomain(of: "foo.example.bd") == "foo.example.bd")
+        #expect(list.publicSuffix(of: "foo.shop.kawasaki.jp") == "shop.kawasaki.jp")
+        #expect(list.registrableDomain(of: "foo.shop.kawasaki.jp") == "foo.shop.kawasaki.jp")
+        #expect(list.registrableDomain(of: "www.city.kawasaki.jp") == "city.kawasaki.jp")
         #expect(list.registrableDomain(of: "www.ck") == "www.ck")
         #expect(list.registrableDomain(of: "a.b.ck") == "a.b.ck")
     }
