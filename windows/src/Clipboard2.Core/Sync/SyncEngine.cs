@@ -865,7 +865,7 @@ public sealed partial class SyncEngine
                 Authenticators.Put(otp.Authenticator with { SpaceId = space.Id, Shares = Authenticators.Find(otp.Authenticator.Id)?.Shares });
                 break;
             case ItemPayload.Secret secret:
-                vault.Put(id, secret.Name, secret.Value, space.LocalId);
+                vault.Put(id, secret.Name, secret.Value, space.LocalId, secret.Extras);
                 store.SetSecretFolder(ClipStore.SyncId(id), secret.Folder);   // an unknown id reads as the root
                 break;
         }
@@ -906,7 +906,7 @@ public sealed partial class SyncEngine
         public sealed record Clip(string Id, ClipItem Item) : LocalItem(Id);
         public sealed record SnippetItem(string Id, Snippet Snippet) : LocalItem(Id);
         public sealed record FolderItem(string Id, ClipFolder Folder) : LocalItem(Id);
-        public sealed record Secret(string Id, SecretRef Ref, string Value) : LocalItem(Id);
+        public sealed record Secret(string Id, SecretRef Ref, string Value, string? Extras) : LocalItem(Id);
         public sealed record OtpItem(string Id, Authenticator Authenticator) : LocalItem(Id);
     }
 
@@ -919,7 +919,7 @@ public sealed partial class SyncEngine
             SyncCategory.ForClip(c.Item), SyncPayload.Millis(c.Item.LastCopiedAt)),
         LocalItem.SnippetItem s => new(SyncPayload.ForSnippet(s.Snippet), SyncCategory.Snippet, SyncPayload.Millis(s.Snippet.UpdatedAt)),
         LocalItem.FolderItem f => new(SyncPayload.ForFolder(f.Folder), SyncCategory.Folder, SyncPayload.Millis(f.Folder.CreatedAt)),
-        LocalItem.Secret k => new(SyncPayload.ForSecret(k.Ref.Name, k.Value, k.Ref.CreatedAt, store.SecretFolderId(k.Ref.Id)), SyncCategory.Secret,
+        LocalItem.Secret k => new(SyncPayload.ForSecret(k.Ref.Name, k.Value, k.Ref.CreatedAt, store.SecretFolderId(k.Ref.Id), k.Extras), SyncCategory.Secret,
             SyncPayload.Millis(k.Ref.CreatedAt ?? _now())),
         LocalItem.OtpItem o => new(SyncPayload.ForOtp(o.Authenticator), SyncCategory.Otp, SyncPayload.Millis(o.Authenticator.CreatedAt)),
         _ => throw new InvalidOperationException(),
@@ -972,7 +972,7 @@ public sealed partial class SyncEngine
         if (store.FindFolder(id) is { } folder && folder.SpaceId == space.LocalId) return new LocalItem.FolderItem(itemId, folder);
         if (vault.Secrets.FirstOrDefault(s => SecretGuid(s) == id && s.SpaceId == space.LocalId) is { } secret
             && vault.ReadValue(secret) is { } value)
-            return new LocalItem.Secret(itemId, secret, value);
+            return new LocalItem.Secret(itemId, secret, value, vault.ReadExtras(secret));
         return null;
     }
 
@@ -1017,7 +1017,7 @@ public sealed partial class SyncEngine
             if (SecretGuid(secret) is not { } guid) continue;
             var id = ClipStore.SyncId(guid);
             live.Add(id);
-            if (vault.ReadValue(secret) is { } value) push.Add(new LocalItem.Secret(id, secret, value));
+            if (vault.ReadValue(secret) is { } value) push.Add(new LocalItem.Secret(id, secret, value, vault.ReadExtras(secret)));
         }
         return (push, live);
     }

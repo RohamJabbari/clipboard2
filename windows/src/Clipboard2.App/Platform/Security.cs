@@ -151,6 +151,9 @@ public sealed class CredentialProtectedStore : IProtectedStore
 public sealed class SecretVault : ISecretVault
 {
     private const string Prefix = "Clipboard2/secret/";
+    /// <summary>A synced secret's payload fields this client doesn't manage (username, urls, notes, …), JSON, in a
+    /// credential of its own so the secret's value and its LastWritten (its createdAt) stay as they are.</summary>
+    private const string ExtrasPrefix = "Clipboard2/secret-extras/";
     private readonly Settings _settings;
     private DateTime? _lastAuthentication;
     public DateTime? UnlockedUntil { get; private set; }
@@ -209,17 +212,24 @@ public sealed class SecretVault : ISecretVault
     /// <summary>For sync only: reads without Windows Hello. Pasting and showing go through <see cref="RevealAsync"/>.</summary>
     public string? ReadValue(SecretRef secret) => CredentialManager.Read(Prefix + secret.Id);
 
-    public void Put(Guid id, string name, string value, string? spaceId)
+    public void Put(Guid id, string name, string value, string? spaceId, string? extras)
     {
         // Reuse the local spelling of an existing id (older secrets use "N", synced ones may arrive as "D").
         var existing = All.FirstOrDefault(s => Guid.TryParse(s.Id, out var g) && g == id)?.Id ?? id.ToString("N");
-        CredentialManager.Write(Prefix + existing, value, userName: spaceId, comment: name);
+        if (CredentialManager.Write(Prefix + existing, value, userName: spaceId, comment: name))
+        {
+            if (extras is null) CredentialManager.Delete(ExtrasPrefix + existing);
+            else CredentialManager.Write(ExtrasPrefix + existing, extras, userName: spaceId, comment: "Clipboard2 secret fields");
+        }
         Reload();
     }
+
+    public string? ReadExtras(SecretRef secret) => CredentialManager.Read(ExtrasPrefix + secret.Id) is { Length: > 0 } extras ? extras : null;
 
     public void Delete(SecretRef secret)
     {
         CredentialManager.Delete(Prefix + secret.Id);
+        CredentialManager.Delete(ExtrasPrefix + secret.Id);
         Reload();
     }
 

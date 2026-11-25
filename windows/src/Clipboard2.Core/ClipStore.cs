@@ -74,7 +74,7 @@ public sealed class ClipStore : IDisposable
     }
 
     /// <summary>Schema version stored in <c>PRAGMA user_version</c>. v0 is the original, unversioned schema.</summary>
-    public const int SchemaVersion = 8;
+    public const int SchemaVersion = 9;
 
     public int UserVersion => Convert.ToInt32(Scalar("PRAGMA user_version"));
 
@@ -158,6 +158,22 @@ public sealed class ClipStore : IDisposable
                 Exec("""
                     ALTER TABLE sync_spaces ADD COLUMN can_send INTEGER NOT NULL DEFAULT 1;
                     ALTER TABLE sync_spaces ADD COLUMN can_see_secrets INTEGER NOT NULL DEFAULT 1;
+                    """);
+            }
+            if (version < 9)
+            {
+                // v9: payload fields this client doesn't manage (a password's username, urls and notes; whatever later
+                // versions add) are kept with each item and written back on every push. Existing rows have none. The
+                // secrets and authenticators synced before this lost theirs on the way in, so they're applied once
+                // more: their spaces are pulled from the start, and seq 0 makes each look new (still not dirty, so
+                // nothing is pushed and nothing is announced). Secrets and authenticators keep theirs in their
+                // protected stores, not here.
+                Exec("""
+                    ALTER TABLE clips ADD COLUMN extras TEXT;
+                    ALTER TABLE snippets ADD COLUMN extras TEXT;
+                    ALTER TABLE folders ADD COLUMN extras TEXT;
+                    UPDATE sync_cursor SET since = 0 WHERE space_id IN (SELECT space_id FROM sync_meta WHERE category IN ('secret', 'otp'));
+                    UPDATE sync_meta SET remote_seq = 0 WHERE category IN ('secret', 'otp');
                     """);
             }
             Exec($"PRAGMA user_version = {SchemaVersion}");
@@ -442,7 +458,7 @@ public sealed class ClipStore : IDisposable
     public List<Snippet> AllSnippets()
     {
         using var cmd = _db.CreateCommand();
-        cmd.CommandText = "SELECT id, name, keyword, body, created, updated, space_id FROM snippets ORDER BY name COLLATE NOCASE";
+        cmd.CommandText = "SELECT id, name, keyword, body, created, updated, space_id, extras FROM snippets ORDER BY name COLLATE NOCASE";
         using var r = cmd.ExecuteReader();
         var list = new List<Snippet>();
         while (r.Read())
@@ -450,6 +466,7 @@ public sealed class ClipStore : IDisposable
             {
                 Id = Guid.Parse(r.GetString(0)), Name = r.GetString(1), Keyword = r.GetString(2), Body = r.GetString(3),
                 CreatedAt = FromUnix(r.GetInt64(4)), UpdatedAt = FromUnix(r.GetInt64(5)), SpaceId = r.IsDBNull(6) ? null : r.GetString(6),
+                Extras = r.IsDBNull(7) ? null : r.GetString(7),
             });
         return list;
     }
@@ -471,11 +488,11 @@ public sealed class ClipStore : IDisposable
     public void PutSnippet(Snippet snippet)
     {
         Exec("""
-            INSERT INTO snippets (id, name, keyword, body, created, updated, space_id) VALUES ($id, $n, $k, $b, $c, $u, $s)
-            ON CONFLICT(id) DO UPDATE SET name = $n, keyword = $k, body = $b, updated = $u
+            INSERT INTO snippets (id, name, keyword, body, created, updated, space_id, extras) VALUES ($id, $n, $k, $b, $c, $u, $s, $x)
+            ON CONFLICT(id) DO UPDATE SET name = $n, keyword = $k, body = $b, updated = $u, extras = $x
             """,
             ("$id", snippet.Id.ToString()), ("$n", snippet.Name), ("$k", snippet.Keyword), ("$b", snippet.Body),
-            ("$c", ToUnix(snippet.CreatedAt)), ("$u", ToUnix(snippet.UpdatedAt)), ("$s", snippet.SpaceId));
+            ("$c", ToUnix(snippet.CreatedAt)), ("$u", ToUnix(snippet.UpdatedAt)), ("$s", snippet.SpaceId), ("$x", snippet.Extras));
         Commit();
     }
 
@@ -492,7 +509,7 @@ public sealed class ClipStore : IDisposable
     public List<ClipFolder> AllFolders()
     {
         using var cmd = _db.CreateCommand();
-        cmd.CommandText = "SELECT id, name, label, created, updated, space_id, parent_id FROM folders ORDER BY name COLLATE NOCASE";
+        cmd.CommandText = "SELECT id, name, label, created, updated, space_id, parent_id, extras FROM folders ORDER BY name COLLATE NOCASE";
         using var r = cmd.ExecuteReader();
         var list = new List<ClipFolder>();
         while (r.Read())
@@ -501,6 +518,7 @@ public sealed class ClipStore : IDisposable
                 Id = Guid.Parse(r.GetString(0)), Name = r.GetString(1), Label = r.IsDBNull(2) ? null : r.GetString(2),
                 CreatedAt = FromUnix(r.GetInt64(3)), UpdatedAt = FromUnix(r.GetInt64(4)), SpaceId = r.IsDBNull(5) ? null : r.GetString(5),
                 ParentId = !r.IsDBNull(6) && Guid.TryParse(r.GetString(6), out var parent) ? parent : null,
+                Extras = r.IsDBNull(7) ? null : r.GetString(7),
             });
         return list;
     }
@@ -563,9 +581,9 @@ public sealed class ClipStore : IDisposable
     public void PutFolder(ClipFolder folder)
     {
         Exec("""
-            INSERT INTO folders (id, name, label, created, updated, space_id, parent_id) VALUES ($id, $n, $l, $c, $u, $s, $p)
-            ON CONFLICT(id) DO UPDATE SET name = $n, label = $l, created = $c, updated = $u, parent_id = $p
-            """,
+            INSERT INTO folders (id, name, label, created, updated, space_id, parent_id, extras) VALUES ($id, $n, $l, $c, $u, $s, $p, $x)
+            ON CONFLICT(id) DO UPDATE SET name = $n, label = $l, created = $c, updated = $u, parent_id = $p, extras = $x
+            """, ("$x", folder.Extras),
             ("$id", SyncId(folder.Id)), ("$n", folder.Name), ("$l", folder.Label), ("$c", ToUnix(folder.CreatedAt)),
             ("$u", ToUnix(folder.UpdatedAt)), ("$s", folder.SpaceId), ("$p", folder.ParentId is { } parent ? SyncId(parent) : null));
         Commit();
@@ -1036,14 +1054,14 @@ public sealed class ClipStore : IDisposable
 
     private void Save(ClipItem i) => Exec("""
         INSERT INTO clips (id, created, last_copied, kind, text, preview, rtf, html, hash, files, image_file, thumb_file,
-                           width, height, bytes, source_id, source_name, pinned, pinned_at, label, copy_count, space_id, folder_id)
+                           width, height, bytes, source_id, source_name, pinned, pinned_at, label, copy_count, space_id, folder_id, extras)
         VALUES ($id, $created, $last, $kind, $text, $preview, $rtf, $html, $hash, $files, $img, $thumb,
-                $w, $h, $bytes, $sid, $sname, $pinned, $pinnedAt, $label, $count, $space, $folder)
+                $w, $h, $bytes, $sid, $sname, $pinned, $pinnedAt, $label, $count, $space, $folder, $extras)
         ON CONFLICT(id) DO UPDATE SET last_copied = $last, kind = $kind, text = $text, preview = $preview, rtf = $rtf,
             html = $html, hash = $hash, files = $files, image_file = $img, thumb_file = $thumb, width = $w, height = $h,
             bytes = $bytes, source_id = $sid, source_name = $sname, pinned = $pinned, pinned_at = $pinnedAt,
-            label = $label, copy_count = $count, created = $created, folder_id = $folder
-        """,
+            label = $label, copy_count = $count, created = $created, folder_id = $folder, extras = $extras
+        """, ("$extras", i.Extras),
         ("$folder", i.IsPinned && i.FolderId is { } folder ? SyncId(folder) : null),
         ("$id", i.Id.ToString()), ("$created", ToUnix(i.CreatedAt)), ("$last", ToUnix(i.LastCopiedAt)), ("$kind", (int)i.Kind),
         ("$text", i.Text), ("$preview", i.Preview), ("$rtf", i.Rtf), ("$html", i.Html), ("$hash", i.ContentHash),
@@ -1089,6 +1107,7 @@ public sealed class ClipStore : IDisposable
                 SpaceId = Str("space_id"),
                 OcrText = Str("ocr_text"),
                 FolderId = Guid.TryParse(Str("folder_id"), out var folder) ? folder : null,
+                Extras = Str("extras"),
             });
         }
         return list;

@@ -142,7 +142,8 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
   - `notes`: free text.
 - **Authenticator sites (1.11+):** `urls` on `otp`, same rules; set with Edit → Website. Optional, omitted when empty.
 - These fields are content: they're part of the fingerprint like every other field.
-- **Unknown fields:** readers ignore them, but a client that rewrites a payload must keep the fields it doesn't know. Clients up to 1.10 (Mac and Windows) rebuild the payload from the fields they know, so editing a password there wipes its `username`, `urls` and `notes` (and an authenticator's `urls`).
+- **Unknown fields:** readers ignore them, but a client that rewrites a payload must keep the fields it doesn't know. Clients up to 1.10 (Mac) and 1.10.1 (Windows) rebuild the payload from the fields they know, so editing a password there wipes its `username`, `urls` and `notes` (and an authenticator's `urls`).
+  - **Windows ≥ 1.10.2 preserves unknown fields** of every payload type (`clip`, `folder`, `snippet`, `secret`, `otp`): every top-level field it doesn't write itself (except the per-write `rev`, `toDevice`, `fromDevice`) is kept with the item — a secret's in Credential Manager next to its value, an authenticator's in its protected entry, the rest in the local database — and merged back into every payload it pushes. An unchanged item renders to the same canonical JSON (and fingerprint) as received, so it's never pushed back. Secrets and authenticators synced by an older Windows lost theirs on the way in; on upgrade they're applied once more from the server, which restores them without a push.
 
 - **Images:** the PNG and its thumbnail are uploaded as two encrypted blobs. Their ids are listed in the payload and in `blobIds`.
 - **Rich text that won't fit:** if `rtf` + `html` push the ciphertext past the item limit, drop them and sync the item as `text`.
