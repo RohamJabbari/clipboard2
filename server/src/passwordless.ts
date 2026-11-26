@@ -13,7 +13,7 @@ import type { GoogleVerifier } from "./google.js";
 import { IdTokenError } from "./google.js";
 import { RateLimiter } from "./rateLimit.js";
 import { rateKey } from "./auth.js";
-import { decryptEmail, emailIndex, encryptEmail, isP256Point, matchNumber, openEscrow, sealEscrow, type ServerKeys, wrapTo } from "./keys.js";
+import { decryptEmail, emailIndex, encryptEmail, isP256Point, matchNumber, migrateEmails, openEscrow, sealEscrow, type ServerKeys, wrapTo } from "./keys.js";
 
 type Queryable = Pick<pg.PoolClient, "query">;
 
@@ -232,7 +232,12 @@ export function registerPasswordless(app: FastifyInstance, ctx: PasswordlessCont
          SELECT 1`,
       )
       .catch(() => {});
+    // Rows an older instance wrote with a plaintext email during a rollout.
+    migrateEmails(pool, keys).catch(() => {});
   };
+
+  // Any request may run the sweep (after answering), at most every 10 minutes per instance.
+  app.addHook("onResponse", async () => sweep());
 
   /** An email (has @) or a username, to the account's uid; null when nobody has it. */
   const resolve = async (raw: string): Promise<string | null> => {
@@ -482,7 +487,6 @@ export function registerPasswordless(app: FastifyInstance, ctx: PasswordlessCont
   });
 
   app.get("/v1/device-requests", async (request) => {
-    sweep();
     const { rows } = await pool.query<DeviceRequestRow>(
       "SELECT * FROM device_requests WHERE uid = $1 AND status = 'pending' AND expires_at > now() ORDER BY created_at DESC",
       [request.caller.uid],
