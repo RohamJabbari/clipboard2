@@ -244,7 +244,7 @@ struct AuthenticatorPreview: View {
         let actions = PanelAction.authenticatorActions(for: item, signedIn: model.env.sync.isSignedIn,
                                                        shareCount: model.shareCount(of: item))
         HStack {
-            Button("Paste Code") { model.pasteCode(of: item) }
+            Button("Fill Code") { model.pasteCode(of: item) }
                 .buttonStyle(.borderedProminent)
             Button("Copy Code") { model.copyCode(of: item) }
                 .help("Not kept in history, and cleared from the clipboard after 30 seconds")

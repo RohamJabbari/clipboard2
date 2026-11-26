@@ -36,6 +36,10 @@ final class FloatingPanel: NSPanel {
 /// copies, with Saved, each group and Contacts a click away, in a list that scrolls; clicking one
 /// pastes it where the cursor is, without leaving the app. It stays
 /// faint until the pointer reaches it, so it never competes with what's being typed.
+///
+/// In a password field it lists Auth's passwords for the page's site and Suggest Strong
+/// Password; in a field it recognises (email, name, address…) it offers personal info first
+/// (docs/features/auth-autofill.md → Phase 2).
 final class PasteIconController {
     private let env: AppEnvironment
     private var field: TextFieldWatcher.Field?
@@ -45,6 +49,10 @@ final class PasteIconController {
     private var overIcon = false
     private var overPopover = false
     private var pendingHover: DispatchWorkItem?
+    /// The browser page's source domain, read when the list opens.
+    private var pageSite: String?
+    /// What the focused text field asks for, guessed from its label when the list opens.
+    private var fieldKind: FormFieldKind?
 
     private static let iconSize = CGSize(width: 22, height: 22)
     /// Opacity while nobody's reaching for it; full on hover and while its list is open.
@@ -133,8 +141,21 @@ final class PasteIconController {
 
     private func openPopover() {
         guard popover == nil, let field else { return }
-        model.sources = sources()
-        load(.copies)
+        pageSite = FieldAX.pageDomain(pid: field.app.processIdentifier, bundleID: field.app.bundleIdentifier)
+        if field.isSecure {
+            fieldKind = nil
+            model.title = "Passwords"
+            model.sources = [PasteSourceChip(source: .auth, title: pageSite ?? "Auth", symbol: "key")]
+            model.strongPasswords = PasswordGenerator.suggestions()
+            load(.auth)
+        } else {
+            fieldKind = field.element.flatMap { FormFieldGuesser.guess(FieldAX.hints(of: $0)) }
+            model.title = "Paste"
+            model.strongPasswords = nil
+            model.sources = sources()
+            let offersMe = fieldKind.map { !env.cards.matches(for: $0).isEmpty } ?? false
+            load(offersMe ? .me : .copies)
+        }
         let view = PastePopoverView(
             model: model,
             onSource: { [weak self] source in self?.load(source) },
@@ -147,6 +168,11 @@ final class PasteIconController {
             onShowAll: { [weak self] in
                 self?.closePopover()
                 self?.env.showQuickPanel()
+            },
+            onStrongPassword: { [weak self] password in
+                guard let self, let element = field.element else { return }
+                closePopover()
+                env.suggestStrongPassword(password, field: element, in: field.app, site: pageSite)
             },
             appName: field.app.localizedName,
             onHideInApp: { [weak self] in self?.hide(in: field.app) })
@@ -184,10 +210,17 @@ final class PasteIconController {
         updateIconAlpha()
     }
 
-    /// Copies and Saved always; each group and Contacts while signed in to sync.
+    /// Copies and Saved always; Me with personal info cards, Auth on a page with passwords for its
+    /// site; each group and Contacts while signed in to sync.
     private func sources() -> [PasteSourceChip] {
         var chips = [PasteSourceChip(source: .copies, title: "Copies", symbol: "clock"),
                      PasteSourceChip(source: .saved, title: "Saved", symbol: "bookmark")]
+        if !env.cards.cards.isEmpty {
+            chips.insert(PasteSourceChip(source: .me, title: "Me", symbol: "person.text.rectangle"), at: 0)
+        }
+        if let pageSite, env.secrets.secrets.contains(where: { SiteMatch.matches($0, domain: pageSite) }) {
+            chips.append(PasteSourceChip(source: .auth, title: "Auth", symbol: "key"))
+        }
         guard env.sync.isSignedIn else { return chips }
         chips += env.sync.groups.map { PasteSourceChip(source: .group($0.id), title: $0.name, symbol: "person.2") }
         chips.append(PasteSourceChip(source: .contacts, title: "Contacts", symbol: "person.crop.circle"))
@@ -198,7 +231,14 @@ final class PasteIconController {
     private func load(_ source: PasteSource) {
         let sync = env.sync
         let items: [ClipItem]
+        model.rows = []
         switch source {
+        case .auth:
+            items = []
+            model.rows = authRows()
+        case .me:
+            items = []
+            model.rows = meRows()
         case .copies:
             // Contacts' items live in the Inbox only.
             items = Array(env.store.allItems().lazy.filter { sync.isListed($0, inInbox: false) }.prefix(Self.itemLimit))
@@ -215,6 +255,78 @@ final class PasteIconController {
         model.byline = { item in item.spaceID == nil ? nil : sync.badge(for: item)?.text }
     }
 
+    /// Passwords (and codes) for the page's site; every password when it isn't a browser page.
+    private func authRows() -> [PasteRow] {
+        guard let field else { return [] }
+        let site = pageSite
+        let passwords = env.secrets.secrets.filter { ref in
+            guard ref.spaceID == nil || env.sync.groups.contains(where: { $0.id == ref.spaceID }) else { return false }
+            return site.map { SiteMatch.matches(ref, domain: $0) } ?? ref.isPassword
+        }
+        .sorted { ($0.username ?? $0.name).localizedStandardCompare($1.username ?? $1.name) == .orderedAscending }
+        var rows = passwords.prefix(Self.itemLimit).map { ref in
+            PasteRow(id: "k-" + ref.id, title: ref.username ?? ref.name,
+                     subtitle: AuthSource.of(ref)?.name ?? ref.name, symbol: "person.badge.key",
+                     detail: field.isSecure ? "Fills the password." : "Fills the username and password.") { [weak self] in
+                guard let self else { return }
+                closePopover()
+                AuthSourceUsage.shared.record(AuthSource.of(ref))
+                env.fillPassword(ref, into: field.app)
+            }
+        }
+        if let site {
+            for item in env.authenticators.items where SiteMatch.matches(item, domain: site) {
+                rows.append(PasteRow(id: "a-" + item.id, title: item.title, subtitle: "Authenticator code",
+                                     symbol: "lock.rotation", detail: "Fills the current code.") { [weak self] in
+                    guard let self, let code = item.code(at: .now) else { NSSound.beep(); return }
+                    closePopover()
+                    env.fillCode(code, into: field.app)
+                })
+            }
+        }
+        return rows
+    }
+
+    /// Personal info: the value the field asks for first (from each card), Fill Form, then the
+    /// cards' other values.
+    private func meRows() -> [PasteRow] {
+        guard let field else { return [] }
+        var rows: [PasteRow] = []
+        var used = Set<String>()
+        func valueRow(_ card: PersonalCard, _ kind: FormFieldKind, _ value: String) -> PasteRow {
+            PasteRow(id: "\(card.id)-\(kind.rawValue)", title: value, subtitle: "\(card.title) · \(kind.title)",
+                     symbol: kind.symbol, detail: value) { [weak self] in
+                guard let self else { return }
+                closePopover()
+                env.fillText(value, into: field.app)
+            }
+        }
+        if let fieldKind {
+            for match in env.cards.matches(for: fieldKind) {
+                rows.append(valueRow(match.card, fieldKind, match.value))
+                used.insert("\(match.card.id)-\(fieldKind.rawValue)")
+            }
+        }
+        if let element = field.element {
+            for card in env.cards.cards where !card.isEmpty {
+                let multiple = env.cards.cards.count > 1
+                rows.append(PasteRow(id: "fill-\(card.id)", title: multiple ? "Fill Form with \(card.title)" : "Fill Form",
+                                     subtitle: "Every field it recognises on this page", symbol: "text.badge.checkmark",
+                                     detail: "Fills empty name, email, phone and address fields.") { [weak self] in
+                    guard let self else { return }
+                    closePopover()
+                    env.fillForm(with: card, around: element, in: field.app)
+                })
+            }
+        }
+        for card in env.cards.cards {
+            for entry in card.values where !used.contains("\(card.id)-\(entry.kind.rawValue)") {
+                rows.append(valueRow(card, entry.kind, entry.value))
+            }
+        }
+        return rows
+    }
+
     /// "Don't Show in ‹App›": hides the paste icon in that app.
     private func hide(in app: NSRunningApplication) {
         guard let ref = FrontmostAppTracker.ref(for: app) else { return }
@@ -228,6 +340,24 @@ final class PasteIconController {
 /// Where the paste list's items come from.
 enum PasteSource: Hashable {
     case copies, saved, group(String), contacts
+    /// Passwords (and codes) for the page's site.
+    case auth
+    /// Personal info cards.
+    case me
+
+    /// Lists `PastePopoverModel.rows` rather than clips.
+    var listsRows: Bool { self == .auth || self == .me }
+}
+
+/// A row of Auth or Me in the paste list: clicking it fills.
+struct PasteRow: Identifiable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let symbol: String
+    /// Shown under the list while hovered.
+    let detail: String
+    let action: () -> Void
 }
 
 struct PasteSourceChip: Identifiable, Hashable {
@@ -242,7 +372,12 @@ final class PastePopoverModel {
     var sources: [PasteSourceChip] = []
     var source: PasteSource = .copies
     var items: [ClipItem] = []
+    /// Auth's or Me's rows (instead of `items`).
+    var rows: [PasteRow] = []
     var hovered: Int?
+    var title = "Paste"
+    /// Suggest Strong Password (password fields only).
+    var strongPasswords: PasswordGenerator.Suggestions?
     /// Who shared or sent a group or contact item, shown instead of the app it came from.
     @ObservationIgnored var byline: (ClipItem) -> String? = { _ in nil }
 }
@@ -332,6 +467,7 @@ private struct PastePopoverView: View {
     let shortcut: String?
     let onPaste: (ClipItem) -> Void
     let onShowAll: () -> Void
+    let onStrongPassword: (String) -> Void
     /// The app being typed in, for "Don't Show in ‹App›".
     let appName: String?
     let onHideInApp: () -> Void
@@ -339,7 +475,7 @@ private struct PastePopoverView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
-                Text("Paste").font(.headline)
+                Text(model.title).font(.headline)
                 Spacer()
                 Button(action: onShowAll) {
                     HStack(spacing: 5) {
@@ -360,8 +496,16 @@ private struct PastePopoverView: View {
             .padding(.bottom, 4)
             sourceChips
             list
-            Text(model.hovered.flatMap { model.items.indices.contains($0) ? PasteRowText.preview(model.items[$0]) : nil }
-                 ?? "Click an item to paste it where you're typing.")
+            if let suggestions = model.strongPasswords, model.source == .auth {
+                Text("Suggest Strong Password")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.top, 6)
+                PasswordSuggestionsView(suggestions: suggestions, compact: true, onPick: onStrongPassword)
+                    .padding(.horizontal, 2)
+            }
+            Text(hoverText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
@@ -387,6 +531,15 @@ private struct PastePopoverView: View {
         .frame(width: 340)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Color.primary.opacity(0.12)))
+    }
+
+    private var hoverText: String {
+        if model.source.listsRows {
+            if let hovered = model.hovered, model.rows.indices.contains(hovered) { return model.rows[hovered].detail }
+            return model.source == .auth ? "Click one to fill it. Asks for Touch ID." : "Click one to fill it where you're typing."
+        }
+        return model.hovered.flatMap { model.items.indices.contains($0) ? PasteRowText.preview(model.items[$0]) : nil }
+            ?? "Click an item to paste it where you're typing."
     }
 
     /// Copies · Saved · each group · Contacts. Scrolls sideways when there are many groups.
@@ -420,6 +573,16 @@ private struct PastePopoverView: View {
     private var list: some View {
         ScrollView(.vertical) {
             LazyVStack(spacing: 2) {
+                ForEach(Array(model.rows.enumerated()), id: \.element.id) { index, row in
+                    Button(action: row.action) {
+                        extraRow(row, hot: model.hovered == index)
+                    }
+                    .buttonStyle(.plain)
+                    .background(RowHover { inside in
+                        if inside { model.hovered = index } else if model.hovered == index { model.hovered = nil }
+                    })
+                    .accessibilityLabel("\(row.title), \(row.subtitle)")
+                }
                 ForEach(Array(model.items.enumerated()), id: \.element.id) { index, item in
                     Button { onPaste(item) } label: {
                         row(item, hot: model.hovered == index)
@@ -434,11 +597,38 @@ private struct PastePopoverView: View {
         }
         .id(model.source)   // back to the top when the source changes
         .overlay {
-            if model.items.isEmpty {
-                Text("Nothing here yet").font(.callout).foregroundStyle(.secondary)
+            if model.items.isEmpty && model.rows.isEmpty {
+                Text(model.source == .auth ? "No passwords for this site" : "Nothing here yet")
+                    .font(.callout).foregroundStyle(.secondary)
             }
         }
         .frame(height: CGFloat(PasteIconController.visibleRows) * 44)
+    }
+
+    private func extraRow(_ row: PasteRow, hot: Bool) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: row.symbol)
+                .font(.system(size: 13))
+                .frame(width: 26, height: 26)
+                .foregroundStyle(hot ? AnyShapeStyle(.white) : AnyShapeStyle(.tint))
+                .background(hot ? AnyShapeStyle(.white.opacity(0.15)) : AnyShapeStyle(Color.primary.opacity(0.06)),
+                            in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(row.title)
+                    .lineLimit(1)
+                    .foregroundStyle(hot ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+                Text(row.subtitle)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .foregroundStyle(hot ? AnyShapeStyle(.white.opacity(0.85)) : AnyShapeStyle(.secondary))
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 5)
+        .background(hot ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.clear),
+                    in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .contentShape(Rectangle())
     }
 
     private func row(_ item: ClipItem, hot: Bool) -> some View {

@@ -40,6 +40,8 @@ final class AppEnvironment {
     let chatGPTAccount = SubscriptionAccount(cli: .codex)
     let updates = UpdateController()
     let modelCatalog = AIModelCatalog()
+    /// Personal info cards (Auth → Me): this Mac only, not synced.
+    let cards = PersonalCardStore()
 
     @ObservationIgnored private(set) lazy var panel = QuickPanelController(env: self)
     @ObservationIgnored private let permissionsWindow = PermissionsWindowController()

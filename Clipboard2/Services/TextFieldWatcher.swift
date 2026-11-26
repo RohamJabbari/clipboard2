@@ -2,8 +2,9 @@ import AppKit
 import ApplicationServices
 
 /// Follows the focused text field in the frontmost app through the Accessibility API, for the
-/// paste icon in text fields. It reads only when focus changes, never reads text, skips password
-/// fields, and gives up quickly on apps that don't answer.
+/// paste icon in text fields. It reads only when focus changes and never reads text. Password
+/// fields are reported too (flagged `isSecure`), for Auth's items there; it gives up quickly on
+/// apps that don't answer.
 ///
 /// It deliberately doesn't set `AXManualAccessibility` on Electron apps: that makes them build
 /// their whole accessibility tree, which slowed typing and copying in them by seconds.
@@ -12,6 +13,10 @@ final class TextFieldWatcher {
     struct Field: Equatable {
         let frame: CGRect
         let app: NSRunningApplication
+        /// A password field.
+        var isSecure = false
+        /// The field itself, for Fill (its kind, the form around it).
+        var element: AXElement?
     }
 
     /// Called on the main thread whenever the focused field changes (nil: none).
@@ -129,11 +134,13 @@ final class TextFieldWatcher {
             return
         }
         let subrole: String? = Self.value(element, kAXSubroleAttribute)
-        if subrole == (kAXSecureTextFieldSubrole as String) {
+        let role: String? = Self.value(element, kAXRoleAttribute)
+        let secure = subrole == (kAXSecureTextFieldSubrole as String) || role == "AXSecureTextField"
+        guard secure || Self.isEditable(element) else {
             report(nil)
             return
         }
-        report(Self.isEditable(element) ? Self.visibleFrame(of: element).map { Field(frame: $0, app: app) } : nil)
+        report(Self.visibleFrame(of: element).map { Field(frame: $0, app: app, isSecure: secure, element: AXElement(raw: element)) })
     }
 
     private func report(_ field: Field?) {

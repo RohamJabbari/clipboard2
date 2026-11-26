@@ -158,6 +158,8 @@ enum PanelMode: Equatable {
     case addContact
     /// Save… / Edit Saved…: label and one destination, yours or a group's.
     case save
+    /// New Card… / Edit on a personal info card (Auth → Me).
+    case cardForm
 }
 
 enum PanelAction: Identifiable, Hashable {
@@ -543,8 +545,8 @@ final class EditSecretState {
     /// One row per site; an empty last row is where the next one is typed.
     var sites: [String]
     var notes: String
-    var showsGeneratorOptions = false
-    var generator = PasswordGenerator.Options()
+    /// Generate's two options, side by side until one is picked.
+    var suggestions: PasswordGenerator.Suggestions?
     var error: String?
 
     init(ref: SecretRef, value: String, notes: String? = nil) {
@@ -597,8 +599,14 @@ final class EditSecretState {
         if sites.isEmpty { sites = [""] }
     }
 
+    /// Offers two strong passwords: letters and digits, and one with symbols.
     func generate() {
-        value = PasswordGenerator.generate(generator)
+        suggestions = PasswordGenerator.suggestions()
+    }
+
+    func use(_ password: String) {
+        value = password
+        suggestions = nil
     }
 
     /// The name to save under: as typed, or for a password its site, else its username.
@@ -996,6 +1004,7 @@ final class PanelViewModel {
                 if previewSelection != nil { previewSelection = nil }
                 if revealedSecretID != nil { revealedSecretID = nil }
                 if pendingDeleteID != nil { pendingDeleteID = nil }
+                if selectedID != nil, selectedCardID != nil { selectedCardID = nil }
             }
             guard !adjustingSelection else { return }
             selectedIDs = selectedID.map { [$0] } ?? []
@@ -1026,6 +1035,10 @@ final class PanelViewModel {
     private(set) var folderNameForm: FolderNameState?
     private(set) var authenticatorForm: AuthenticatorFormState?
     private(set) var peopleForm: AuthenticatorPeopleState?
+    /// New Card… / Edit on a personal info card (Auth → Me).
+    private(set) var cardForm: CardFormState?
+    /// The personal info card shown in the right pane (Auth → Me); a list row being selected clears it.
+    var selectedCardID: UUID?
     private(set) var folderPicker: FolderPickerState?
     private(set) var addItemsForm: AddItemsState?
     private(set) var contactPicker: ContactPickerState?
@@ -1067,6 +1080,9 @@ final class PanelViewModel {
     /// The app that was frontmost when the panel opened — pastes go here.
     private(set) var targetApp: NSRunningApplication?
     var targetRef: AppRef? { targetApp.flatMap(FrontmostAppTracker.ref(for:)) }
+    /// The source domain of the browser page the panel opened over, for "For ‹site›" in Auth.
+    private(set) var pageSite: String?
+    @ObservationIgnored private var pageSiteTask: Task<Void, Never>?
 
     static let maxEntries = 300
 
@@ -1098,6 +1114,8 @@ final class PanelViewModel {
         resetMode()
         notice = nil
         targetApp = target
+        readPageSite(target)
+        selectedCardID = nil
         query = ""
         // Back to Copies without the group pill animating closed behind the opening panel.
         var reset = Transaction()
@@ -1289,6 +1307,7 @@ final class PanelViewModel {
     func retarget(_ app: NSRunningApplication?) {
         guard let app, app.processIdentifier != targetApp?.processIdentifier else { return }
         targetApp = app
+        readPageSite(app)
         refresh()
     }
 
@@ -1308,6 +1327,7 @@ final class PanelViewModel {
         folderNameForm = nil
         authenticatorForm = nil
         peopleForm = nil
+        cardForm = nil
         folderPicker = nil
         addItemsForm = nil
         contactPicker = nil
@@ -1418,10 +1438,21 @@ final class PanelViewModel {
         var result: [PanelEntry]
         var authStarts: [String: AuthSourceHeading] = [:]
         if q.isEmpty && authView {
+            result = []
+            // Over a browser: "For ‹site›" first, with that site's items (phase 2).
+            if let site = pageSite {
+                let suggested = Self.authSuggestions(secrets: secrets, authenticators: authenticators, site: site)
+                if let first = suggested.first {
+                    authStarts[first.id] = AuthSourceHeading(source: .domain(site), isSuggestion: true)
+                    result += suggested
+                    let taken = Set(suggested.map(\.id))
+                    secrets.removeAll { taken.contains(PanelEntry.secret($0).id) }
+                    authenticators.removeAll { taken.contains(PanelEntry.authenticator($0).id) }
+                }
+            }
             // Grouped by source, the most recently used first; "No website" last.
             let groups = Self.authGroups(secrets: secrets, authenticators: authenticators,
                                          lastUsed: AuthSourceUsage.shared.lastUsed)
-            result = []
             for group in groups {
                 if let first = group.items.first { authStarts[first.id] = AuthSourceHeading(source: group.source) }
                 result += group.items
@@ -1483,7 +1514,9 @@ final class PanelViewModel {
         authSourceStarts = authStarts
         sectionStarts = q.isEmpty && !authView ? Self.dateSections(entries, date: savedView ? { $0.folder == nil ? $0.savedDate : nil }
                                                                          : { $0.clip?.lastCopiedAt ?? $0.secret?.createdAt }) : [:]
-        if resetSelection || !userMovedSelection || !entries.contains(where: { $0.id == selectedID }) {
+        if !resetSelection, selectedID == nil, selectedCard != nil {
+            // A card in Me stays selected.
+        } else if resetSelection || !userMovedSelection || !entries.contains(where: { $0.id == selectedID }) {
             selectedID = entries.first?.id
         } else {
             let live = Set(entries.map(\.id))
@@ -1531,6 +1564,44 @@ final class PanelViewModel {
     /// What search sees of an authenticator: never its secret or codes.
     static func authSearchText(_ item: AuthenticatorItem) -> String {
         ([item.searchText, AuthSource.of(item)?.name ?? ""] + item.urls).joined(separator: " ")
+    }
+
+    /// "For ‹site›": passwords with that site, and authenticators for it. Passwords first.
+    static func authSuggestions(secrets: [SecretRef], authenticators: [AuthenticatorItem], site: String) -> [PanelEntry] {
+        let passwords = secrets.filter { SiteMatch.matches($0, domain: site) }
+            .sorted { ($0.username ?? $0.name).localizedStandardCompare($1.username ?? $1.name) == .orderedAscending }
+        let codes = authenticators.filter { SiteMatch.matches($0, domain: site) }
+            .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+        return passwords.map(PanelEntry.secret) + codes.map(PanelEntry.authenticator)
+    }
+
+    /// Fill offers "Remember for ‹site›" on a password that isn't for the page's site yet.
+    func remembersSite(for ref: SecretRef) -> String? {
+        guard let site = pageSite, ref.isPassword, !SiteMatch.matches(ref, domain: site) else { return nil }
+        return site
+    }
+
+    /// Fills the password into the target app; `remember` adds the page's site to it first.
+    func fill(_ ref: SecretRef, remember: Bool = false) {
+        let target = targetApp
+        noteAuthUse(.secret(ref))
+        let site = remember ? remembersSite(for: ref) : nil
+        onClose()
+        env.fillPassword(ref, into: target, remember: site)
+    }
+
+    /// Reads the page the panel opened over (browsers only), off the main thread.
+    private func readPageSite(_ target: NSRunningApplication?) {
+        pageSiteTask?.cancel()
+        pageSite = nil
+        guard let target, AXPermission.isTrusted, BrowserKind.of(bundleID: target.bundleIdentifier) != nil else { return }
+        let pid = target.processIdentifier, bundleID = target.bundleIdentifier
+        pageSiteTask = Task { [weak self] in
+            let site = await Task.detached { FieldAX.pageDomain(pid: pid, bundleID: bundleID) }.value
+            guard let self, !Task.isCancelled, site != pageSite else { return }
+            pageSite = site
+            if isAuthView && mode == .browse { refresh(resetSelection: !userMovedSelection) }
+        }
     }
 
     /// Pasting or copying from a source moves it to the top of Auth.
@@ -1772,6 +1843,8 @@ final class PanelViewModel {
                 snippetForm = SnippetFormState(snippet: snippet, fields: fields)
                 mode = .snippetForm
             }
+        case .secret(let ref) where ref.isPassword:
+            fill(ref)
         case .secret(let ref):
             let target = targetApp
             noteAuthUse(entry)
@@ -1810,7 +1883,7 @@ final class PanelViewModel {
         let nextStart = now.addingTimeInterval(left)
         guard left < Self.nextCodeThreshold, item.code(at: nextStart.addingTimeInterval(0.05)) != nil else {
             onClose()
-            env.pasteCode(current, into: target)
+            env.fillCode(current, into: target)
             return
         }
         showNotice("Next code…")
@@ -1820,7 +1893,7 @@ final class PanelViewModel {
             guard let self, !Task.isCancelled, let code = item.code(at: .now) else { return }
             self.codeWait = nil
             self.onClose()
-            self.env.pasteCode(code, into: target)
+            self.env.fillCode(code, into: target)
         }
     }
 
@@ -2215,6 +2288,63 @@ final class PanelViewModel {
     func beginNewPassword() {
         editSecretForm = EditSecretState(new: .password)
         mode = .editSecret
+    }
+
+    // MARK: Personal info cards (Auth → Me)
+
+    /// Auth's "Me" section: every card, or those whose label, name or email match the search.
+    var meCards: [PersonalCard] {
+        guard isAuthView else { return [] }
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cards = env.cards.cards
+        guard !q.isEmpty else { return cards }
+        return cards.filter { FuzzyMatcher.score(query: q, in: [$0.label, $0.name, $0.email, $0.company].joined(separator: " ")) != nil }
+    }
+
+    var selectedCard: PersonalCard? {
+        guard isAuthView, let selectedCardID else { return nil }
+        return env.cards.card(withID: selectedCardID)
+    }
+
+    func selectCard(_ card: PersonalCard) {
+        selectedID = nil
+        selectedCardID = card.id
+        userMovedSelection = true
+    }
+
+    func beginNewCard() {
+        cardForm = CardFormState(card: PersonalCard(label: env.cards.cards.isEmpty ? "Home" : ""), isNew: true)
+        mode = .cardForm
+    }
+
+    func beginEditCard(_ card: PersonalCard) {
+        cardForm = CardFormState(card: card, isNew: false)
+        mode = .cardForm
+    }
+
+    func submitCardForm() {
+        guard let form = cardForm else { return }
+        guard form.canSave else {
+            form.error = "Enter a label or at least one value."
+            return
+        }
+        guard env.cards.save(form.card) else {
+            form.error = "Couldn't save to the Keychain."
+            return
+        }
+        let id = form.card.id
+        resetMode()
+        refresh()
+        selectedID = nil
+        selectedCardID = id
+        showNotice("Saved “\(form.card.title)”")
+    }
+
+    func deleteCard(_ card: PersonalCard) {
+        env.cards.delete(card)
+        if selectedCardID == card.id { selectedCardID = nil }
+        refresh(resetSelection: true)
+        showNotice("Deleted “\(card.title)”")
     }
 
     func beginNewSecret() {
@@ -2922,9 +3052,10 @@ final class PanelViewModel {
     /// An action's title for the current selection.
     func title(for action: PanelAction) -> String {
         if selectedEntry?.authenticator != nil && !isMultiSelecting {
-            if action == .paste { return "Paste Code" }
+            if action == .paste { return "Fill Code" }
             if action == .copy { return "Copy Code" }
         }
+        if selectedEntry?.secret?.isPassword == true && !isMultiSelecting && action == .paste { return "Fill" }
         if let count = pickedFileCount {
             switch action {
             case .paste: return "Paste \(count.picked) of \(count.total) Files"
@@ -3576,7 +3707,7 @@ final class PanelViewModel {
         switch mode {
         case .browse: handleBrowseKey(event)
         case .actions: handleActionKey(event)
-        case .snippetForm, .saveSecret, .label, .editSecret, .folderName, .authenticatorForm: handleFormKey(event)
+        case .snippetForm, .saveSecret, .label, .editSecret, .folderName, .authenticatorForm, .cardForm: handleFormKey(event)
         case .shareToGroup: handleShareKey(event)
         case .ai: handleAIKey(event)
         case .authenticatorPeople: handlePeopleKey(event)
@@ -3801,6 +3932,7 @@ final class PanelViewModel {
             case .folderName: submitFolderName()
             case .editSecret: submitEditSecret()
             case .authenticatorForm: submitAuthenticatorForm()
+            case .cardForm: submitCardForm()
             default: submitSnippetForm()
             }
             return true

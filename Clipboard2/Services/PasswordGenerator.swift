@@ -15,7 +15,23 @@ nonisolated enum PasswordGenerator {
     static let lowercase = Array("abcdefghijkmnopqrstuvwxyz")   // no l: it reads like 1 and I
     static let uppercase = Array("ABCDEFGHJKLMNPQRSTUVWXYZ")    // no I, O
     static let digits = Array("23456789")                      // no 0, 1
-    static let symbolSet = Array("!#$%&*+.=?@^_~")   // no "-": it reads as a group separator
+    /// No "-" (it reads as a group separator), and nothing that commonly breaks sites or shells:
+    /// no quotes, backslash, backtick or space.
+    static let symbolSet = Array("!#$%&*+.=?@^_~")
+
+    /// What Generate and Suggest Strong Password offer side by side: the same length, one with
+    /// letters and digits only (`xxxxxx-xxxxxx-xxxxxx`), one with symbols.
+    struct Suggestions: Equatable, Sendable {
+        let plain: String
+        let symbols: String
+
+        var both: [String] { [plain, symbols] }
+    }
+
+    static func suggestions(length: Int = Options().length) -> Suggestions {
+        Suggestions(plain: generate(Options(length: length, symbols: false)),
+                    symbols: generate(Options(length: length, symbols: true)))
+    }
 
     static func generate(_ options: Options = Options()) -> String {
         var rng = SystemRandomNumberGenerator()

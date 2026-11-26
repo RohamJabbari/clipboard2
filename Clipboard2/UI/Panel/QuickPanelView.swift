@@ -203,7 +203,7 @@ struct QuickPanelView: View {
                 }
             } else if model.filter == .groups && model.groupFilter == nil {
                 NoGroupsView()
-            } else if model.entries.isEmpty {
+            } else if model.entries.isEmpty && model.meCards.isEmpty {
                 let inbox = model.filter == .inbox && model.groupFilter == nil
                 ContentUnavailableView {
                     Label(model.query.isEmpty ? (inbox ? "Your Inbox Is Empty" : "Nothing Here Yet") : "No Matches",
@@ -247,6 +247,9 @@ struct QuickPanelView: View {
                                 } else {
                                     row(for: entry, at: index)
                                 }
+                            }
+                            if model.isAuthView, !model.meCards.isEmpty {
+                                MeSection(model: model, cards: model.meCards)
                             }
                         }
                         .padding(.horizontal, 8)
@@ -313,7 +316,7 @@ struct QuickPanelView: View {
     private func authenticatorContextMenu(_ item: AuthenticatorItem) -> some View {
         let actions = PanelAction.authenticatorActions(for: item, signedIn: env.sync.isSignedIn,
                                                        shareCount: model.shareCount(of: item))
-        Button("Paste Code") { model.pasteCode(of: item) }
+        Button("Fill Code") { model.pasteCode(of: item) }
         Button("Copy Code") { model.copyCode(of: item) }
         let more = actions.compactMap { action -> AuthenticatorAction? in
             if case .authenticator(let a) = action { a } else { nil }
@@ -522,6 +525,10 @@ struct QuickPanelView: View {
             if let form = model.editSecretForm {
                 EditSecretView(form: form) { model.submitEditSecret() }
             }
+        case .cardForm:
+            if let form = model.cardForm {
+                CardFormView(form: form) { model.submitCardForm() }
+            }
         case .shareToGroup:
             if let form = model.shareForm {
                 ShareToGroupView(form: form) { model.submitShare() }
@@ -574,6 +581,9 @@ struct QuickPanelView: View {
             } else if let folder = model.selectedEntry?.folder {
                 FolderPreview(folder: folder, count: model.folderCounts[folder.id] ?? 0, model: model)
                     .id(folder.id)
+            } else if model.selectedID == nil, let card = model.selectedCard {
+                CardPreview(card: card, model: model)
+                    .id(card.id)
             } else if let item = model.selectedEntry?.authenticator {
                 AuthenticatorPreview(item: item, model: model)
                     .id(item.id)
@@ -1180,7 +1190,10 @@ struct HintBar: View {
                 hint("⏎", "Open")
                 hint("⌘K", "Actions")
             case .browse where entry?.authenticator != nil:
-                hint("⏎", "Paste Code")
+                hint("⏎", "Fill Code")
+                hint("⌘K", "Actions")
+            case .browse where entry?.secret?.isPassword == true:
+                hint("⏎", "Fill")
                 hint("⌘K", "Actions")
             case .browse where entry?.isSuggestion == true:
                 hint("⏎", "Add")
@@ -1203,7 +1216,7 @@ struct HintBar: View {
             case .snippetForm:
                 hint("⇥", "Next Field")
                 hint("⏎", "Paste")
-            case .saveSecret, .label, .editSecret, .folderName, .authenticatorForm:
+            case .saveSecret, .label, .editSecret, .folderName, .authenticatorForm, .cardForm:
                 hint("⏎", "Save")
             case .authenticatorPeople, .folderPicker:
                 hint("↑↓", "Choose")

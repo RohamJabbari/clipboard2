@@ -258,16 +258,49 @@ struct EditSecretView: View {
                 .focused($focus, equals: .value)
             if form.showsPasswordFields {
                 Button("Generate") { form.generate() }
-                    .help("A strong password like xxxxxx-xxxxxx-xxxxxx")
+                    .help("Suggests two strong passwords")
             }
         }
-        if form.showsPasswordFields {
-            DisclosureGroup("Password options", isExpanded: $form.showsGeneratorOptions) {
-                Stepper("Length: \(form.generator.length)", value: $form.generator.length,
-                        in: PasswordGenerator.Options.lengthRange)
-                Toggle("Symbols", isOn: $form.generator.symbols)
-            }
+        if form.showsPasswordFields, let suggestions = form.suggestions {
+            PasswordSuggestionsView(suggestions: suggestions) { form.use($0) }
         }
+    }
+}
+
+/// Two strong passwords side by side, one without and one with symbols; clicking one uses it.
+struct PasswordSuggestionsView: View {
+    let suggestions: PasswordGenerator.Suggestions
+    var compact = false
+    let onPick: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            option("Letters & digits", suggestions.plain)
+            option("With symbols", suggestions.symbols)
+        }
+    }
+
+    private func option(_ title: String, _ password: String) -> some View {
+        Button { onPick(password) } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(password)
+                    .font(.system(size: compact ? 10.5 : 12, design: .monospaced))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .foregroundStyle(.primary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help("Use this password")
+        .accessibilityLabel("Use password, \(title.lowercased())")
     }
 }
 

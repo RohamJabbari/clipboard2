@@ -155,7 +155,8 @@ struct PasswordFormTests {
         form.sites = ["https://accounts.form-test.example", "  "]
         form.username = "  formuser "
         form.generate()
-        #expect(PasswordGenerator.isValid(form.value, options: form.generator))
+        form.use(try #require(form.suggestions).plain)
+        #expect(PasswordGenerator.isValid(form.value, options: .init()))
         form.notes = "a note"
         model.submitEditSecret()
         #expect(model.mode == .browse)

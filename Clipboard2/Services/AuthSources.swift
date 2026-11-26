@@ -163,7 +163,12 @@ nonisolated struct AuthSourceGroup<Item> {
 nonisolated struct AuthSourceHeading: Hashable, Sendable {
     /// Nil is "No website".
     var source: AuthSource?
-    var title: String { source?.name ?? "No website" }
+    /// "For ‹site›": the page the panel opened over (phase 2).
+    var isSuggestion = false
+    var title: String {
+        if isSuggestion, let source { return "For \(source.name)" }
+        return source?.name ?? "No website"
+    }
 }
 
 nonisolated enum AuthSourceGrouping {

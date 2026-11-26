@@ -66,7 +66,9 @@ struct PreviewPane: View {
         case .secret(let ref):
             if ref.isPassword {
                 PasswordPreview(ref: ref, onEdit: onEditSecret.map { edit in { edit(ref) } },
-                                onUse: { model?.noteAuthUse(entry) })
+                                onUse: { model?.noteAuthUse(entry) },
+                                onFill: model.map { model in { remember in model.fill(ref, remember: remember) } },
+                                rememberSite: model?.remembersSite(for: ref))
             } else {
                 SecretPreviewView(ref: ref, onEdit: onEditSecret.map { edit in { edit(ref) } })
             }

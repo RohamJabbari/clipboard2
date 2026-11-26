@@ -65,6 +65,8 @@ struct AuthHeader: View {
                 Button("New Password…") { model.beginNewPassword() }
                 Button("New Secret…") { model.beginNewSecret() }
                 Button("New Authenticator…") { model.beginAddAuthenticator() }
+                Divider()
+                Button("New Card…") { model.beginNewCard() }
             } label: {
                 Image(systemName: "plus")
             }

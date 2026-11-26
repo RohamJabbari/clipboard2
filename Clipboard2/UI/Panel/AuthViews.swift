@@ -70,6 +70,10 @@ struct PasswordPreview: View {
     var onEdit: (() -> Void)?
     /// Copying a field counts as using its source.
     var onUse: () -> Void = {}
+    /// Fill (phase 2); true: and remember the page's site for this password.
+    var onFill: ((Bool) -> Void)?
+    /// The page's site, when this password isn't for it yet ("Remember for ‹site›").
+    var rememberSite: String?
     @Environment(AppEnvironment.self) private var env
     @State private var revealed: String?
     @State private var notes: String?
@@ -121,6 +125,14 @@ struct PasswordPreview: View {
                 }
             }
             HStack {
+                if let onFill {
+                    Button("Fill") { onFill(false) }
+                        .help("Types it into the app you were in")
+                    if let rememberSite {
+                        Button("Fill and Remember for \(rememberSite)") { onFill(true) }
+                            .help("Adds \(rememberSite) to this password, then fills it")
+                    }
+                }
                 if let onEdit { Button("Edit…", action: onEdit) }
                 Spacer()
                 SecretUnlockControl(secrets: env.secrets)
@@ -155,8 +167,9 @@ struct PasswordPreview: View {
         let clear = env.prefs.secretClearSeconds > 0
             ? " The clipboard clears after \(env.prefs.secretClearSeconds) seconds."
             : ""
-        if env.secrets.isUnlocked { return "Unlocked. Return pastes the password." + clear }
-        return "Return pastes the password after Touch ID or your password." + clear
+        let what = ref.username == nil ? "the password" : "the username and password"
+        if env.secrets.isUnlocked { return "Unlocked. Return fills \(what)." + clear }
+        return "Return fills \(what) after Touch ID or your password." + clear
     }
 
     private func toggleReveal() {
