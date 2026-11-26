@@ -234,6 +234,52 @@ targets:
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_IDENTITY: Apple Development
         ENABLE_HARDENED_RUNTIME: NO
+    dependencies:
+      - target: Clipboard2 Share
+
+  # "Share to Clipboard2": text, links, images and files into Copies or Saved.
+  Clipboard2 Share:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: iOS/ShareExtension
+      - path: iOS/Shared
+      - path: Core
+    info:
+      path: iOS/ShareExtension/Info.plist
+      properties:
+        CFBundleDisplayName: Clipboard2
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        AppIdentifierPrefix: $(AppIdentifierPrefix)
+        NSHumanReadableCopyright: "© 2026 Softmaze Solutions GmbH"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsText: true
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsImageWithMaxCount: 10
+              NSExtensionActivationSupportsMovieWithMaxCount: 10
+              NSExtensionActivationSupportsFileWithMaxCount: 10
+              NSExtensionActivationSupportsAttachmentsWithMaxCount: 10
+    entitlements:
+      path: iOS/ShareExtension/Clipboard2Share.entitlements
+      properties:
+        com.apple.security.application-groups: [group.at.softmaze.Clippy.ios]
+        keychain-access-groups: [$(AppIdentifierPrefix)at.softmaze.Clippy.ios.shared]
+    settings:
+      base:
+        PRODUCT_NAME: Clipboard2 Share
+        PRODUCT_MODULE_NAME: Clipboard2Share
+        PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.ios.share
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: Apple Development
+        ENABLE_HARDENED_RUNTIME: NO
+        SKIP_INSTALL: YES
 
 schemes:
   Clipboard2:
