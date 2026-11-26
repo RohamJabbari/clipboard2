@@ -2,49 +2,78 @@ import SwiftUI
 
 // Auth's sources and passwords (docs/features/auth-autofill.md, phase 1).
 
-/// A source above its items: the site's favicon (or its first letter) and its name.
+/// A source above its items: the site's favicon (or its first letter) and its name. Clicking it
+/// opens the site's page.
 struct AuthSourceHeader: View {
     let heading: AuthSourceHeading
     var isFirst = false
+    var isSelected = false
+    var onSelect: (() -> Void)?
+    @State private var hovering = false
 
     var body: some View {
         HStack(spacing: 7) {
-            SourceIcon(source: heading.source, size: 16)
+            SourceIcon(source: heading.source, origin: heading.origin, size: 16)
             Text(heading.title)
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(heading.source == nil ? .secondary : .primary)
+                .foregroundStyle(heading.source == nil && heading.origin == nil ? .secondary : .primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+            if onSelect != nil, hovering || isSelected {
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 10)
-        .padding(.top, isFirst ? 4 : 12)
-        .padding(.bottom, 3)
+        .padding(.vertical, 2)
+        .background(isSelected ? AnyShapeStyle(Color.accentColor.opacity(0.18)) : AnyShapeStyle(.clear),
+                    in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .padding(.top, isFirst ? 2 : 10)
+        .padding(.bottom, 1)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .onTapGesture { onSelect?() }
+        .help(onSelect == nil ? "" : "Edit everything for \(heading.title)")
         .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(.isHeader)
+        .accessibilityAddTraits(onSelect == nil ? .isHeader : [.isHeader, .isButton])
+        .accessibilityAction { onSelect?() }
     }
 }
 
 /// The cached favicon of a source, else a badge with its first letter. Never waits for the network.
+/// An origin's own icon choice (letter, symbol, emoji, another site's favicon) wins.
 struct SourceIcon: View {
     let source: AuthSource?
+    var origin: AuthOrigin? = nil
     var size: CGFloat = 16
 
     var body: some View {
         Group {
-            if let domain = source?.domain, let image = FaviconCache.shared.image(for: domain) {
+            if let origin, case .symbol(let name) = origin.icon {
+                RoundedRectangle(cornerRadius: size * 0.25, style: .continuous)
+                    .fill(Self.color(for: "origin:" + origin.id).gradient)
+                    .overlay {
+                        Image(systemName: name)
+                            .font(.system(size: size * 0.55, weight: .semibold))
+                            .foregroundStyle(.white)
+                    }
+            } else if let origin, case .emoji(let text) = origin.icon {
+                Text(text)
+                    .font(.system(size: size * 0.8))
+                    .frame(width: size, height: size)
+            } else if let origin, case .letter = origin.icon {
+                letterBadge(name: origin.title, key: "origin:" + origin.id)
+            } else if let origin, source == nil {
+                letterBadge(name: origin.title, key: "origin:" + origin.id)
+            } else if let domain = source?.domain, let image = FaviconCache.shared.image(for: domain) {
                 Image(nsImage: image)
                     .resizable()
                     .interpolation(.high)
                     .aspectRatio(contentMode: .fit)
             } else if let source {
-                RoundedRectangle(cornerRadius: size * 0.25, style: .continuous)
-                    .fill(Self.color(for: source.key).gradient)
-                    .overlay {
-                        Text(source.name.first.map { String($0).uppercased() } ?? "?")
-                            .font(.system(size: size * 0.62, weight: .bold, design: .rounded))
-                            .foregroundStyle(.white)
-                    }
+                letterBadge(name: origin?.title ?? source.name, key: origin.map { "origin:" + $0.id } ?? source.key)
             } else {
                 Image(systemName: "globe")
                     .font(.system(size: size * 0.8))
@@ -53,6 +82,16 @@ struct SourceIcon: View {
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)
+    }
+
+    private func letterBadge(name: String, key: String) -> some View {
+        RoundedRectangle(cornerRadius: size * 0.25, style: .continuous)
+            .fill(Self.color(for: key).gradient)
+            .overlay {
+                Text(name.first.map { String($0).uppercased() } ?? "?")
+                    .font(.system(size: size * 0.62, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+            }
     }
 
     /// A stable colour per source.
