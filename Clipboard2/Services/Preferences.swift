@@ -108,6 +108,8 @@ final class Preferences {
         static let restoredSendToGroupDefault = "restoredSendToGroupDefault"
         static let pasteIcon = "pasteIcon"
         static let pasteIconHiddenApps = "pasteIconHiddenApps"
+        static let offerToSavePasswords = "offerToSavePasswords"
+        static let neverSavePasswordSites = "neverSavePasswordSites"
         static let notificationsEnabled = "notificationsEnabled"
         static let notificationKindsOff = "notificationKindsOff"
         static let mutedNotificationGroups = "mutedNotificationGroups"
@@ -163,6 +165,10 @@ final class Preferences {
     var pasteIcon: Bool { didSet { defaults.set(pasteIcon, forKey: Key.pasteIcon) } }
     /// Apps where each icon stays away ("Don't Show in …"); hiding one leaves the other.
     var pasteIconHiddenApps: [AppRef] { didSet { store(pasteIconHiddenApps, Key.pasteIconHiddenApps) } }
+    /// Offer to save a login whose password was pasted into a password field (Settings → Auth).
+    var offerToSavePasswords: Bool { didSet { defaults.set(offerToSavePasswords, forKey: Key.offerToSavePasswords) } }
+    /// Sites the user picked "Never for this site" for.
+    var neverSavePasswordSites: [NeverSaveSite] { didSet { store(neverSavePasswordSites, Key.neverSavePasswordSites) } }
     var ignoredApps: [AppRef] { didSet { store(ignoredApps, Key.ignoredApps) } }
     var appTransforms: [AppTransformRule] { didSet { store(appTransforms, Key.appTransforms) } }
     var aiProvider: AIProviderKind { didSet { defaults.set(aiProvider.rawValue, forKey: Key.aiProvider) } }
@@ -246,6 +252,7 @@ final class Preferences {
             Key.contextMenuModifier: ContextMenuModifier.command.rawValue,
             Key.confirmGroupSends: true,
             Key.pasteIcon: true,
+            Key.offerToSavePasswords: true,
             Key.blockSensitiveGroupSends: true,
             Key.notificationsEnabled: true,
         ])
@@ -271,6 +278,8 @@ final class Preferences {
         panelOrigin = PanelOrigin(rawValue: defaults.string(forKey: Key.panelOrigin) ?? "") ?? .top
         pasteIcon = defaults.bool(forKey: Key.pasteIcon)
         pasteIconHiddenApps = Self.load([AppRef].self, defaults, Key.pasteIconHiddenApps) ?? []
+        offerToSavePasswords = defaults.bool(forKey: Key.offerToSavePasswords)
+        neverSavePasswordSites = Self.load([NeverSaveSite].self, defaults, Key.neverSavePasswordSites) ?? []
         ignoredApps = Self.load([AppRef].self, defaults, Key.ignoredApps) ?? AppRef.defaultIgnored
         appTransforms = Self.load([AppTransformRule].self, defaults, Key.appTransforms) ?? []
         aiProvider = AIProviderKind(rawValue: defaults.string(forKey: Key.aiProvider) ?? "") ?? .claudeCode
