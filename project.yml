@@ -3,6 +3,7 @@ options:
   bundleIdPrefix: at.softmaze
   deploymentTarget:
     macOS: "14.0"
+    iOS: "17.0"
   createIntermediateGroups: true
   groupSortPosition: top
 
@@ -49,6 +50,8 @@ targets:
       # Trimmed public suffix list for grouping Auth by site (AuthSources.swift).
       - path: Clipboard2/Resources/PublicSuffixList.dat
         buildPhase: resources
+      # Platform-neutral code shared with the iOS app (docs/features/ios.md).
+      - path: Core
     info:
       path: Clipboard2/Info.plist
       properties:
@@ -142,7 +145,7 @@ targets:
     sources:
       - path: Clipboard2AutoFill
       - path: Clipboard2/Shared
-      - path: Clipboard2/Services/TOTP.swift
+      - path: Core/Auth/TOTP.swift
     info:
       path: Clipboard2AutoFill/Info.plist
       properties:
@@ -186,6 +189,117 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.ClippyTests
         GENERATE_INFOPLIST_FILE: YES
 
+  # iOS app (docs/features/ios.md). Shares Core/ with the Mac app. Apple Development, automatic
+  # signing: Developer ID can't sign iOS. Simulator builds need no provisioning profile.
+  Clipboard2 iOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: iOS/App
+      - path: iOS/Shared
+      - path: iOS/Resources
+      - path: Core
+      - path: Clipboard2/Resources/PublicSuffixList.dat
+        buildPhase: resources
+    info:
+      path: iOS/App/Info.plist
+      properties:
+        CFBundleDisplayName: Clipboard2
+        CFBundleName: Clipboard2
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.productivity
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        NSFaceIDUsageDescription: Clipboard2 asks for Face ID before showing or copying a password.
+        # Read at run time to name the shared Keychain group (SharedContainer.swift).
+        AppIdentifierPrefix: $(AppIdentifierPrefix)
+        NSHumanReadableCopyright: "© 2026 Softmaze Solutions GmbH"
+    entitlements:
+      path: iOS/App/Clipboard2iOS.entitlements
+      properties:
+        com.apple.security.application-groups: [group.at.softmaze.Clippy.ios]
+        keychain-access-groups: [$(AppIdentifierPrefix)at.softmaze.Clippy.ios.shared]
+    settings:
+      base:
+        PRODUCT_NAME: Clipboard2
+        PRODUCT_MODULE_NAME: Clipboard2iOS
+        PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.ios
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: Apple Development
+        ENABLE_HARDENED_RUNTIME: NO
+    dependencies:
+      - target: Clipboard2 Share
+
+  # "Share to Clipboard2": text, links, images and files into Copies or Saved.
+  Clipboard2 Share:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: iOS/ShareExtension
+      - path: iOS/Shared
+      - path: Core
+    info:
+      path: iOS/ShareExtension/Info.plist
+      properties:
+        CFBundleDisplayName: Clipboard2
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        AppIdentifierPrefix: $(AppIdentifierPrefix)
+        NSHumanReadableCopyright: "© 2026 Softmaze Solutions GmbH"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsText: true
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsImageWithMaxCount: 10
+              NSExtensionActivationSupportsMovieWithMaxCount: 10
+              NSExtensionActivationSupportsFileWithMaxCount: 10
+              NSExtensionActivationSupportsAttachmentsWithMaxCount: 10
+    entitlements:
+      path: iOS/ShareExtension/Clipboard2Share.entitlements
+      properties:
+        com.apple.security.application-groups: [group.at.softmaze.Clippy.ios]
+        keychain-access-groups: [$(AppIdentifierPrefix)at.softmaze.Clippy.ios.shared]
+    settings:
+      base:
+        PRODUCT_NAME: Clipboard2 Share
+        PRODUCT_MODULE_NAME: Clipboard2Share
+        PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.ios.share
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: Apple Development
+        ENABLE_HARDENED_RUNTIME: NO
+        SKIP_INSTALL: YES
+
+  Clipboard2 iOS Tests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: iOS/Tests
+    dependencies:
+      - target: Clipboard2 iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.iosTests
+        GENERATE_INFOPLIST_FILE: YES
+        # The app's product is Clipboard2.app, not "Clipboard2 iOS.app".
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Clipboard2.app/Clipboard2
+        BUNDLE_LOADER: $(TEST_HOST)
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: Apple Development
+        ENABLE_HARDENED_RUNTIME: NO
+
 schemes:
   Clipboard2:
     build:
@@ -198,5 +312,18 @@ schemes:
       config: Debug
       targets:
         - Clipboard2Tests
+    archive:
+      config: Release
+  Clipboard2 iOS:
+    build:
+      targets:
+        Clipboard2 iOS: all
+        Clipboard2 iOS Tests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - Clipboard2 iOS Tests
     archive:
       config: Release
