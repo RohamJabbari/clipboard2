@@ -15,6 +15,7 @@ import type { BlobStorage } from "../src/services.js";
 import { issueSignupCode } from "../src/auth.js";
 import { Semaphore } from "../src/rateLimit.js";
 import * as cc from "../src/clientCrypto.js";
+import { serverKeys } from "../src/keys.js";
 
 let embedded: EmbeddedPostgres;
 let dataDir: string;
@@ -22,6 +23,7 @@ let pool: pg.Pool;
 let app: FastifyInstance;
 let currentLimits: Limits;
 const deletedPaths: string[] = [];
+const testKeys = serverKeys(Buffer.alloc(32, 7));
 
 const storage: BlobStorage = {
   async signedPutUrl(path, size, options = {}) {
@@ -39,7 +41,7 @@ const storage: BlobStorage = {
 
 function rebuild(overrides: Partial<Limits> = {}) {
   currentLimits = { ...defaultLimits(), ...overrides };
-  app = buildApp({ pool, storage, limits: currentLimits });
+  app = buildApp({ pool, storage, limits: currentLimits, keys: testKeys });
 }
 
 beforeAll(async () => {
@@ -50,7 +52,7 @@ beforeAll(async () => {
   await embedded.start();
   await embedded.createDatabase("c2test");
   pool = new pg.Pool({ connectionString: `postgres://postgres:postgres@localhost:${port}/c2test`, max: 4 });
-  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql", "003_hardening.sql", "004_contacts.sql", "005_folders.sql", "006_authenticators.sql", "007_member_access.sql"]);
+  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql", "003_hardening.sql", "004_contacts.sql", "005_folders.sql", "006_authenticators.sql", "007_member_access.sql", "008_passwordless.sql"]);
   expect(await migrate(pool)).toEqual([]);
 }, 120_000);
 
@@ -62,7 +64,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await pool.query("TRUNCATE users, sessions, spaces, space_members, items, blobs, invites, signup_codes, auth_attempts CASCADE");
+  await pool.query("TRUNCATE users, sessions, spaces, space_members, items, blobs, invites, signup_codes, auth_attempts, rate_buckets, used_id_tokens CASCADE");
   deletedPaths.length = 0;
   rebuild();
 });
@@ -919,7 +921,7 @@ describe("items", () => {
         });
       };
     });
-    const slowApp = buildApp({ pool: slowPool, storage, limits: currentLimits });
+    const slowApp = buildApp({ pool: slowPool, storage, limits: currentLimits, keys: testKeys });
     try {
       const firstId = randomUUID();
       const first = slowApp.inject({
@@ -1059,7 +1061,7 @@ describe("sessions", () => {
     const listed = (await call(alice, "GET", "/v1/sessions")).body.sessions;
     expect(listed).toHaveLength(2);
     for (const s of listed) {
-      expect(Object.keys(s).sort()).toEqual(["createdAt", "current", "deviceName", "id", "lastUsedAt"]);
+      expect(Object.keys(s).sort()).toEqual(["city", "country", "createdAt", "current", "deviceName", "expiresAt", "id", "kind", "lastUsedAt", "platform", "windowMs"]);
       expect(s.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     }
     const mine = listed.find((s: { current: boolean }) => s.current);
@@ -1193,7 +1195,7 @@ describe("client IPs, auth limits and logs", () => {
   it("counts auth attempts across instances, keyed by HMAC", async () => {
     await freshAuthWindow();
     rebuild({ authPerMinutePerEmail: 2 });
-    const other = buildApp({ pool, storage, limits: currentLimits });
+    const other = buildApp({ pool, storage, limits: currentLimits, keys: testKeys });
     try {
       expect((await call(null, "POST", "/v1/auth/prelogin", { email: "x@example.com" })).status).toBe(200);
       const res = await other.inject({ method: "POST", url: "/v1/auth/prelogin", payload: { email: "x@example.com" }, headers: { "x-forwarded-for": "10.1.1.1" } });
@@ -1243,7 +1245,7 @@ describe("client IPs, auth limits and logs", () => {
 
   it("keeps IPs and emails out of request logs", async () => {
     const lines: string[] = [];
-    app = buildApp({ pool, storage, limits: currentLimits, logger: true, logStream: { write: (line) => lines.push(line) } });
+    app = buildApp({ pool, storage, limits: currentLimits, keys: testKeys, logger: true, logStream: { write: (line) => lines.push(line) } });
     const alice = await signUp("alice");
     await logIn(alice.email, alice.password, "10.4.4.4");
     await call(alice, "GET", "/v1/account");
