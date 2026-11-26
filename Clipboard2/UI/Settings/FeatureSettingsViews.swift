@@ -589,6 +589,8 @@ struct SecretsSettingsView: View {
     var body: some View {
         @Bindable var prefs = env.prefs
         Form {
+            AutoFillSettingsSection()
+
             Section {
                 HStack {
                     Text("Passwords from Apple Passwords, Chrome or 1Password (a CSV export).")
