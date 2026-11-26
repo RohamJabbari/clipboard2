@@ -403,6 +403,43 @@ Changes to shares and batches notify the people involved the same way item chang
 **Limits:** 200 authenticators owned per user, 200 shared with a user, 20 shares per authenticator.
 Deleting an account deletes the authenticators it owns and the shares to it.
 
+### Heads
+
+A cheap "did anything change?" check, so clients can poll every few seconds and run a full sync
+only when something did. Optional: a server without it answers `404` and clients fall back to
+polling the full sync.
+
+| Request | Response |
+|---|---|
+| `GET /v1/heads` | `{heads: {<spaceId>: <seq>}, spaces, codes, contacts}` |
+
+- **`heads`:** every space the caller is a member of (all kinds, pending contacts included), with
+  the highest `seq` the caller could get from its `changes` (`0` when empty). Any write or
+  tombstone moves it. Without [Secrets](#member-access), a group's `secret` rows are left out here
+  too, so their writes never move a member's head. A purge can lower a head; treat any difference
+  as a change.
+- **`spaces`:** an opaque revision (hex) of what `GET /v1/spaces` returns: membership, kind, role,
+  owner, wrapped key, encrypted name, member access, and each space's members with their role and
+  `name`. Joining, leaving, a rename, a new username or an access change moves it.
+- **`codes`:** an opaque revision of `GET /v1/shared-codes` (shares to the caller, their batches
+  and the owner's name) and of the shares of authenticators the caller owns (a new recipient or
+  another device's top-up).
+- **`contacts`:** an opaque revision of `GET /v1/contacts/requests` (both directions) and the
+  caller's open contact codes (`GET /v1/contacts/invites`); a code expiring moves it.
+
+Compare values for equality only; they carry no order and change format freely. Everything is
+computed in one statement: one index probe per membership plus hashes over the caller's few
+membership, share and request rows.
+
+**Rate limit:** 90/min per session, counted apart from the 120/min per user for everything else,
+so polling never starves the syncs it triggers and several devices don't add up.
+
+**Client use (macOS):** every 2 s while the panel is open or the user was active in the last 5
+minutes, otherwise every 10 s. A full sync runs when `heads`, `spaces` or `codes` differ from the
+values seen at the start of the last successful sync (or at least every 5 minutes); `contacts`
+alone only reloads the contact lists. That is 30 requests a minute per active device and 6 when
+idle, each a few milliseconds of database time.
+
 ### Items
 
 **Endpoints:**
@@ -471,6 +508,7 @@ Item = {"id","category":"history|pinned|snippet|secret|folder|otp","seq","sortAt
 | Pending invites per group | 20 | 403 `quota_exceeded` |
 | Open sign-up codes per user | 10 | `too_many_codes` |
 | Requests | 120/min per user | `rate_limited` |
+| `GET /v1/heads` | 90/min per session, apart from the above | `rate_limited` |
 | Prelogin, signup and login | 20/min per IP; 10/min per email | `rate_limited` |
 | Password hashing | 2 at a time per instance, short queue | `rate_limited` |
 
@@ -496,7 +534,7 @@ username or email local part (`name`), never the email.
 ## Client sync rules
 
 1. **State.** A local *sync meta* table holds `(localId, spaceId, category, fingerprint, remoteSeq, updatedAt)`. `fingerprint` is the SHA-256 of the canonical payload JSON last sent or received. Each space also has a `since` cursor.
-2. **Tick.** Triggered 3 s after a local store change (debounced), every 60 s, when the panel opens, and on "Sync now". One tick at a time.
+2. **Tick.** Triggered 3 s after a local store change (debounced), when the panel opens, on "Sync now", and when [`GET /v1/heads`](#heads) shows a change (polled every 2–10 s; at least every 5 minutes regardless). Against a server without heads, every 3/15/60 s (panel open / active / idle). One tick at a time.
    1. Call `GET /v1/spaces` and unwrap any new space keys.
    2. For each space, pull before pushing.
 3. **Pull.** Page through `changes` and apply each item:

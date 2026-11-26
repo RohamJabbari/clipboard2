@@ -337,6 +337,9 @@ export function buildApp(deps: Deps): FastifyInstance {
   // "trust nothing".)
   const app = Fastify({ logger, bodyLimit: Math.ceil(limits.itemBytes * 1.4) + 64 * 1024, trustProxy: (_address: string, hop: number) => hop < 1 });
   const requests = new RateLimiter(limits.requestsPerMinute);
+  // Devices poll /v1/heads every few seconds; it has its own per-session bucket so polling never
+  // eats into the budget of the syncs it triggers (and several devices don't add up).
+  const headPolls = new RateLimiter(limits.headsPerMinute);
   const inviteLookups = new RateLimiter(limits.invitesPerMinute);
 
   // The server-wide cap only guards the shared database and bucket, but summing every row on the
@@ -399,7 +402,7 @@ export function buildApp(deps: Deps): FastifyInstance {
     );
     const session = rows[0];
     if (!session) throw new ApiError(401, "unauthenticated", "Your session ended; sign in again");
-    const wait = requests.take(session.uid);
+    const wait = request.url.split("?")[0] === "/v1/heads" ? headPolls.take(hash.toString("hex")) : requests.take(session.uid);
     if (wait > 0) throw new ApiError(429, "rate_limited", "Too many requests", { retryAfter: wait });
     if (session.stale) {
       await pool.query(`UPDATE sessions SET last_used_at = now(), expires_at = now() + make_interval(days => $2) WHERE token_hash = $1`, [hash, SESSION_DAYS]);
@@ -852,6 +855,50 @@ export function buildApp(deps: Deps): FastifyInstance {
       [request.caller.uid, include.includes("direct"), include.includes("authenticator")],
     );
     return { spaces: rows.map(spaceJson) };
+  });
+
+  /**
+   * What changed, cheaply: polled every few seconds so a device runs its full sync only when
+   * something did (PROTOCOL.md → Heads). One statement: per membership one backward probe of
+   * items_changes; the revisions hash the few rows that feed /v1/spaces, /v1/shared-codes, the
+   * owner's share lists and the contact lists. Secrets a member can't see never move their head.
+   */
+  app.get("/v1/heads", async (request) => {
+    const { rows } = await pool.query<{ heads: Record<string, number | null>; spaces: string; codes: string; contacts: string }>(
+      `WITH mine AS (
+         SELECT m.space_id, m.role, m.can_send, m.can_see_secrets, m.wrapped_key, s.kind, s.owner_uid, s.encrypted_name
+         FROM space_members m JOIN spaces s ON s.id = m.space_id WHERE m.uid = $1)
+       SELECT
+         (SELECT COALESCE(json_object_agg(mine.space_id, (
+             SELECT i.seq FROM items i
+             WHERE i.space_id = mine.space_id AND NOT (mine.kind = 'group' AND NOT mine.can_see_secrets AND i.category = 'secret')
+             ORDER BY i.seq DESC LIMIT 1)), '{}'::json) FROM mine) AS heads,
+         (SELECT md5(COALESCE(string_agg(concat_ws('|', mine.space_id, mine.kind, mine.role, mine.owner_uid, mine.can_send, mine.can_see_secrets,
+                   md5(mine.wrapped_key), md5(COALESCE(mine.encrypted_name, ''::bytea)),
+                   (SELECT string_agg(concat_ws(':', x.uid, x.role, ${nameOf}), ',' ORDER BY x.uid)
+                      FROM space_members x JOIN users u ON u.uid = x.uid WHERE x.space_id = mine.space_id)),
+                 ';' ORDER BY mine.space_id), '')) FROM mine) AS spaces,
+         (SELECT md5(COALESCE(string_agg(concat_ws('|', a.space_id, a.recipient_uid, a.codes_until, a.updated_at, a.owner_name),
+                   ';' ORDER BY a.space_id, a.recipient_uid), ''))
+            FROM (SELECT a.space_id, a.recipient_uid, a.codes_until, a.updated_at, ${nameOf} AS owner_name
+                    FROM authenticator_shares a JOIN spaces s ON s.id = a.space_id JOIN users u ON u.uid = s.owner_uid
+                    WHERE a.recipient_uid = $1
+                  UNION ALL
+                  SELECT a.space_id, a.recipient_uid, a.codes_until, a.updated_at, NULL
+                    FROM authenticator_shares a JOIN mine ON mine.space_id = a.space_id
+                    WHERE mine.kind = 'authenticator' AND mine.role = 'owner') a) AS codes,
+         md5(concat(
+           (SELECT string_agg(concat_ws('|', r.space_id, r.requester, r.recipient), ';' ORDER BY r.space_id)
+              FROM contact_requests r WHERE r.requester = $1 OR r.recipient = $1),
+           '#',
+           (SELECT string_agg(i.id, ';' ORDER BY i.id) FROM invites i JOIN spaces s ON s.id = i.space_id
+              WHERE i.created_by = $1 AND s.kind = 'direct' AND i.expires_at > now()))) AS contacts`,
+      [request.caller.uid],
+    );
+    const row = rows[0]!;
+    // An empty space has head 0, like a cursor that has seen nothing.
+    const heads = Object.fromEntries(Object.entries(row.heads).map(([id, seq]) => [id, Number(seq ?? 0)]));
+    return { heads, spaces: row.spaces, codes: row.codes, contacts: row.contacts };
   });
 
   app.post("/v1/groups", async (request, reply) => {
