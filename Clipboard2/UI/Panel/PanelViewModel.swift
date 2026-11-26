@@ -1147,34 +1147,68 @@ final class PanelViewModel {
         mode = .actions
     }
 
+    /// ⇧⌘V: at the newest copy when something was copied since the last open (Copies, no
+    /// search, newest selected, scrolled to the top); otherwise right where you left off: chip,
+    /// group, search, expanded folders, selection and scroll position.
     func prepareForOpen(target: NSRunningApplication?) {
         selectionItem = nil
         resetMode()
         notice = nil
+        let sameTarget = target?.bundleIdentifier == targetApp?.bundleIdentifier
         targetApp = target
         readPageSite(target)
-        selectedCardID = nil
-        query = ""
-        // Back to Copies without the group pill animating closed behind the opening panel.
-        var reset = Transaction()
-        reset.disablesAnimations = true
-        withTransaction(reset) {
-            groupFilter = nil
-            filter = .copies
-            onlyThisApp = false
+        let newest = newestCopyMark()
+        let atNewest = Self.opensAtNewestCopy(lastSeen: lastSeenNewestCopy, newest: newest)
+        lastSeenNewestCopy = .some(newest)
+        if atNewest {
+            selectedCardID = nil
+            query = ""
+            // Back to Copies without the group pill animating closed behind the opening panel.
+            var reset = Transaction()
+            reset.disablesAnimations = true
+            withTransaction(reset) {
+                groupFilter = nil
+                filter = .copies
+                onlyThisApp = false
+            }
+            userMovedSelection = false
+        } else if !sameTarget && onlyThisApp {
+            onlyThisApp = false   // "Only from ‹App›" was about the app it pasted into then
         }
-        userMovedSelection = false
         isCommandHeld = false
         tipIndex &+= 1
         env.sync.periodicSync()
         env.emailCodes.fetchNow()
-        refresh(resetSelection: true)
+        refresh(resetSelection: atNewest)
         focusToken &+= 1
-        openToken &+= 1
+        if atNewest { openToken &+= 1 }
         otpClock.start()
     }
 
-    /// Bumped on every open so the list scrolls back to the top.
+    /// Copies' newest item as of the last open (`.none`: never opened yet; `.some(nil)`: Copies was empty).
+    @ObservationIgnored private var lastSeenNewestCopy: CopyMark??
+
+    /// Copies' newest item and when it was copied.
+    struct CopyMark: Equatable {
+        let id: UUID
+        let copiedAt: Date
+    }
+
+    private func newestCopyMark() -> CopyMark? {
+        env.store.newestItem(inSpace: nil).map { CopyMark(id: $0.id, copiedAt: $0.lastCopiedAt) }
+    }
+
+    /// The open-position rule: the first open, or anything copied since the last open (a new
+    /// item, or an older one copied again), starts at the newest copy. Otherwise, deletions
+    /// included, the panel opens where it was.
+    static func opensAtNewestCopy(lastSeen: CopyMark??, newest: CopyMark?) -> Bool {
+        guard let lastSeen else { return true }
+        guard let newest else { return false }
+        guard let last = lastSeen else { return true }
+        return newest.copiedAt > last.copiedAt || (newest.copiedAt == last.copiedAt && newest.id != last.id)
+    }
+
+    /// Bumped on an open at the newest copy so the list scrolls back to the top.
     private(set) var openToken = 0
     /// Until the user moves the selection, it stays on the newest item — even when a copy made
     /// just before opening lands a moment later.

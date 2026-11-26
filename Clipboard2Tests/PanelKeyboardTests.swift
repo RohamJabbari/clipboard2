@@ -251,14 +251,16 @@ struct PanelKeyboardTests {
         #expect(model.pickedFiles.isEmpty)
     }
 
-    @Test func openingAlwaysSelectsTheNewestItem() {
+    @Test func openingAfterANewCopySelectsTheNewestItem() {
         let older = env.store.ingest(.text("open-older \(UUID())"), now: .now.addingTimeInterval(-10))
         let newer = env.store.ingest(.text("open-newer \(UUID())"))
         defer { [older, newer].forEach(env.store.delete) }
         model.prepareForOpen(target: nil)
         model.moveSelection(by: 1)                       // user picks something lower down
-        model.prepareForOpen(target: nil)                // reopen
-        #expect(model.selectedID == model.entries.first?.id)
+        let copied = env.store.ingest(.text("open-copied \(UUID())"))
+        defer { env.store.delete(copied) }
+        model.prepareForOpen(target: nil)                // reopen after a new copy
+        #expect(model.selectedID == PanelEntry.clip(copied).id && model.selectedID == model.entries.first?.id)
 
         // A copy that lands just after opening becomes the selection too.
         let late = env.store.ingest(.text("open-late \(UUID())"))

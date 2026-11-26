@@ -55,9 +55,13 @@ struct PanelV3ChipTests {
         #expect(Set(model.entries.compactMap(\.clip?.id)) == [fromApp.id, elsewhere.id])
         model.onlyThisApp = true
         #expect(model.entries.compactMap(\.clip?.id) == [fromApp.id])
-        // Every open starts without it.
+        // Reopening with nothing new copied keeps it; after a new copy, Copies starts without it.
         model.prepareForOpen(target: app)
-        #expect(!model.onlyThisApp)
+        #expect(model.onlyThisApp && model.query == tag)
+        let copied = env.store.ingest(.text("copied \(tag)"))
+        defer { env.store.delete(copied) }
+        model.prepareForOpen(target: app)
+        #expect(!model.onlyThisApp && model.query.isEmpty)
     }
 
     @Test func savedHoldsClipsSnippetsAndFoldersButNoSecretsOrAuthenticators() throws {

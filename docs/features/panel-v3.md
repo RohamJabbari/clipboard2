@@ -75,6 +75,13 @@ Replace All · Saved · ‹This App› · Contacts · ‹group chips›.
 - A stored filter that no longer exists falls back to Copies.
 - Search in Copies covers only Copies. Search from Auth covers only Auth. Each chip searches its own content.
 
+### Where ⇧⌘V opens
+- If something was copied into Copies since the panel last opened (a new item, or an older one copied again), it opens on **Copies**, search cleared, with that newest item selected and the list at the top. The first open after launch does the same.
+- Otherwise it opens exactly where you left it: chip, group (and its Copies | Saved), search text, expanded folders, selected row and scroll position.
+  - Deleting the newest copy doesn't count as a new copy.
+  - "Only from ‹App›" stays on only if the panel pastes into the same app as last time.
+- Modes (⌘K, forms) never carry over: the panel always opens on the list.
+
 ## 5. Preview (⌘Y)
 - **Bug:** ⌘Y on some items shows Quick Look's "No item selected". Quick Look only gets URLs for non-transient clips with files. Text, rich text, colours, links and images without a file give it nothing.
 - **Fix:** every previewable entry gets a file.
