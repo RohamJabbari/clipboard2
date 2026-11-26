@@ -73,6 +73,8 @@ final class AppEnvironment {
         monitor = ClipboardMonitor(store: store, prefs: prefs, tracker: appTracker, blobs: blobs)
         paste = PasteService(store: store, prefs: prefs, tracker: appTracker)
         snippets = SnippetStore(context: container.mainContext)
+        // AutoFill builds: secrets and authenticators move to the shared Keychain first.
+        if !Self.isRunningTests { KeychainLocation.prepare() }
         secrets = SecretStore(prefs: prefs)
         slots = QuickSlots(defaults: .standard, store: store, snippets: snippets, secrets: secrets)
         // Tests never touch the login keychain's authenticators.
@@ -141,9 +143,12 @@ final class AppEnvironment {
         secrets.onChange = { [weak self] in
             guard let self else { return }
             self.removeHistoryCopiesOfSecrets()
+            self.updateAutoFill()
             self.sync.localChange()
         }
+        authenticators.onReload = { [weak self] in self?.updateAutoFill() }
         removeHistoryCopiesOfSecrets()
+        updateAutoFill()
         store.onCommit = { [weak self] in self?.sync.localChange() }
         snippets.onCommit = { [weak self] in self?.sync.localChange() }
         // Retention only stops tracking items (ClipStore drops their sync metadata itself), so
@@ -269,9 +274,16 @@ final class AppEnvironment {
         }
     }
 
+    /// System AutoFill's list and identities (no-op without CLIPBOARD2_AUTOFILL=1). Not in tests.
+    private func updateAutoFill() {
+        guard !Self.isRunningTests else { return }
+        AutoFillIdentities.update(secrets: secrets.secrets, authenticators: authenticators.items)
+    }
+
     func runMaintenance() {
         contextMenu.update()   // starts the right-click tap once Accessibility is granted
         updateTextFieldIcons()   // and the text field icons
+        AutoFillIdentities.checkEnabled()   // re-registers once it's turned on in System Settings
         guard storeOpenError == nil else { return }
         store.enforceRetention(maxItems: prefs.maxItems, maxAge: prefs.maxAge)
         // Sync polls on its own cadence (3 s / 15 s / 60 s).
