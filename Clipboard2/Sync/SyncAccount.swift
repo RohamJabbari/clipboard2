@@ -18,6 +18,23 @@ nonisolated struct StoredSyncSession: Codable, Sendable, Equatable {
     var spaceKeyPins: [String: String]?
     /// This Mac's session id from `/v1/sessions`.
     var deviceId: String?
+    /// Passwordless (docs/features/passwordless.md): this Mac's own P-256 key, and whether its
+    /// session is a device session (wiped, not paused, when it ends). nil on password sessions.
+    var devicePrivateKey: Data? = nil
+    var isDeviceSession: Bool? = nil
+    /// When a device session's window ends (nil: indefinitely, or a password session).
+    var expiresAt: Date? = nil
+}
+
+/// A recovery this Mac started and is waiting out (kept across launches: it takes 72 hours).
+nonisolated struct PendingRecovery: Codable, Sendable, Equatable {
+    var recoveryId: String
+    var secret: String
+    var devicePrivateKey: Data
+    var identifier: String
+    var releaseAt: Date
+    var expiresAt: Date
+    var windowMs: Int64?
 }
 
 protocol SyncSessionStore: AnyObject {
@@ -27,6 +44,14 @@ protocol SyncSessionStore: AnyObject {
     /// The PBKDF2 iterations last used successfully, by email digest. Survives sign-out.
     func kdfFloors() -> [String: Int]
     func saveKDFFloors(_ floors: [String: Int])
+    /// A recovery waiting on this Mac (nil clears it).
+    func pendingRecovery() -> PendingRecovery?
+    func savePendingRecovery(_ recovery: PendingRecovery?)
+}
+
+extension SyncSessionStore {
+    func pendingRecovery() -> PendingRecovery? { nil }
+    func savePendingRecovery(_ recovery: PendingRecovery?) {}
 }
 
 /// Generic-password items (service `<bundle id>.sync`), readable only on this device: the session,
@@ -79,6 +104,20 @@ final class KeychainSyncSessionStore: SyncSessionStore {
         guard let data = try? JSONEncoder().encode(floors) else { return }
         write(data, account: kdfAccount)
     }
+
+    private let recoveryAccount = "recovery"
+
+    func pendingRecovery() -> PendingRecovery? {
+        read(recoveryAccount).flatMap { try? JSONDecoder().decode(PendingRecovery.self, from: $0) }
+    }
+
+    func savePendingRecovery(_ recovery: PendingRecovery?) {
+        guard let recovery, let data = try? JSONEncoder().encode(recovery) else {
+            SecItemDelete(query(recoveryAccount) as CFDictionary)
+            return
+        }
+        write(data, account: recoveryAccount)
+    }
 }
 
 /// A group as the UI shows it (the name is decrypted on this device).
@@ -124,6 +163,13 @@ nonisolated struct SyncDevice: Identifiable, Hashable, Sendable {
     var lastUsedAt: Date
     /// This Mac.
     var isCurrent: Bool
+    /// A passwordless device (it has a window); false for password sessions.
+    var isDeviceSession = false
+    var platform: String?
+    var window: SessionWindow?
+    /// When it signs out by itself (device sessions; nil: indefinitely).
+    var expiresAt: Date?
+    var location: String?
 
     init(_ remote: RemoteDevice) {
         id = remote.id
@@ -131,6 +177,11 @@ nonisolated struct SyncDevice: Identifiable, Hashable, Sendable {
         createdAt = Date(syncMillis: remote.createdAt)
         lastUsedAt = Date(syncMillis: remote.lastUsedAt)
         isCurrent = remote.current
+        isDeviceSession = remote.kind == "device"
+        platform = remote.platform
+        window = isDeviceSession ? SessionWindow(milliseconds: remote.windowMs) : nil
+        expiresAt = isDeviceSession ? remote.expiresAt.map(Date.init(syncMillis:)) : nil
+        location = PasswordlessText.location(country: remote.country, city: remote.city)
     }
 }
 
@@ -166,6 +217,12 @@ nonisolated enum SyncAccountError: LocalizedError, Equatable {
     case ownContactCode
     /// Over a contact limit; the server's words.
     case contactLimit(String)
+    /// A passwordless account has no password to sign in with.
+    case noPassword
+    case numberMismatch
+    case acknowledgementNeeded
+    case invalidWindow
+    case recoveryShareMissing
 
     var errorDescription: String? {
         switch self {
@@ -189,6 +246,11 @@ nonisolated enum SyncAccountError: LocalizedError, Equatable {
         case .ownContactCode: "That's your own contact code. Send it to the person you want to add."
         case .contactLimit(let message):
             message.isEmpty ? "You've reached the limit for contacts." : message.hasSuffix(".") ? message : message + "."
+        case .noPassword: "This account signs in without a password. Use “Sign in with another device”."
+        case .numberMismatch: "That wasn't the number on the new device, so it wasn't let in. If you're signing in yourself, start again there."
+        case .acknowledgementNeeded: "To stay signed in indefinitely, type the sentence exactly as shown."
+        case .invalidWindow: "Pick a window between 15 minutes and 365 days."
+        case .recoveryShareMissing: "The recovery didn't include every share. Start it again."
         }
     }
 }
@@ -243,6 +305,36 @@ final class SyncAccount {
     @ObservationIgnored private var contactsGeneration = 0
     /// Incoming requests already seen this session (nil before the first look).
     @ObservationIgnored private var seenRequests: Set<String>?
+
+    // Passwordless (docs/features/passwordless.md)
+    /// This Mac asking an existing device to let it in.
+    private(set) var deviceLogin: DeviceLoginProgress?
+    /// This Mac recovering an account (waiting out the 72 hours).
+    private(set) var recovery: RecoveryProgress?
+    /// New devices asking to join this account.
+    private(set) var deviceRequests: [PendingDeviceRequest] = []
+    private(set) var recoverySetup: RecoverySetupState?
+    /// The recovery setup was loaded at least once (nil setup then means none).
+    private(set) var recoveryLoaded = false
+    /// Contacts asking you to be their recovery contact (and those you are).
+    private(set) var recoveryInvitations: [RecoveryInvitation] = []
+    /// Contacts recovering their account with your share.
+    private(set) var recoveryHelpRequests: [RecoveryHelpRequest] = []
+    /// Recoveries of this account in progress (someone may be taking it over).
+    private(set) var accountRecoveries: [AccountRecovery] = []
+    /// The account still has a password (nil until known).
+    private(set) var accountHasPassword: Bool?
+    private(set) var emailVerified: Bool?
+    private(set) var emailReleased = false
+    @ObservationIgnored private var lastSecurityRevision: String?
+    @ObservationIgnored private var expiryTask: Task<Void, Never>?
+    @ObservationIgnored private var deviceLoginTask: Task<Void, Never>?
+    @ObservationIgnored private var recoveryTask: Task<Void, Never>?
+    @ObservationIgnored private var deviceLoginTicket: DeviceLoginTicket?
+    /// Requests already announced, so a notification goes out once each.
+    @ObservationIgnored private var announcedSecurity: Set<String> = []
+    /// A new device or recovery wants attention: what to say ("“MacBook” wants to sign in").
+    @ObservationIgnored var onSecurityAlert: ((String) -> Void)?
 
     @ObservationIgnored private let credentials: any SyncSessionStore
     @ObservationIgnored private let prefs: Preferences
@@ -521,19 +613,33 @@ final class SyncAccount {
     func start() {
         guard let saved = credentials.load() else {
             state = .signedOut
+            resumePendingRecovery()
+            return
+        }
+        if saved.isDeviceSession == true, SessionExpiry.isExpired(saved.expiresAt, now: clock()) {
+            // The window ended while the app wasn't running: nothing of the account stays.
+            session = saved
+            windowEnded()
             return
         }
         session = saved
         username = saved.username
         loadGroups()
+        if saved.token == nil, saved.isDeviceSession == true {
+            session = saved
+            windowEnded(message: "This Mac was signed out of Sync, and its synced data was removed.")
+            return
+        }
         if saved.token == nil {
             state = .needsPassword(email: saved.email)
             onSessionChange?(true)
         } else if let identity = identity(from: saved) {
             activate(identity)
+            scheduleExpiry()
             Task {
                 await refreshAccount()
                 await refreshDevices()
+                await refreshSecurity()
             }
         } else {
             state = .needsPassword(email: saved.email)
@@ -722,7 +828,16 @@ final class SyncAccount {
     /// Opens the account key from a fresh `Account`, stores the session and starts syncing.
     private func adopt(_ remote: RemoteSession, wrapKey: Data, adopting keys: [String: Data] = [:]) throws {
         let account = remote.account
-        let ak = try SyncCrypto.open(account.wrappedAccountKey, key: wrapKey, aad: SyncCrypto.AAD.accountKey(uid: account.uid))
+        guard let wrapped = account.wrappedAccountKey else { throw SyncAccountError.noPassword }
+        let ak = try SyncCrypto.open(wrapped, key: wrapKey, aad: SyncCrypto.AAD.accountKey(uid: account.uid))
+        try adopt(remote, accountKey: ak, adopting: keys)
+    }
+
+    /// Stores a session whose account key this Mac already has (opened with the password, or
+    /// wrapped to this device). `device` makes it a passwordless device session.
+    private func adopt(_ remote: RemoteSession, accountKey ak: Data, device: Data? = nil, adopting keys: [String: Data] = [:]) throws {
+        let account = remote.account
+        // The account key is right only if it opens the private key (GCM authenticates).
         let priv = try SyncCrypto.open(account.wrappedPrivateKey, key: ak, aad: SyncCrypto.AAD.privateKey(uid: account.uid))
         let previous = session
         if let previous, previous.uid != account.uid {
@@ -736,13 +851,21 @@ final class SyncAccount {
         let stored = StoredSyncSession(uid: account.uid, email: account.email, token: remote.token, accountKey: ak,
                                        privateKey: priv, personalSpaceId: account.personalSpaceId, username: account.username,
                                        spaceKeyPins: sameAccount ? previous?.spaceKeyPins : nil,
-                                       deviceId: nil)
+                                       deviceId: nil,
+                                       devicePrivateKey: device,
+                                       isDeviceSession: device != nil ? true : nil,
+                                       expiresAt: device != nil ? remote.expiresAt.map(Date.init(syncMillis:)) : nil)
         session = stored
         username = account.username
+        rememberAccount(account)
         credentials.save(stored)
         guard let identity = identity(from: stored) else { throw SyncCryptoError.badKey }
         activate(identity, adopting: keys, signingIn: true)
-        Task { await refreshDevices() }
+        scheduleExpiry()
+        Task {
+            await refreshDevices()
+            await refreshSecurity()
+        }
     }
 
     // MARK: Account management
@@ -773,6 +896,13 @@ final class SyncAccount {
     private func refreshAccount() async {
         guard let api = engine?.api, let account = try? await api.account() else { return }
         rememberUsername(account.username)
+        rememberAccount(account)
+    }
+
+    private func rememberAccount(_ account: RemoteAccount) {
+        accountHasPassword = account.hasPassword ?? (account.wrappedAccountKey != nil)
+        emailVerified = account.emailVerified
+        emailReleased = account.emailReleased ?? false
     }
 
     private func rememberUsername(_ name: String?) {
@@ -846,14 +976,28 @@ final class SyncAccount {
         forgetLocally()
     }
 
-    private func forgetLocally() {
+    /// `includingPersonal`: a passwordless device leaving takes everything of the account with it.
+    private func forgetLocally(includingPersonal: Bool = false) {
         debounceTask?.cancel()
         pollTask?.cancel()
+        expiryTask?.cancel()
         engine?.stop()
         engine = nil
-        SyncEngine.wipeLocalState(context: context, store: store, snippets: snippets, secrets: secrets, authenticators: authenticators)
+        SyncEngine.wipeLocalState(context: context, store: store, snippets: snippets, secrets: secrets, authenticators: authenticators,
+                                  includingPersonal: includingPersonal)
         credentials.clear()
         session = nil
+        deviceRequests = []
+        recoverySetup = nil
+        recoveryLoaded = false
+        recoveryInvitations = []
+        recoveryHelpRequests = []
+        accountRecoveries = []
+        accountHasPassword = nil
+        emailVerified = nil
+        emailReleased = false
+        lastSecurityRevision = nil
+        announcedSecurity = []
         groups = []
         contacts = []
         contactRequests = ContactRequests()
@@ -1029,6 +1173,11 @@ final class SyncAccount {
     /// safety-net interval passed, or the server has no heads. Returns whether a tick was started.
     @discardableResult
     func poll() async -> Bool {
+        // A passwordless device whose window ended (the timer may not have fired during sleep).
+        if session?.isDeviceSession == true, SessionExpiry.isExpired(session?.expiresAt, now: clock()) {
+            windowEnded()
+            return false
+        }
         guard let engine, !isTicking, !tickPending else { return false }
         if let until = backoffUntil, until > clock() { return false }
         let fullSyncDue = lastTickAt.map { clock().timeIntervalSince($0) >= SyncConfig.fullSyncInterval } ?? true
@@ -1050,6 +1199,10 @@ final class SyncAccount {
             lastContactsRevision = heads.contacts
             lastContactsRefresh = clock()
             Task { await refreshContacts() }
+        }
+        if let security = heads.security, security != lastSecurityRevision {
+            lastSecurityRevision = security
+            Task { await refreshSecurity() }
         }
         guard heads.needsSync(since: lastHeads), !isTicking else { return false }
         startTick()
@@ -1213,8 +1366,15 @@ final class SyncAccount {
         lastSyncError = error.localizedDescription
     }
 
-    /// `401 unauthenticated`: keep the keys, drop the token, ask for the password.
+    /// `401 unauthenticated`: keep the keys, drop the token, ask for the password. A passwordless
+    /// device can't sign in again by itself: it was signed out elsewhere or its window ended, so it
+    /// removes everything of the account instead.
     private func sessionEnded() {
+        if session?.isDeviceSession == true {
+            windowEnded(message: SessionExpiry.isExpired(session?.expiresAt, now: clock())
+                        ? nil : "This Mac was signed out of Sync from another device, and its synced data was removed.")
+            return
+        }
         engine?.stop()
         engine = nil
         debounceTask?.cancel()
@@ -1757,6 +1917,642 @@ final class SyncAccount {
         } else {
             state = .signedOut
         }
+    }
+}
+
+// MARK: - Passwordless (docs/features/passwordless.md)
+
+/// This Mac waiting for another device to let it in: the number to show, and how it went.
+nonisolated struct DeviceLoginProgress: Equatable, Sendable {
+    enum Status: Equatable, Sendable {
+        case waiting
+        case denied
+        case mismatch
+        case expired
+        case cancelled
+        case failed(String)
+    }
+    var requestId: String
+    var identifier: String
+    var number: Int
+    var expiresAt: Date
+    var window: SessionWindow
+    var status: Status = .waiting
+
+    var isWaiting: Bool { status == .waiting }
+}
+
+/// This Mac recovering an account: the number contacts must pick, and when the server lets go.
+nonisolated struct RecoveryProgress: Equatable, Sendable {
+    enum Status: Equatable, Sendable {
+        case waiting
+        case denied
+        case mismatch
+        case cancelled
+        case expired
+        case failed(String)
+    }
+    var recoveryId: String
+    var identifier: String
+    var number: Int
+    var releaseAt: Date
+    var approvals = 0
+    var needed = 1
+    var status: Status = .waiting
+}
+
+/// Words the passwordless UI shares.
+nonisolated enum PasswordlessText {
+    /// "Vienna, AT", "AT", or nil when unknown.
+    static func location(country: String?, city: String?) -> String? {
+        switch (city?.isEmpty == false ? city : nil, country?.isEmpty == false ? country : nil) {
+        case let (city?, country?): "\(city), \(country)"
+        case let (nil, country?): country
+        case let (city?, nil): city
+        default: nil
+        }
+    }
+
+    static func platform(_ platform: String?) -> String {
+        switch platform {
+        case "macos": "Mac"
+        case "windows": "Windows PC"
+        case "ios": "iPhone or iPad"
+        case let other?: other
+        case nil: "Unknown device"
+        }
+    }
+}
+
+extension SyncAccount {
+    /// This Mac signs in without a password (its session ends at its window and wipes it).
+    var isPasswordlessDevice: Bool { session?.isDeviceSession == true }
+
+    /// When this Mac's sign-in ends (nil: indefinitely, or a password session).
+    var sessionExpiresAt: Date? { session?.isDeviceSession == true ? session?.expiresAt : nil }
+
+    /// Only this Mac and no recovery: losing it loses the synced data.
+    var needsRecoveryWarning: Bool {
+        recoveryLoaded && recoverySetup?.status != "active" && devices.count == 1
+    }
+
+    private var platformName: String { "macos" }
+
+    // MARK: Sign up
+
+    /// A passwordless account: this Mac makes every key, including its own device key, and is
+    /// trusted indefinitely. `googleIdToken` verifies the email (it replaces `email`).
+    func signUpPasswordless(email rawEmail: String?, googleIdToken: String? = nil, username rawUsername: String, inviteCode: String) async {
+        clearMessages()
+        let username = rawUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let problem = Self.usernameProblem(username) {
+            errorMessage = problem
+            return
+        }
+        var signupCode: String?
+        var groupCode: Data?
+        if let code = SyncCrypto.Invite.parse(inviteCode) {
+            groupCode = code
+        } else if let code = SyncCrypto.Invite.normalizeSignupCode(inviteCode) {
+            signupCode = code
+        } else {
+            errorMessage = (inviteCode.trimmingCharacters(in: .whitespaces).isEmpty
+                            ? SyncAccountError.inviteRequired : SyncAccountError.invalidInviteCode).errorDescription
+            return
+        }
+        state = .working("Creating your account…")
+        do {
+            let uid = SyncCrypto.newID()
+            let ak = SyncCrypto.randomBytes(32)
+            let priv = SyncCrypto.newPrivateKey()
+            let pub = try SyncCrypto.publicKey(of: priv)
+            let devicePriv = SyncCrypto.newPrivateKey()
+            let personalId = SyncCrypto.newID()
+            let spaceKey = SyncCrypto.randomBytes(32)
+            let body = PasswordlessSignupRequest(
+                email: googleIdToken == nil ? rawEmail.map(Self.normalize(email:)) : nil,
+                googleIdToken: googleIdToken,
+                username: username,
+                signupCode: signupCode,
+                groupInviteId: groupCode.map(SyncCrypto.Invite.id),
+                uid: uid,
+                publicKey: pub,
+                wrappedPrivateKey: try SyncCrypto.seal(priv, key: ak, aad: SyncCrypto.AAD.privateKey(uid: uid)),
+                personalSpace: .init(id: personalId, wrappedKey: try SyncCrypto.wrapSpaceKey(
+                    spaceKey, spaceId: personalId, memberUid: uid, memberPublicKey: pub)),
+                device: DeviceInfo(publicKey: try SyncCrypto.publicKey(of: devicePriv), name: deviceName, platform: platformName))
+            let remote: RemoteSession
+            do {
+                remote = try await makeAPI().passwordlessSignup(body)
+            } catch let error as SyncAPIError where error.code == "username_taken" {
+                throw SyncAccountError.usernameTaken
+            } catch let error as SyncAPIError where error.code == "conflict" {
+                throw SyncAccountError.emailTaken
+            }
+            try adopt(remote, accountKey: ak, device: devicePriv, adopting: [remote.account.personalSpaceId: spaceKey])
+        } catch {
+            fail(error)
+            return
+        }
+        if let groupCode {
+            do {
+                let preview = try await previewInvite(code: SyncCrypto.Invite.format(groupCode))
+                try await join(preview)
+                notice = "You joined “\(preview.name)”."
+            } catch {
+                errorMessage = "Your account is ready, but joining the group didn't work: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    // MARK: Signing in on a new device
+
+    /// Asks the account's signed-in devices to let this Mac in. Polls until one answers, the
+    /// request expires or it's cancelled.
+    func startDeviceLogin(identifier raw: String, window: SessionWindow, acknowledgement: String = "") async {
+        clearMessages()
+        guard window.isValid else {
+            errorMessage = SyncAccountError.invalidWindow.errorDescription
+            return
+        }
+        guard window.canStart(acknowledgement: acknowledgement) else {
+            errorMessage = SyncAccountError.acknowledgementNeeded.errorDescription
+            return
+        }
+        let identifier = raw.contains("@") ? Self.normalize(email: raw) : raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        deviceLoginTask?.cancel()
+        do {
+            let devicePriv = SyncCrypto.newPrivateKey()
+            let devicePub = try SyncCrypto.publicKey(of: devicePriv)
+            let api = makeAPI()
+            let ticket = try await api.requestDeviceLogin(WindowedRequest(
+                identifier: identifier, method: nil, device: DeviceInfo(publicKey: devicePub, name: deviceName, platform: platformName),
+                window: window, acknowledgement: SessionWindow.acknowledgement))
+            deviceLoginTicket = ticket
+            deviceLogin = DeviceLoginProgress(
+                requestId: ticket.requestId, identifier: identifier,
+                number: PasswordlessCrypto.matchNumber(requestId: ticket.requestId, devicePublicKey: devicePub),
+                expiresAt: Date(syncMillis: ticket.expiresAt), window: window)
+            deviceLoginTask = Task { [weak self] in
+                await self?.pollDeviceLogin(ticket: ticket, devicePrivateKey: devicePriv, api: api)
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func pollDeviceLogin(ticket: DeviceLoginTicket, devicePrivateKey: Data, api: any SyncService) async {
+        while !Task.isCancelled, deviceLogin?.requestId == ticket.requestId, deviceLogin?.isWaiting == true {
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, deviceLogin?.requestId == ticket.requestId else { return }
+            if clock() > Date(syncMillis: ticket.expiresAt).addingTimeInterval(5) {
+                deviceLogin?.status = .expired
+                return
+            }
+            let result: DeviceLoginPoll
+            do {
+                result = try await api.pollDeviceLogin(id: ticket.requestId, secret: ticket.secret)
+            } catch let error as SyncAPIError where error.isRateLimited || error.isNetwork {
+                continue
+            } catch {
+                deviceLogin?.status = .failed(error.localizedDescription)
+                return
+            }
+            switch result.status {
+            case "pending": continue
+            case "approved":
+                await finishDeviceLogin(result, ticket: ticket, devicePrivateKey: devicePrivateKey)
+                return
+            case "denied": deviceLogin?.status = .denied
+            case "mismatch": deviceLogin?.status = .mismatch
+            case "cancelled": deviceLogin?.status = .cancelled
+            case "expired": deviceLogin?.status = .expired
+            default: deviceLogin?.status = .failed("This sign-in request can't be used any more. Start again.")
+            }
+            return
+        }
+    }
+
+    private func finishDeviceLogin(_ result: DeviceLoginPoll, ticket: DeviceLoginTicket, devicePrivateKey: Data) async {
+        guard let token = result.token, let account = result.account, let wrapped = result.wrappedAccountKey else {
+            deviceLogin?.status = .failed("The approval was incomplete. Start again.")
+            return
+        }
+        do {
+            let ak = try PasswordlessCrypto.unwrapAccountKey(wrapped, uid: account.uid, requestId: ticket.requestId,
+                                                             devicePrivateKey: devicePrivateKey)
+            try adopt(RemoteSession(token: token, expiresAt: result.expiresAt, account: account), accountKey: ak, device: devicePrivateKey)
+            deviceLogin = nil
+            notice = "This Mac is signed in."
+        } catch {
+            deviceLogin?.status = .failed("The approval couldn't be opened on this Mac. Start again.")
+        }
+    }
+
+    /// Stops waiting (and tells the server, so the other devices stop asking).
+    func cancelDeviceLogin() {
+        deviceLoginTask?.cancel()
+        deviceLoginTask = nil
+        if let ticket = deviceLoginTicket {
+            let api = makeAPI()
+            Task { try? await api.cancelDeviceLogin(id: ticket.requestId, secret: ticket.secret) }
+        }
+        deviceLoginTicket = nil
+        deviceLogin = nil
+    }
+
+    // MARK: Approving new devices
+
+    /// Reloads what the heads `security` revision covers: device requests, recoveries both ways,
+    /// the recovery setup and the device list. Announces new requests once.
+    func refreshSecurity() async {
+        guard let api = engine?.api else { return }
+        async let requests = try? api.deviceRequests()
+        async let invitations = try? api.recoveryInvitations()
+        async let help = try? api.recoveryRequests()
+        async let mine = try? api.accountRecoveries()
+        async let setup = try? api.recoverySetup()
+        let (r, i, h, m) = await (requests, invitations, help, mine)
+        let s: RecoverySetupState?? = await setup
+        if let r, r != deviceRequests { deviceRequests = r }
+        if let i, i != recoveryInvitations { recoveryInvitations = i }
+        if let h, h != recoveryHelpRequests { recoveryHelpRequests = h }
+        if let m, m != accountRecoveries { accountRecoveries = m }
+        if let s {
+            if s != recoverySetup { recoverySetup = s }
+            recoveryLoaded = true
+        }
+        await refreshDevices()
+        announceSecurity()
+    }
+
+    private func announceSecurity() {
+        var alerts: [String] = []
+        for request in deviceRequests where announcedSecurity.insert("device:\(request.id)").inserted {
+            alerts.append("“\(request.deviceName ?? PasswordlessText.platform(request.platform))” wants to sign in to your Sync account")
+        }
+        for recovery in accountRecoveries where announcedSecurity.insert("recovery:\(recovery.id)").inserted {
+            alerts.append("Someone started recovering your Sync account. Cancel it if it isn't you.")
+        }
+        for help in recoveryHelpRequests where announcedSecurity.insert("help:\(help.id)").inserted {
+            alerts.append("\(help.name) is recovering their account and needs your approval")
+        }
+        for invitation in recoveryInvitations where !invitation.accepted && announcedSecurity.insert("invite:\(invitation.id)").inserted {
+            alerts.append("\(invitation.name) asked you to be their recovery contact")
+        }
+        for alert in alerts { onSecurityAlert?(alert) }
+    }
+
+    /// The approver's side of number matching: the pick is checked here, against the number this
+    /// Mac derives from the new device's key, before the account key is wrapped to it.
+    func approve(_ request: PendingDeviceRequest, picked number: Int) async throws {
+        let session = try requireSession()
+        let correct = PasswordlessCrypto.matchNumber(requestId: request.id, devicePublicKey: request.devicePublicKey)
+        guard number == correct else {
+            // Tell the server, which closes the request; then say so.
+            try? await call { try await $0.api.approveDeviceRequest(id: request.id, number: number, wrappedAccountKey: nil) }
+            deviceRequests.removeAll { $0.id == request.id }
+            throw SyncAccountError.numberMismatch
+        }
+        let wrapped = try PasswordlessCrypto.wrapAccountKey(session.accountKey, uid: session.uid, requestId: request.id,
+                                                            devicePublicKey: request.devicePublicKey)
+        do {
+            try await call { try await $0.api.approveDeviceRequest(id: request.id, number: number, wrappedAccountKey: wrapped) }
+        } catch let error as SyncAPIError where error.code == "number_mismatch" {
+            deviceRequests.removeAll { $0.id == request.id }
+            throw SyncAccountError.numberMismatch
+        }
+        deviceRequests.removeAll { $0.id == request.id }
+        Task { await refreshDevices() }
+    }
+
+    /// `block`: "This wasn't me" (that source is blocked and new requests pause for a while).
+    func deny(_ request: PendingDeviceRequest, block: Bool) async throws {
+        try await call { try await $0.api.denyDeviceRequest(id: request.id, block: block) }
+        deviceRequests.removeAll { $0.id == request.id }
+    }
+
+    // MARK: Session windows
+
+    /// Wipes this Mac when its window ends, to the second.
+    private func scheduleExpiry() {
+        expiryTask?.cancel()
+        guard session?.isDeviceSession == true, let ends = session?.expiresAt else { return }
+        expiryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let left = ends.timeIntervalSince(self.clock())
+                if left <= 0 { break }
+                // Re-checks at least every minute, so a sleeping Mac catches up when it wakes.
+                try? await Task.sleep(for: .seconds(min(left, 60)))
+            }
+            guard !Task.isCancelled else { return }
+            self?.windowEnded()
+        }
+    }
+
+    /// The window ended (or the server signed this device out): sign out and remove everything
+    /// of the account from this Mac, personal history included.
+    func windowEnded(message: String? = nil) {
+        if let token = session?.token {
+            let api = makeService { token }
+            Task { try? await api.logout() }
+        }
+        deviceLoginTask?.cancel()
+        forgetLocally(includingPersonal: true)
+        notice = message ?? "This Mac's sign-in window ended, so it signed out of Sync and removed its synced data. Sign in again from another device to continue."
+    }
+
+    /// Any device may shorten any device's window; only this Mac may lengthen its own.
+    func changeWindow(of device: SyncDevice, to window: SessionWindow, acknowledgement: String = "") async throws {
+        guard window.isValid else { throw SyncAccountError.invalidWindow }
+        guard window.canStart(acknowledgement: acknowledgement) else { throw SyncAccountError.acknowledgementNeeded }
+        let updated = try await call {
+            try await $0.api.setSessionWindow(id: device.id, window: window, acknowledgement: SessionWindow.acknowledgement)
+        }
+        if device.isCurrent, var stored = session {
+            stored.expiresAt = updated.expiresAt.map(Date.init(syncMillis:))
+            session = stored
+            credentials.save(stored)
+            scheduleExpiry()
+        }
+        await refreshDevices()
+    }
+
+    // MARK: Switching an existing account
+
+    /// Makes this Mac a passwordless device (signed in indefinitely). `retirePassword` removes the
+    /// password too; the server refuses while another device still signs in with it.
+    func switchToPasswordless(password: String, retirePassword: Bool) async -> Bool {
+        clearMessages()
+        guard var stored = session, let api = engine?.api else { return false }
+        do {
+            let kdf = try checkedKDF(try await api.prelogin(email: stored.email), email: stored.email)
+            let keys = try await SyncCrypto.derivePasswordKeys(password: password, salt: kdf.salt, iterations: kdf.iterations)
+            let devicePriv = stored.devicePrivateKey ?? SyncCrypto.newPrivateKey()
+            let result: PasswordlessSwitch
+            do {
+                result = try await api.switchToPasswordless(authKey: keys.authKey, devicePublicKey: try SyncCrypto.publicKey(of: devicePriv),
+                                                            retirePassword: retirePassword)
+            } catch let error as SyncAPIError where error.code == "invalid_credentials" {
+                errorMessage = "The password is wrong."
+                return false
+            } catch let error as SyncAPIError where error.code == "password_devices" {
+                errorMessage = "Other devices still sign in with your password (Windows needs it). Sign them out under Devices first, or keep the password."
+                return false
+            }
+            stored.devicePrivateKey = devicePriv
+            stored.isDeviceSession = true
+            stored.expiresAt = result.session.expiresAt.map(Date.init(syncMillis:))
+            session = stored
+            credentials.save(stored)
+            rememberAccount(result.account)
+            scheduleExpiry()
+            notice = retirePassword
+                ? "This Mac is now passwordless, and the password was removed. New devices sign in with your approval."
+                : "This Mac is now passwordless. Your password still works on other devices."
+            await refreshDevices()
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Deletes a passwordless account; the username, typed, confirms it.
+    func deletePasswordlessAccount(confirm: String) async -> Bool {
+        clearMessages()
+        do {
+            try await call { try await $0.api.deletePasswordlessAccount(confirm: confirm) }
+            forgetLocally(includingPersonal: true)
+            notice = "Your account and synced data were deleted."
+            return true
+        } catch let error as SyncAPIError where error.code == "invalid" {
+            errorMessage = "Type your username exactly to confirm."
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        return false
+    }
+
+    /// Verifies (or changes) the email with a Google ID token.
+    func verifyEmail(googleIdToken: String) async throws {
+        let account = try await call { try await $0.api.setEmail(nil, googleIdToken: googleIdToken) }
+        rememberAccount(account)
+        if var stored = session, stored.email != account.email {
+            stored.email = account.email
+            session = stored
+            credentials.save(stored)
+            state = .signedIn(email: account.email)
+        }
+        notice = "Your email is verified."
+    }
+
+    // MARK: Recovery (owner)
+
+    /// Splits the account key between `contacts` (1 or 2) and the server, wrapping each share to
+    /// that contact's key. They must accept before it's active.
+    func setUpRecovery(with contacts: [SyncContact]) async throws {
+        let session = try requireSession()
+        guard (1...2).contains(contacts.count) else { throw SyncAccountError.notSaved }
+        let setupId = SyncCrypto.newID()
+        let shares = PasswordlessCrypto.split(session.accountKey, into: contacts.count + 1)
+        var wrapped: [(uid: String, wrappedShare: Data)] = []
+        for (index, contact) in contacts.enumerated() {
+            guard let uid = contact.uid else { throw SyncAccountError.unknownUsername(contact.name) }
+            let user = try await call { try await $0.api.user(id: uid) }
+            let share = try PasswordlessCrypto.wrap(shares[index], to: user.publicKey,
+                                                    info: PasswordlessCrypto.shareInfo(setupId: setupId),
+                                                    aad: PasswordlessCrypto.shareAAD(setupId: setupId, contactUid: uid))
+            wrapped.append((uid, share))
+        }
+        let escrow = shares[contacts.count]
+        recoverySetup = try await call { try await $0.api.setUpRecovery(setupId: setupId, contacts: wrapped, escrowShare: escrow) }
+        recoveryLoaded = true
+    }
+
+    func removeRecovery() async throws {
+        try await call { try await $0.api.deleteRecovery() }
+        recoverySetup = nil
+    }
+
+    /// Someone may be taking over the account: stop it (new recoveries then wait a day).
+    func cancel(_ recovery: AccountRecovery) async throws {
+        try await call { try await $0.api.cancelAccountRecovery(id: recovery.id) }
+        accountRecoveries.removeAll { $0.id == recovery.id }
+    }
+
+    // MARK: Recovery (contact)
+
+    func accept(_ invitation: RecoveryInvitation) async throws {
+        try await call { try await $0.api.acceptRecoveryInvitation(setupId: invitation.setupId) }
+        await refreshSecurity()
+    }
+
+    func decline(_ invitation: RecoveryInvitation) async throws {
+        try await call { try await $0.api.declineRecoveryInvitation(setupId: invitation.setupId) }
+        recoveryInvitations.removeAll { $0.id == invitation.id }
+    }
+
+    /// The contact's side: check the number, open your share and wrap it to their new device.
+    func approve(_ help: RecoveryHelpRequest, picked number: Int) async throws {
+        let session = try requireSession()
+        let correct = PasswordlessCrypto.matchNumber(requestId: help.id, devicePublicKey: help.devicePublicKey)
+        guard number == correct else {
+            try? await call { try await $0.api.approveRecovery(id: help.id, number: number, wrappedShare: nil) }
+            recoveryHelpRequests.removeAll { $0.id == help.id }
+            throw SyncAccountError.numberMismatch
+        }
+        let share = try PasswordlessCrypto.unwrap(help.wrappedShare, privateKey: session.privateKey,
+                                                  info: PasswordlessCrypto.shareInfo(setupId: help.setupId),
+                                                  aad: PasswordlessCrypto.shareAAD(setupId: help.setupId, contactUid: session.uid))
+        let rewrapped = try PasswordlessCrypto.wrap(share, to: help.devicePublicKey,
+                                                    info: PasswordlessCrypto.recoveredInfo(recoveryId: help.id),
+                                                    aad: PasswordlessCrypto.recoveredAAD(recoveryId: help.id, holder: session.uid))
+        try await call { try await $0.api.approveRecovery(id: help.id, number: number, wrappedShare: rewrapped) }
+        recoveryHelpRequests.removeAll { $0.id == help.id }
+    }
+
+    func deny(_ help: RecoveryHelpRequest) async throws {
+        try await call { try await $0.api.denyRecovery(id: help.id) }
+        recoveryHelpRequests.removeAll { $0.id == help.id }
+    }
+
+    // MARK: Recovering on a new device
+
+    /// Starts recovering with contacts. The wait (72 h) survives quitting the app.
+    func startRecovery(identifier raw: String, window: SessionWindow, acknowledgement: String = "") async {
+        clearMessages()
+        guard window.isValid else {
+            errorMessage = SyncAccountError.invalidWindow.errorDescription
+            return
+        }
+        guard window.canStart(acknowledgement: acknowledgement) else {
+            errorMessage = SyncAccountError.acknowledgementNeeded.errorDescription
+            return
+        }
+        let identifier = raw.contains("@") ? Self.normalize(email: raw) : raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            let devicePriv = SyncCrypto.newPrivateKey()
+            let devicePub = try SyncCrypto.publicKey(of: devicePriv)
+            let ticket = try await makeAPI().startRecovery(WindowedRequest(
+                identifier: identifier, method: "contacts",
+                device: DeviceInfo(publicKey: devicePub, name: deviceName, platform: platformName),
+                window: window, acknowledgement: SessionWindow.acknowledgement))
+            let pending = PendingRecovery(recoveryId: ticket.recoveryId, secret: ticket.secret, devicePrivateKey: devicePriv,
+                                          identifier: identifier, releaseAt: Date(syncMillis: ticket.releaseAt),
+                                          expiresAt: Date(syncMillis: ticket.expiresAt), windowMs: window.milliseconds)
+            credentials.savePendingRecovery(pending)
+            resumeRecovery(pending)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Picks a stored recovery back up (at launch).
+    func resumePendingRecovery() {
+        guard session == nil, recovery == nil, let pending = credentials.pendingRecovery() else { return }
+        if clock() > pending.expiresAt {
+            credentials.savePendingRecovery(nil)
+            return
+        }
+        resumeRecovery(pending)
+    }
+
+    private func resumeRecovery(_ pending: PendingRecovery) {
+        let pub = (try? SyncCrypto.publicKey(of: pending.devicePrivateKey)) ?? Data()
+        recovery = RecoveryProgress(recoveryId: pending.recoveryId, identifier: pending.identifier,
+                                    number: PasswordlessCrypto.matchNumber(requestId: pending.recoveryId, devicePublicKey: pub),
+                                    releaseAt: pending.releaseAt)
+        recoveryTask?.cancel()
+        recoveryTask = Task { [weak self] in await self?.pollRecovery(pending) }
+    }
+
+    private func pollRecovery(_ pending: PendingRecovery) async {
+        let api = makeAPI()
+        var first = true
+        while !Task.isCancelled, recovery?.recoveryId == pending.recoveryId, recovery?.status == .waiting {
+            if !first { try? await Task.sleep(for: .seconds(15)) }
+            first = false
+            guard !Task.isCancelled else { return }
+            let result: RecoveryPoll
+            do {
+                result = try await api.pollRecovery(id: pending.recoveryId, secret: pending.secret)
+            } catch let error as SyncAPIError where error.isRateLimited || error.isNetwork {
+                continue
+            } catch {
+                recovery?.status = .failed(error.localizedDescription)
+                return
+            }
+            switch result.status {
+            case "waiting":
+                recovery?.approvals = result.approvals ?? 0
+                recovery?.needed = result.needed ?? 1
+                if let releaseAt = result.releaseAt { recovery?.releaseAt = Date(syncMillis: releaseAt) }
+                continue
+            case "ready":
+                finishRecovery(result, pending: pending)
+                return
+            case "denied": recovery?.status = .denied
+            case "mismatch": recovery?.status = .mismatch
+            case "cancelled": recovery?.status = .cancelled
+            case "expired": recovery?.status = .expired
+            default: recovery?.status = .failed("This recovery can't be used any more.")
+            }
+            credentials.savePendingRecovery(nil)
+            return
+        }
+    }
+
+    /// Opens every share with this Mac's key, puts the account key back together and signs in.
+    private func finishRecovery(_ result: RecoveryPoll, pending: PendingRecovery) {
+        do {
+            guard let token = result.token, let account = result.account, let escrow = result.escrowShare,
+                  let contactShares = result.shares, !contactShares.isEmpty else { throw SyncAccountError.recoveryShareMissing }
+            var shares = try contactShares.map {
+                try PasswordlessCrypto.unwrap($0.wrappedShare, privateKey: pending.devicePrivateKey,
+                                              info: PasswordlessCrypto.recoveredInfo(recoveryId: pending.recoveryId),
+                                              aad: PasswordlessCrypto.recoveredAAD(recoveryId: pending.recoveryId, holder: $0.uid))
+            }
+            shares.append(try PasswordlessCrypto.unwrap(escrow, privateKey: pending.devicePrivateKey,
+                                                        info: PasswordlessCrypto.recoveredInfo(recoveryId: pending.recoveryId),
+                                                        aad: PasswordlessCrypto.recoveredAAD(recoveryId: pending.recoveryId, holder: "server")))
+            let ak = PasswordlessCrypto.combine(shares)
+            try adopt(RemoteSession(token: token, expiresAt: result.expiresAt, account: account), accountKey: ak,
+                      device: pending.devicePrivateKey)
+            credentials.savePendingRecovery(nil)
+            recovery = nil
+            notice = "Your account is recovered. Set up recovery again: the old shares were used."
+        } catch {
+            credentials.savePendingRecovery(nil)
+            recovery?.status = .failed("The recovered key didn't open your account. Ask your contacts and start again.")
+        }
+    }
+
+    /// Gives up on the recovery here (the server closes it too).
+    func cancelRecoveryHere() {
+        recoveryTask?.cancel()
+        if let pending = credentials.pendingRecovery() {
+            let api = makeAPI()
+            Task { try? await api.cancelRecovery(id: pending.recoveryId, secret: pending.secret) }
+        }
+        credentials.savePendingRecovery(nil)
+        recovery = nil
+    }
+
+    func dismissRecovery() {
+        recoveryTask?.cancel()
+        recovery = nil
+    }
+
+    func dismissDeviceLogin() {
+        deviceLoginTask?.cancel()
+        deviceLogin = nil
+    }
+
+    private func requireSession() throws -> StoredSyncSession {
+        guard let session, engine != nil else { throw SyncAccountError.notSignedIn }
+        return session
     }
 }
 

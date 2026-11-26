@@ -372,10 +372,13 @@ actor FakeSyncServer {
         var wrappedPrivateKey: Data
         var personalSpaceId: String
         var username: String?
+        /// Made without a password: no KDF or wrapped account key on the wire.
+        var passwordless = false
 
         var remote: RemoteAccount {
-            RemoteAccount(uid: uid, email: email, kdf: kdf, wrappedAccountKey: wrappedAccountKey, publicKey: publicKey,
-                          wrappedPrivateKey: wrappedPrivateKey, personalSpaceId: personalSpaceId, username: username)
+            RemoteAccount(uid: uid, email: email, kdf: passwordless ? nil : kdf, wrappedAccountKey: passwordless ? nil : wrappedAccountKey,
+                          publicKey: publicKey, wrappedPrivateKey: wrappedPrivateKey, personalSpaceId: personalSpaceId, username: username,
+                          hasPassword: !passwordless)
         }
 
         var displayName: String { username ?? String(email.prefix { $0 != "@" }) }
@@ -393,7 +396,22 @@ actor FakeSyncServer {
         var uid: String
         var deviceName: String?
         var createdAt: Int64
+        var windowMs: Int64? = nil
+        var isDevice = false
     }
+
+    /// A new device's sign-in request (PROTOCOL.md → New devices).
+    struct DeviceRequest {
+        var uid: String?
+        var secret: String
+        var devicePublicKey: Data
+        var deviceName: String?
+        var windowMs: Int64?
+        var status = "pending"
+        var wrappedAccountKey: Data?
+        var createdAt: Int64
+    }
+    private(set) var deviceRequests: [String: DeviceRequest] = [:]
 
     struct SignupCodeRecord {
         var id: String
@@ -638,6 +656,70 @@ actor FakeSyncServer {
     }
 
     func logout(token: String) { tokens[token] = nil }
+
+    // MARK: Passwordless
+
+    func passwordlessSignup(_ body: PasswordlessSignupRequest) throws -> RemoteSession {
+        let email = body.email ?? "google-\(body.uid.prefix(6))@gmail.com"
+        guard accounts[email] == nil else { throw SyncAPIError.server(status: 409, code: "conflict", message: "", retryAfter: nil) }
+        if isTaken(body.username) { throw Self.usernameTaken() }
+        let account = Account(uid: body.uid, email: email, authKey: Data(), kdf: KDFParams(salt: Data(count: 16), iterations: 600_000),
+                              wrappedAccountKey: Data(), publicKey: body.publicKey, wrappedPrivateKey: body.wrappedPrivateKey,
+                              personalSpaceId: body.personalSpace.id, username: body.username, passwordless: true)
+        accounts[email] = account
+        createSpace(id: body.personalSpace.id, kind: "personal", owner: body.uid, wrappedKey: body.personalSpace.wrappedKey)
+        let token = issueToken(for: body.uid, deviceName: body.device.name)
+        tokens[token]?.isDevice = true
+        return RemoteSession(token: token, expiresAt: nil, account: account.remote)
+    }
+
+    func requestDeviceLogin(_ body: WindowedRequest) -> DeviceLoginTicket {
+        let uid = accounts.values.first { $0.email == body.identifier || $0.username?.lowercased() == body.identifier.lowercased() }?.uid
+        let id = SyncCrypto.newID()
+        let secret = SyncCrypto.newID()
+        deviceRequests[id] = DeviceRequest(uid: uid, secret: secret, devicePublicKey: body.device.publicKey, deviceName: body.device.name,
+                                           windowMs: body.window.milliseconds, createdAt: Date.now.syncMillis)
+        return DeviceLoginTicket(requestId: id, secret: secret, expiresAt: Date.now.addingTimeInterval(300).syncMillis)
+    }
+
+    func pendingDeviceRequests(uid: String) -> [PendingDeviceRequest] {
+        deviceRequests.filter { $0.value.uid == uid && $0.value.status == "pending" }.map { id, r in
+            PendingDeviceRequest(id: id, deviceName: r.deviceName, platform: "macos", country: nil, city: nil, newCountry: false,
+                                 windowMs: r.windowMs, devicePublicKey: r.devicePublicKey, createdAt: r.createdAt,
+                                 expiresAt: r.createdAt + 300_000)
+        }
+    }
+
+    func approveDeviceRequest(uid: String, id: String, number: Int, wrappedAccountKey: Data?) throws {
+        guard var request = deviceRequests[id], request.uid == uid else { throw SyncAPIError.server(status: 404, code: "not_found", message: "", retryAfter: nil) }
+        guard request.status == "pending" else { throw SyncAPIError.server(status: 409, code: "request_closed", message: "", retryAfter: nil) }
+        guard number == PasswordlessCrypto.matchNumber(requestId: id, devicePublicKey: request.devicePublicKey) else {
+            request.status = "mismatch"
+            deviceRequests[id] = request
+            throw SyncAPIError.server(status: 409, code: "number_mismatch", message: "", retryAfter: nil)
+        }
+        request.status = "approved"
+        request.wrappedAccountKey = wrappedAccountKey
+        deviceRequests[id] = request
+    }
+
+    func denyDeviceRequest(uid: String, id: String) {
+        if deviceRequests[id]?.uid == uid { deviceRequests[id]?.status = "denied" }
+    }
+
+    func pollDeviceLogin(id: String, secret: String) throws -> DeviceLoginPoll {
+        guard let request = deviceRequests[id], request.secret == secret else {
+            throw SyncAPIError.server(status: 404, code: "not_found", message: "", retryAfter: nil)
+        }
+        guard request.status == "approved", let uid = request.uid else { return DeviceLoginPoll(status: request.status) }
+        deviceRequests[id]?.status = "completed"
+        let token = issueToken(for: uid, deviceName: request.deviceName)
+        tokens[token]?.isDevice = true
+        tokens[token]?.windowMs = request.windowMs
+        return DeviceLoginPoll(status: "approved", token: token,
+                               expiresAt: request.windowMs.map { Date.now.syncMillis + $0 },
+                               account: try account(uid: uid).remote, wrappedAccountKey: request.wrappedAccountKey)
+    }
 
     private func account(uid: String) throws -> Account {
         guard let account = accounts.values.first(where: { $0.uid == uid }) else {
@@ -1127,6 +1209,14 @@ nonisolated struct FakeClient: SyncService {
         try await server.login(email: email, authKey: authKey, deviceName: deviceName)
     }
     func logout() async throws { await server.logout(token: try await token()) }
+    func passwordlessSignup(_ body: PasswordlessSignupRequest) async throws -> RemoteSession { try await server.passwordlessSignup(body) }
+    func requestDeviceLogin(_ body: WindowedRequest) async throws -> DeviceLoginTicket { await server.requestDeviceLogin(body) }
+    func pollDeviceLogin(id: String, secret: String) async throws -> DeviceLoginPoll { try await server.pollDeviceLogin(id: id, secret: secret) }
+    func deviceRequests() async throws -> [PendingDeviceRequest] { await server.pendingDeviceRequests(uid: try await caller()) }
+    func approveDeviceRequest(id: String, number: Int, wrappedAccountKey: Data?) async throws {
+        try await server.approveDeviceRequest(uid: try await caller(), id: id, number: number, wrappedAccountKey: wrappedAccountKey)
+    }
+    func denyDeviceRequest(id: String, block: Bool) async throws { await server.denyDeviceRequest(uid: try await caller(), id: id) }
     func changePassword(_ body: PasswordChange) async throws {
         try await server.changePassword(uid: try await caller(), token: try await token(), body)
     }
@@ -1945,14 +2035,15 @@ final class AccountHarness {
     let container: ModelContainer
     let store: ClipStore
     let snippets: SnippetStore
-    let credentials = MemoryCredentials()
+    let credentials: MemoryCredentials
     let prefs: Preferences
     let account: SyncAccount
     /// Background ticks can outlive a test; freeing the container would reset the context under
     /// them (the app's container lives as long as the process), so keep every one alive.
     private static var keepAlive: [ModelContainer] = []
 
-    init(_ server: FakeSyncServer) throws {
+    init(_ server: FakeSyncServer, credentials: MemoryCredentials = MemoryCredentials()) throws {
+        self.credentials = credentials
         container = try ModelContainer(for: AppEnvironment.schema,
                                        configurations: ModelConfiguration(schema: AppEnvironment.schema, isStoredInMemoryOnly: true))
         Self.keepAlive.append(container)

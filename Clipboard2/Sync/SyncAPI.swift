@@ -71,13 +71,20 @@ nonisolated struct KDFParams: Codable, Sendable, Equatable {
 nonisolated struct RemoteAccount: Codable, Sendable, Equatable {
     var uid: String
     var email: String
-    var kdf: KDFParams
-    var wrappedAccountKey: Data
+    /// nil for passwordless accounts (PROTOCOL.md → Passwordless).
+    var kdf: KDFParams?
+    /// nil for passwordless accounts: devices get the account key from another device instead.
+    var wrappedAccountKey: Data?
     var publicKey: Data
     var wrappedPrivateKey: Data
     var personalSpaceId: String
     /// nil for accounts made before usernames, and from servers that don't have them yet.
     var username: String?
+    /// nil from servers before passwordless accounts.
+    var emailVerified: Bool? = nil
+    /// A verified account took this (unverified) address: the user should change it.
+    var emailReleased: Bool? = nil
+    var hasPassword: Bool? = nil
 }
 
 /// `POST /v1/auth/signup`: the verifier plus everything the account's keys need, all wrapped.
@@ -122,6 +129,15 @@ nonisolated struct RemoteDevice: Codable, Sendable, Equatable, Identifiable {
     var createdAt: Int64
     var lastUsedAt: Int64
     var current: Bool
+    /// `password` or `device` (passwordless); nil from older servers.
+    var kind: String? = nil
+    var platform: String? = nil
+    /// Device sessions: the window, nil for indefinitely.
+    var windowMs: Int64? = nil
+    /// nil for a device kept indefinitely (and from older servers).
+    var expiresAt: Int64? = nil
+    var country: String? = nil
+    var city: String? = nil
 }
 
 /// `PUT /v1/account/password`.
@@ -225,6 +241,8 @@ nonisolated struct RemoteHeads: Codable, Sendable, Equatable {
     var spaces: String
     var codes: String
     var contacts: String
+    /// Device requests, recoveries and sessions (PROTOCOL.md → Heads); nil from older servers.
+    var security: String? = nil
 
     /// Something a full sync fetches moved since `old` (contacts are reloaded on their own).
     func needsSync(since old: RemoteHeads?) -> Bool {
@@ -399,7 +417,7 @@ nonisolated enum SyncAPIError: LocalizedError, Equatable {
 // MARK: - Service
 
 /// Every server call sync makes. `SyncAPI` talks HTTP; tests use an in-memory server.
-nonisolated protocol SyncService: Sendable {
+nonisolated protocol SyncService: PasswordlessService {
     // Auth (prelogin, signup and login need no session)
     func prelogin(email: String) async throws -> KDFParams
     func signup(_ body: SignupRequest) async throws -> RemoteSession
@@ -499,7 +517,7 @@ nonisolated struct SyncAPI: SyncService {
     private static let encoder = JSONEncoder()
     private static let decoder = JSONDecoder()
 
-    nonisolated private struct Empty: Codable {}
+    nonisolated struct Empty: Codable {}
     nonisolated private struct SpacesBody: Codable { var spaces: [RemoteSpace] }
     nonisolated private struct MembersBody: Codable { var members: [RemoteMember] }
     nonisolated private struct AccessBody: Codable { var canSend: Bool?; var canSeeSecrets: Bool? }
@@ -510,7 +528,7 @@ nonisolated struct SyncAPI: SyncService {
     nonisolated private struct RenameBody: Codable { var encryptedName: Data }
     nonisolated private struct EmailBody: Codable { var email: String }
     nonisolated private struct PreloginBody: Codable { var kdf: KDFParams }
-    nonisolated private struct LoginBody: Codable { var email: String; var authKey: Data; var deviceName: String? }
+    nonisolated private struct LoginBody: Codable { var email: String; var authKey: Data; var deviceName: String?; var platform: String? = "macos" }
     nonisolated private struct AuthKeyBody: Codable { var authKey: Data }
     nonisolated private struct InviteBody: Codable { var inviteId: String; var sealedKey: Data }
     nonisolated private struct InvitesBody: Codable { var invites: [PendingInvite] }
@@ -831,18 +849,18 @@ nonisolated struct SyncAPI: SyncService {
         return request
     }
 
-    private func send<T: Decodable>(_ method: String, _ path: String, query: [String: String] = [:],
+    func send<T: Decodable>(_ method: String, _ path: String, query: [String: String] = [:],
                                     as type: T.Type) async throws -> T {
         try await send(method, path, query: query, bodyData: nil, as: type, authenticated: true)
     }
 
-    private func send<B: Encodable, T: Decodable>(_ method: String, _ path: String, query: [String: String] = [:],
+    func send<B: Encodable, T: Decodable>(_ method: String, _ path: String, query: [String: String] = [:],
                                                   body: B, as type: T.Type, authenticated: Bool = true) async throws -> T {
         try await send(method, path, query: query, bodyData: try Self.encoder.encode(body), as: type,
                        authenticated: authenticated)
     }
 
-    private func send<T: Decodable>(_ method: String, _ path: String, query: [String: String],
+    func send<T: Decodable>(_ method: String, _ path: String, query: [String: String],
                                     bodyData: Data?, as type: T.Type, authenticated: Bool) async throws -> T {
         let request = makeRequest(method, path, query: query, body: bodyData,
                                   token: authenticated ? try await token() : nil)
