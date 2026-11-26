@@ -50,7 +50,7 @@ beforeAll(async () => {
   await embedded.start();
   await embedded.createDatabase("c2test");
   pool = new pg.Pool({ connectionString: `postgres://postgres:postgres@localhost:${port}/c2test`, max: 4 });
-  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql", "003_hardening.sql", "004_contacts.sql", "005_folders.sql", "006_authenticators.sql", "007_member_access.sql"]);
+  expect(await migrate(pool)).toEqual(["001_init.sql", "002_usernames.sql", "003_hardening.sql", "004_contacts.sql", "005_folders.sql", "006_authenticators.sql", "007_member_access.sql", "008_origins.sql"]);
   expect(await migrate(pool)).toEqual([]);
 }, 120_000);
 
@@ -714,6 +714,36 @@ describe("items", () => {
     expect(changes.map((i: { category: string }) => i.category).sort()).toEqual(["folder", "pinned"]);
     const bogus = await putItem(alice, group.id, group.sk, { category: "album" });
     expect(bogus.status).toBe(400);
+  });
+
+  it("keeps origins in the personal space only, with their documents as blobs", async () => {
+    const alice = await signUp("alice");
+    const space = alice.personalSpaceId;
+    const doc = randomUUID();
+    expect((await call(alice, "POST", `/v1/spaces/${space}/blobs`, { id: doc, size: 64 })).status).toBe(200);
+    const payload = {
+      v: 1, type: "origin", name: "PJ Logistik", domains: ["pj-logistik.at"], createdAt: 1, updatedAt: 1,
+      documents: [{ id: doc, name: "Contract.pdf", size: 10, addedAt: 1 }],
+    };
+    const origin = await putItem(alice, space, alice.personalKey, { category: "origin", payload, blobIds: [doc], updatedAt: 1000 });
+    expect(origin.status).toBe(200);
+    const [item] = (await call(alice, "GET", `/v1/spaces/${space}/changes`)).body.items;
+    expect(item).toMatchObject({ id: origin.id, category: "origin", blobIds: [doc], deleted: null });
+    const plain = cc.aeadOpen(cc.itemKey(alice.personalKey), Buffer.from(item.ciphertext, "base64"), cc.aad.item(space, origin.id, "origin"));
+    expect(JSON.parse(plain.toString()).name).toBe("PJ Logistik");
+    // Rewritten without the document: its blob goes.
+    const again = await putItem(alice, space, alice.personalKey, {
+      id: origin.id, category: "origin", payload: { ...payload, documents: [] }, updatedAt: 2000,
+    });
+    expect(again.status).toBe(200);
+    expect(deletedPaths).toEqual([`${space}/${doc}`]);
+    // Never in a group or an authenticator.
+    const group = await createGroup(alice);
+    expect((await putItem(alice, group.id, group.sk, { category: "origin", payload })).body.error).toBe("invalid");
+    const auth = await createAuthenticator(alice);
+    expect((await putItem(alice, auth.id, auth.sk, { category: "origin", payload })).body.error).toBe("invalid");
+    // Deleting it is a plain tombstone.
+    expect((await call(alice, "DELETE", `/v1/spaces/${space}/items/${origin.id}?updatedAt=3000`)).status).toBe(200);
   });
 
   it("writes tombstones, refuses stale deletes and is idempotent", async () => {

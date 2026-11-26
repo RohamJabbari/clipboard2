@@ -75,7 +75,7 @@ const b64 = (maxBytes: number) =>
     .transform((s) => Buffer.from(s, "base64"))
     .refine((b) => b.length <= maxBytes, `at most ${maxBytes} bytes`);
 const millis = z.number().int().nonnegative().max(8.64e15);
-const category = z.enum(["history", "pinned", "snippet", "secret", "folder", "otp"]);
+const category = z.enum(["history", "pinned", "snippet", "secret", "folder", "otp", "origin"]);
 const kdf = z.object({ salt: b64(64).refine((b) => b.length >= 16, "salt too short"), iterations: z.number().int().min(100_000).max(10_000_000) });
 const sealed = b64(4096);
 const publicKey = b64(65).refine((b) => b.length === 65 && b[0] === 0x04, "X9.63 uncompressed P-256 key");
@@ -1503,6 +1503,10 @@ export function buildApp(deps: Deps): FastifyInstance {
       // An authenticator holds its `otp` item and nothing else; `otp` lives nowhere else.
       if ((membership.kind === "authenticator") !== (body.category === "otp")) {
         throw new ApiError(400, "invalid", "otp items go in authenticators, and authenticators hold only otp items");
+      }
+      // Origins (Auth's sites edited by hand) are personal: only the personal space holds them.
+      if (body.category === "origin" && membership.kind !== "personal") {
+        throw new ApiError(400, "invalid", "origin items go in the personal space");
       }
       await requireContactEstablished(db, spaceId, membership);
       const { rows: current } = await db.query<ItemRow>(`SELECT ${ITEM_COLUMNS} FROM items WHERE space_id = $1 AND id = $2 FOR UPDATE`, [spaceId, itemId]);
