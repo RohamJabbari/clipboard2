@@ -271,6 +271,17 @@ final class SyncAccount {
     @ObservationIgnored private(set) var backoffUntil: Date?
     @ObservationIgnored private(set) var isPanelOpen = false
     @ObservationIgnored private var lastActivity: Date = .distantPast
+    /// Heads as of the start of the last successful tick; a poll that sees others syncs.
+    @ObservationIgnored private(set) var lastHeads: RemoteHeads?
+    @ObservationIgnored private var lastContactsRevision: String?
+    /// When the last tick finished; a full sync runs at least every `fullSyncInterval`.
+    @ObservationIgnored private var lastTickAt: Date?
+    /// The server answered heads with `404`: poll with full ticks until then.
+    @ObservationIgnored private(set) var headsUnsupportedUntil: Date?
+    /// Heads polls failed in a row (offline, server errors): the poll interval backs off.
+    @ObservationIgnored private var headsFailures = 0
+    /// Ticks started so far (tests compare it around a poll).
+    var ticksStarted: Int { startedTicks }
     /// The time source for polling and back-off (tests move it).
     @ObservationIgnored var clock: () -> Date = { .now }
     /// true once a session is active, false after sign-out (drives the ⌥⌘C shortcut).
@@ -556,6 +567,7 @@ final class SyncAccount {
         for (space, key) in keys { engine.adoptSpaceKey(key, for: space) }
         self.engine = engine
         backoffUntil = nil
+        resetHeads()
         isOffline = false
         state = .signedIn(email: session?.email ?? "")
         onSessionChange?(true)
@@ -857,6 +869,7 @@ final class SyncAccount {
         lastSyncError = nil
         isOffline = false
         backoffUntil = nil
+        resetHeads()
         prefs.syncDefaultGroupID = nil
         clearMessages()
         state = .signedOut
@@ -970,7 +983,7 @@ final class SyncAccount {
         if pollInterval < before { restartPolling() }
     }
 
-    /// The quick panel opened or closed. Opening syncs at once and polls every 3 s while open.
+    /// The quick panel opened or closed. Opening syncs at once and polls fast while open.
     func setPanelOpen(_ open: Bool) {
         guard open != isPanelOpen else { return }
         isPanelOpen = open
@@ -981,11 +994,22 @@ final class SyncAccount {
         restartPolling()
     }
 
-    /// 3 s while the panel is open, 15 s after recent activity, otherwise 60 s.
+    /// The server has `GET /v1/heads` (or hasn't said otherwise lately).
+    var usesHeads: Bool {
+        headsUnsupportedUntil.map { clock() >= $0 } ?? true
+    }
+
+    /// With heads: 2 s while the panel is open or after recent activity, otherwise 10 s, backing
+    /// off after failed polls. Without: full ticks every 3 s / 15 s / 60 s.
     var pollInterval: Duration {
-        if isPanelOpen { return SyncConfig.pollWhilePanelOpen }
-        if clock().timeIntervalSince(lastActivity) < SyncConfig.activeWindow { return SyncConfig.pollWhileActive }
-        return SyncConfig.pollWhileIdle
+        let active = isPanelOpen || clock().timeIntervalSince(lastActivity) < SyncConfig.activeWindow
+        guard usesHeads else {
+            if isPanelOpen { return SyncConfig.pollWhilePanelOpen }
+            return active ? SyncConfig.pollWhileActive : SyncConfig.pollWhileIdle
+        }
+        let base = active ? SyncConfig.headsWhileActive : SyncConfig.headsWhileIdle
+        guard headsFailures > 0 else { return base }
+        return max(base, min(SyncConfig.headsMaxBackoff, .seconds(1 << min(headsFailures, 6))))
     }
 
     private func restartPolling() {
@@ -996,9 +1020,83 @@ final class SyncAccount {
                 guard let interval = self?.pollInterval else { return }
                 try? await Task.sleep(for: interval)
                 guard !Task.isCancelled, let self, self.engine != nil else { return }
-                if !self.isTicking { self.startTick() }
+                await self.poll()
             }
         }
+    }
+
+    /// One poll: asks the server for heads and starts a tick only when something moved, the
+    /// safety-net interval passed, or the server has no heads. Returns whether a tick was started.
+    @discardableResult
+    func poll() async -> Bool {
+        guard let engine, !isTicking, !tickPending else { return false }
+        if let until = backoffUntil, until > clock() { return false }
+        let fullSyncDue = lastTickAt.map { clock().timeIntervalSince($0) >= SyncConfig.fullSyncInterval } ?? true
+        guard usesHeads, !fullSyncDue else {
+            startTick()
+            return true
+        }
+        let heads: RemoteHeads
+        do {
+            heads = try await engine.api.heads()
+        } catch {
+            guard self.engine === engine else { return false }
+            return headsFailed(error)
+        }
+        guard self.engine === engine else { return false }
+        headsFailures = 0
+        if isOffline { isOffline = false }
+        if heads.contacts != lastContactsRevision {
+            lastContactsRevision = heads.contacts
+            lastContactsRefresh = clock()
+            Task { await refreshContacts() }
+        }
+        guard heads.needsSync(since: lastHeads), !isTicking else { return false }
+        startTick()
+        return true
+    }
+
+    /// A heads poll failed: fall back on `404`, wait out a rate limit, back off otherwise.
+    private func headsFailed(_ error: any Error) -> Bool {
+        if error is CancellationError { return false }
+        if let api = error as? SyncAPIError {
+            if api.status == 404 {
+                Log.sync.notice("The sync server has no heads; polling with full syncs")
+                headsUnsupportedUntil = clock().addingTimeInterval(SyncConfig.headsRetryInterval)
+                startTick()
+                return true
+            }
+            if api.code == "unauthenticated" || api.code == "no_account" {
+                sessionEnded()
+                return false
+            }
+            if api.isRateLimited {
+                backoffUntil = clock().addingTimeInterval(TimeInterval(max(1, api.retryAfter ?? 30)))
+                return false
+            }
+            if api.isNetwork, !isOffline { isOffline = true }
+        }
+        headsFailures += 1
+        return false
+    }
+
+    /// Heads as they were before this tick's pull, so whatever lands after it is seen next poll.
+    private func headsBeforeTick(_ engine: SyncEngine) async -> RemoteHeads? {
+        guard usesHeads else { return nil }
+        do {
+            return try await engine.api.heads()
+        } catch let error as SyncAPIError where error.status == 404 {
+            headsUnsupportedUntil = clock().addingTimeInterval(SyncConfig.headsRetryInterval)
+        } catch {}
+        return nil
+    }
+
+    private func resetHeads() {
+        lastHeads = nil
+        lastContactsRevision = nil
+        lastTickAt = nil
+        headsUnsupportedUntil = nil
+        headsFailures = 0
     }
 
     /// Syncs now and waits up to `timeout` for a tick that started after this call (so its pull is
@@ -1062,7 +1160,11 @@ final class SyncAccount {
             // The first sync after signing in only records what's there.
             let recordOnly = !engine.announcesArrivals
             do {
+                let heads = await headsBeforeTick(engine)
                 try await engine.tick()
+                if let heads { lastHeads = heads }
+                lastTickAt = clock()
+                headsFailures = 0
                 engine.announcesArrivals = true   // from the second sync after signing in on
                 lastSyncAt = .now
                 isOffline = false
@@ -1107,6 +1209,7 @@ final class SyncAccount {
             }
             isOffline = api.isNetwork
         }
+        headsFailures += 1   // offline or failing: poll less often until something works
         lastSyncError = error.localizedDescription
     }
 

@@ -217,6 +217,22 @@ nonisolated struct SharedCodesEntry: Codable, Sendable, Equatable {
     var updatedAt: Int64
 }
 
+/// `GET /v1/heads` (PROTOCOL.md → Heads): a cheap look at whether a full sync would find anything.
+nonisolated struct RemoteHeads: Codable, Sendable, Equatable {
+    /// Space id → the newest seq the caller can see there.
+    var heads: [String: Int64]
+    /// Opaque revisions: the spaces list, shared codes and shares, contact requests and codes.
+    var spaces: String
+    var codes: String
+    var contacts: String
+
+    /// Something a full sync fetches moved since `old` (contacts are reloaded on their own).
+    func needsSync(since old: RemoteHeads?) -> Bool {
+        guard let old else { return true }
+        return heads != old.heads || spaces != old.spaces || codes != old.codes
+    }
+}
+
 nonisolated struct RemoteSpace: Codable, Sendable, Equatable {
     var id: String
     var kind: String          // personal | group | direct | authenticator
@@ -404,6 +420,8 @@ nonisolated protocol SyncService: Sendable {
     func revokeSession(id: String) async throws
 
     func spaces() async throws -> [RemoteSpace]
+    /// `404` from a server without it (PROTOCOL.md → Heads).
+    func heads() async throws -> RemoteHeads
     func createGroup(id: String, encryptedName: Data, wrappedKey: Data) async throws -> RemoteSpace
     func renameGroup(id: String, encryptedName: Data) async throws
     func deleteGroup(id: String) async throws
@@ -460,6 +478,11 @@ nonisolated protocol SyncService: Sendable {
 }
 
 extension SyncService {
+    /// Services that don't know heads behave like an older server.
+    func heads() async throws -> RemoteHeads {
+        throw SyncAPIError.server(status: 404, code: "not_found", message: "", retryAfter: nil)
+    }
+
     func downloadBlob(spaceId: String, blobId: String, progress: @escaping DownloadProgress) async throws -> Data {
         let data = try await downloadBlob(spaceId: spaceId, blobId: blobId)
         progress(Int64(data.count), Int64(data.count))
@@ -574,6 +597,10 @@ nonisolated struct SyncAPI: SyncService {
     /// as unnamed groups.
     func spaces() async throws -> [RemoteSpace] {
         try await send("GET", "v1/spaces", query: ["include": "direct,authenticator"], as: SpacesBody.self).spaces
+    }
+
+    func heads() async throws -> RemoteHeads {
+        try await send("GET", "v1/heads", as: RemoteHeads.self)
     }
 
     func createGroup(id: String, encryptedName: Data, wrappedKey: Data) async throws -> RemoteSpace {
