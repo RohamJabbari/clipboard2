@@ -30,9 +30,13 @@ nonisolated struct OAuthClients: Equatable, Sendable {
     }
 
     static let bundled: OAuthClients = {
-        guard let url = Bundle.main.url(forResource: "OAuthClients", withExtension: "plist"),
-              let dictionary = NSDictionary(contentsOf: url) as? [String: Any] else { return OAuthClients() }
-        return OAuthClients(dictionary: dictionary)
+        func load(_ name: String) -> [String: Any] {
+            guard let url = Bundle.main.url(forResource: name, withExtension: "plist") else { return [:] }
+            return NSDictionary(contentsOf: url) as? [String: Any] ?? [:]
+        }
+        // OAuthSecrets.plist is gitignored (the repo is public); its non-empty values win.
+        let secrets = load("OAuthSecrets").filter { ($0.value as? String)?.isEmpty == false }
+        return OAuthClients(dictionary: load("OAuthClients").merging(secrets) { _, secret in secret })
     }()
 
     func clientID(for provider: EmailProvider) -> String {

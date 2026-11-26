@@ -6,9 +6,10 @@
 	<!-- Azure app registration → Application (client) ID. -->
 	<key>MicrosoftClientID</key>
 	<string></string>
-	<!-- Google Cloud → OAuth client (type: Desktop app) → Client ID and Client secret. -->
+	<!-- Google Cloud (rohams-tools) → OAuth client "Clipboard2 Mac" (type: Desktop app). -->
 	<key>GoogleClientID</key>
-	<string></string>
+	<string>120641536104-qq1me16vfqkfhh8rmt39pknuv4ulsia9.apps.googleusercontent.com</string>
+	<!-- The secret lives in OAuthSecrets.plist (gitignored, bundled next to this file); a value there wins. -->
 	<key>GoogleClientSecret</key>
 	<string></string>
 </dict>

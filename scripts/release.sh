@@ -14,6 +14,9 @@ APP_NAME=Clipboard2
 
 [[ -z "$(git status --porcelain)" ]] || { echo "Commit or stash your changes first."; exit 1; }
 git rev-parse "v$VERSION" >/dev/null 2>&1 && { echo "v$VERSION already exists."; exit 1; }
+# Gmail sign-in needs the client secret, kept out of the public repo (see OAuthClients.plist).
+/usr/libexec/PlistBuddy -c "Print :GoogleClientSecret" Clipboard2/Resources/OAuthSecrets.plist 2>/dev/null | grep -q . \
+  || { echo "Clipboard2/Resources/OAuthSecrets.plist with GoogleClientSecret is missing; Gmail sign-in would break."; exit 1; }
 
 BUILD=$(( $(sed -n 's/.*CURRENT_PROJECT_VERSION: "\([0-9]*\)".*/\1/p' project.yml) + 1 ))
 sed -i '' -e "s/MARKETING_VERSION: \".*\"/MARKETING_VERSION: \"$VERSION\"/" \
