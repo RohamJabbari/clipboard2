@@ -37,7 +37,10 @@ Build in phases; each phase ships on its own:
 ### New and edited passwords
 - Auth's header has **+** → New Password… / New Secret… / New Authenticator….
   - The form fields: site(s), username, password (with Generate), notes.
-- **Generate:** 20 characters in Apple's style, `xxxxxx-xxxxxx-xxxxxx`, from letters and digits with one uppercase and one digit guaranteed. Options for length and symbols sit behind a disclosure.
+- **Generate:** offers two passwords side by side, both 20 characters; the user picks one and nothing is filled before that.
+  - **Letters & digits:** Apple's style, `xxxxxx-xxxxxx-xxxxxx`, with one uppercase, one lowercase and one digit guaranteed.
+  - **With symbols:** no hyphens, at least one uppercase, lowercase, digit and symbol. Symbols are `!#$%&*+.=?@^_~` only: no quotes, backslash, backtick or space, which commonly break sites and shells.
+  - The same two options appear wherever a strong password is suggested (Suggest Strong Password, phase 2).
 - Import: CSV from Apple Passwords, Chrome or 1Password export (`url,username,password,notes`). Settings → Auth → Import…. The file is read once and never kept.
 
 ### Sync and storage
@@ -71,6 +74,17 @@ Build in phases; each phase ships on its own:
   - In a text field, the paste icon guesses the field from its accessibility label, placeholder or identifier (email, name, phone, street, zip, city, country) and offers the matching value first.
   - **Fill Form** fills every field it can recognise in the same web area.
   - The rest of the card's values follow, so anything can be picked manually.
+  - **Storage: local only in this phase.** Cards are one item in the login Keychain on this Mac. They are not a sync payload and don't sync between devices or to groups.
+
+### As built (1.11)
+- **Fill:** Return on a password fills it (⌘K → Fill, and Fill in the preview). A plain secret (no site, no username) still pastes, concealed, as before: it may be multi-line. In a text field with no password field after it, Fill types only the username (username-first sign-ins), or the password when there's no username.
+  - The focused field's kind comes from `AXSubrole` `AXSecureTextField`; the next field from VoiceOver's text-field search in the web area (`AXUIElementsForSearchPredicate`), else a bounded tree walk.
+  - "Secure input elsewhere" is `kCGSSessionSecureInputPID` naming a process other than the target. The target's own password field holding secure input doesn't block typing.
+  - Without Accessibility, the value lands on the clipboard (concealed, transient) for a manual ⌘V.
+- **Remember for ‹site›:** the preview of a password that isn't for the page shows **Fill and Remember for ‹site›**. No prompt after filling.
+- **Paste icon:** in a password field it lists the page's passwords (all passwords outside browsers) and the page's authenticators, then Suggest Strong Password with the two options above. In a text field on a page with passwords for its site, an **Auth** chip offers them too (username, Tab, password).
+  - Suggest Strong Password types the chosen password, then the next password field after it (confirm), saves it named after the site with the nearest text field above as username, and shows "Saved a password for ‹site›" · Undo. Undo deletes the saved password; what was typed stays in the page.
+- **Me:** cards are listed at the end of Auth; + → New Card…; double-click or Edit… edits inline in the right pane. With cards, the paste icon gets a **Me** chip; it opens on Me when the field's kind is recognised and a card has that value. Fill Form fills only empty fields.
 
 ## Phase 3: system autofill (passwords and codes)
 - An AutoFill **credential provider extension**, "Clipboard2", provides **passwords** and **one-time codes** (macOS 15+). Clipboard2 then appears in the system autofill suggestions in Safari, Chrome and apps, next to or instead of Apple Passwords.
