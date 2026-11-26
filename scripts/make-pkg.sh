@@ -31,10 +31,29 @@ if [[ -n "$APP_ID" ]]; then
 else
     echo "  app signing: Apple Development (no Developer ID Application certificate found)"
 fi
+# System AutoFill: only with Developer ID and both provisioning profiles (docs/features/autofill-setup.md).
+if [[ -n "$APP_ID" ]]; then
+    AUTOFILL_ARGS_TEXT=$(scripts/autofill-profiles.sh)
+    while IFS= read -r arg; do [[ -n "$arg" ]] && SIGN_ARGS+=("$arg"); done <<< "$AUTOFILL_ARGS_TEXT"
+else
+    echo "  AutoFill: skipped (needs a Developer ID Application certificate)"
+fi
+if [[ "${CLIPBOARD2_REQUIRE_AUTOFILL:-0}" == 1 && " ${SIGN_ARGS[*]-} " != *" CLIPBOARD2_AUTOFILL=1 "* ]]; then
+    echo "Earlier releases shipped system AutoFill (scripts/autofill-required); this one can't go without it:"
+    echo "users' secrets are in the shared Keychain now. Put the profiles in place (docs/features/autofill-setup.md)."
+    exit 1
+fi
 xcodebuild -project "$APP_NAME.xcodeproj" -scheme "$APP_NAME" -configuration Release \
     -derivedDataPath "$DERIVED" -destination 'platform=macOS' build -quiet ${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"}
 APP="$DERIVED/Build/Products/Release/$APP_NAME.app"
 VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist")
+APPEX="$APP/Contents/PlugIns/Clipboard2 AutoFill.appex"
+if [[ " ${SIGN_ARGS[*]-} " == *" CLIPBOARD2_AUTOFILL=1 "* ]]; then
+    # The extension must be in, signed with its profile's entitlements, or the release is wrong.
+    [[ -d "$APPEX" ]] || { echo "AutoFill build without the extension in the app."; exit 1; }
+    codesign -d --entitlements - "$APPEX" 2>/dev/null | grep -q autofill-credential-provider \
+        || { echo "The AutoFill extension isn't signed with the AutoFill entitlement."; exit 1; }
+fi
 
 # Sparkle's helper tools must carry our Developer ID, hardened runtime and a timestamp to pass
 # notarization; re-sign them inside-out, then the app (keeping its entitlements).

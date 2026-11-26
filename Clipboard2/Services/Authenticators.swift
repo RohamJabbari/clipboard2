@@ -268,58 +268,42 @@ protocol AuthenticatorBacking: AnyObject {
 
 /// One generic-password item per authenticator, like secrets: the payload (with the seed) as the
 /// value, the authenticator space as the generic attribute. Code batches shared with you get
-/// their own service.
+/// their own service. In the login Keychain, or in AutoFill builds the shared one (`AuthKeychain.current`).
 final class KeychainAuthenticatorBacking: AuthenticatorBacking {
-    nonisolated static let ownedService = (Bundle.main.bundleIdentifier ?? "at.softmaze.Clippy") + ".authenticators"
-    nonisolated static let sharedService = (Bundle.main.bundleIdentifier ?? "at.softmaze.Clippy") + ".sharedcodes"
+    nonisolated static let ownedService = KeychainServices.authenticators
+    nonisolated static let sharedService = KeychainServices.sharedCodes
+
+    private let keychain: any KeychainBackend
+
+    init(keychain: any KeychainBackend = AuthKeychain.current) {
+        self.keychain = keychain
+    }
 
     /// Attributes of all items first, then each one's value: the login (file-based) Keychain refuses
     /// kSecReturnData together with kSecMatchLimitAll (errSecParam), which left every list empty.
     private func all(service: String) -> [(account: String, generic: String?, data: Data)] {
-        let query: [CFString: Any] = [
-            kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
-            kSecReturnAttributes: true,
-            kSecMatchLimit: kSecMatchLimitAll,
-        ]
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let items = result as? [[String: Any]] else { return [] }
-        return items.compactMap { attrs in
+        keychain.allAttributes(service: service).compactMap { attrs in
             guard let account = attrs[kSecAttrAccount as String] as? String,
-                  let data = value(service: service, account: account) else { return nil }
+                  let data = keychain.data(service: service, account: account) else { return nil }
             let generic = (attrs[kSecAttrGeneric as String] as? Data).map { String(decoding: $0, as: UTF8.self) }
             return (account, generic?.isEmpty == false ? generic : nil, data)
         }
-    }
-
-    private func value(service: String, account: String) -> Data? {
-        let query: [CFString: Any] = [
-            kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
-            kSecAttrAccount: account,
-            kSecReturnData: true,
-            kSecMatchLimit: kSecMatchLimitOne,
-        ]
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
-        return result as? Data
     }
 
     private func write(service: String, account: String, label: String, data: Data, generic: String?) -> Bool {
         let base: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecAttrAccount: account]
         var changes: [CFString: Any] = [kSecValueData: data, kSecAttrLabel: label,
                                         kSecAttrGeneric: Data((generic ?? "").utf8)]
-        let status = SecItemUpdate(base as CFDictionary, changes as CFDictionary)
+        let status = keychain.update(base, changes)
         if status == errSecSuccess { return true }
         guard status == errSecItemNotFound else { return false }
         changes.merge(base) { new, _ in new }
         changes[kSecAttrDescription] = "Clipboard2 authenticator"
-        return SecItemAdd(changes as CFDictionary, nil) == errSecSuccess
+        return keychain.add(changes) == errSecSuccess
     }
 
     private func remove(service: String, account: String) {
-        SecItemDelete([kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecAttrAccount: account] as CFDictionary)
+        keychain.remove(service: service, account: account)
     }
 
     func loadOwned() -> [Authenticator] {
@@ -377,6 +361,8 @@ final class AuthenticatorStore {
     private(set) var shareCounts: [String: Int] = [:]
     /// A local change that sync should upload.
     @ObservationIgnored var onChange: (() -> Void)?
+    /// After every reload (local changes and sync): AutoFill re-registers its codes.
+    @ObservationIgnored var onReload: (() -> Void)?
     @ObservationIgnored private let backing: any AuthenticatorBacking
 
     init(backing: any AuthenticatorBacking) {
@@ -388,6 +374,7 @@ final class AuthenticatorStore {
         owned = backing.loadOwned().sorted { $0.createdAt > $1.createdAt }
         shared = backing.loadShared().sorted { $0.addedAt > $1.addedAt }
         revision &+= 1
+        onReload?()
     }
 
     /// Owned and shared, newest first.

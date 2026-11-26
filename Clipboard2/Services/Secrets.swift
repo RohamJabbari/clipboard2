@@ -33,10 +33,13 @@ nonisolated struct SecretExtras: Codable, Equatable, Sendable {
     var urls: [String]?
     /// Short hash of the notes: changes the item (and its modification date) when only the notes do.
     var notes: String?
+    /// When it was first saved (Unix ms), kept here once it moved Keychains: a moved item gets a
+    /// new creation date, and the creation date is part of what syncs.
+    var created: Int64?
 
     static let plainDescription = "Clipboard2 secret"
 
-    var isEmpty: Bool { username == nil && urls == nil && notes == nil }
+    var isEmpty: Bool { username == nil && urls == nil && notes == nil && created == nil }
 
     /// The description attribute for these extras.
     var descriptionValue: String {
@@ -51,14 +54,23 @@ nonisolated struct SecretExtras: Codable, Equatable, Sendable {
         guard let descriptionValue, descriptionValue.hasPrefix("{"),
               let decoded = try? JSONDecoder().decode(SecretExtras.self, from: Data(descriptionValue.utf8))
         else { self.init(); return }
-        self.init(username: decoded.username, urls: decoded.urls, notes: decoded.notes)
+        self.init(username: decoded.username, urls: decoded.urls, notes: decoded.notes, created: decoded.created)
     }
 
-    init(username: String? = nil, urls: [String]? = nil, notes: String? = nil) {
+    init(username: String? = nil, urls: [String]? = nil, notes: String? = nil, created: Int64? = nil) {
         self.username = Self.cleanUsername(username)
         let sites = Self.cleanURLs(urls ?? [])
         self.urls = sites.isEmpty ? nil : sites
         self.notes = notes?.isEmpty == true ? nil : notes
+        self.created = created
+    }
+
+    /// A secret's description on its way to the shared Keychain: its creation date joins it.
+    static func movedDescription(_ description: String?, created: Date?) -> String? {
+        var extras = SecretExtras(descriptionValue: description)
+        guard extras.created == nil, let created else { return description }
+        extras.created = Int64((created.timeIntervalSince1970 * 1000).rounded())
+        return extras.descriptionValue
     }
 
     static func cleanUsername(_ username: String?) -> String? {
@@ -79,15 +91,17 @@ nonisolated struct SecretExtras: Codable, Equatable, Sendable {
     }
 }
 
-/// Secret values live only in the login keychain (one generic-password item each). Names are
+/// Secret values live only in the Keychain (one generic-password item each): the login Keychain, or
+/// in AutoFill builds the shared data-protection one (`AuthKeychain.current`, SharedKeychain.swift). Names are
 /// stored as the item label so listing never needs to touch the values; a sync group id, if
 /// any, as the generic attribute; the Saved folder, if any, as the comment; a password's username
 /// and sites as JSON in the description (`SecretExtras`). Notes get an item of their own in
 /// `notesService` (same account), so they're encrypted like the value.
-/// TODO(auth-autofill phase 3): move to the data-protection Keychain in the shared access group.
 nonisolated enum SecretVault {
-    static let service = (Bundle.main.bundleIdentifier ?? "at.softmaze.Clippy") + ".secrets"
-    static let notesService = (Bundle.main.bundleIdentifier ?? "at.softmaze.Clippy") + ".secretnotes"
+    static let service = KeychainServices.secrets
+    static let notesService = KeychainServices.secretNotes
+
+    private static var keychain: any KeychainBackend { AuthKeychain.current }
 
     static func list() -> [SecretRef] {
         let query: [CFString: Any] = [
@@ -96,10 +110,8 @@ nonisolated enum SecretVault {
             kSecReturnAttributes: true,
             kSecMatchLimit: kSecMatchLimitAll,
         ]
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let items = result as? [[String: Any]]
-        else { return [] }
+        let (status, result) = keychain.copyMatching(query)
+        guard status == errSecSuccess, let items = result as? [[String: Any]] else { return [] }
         return items.compactMap { attrs in
             guard let account = attrs[kSecAttrAccount as String] as? String else { return nil }
             let space = (attrs[kSecAttrGeneric as String] as? Data).map { String(decoding: $0, as: UTF8.self) }
@@ -107,7 +119,8 @@ nonisolated enum SecretVault {
             return SecretRef(
                 id: account,
                 name: attrs[kSecAttrLabel as String] as? String ?? "Untitled",
-                createdAt: attrs[kSecAttrCreationDate as String] as? Date,
+                createdAt: extras.created.map { Date(timeIntervalSince1970: TimeInterval($0) / 1000) }
+                    ?? attrs[kSecAttrCreationDate as String] as? Date,
                 spaceID: space?.isEmpty == false ? space : nil,
                 updatedAt: attrs[kSecAttrModificationDate as String] as? Date,
                 folderID: (attrs[kSecAttrComment as String] as? String).flatMap(UUID.init(uuidString:)),
@@ -134,7 +147,7 @@ nonisolated enum SecretVault {
         ]
         if let spaceID { attributes[kSecAttrGeneric] = Data(spaceID.utf8) }
         if let folderID { attributes[kSecAttrComment] = folderID.uuidString.lowercased() }
-        guard SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess else { return nil }
+        guard keychain.add(attributes) == errSecSuccess else { return nil }
         writeNotes(notes, id: id)
         return SecretRef(id: id, name: name, createdAt: .now, spaceID: spaceID, updatedAt: .now, folderID: folderID,
                          username: extras.username, urls: extras.urls ?? [], notesStamp: extras.notes)
@@ -152,12 +165,12 @@ nonisolated enum SecretVault {
         if username != nil || urls != nil || notes != nil {
             let current = extras(id: id)
             let extras = SecretExtras(username: username ?? current.username, urls: urls ?? current.urls,
-                                      notes: notes.map(SecretExtras.notesStamp) ?? current.notes)
+                                      notes: notes.map(SecretExtras.notesStamp) ?? current.notes, created: current.created)
             if extras != current { changes[kSecAttrDescription] = extras.descriptionValue }
             if let notes, SecretExtras.notesStamp(notes) != current.notes { writeNotes(notes, id: id) }
         }
         guard !changes.isEmpty else { return true }
-        return SecItemUpdate(baseQuery(id) as CFDictionary, changes as CFDictionary) == errSecSuccess
+        return keychain.update(baseQuery(id), changes) == errSecSuccess
     }
 
     /// The username, sites and notes stamp, without the value.
@@ -165,17 +178,16 @@ nonisolated enum SecretVault {
         var query = baseQuery(id)
         query[kSecReturnAttributes] = true
         query[kSecMatchLimit] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let attrs = result as? [String: Any] else { return SecretExtras() }
+        let (status, result) = keychain.copyMatching(query)
+        guard status == errSecSuccess, let attrs = result as? [String: Any] else { return SecretExtras() }
         return SecretExtras(descriptionValue: attrs[kSecAttrDescription as String] as? String)
     }
 
     static func notes(id: String) -> String? {
         let query: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: notesService,
                                       kSecAttrAccount: id, kSecReturnData: true, kSecMatchLimit: kSecMatchLimitOne]
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess, let data = result as? Data,
+        let (status, result) = keychain.copyMatching(query)
+        guard status == errSecSuccess, let data = result as? Data,
               let text = String(data: data, encoding: .utf8), !text.isEmpty else { return nil }
         return text
     }
@@ -183,15 +195,15 @@ nonisolated enum SecretVault {
     private static func writeNotes(_ notes: String?, id: String) {
         let base: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: notesService, kSecAttrAccount: id]
         guard let notes, !notes.isEmpty else {
-            SecItemDelete(base as CFDictionary)
+            keychain.delete(base)
             return
         }
         let data = Data(notes.utf8)
-        if SecItemUpdate(base as CFDictionary, [kSecValueData: data] as CFDictionary) == errSecItemNotFound {
+        if keychain.update(base, [kSecValueData: data]) == errSecItemNotFound {
             var add = base
             add[kSecValueData] = data
             add[kSecAttrLabel] = "Clipboard2 notes"
-            SecItemAdd(add as CFDictionary, nil)
+            _ = keychain.add(add)
         }
     }
 
@@ -199,15 +211,13 @@ nonisolated enum SecretVault {
         var query = baseQuery(id)
         query[kSecReturnData] = true
         query[kSecMatchLimit] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data
-        else { return nil }
+        let (status, result) = keychain.copyMatching(query)
+        guard status == errSecSuccess, let data = result as? Data else { return nil }
         return String(data: data, encoding: .utf8)
     }
 
     static func delete(id: String) {
-        SecItemDelete(baseQuery(id) as CFDictionary)
+        keychain.delete(baseQuery(id))
         writeNotes(nil, id: id)
     }
 
@@ -246,10 +256,10 @@ final class SecretStore {
     /// Content hashes of secret values (never the values), so matching copies stay out of history.
     @ObservationIgnored private(set) var valueHashes: Set<String> = []
     @ObservationIgnored var onChange: (() -> Void)?
-    @ObservationIgnored private var lastAuthentication: Date?
+    @ObservationIgnored private var lastAuthentication: Date? { didSet { publishUnlockWindow() } }
     /// Explicit "Leave Unlocked For…" choice. Unlike the automatic window it survives sleep and
     /// screen lock (that's the point of choosing it), but not quitting Clipboard2.
-    private(set) var unlockedUntil: Date?
+    private(set) var unlockedUntil: Date? { didSet { publishUnlockWindow() } }
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
     @ObservationIgnored private let prefs: Preferences
     /// True while the Touch ID / password sheet is up, so the quick panel doesn't close under it.
@@ -272,6 +282,11 @@ final class SecretStore {
         observers.append(workspace.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main, using: lock))
         observers.append(DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main, using: lock))
+        // Quitting ends every window, the AutoFill extension's copy included.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { AutoFillIdentities.publishUnlockWindow(until: nil) }
+        })
     }
 
     func reload() {
@@ -354,6 +369,16 @@ final class SecretStore {
         if isManuallyUnlocked { return true }
         guard prefs.secretGraceMinutes > 0, let lastAuthentication else { return false }
         return Date.now.timeIntervalSince(lastAuthentication) < TimeInterval(prefs.secretGraceMinutes * 60)
+    }
+
+    /// Until when nothing asks for Touch ID; nil: it asks now. The AutoFill extension shares it.
+    var unlockWindowEnd: Date? {
+        AutoFillUnlock.until(lastAuthentication: lastAuthentication, graceMinutes: prefs.secretGraceMinutes,
+                             unlockedUntil: unlockedUntil, now: .now)
+    }
+
+    private func publishUnlockWindow() {
+        AutoFillIdentities.publishUnlockWindow(until: unlockWindowEnd)
     }
 
     var isManuallyUnlocked: Bool {

@@ -196,10 +196,9 @@ final class EmailCodeCenter {
         revision &+= 1
         vault.encode(codes.isEmpty ? nil : codes, EmailVaultKey.codes)
         scheduleExpiry()
-        // TODO(autofill, phase 3): hand the codes to the AutoFill extension once AutoFillIdentities
-        // lands on main:
-        // AutoFillIdentities.update(codes: codes.map {
-        //     AutoFillEmailCode(id: $0.id, code: $0.code, domain: $0.source, receivedAt: $0.receivedAt) })
+        // Offered as one-time codes in system AutoFill (does nothing in builds without AutoFill).
+        AutoFillIdentities.update(codes: codes.map {
+            AutoFillEmailCode(id: $0.id, code: $0.code, domain: $0.source, receivedAt: $0.receivedAt) })
     }
 
     private func scheduleExpiry() {
