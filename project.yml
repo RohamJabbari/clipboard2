@@ -281,6 +281,25 @@ targets:
         ENABLE_HARDENED_RUNTIME: NO
         SKIP_INSTALL: YES
 
+  Clipboard2 iOS Tests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: iOS/Tests
+    dependencies:
+      - target: Clipboard2 iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.iosTests
+        GENERATE_INFOPLIST_FILE: YES
+        # The app's product is Clipboard2.app, not "Clipboard2 iOS.app".
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Clipboard2.app/Clipboard2
+        BUNDLE_LOADER: $(TEST_HOST)
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: Apple Development
+        ENABLE_HARDENED_RUNTIME: NO
+
 schemes:
   Clipboard2:
     build:
@@ -299,7 +318,12 @@ schemes:
     build:
       targets:
         Clipboard2 iOS: all
+        Clipboard2 iOS Tests: [test]
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - Clipboard2 iOS Tests
     archive:
       config: Release
