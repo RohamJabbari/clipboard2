@@ -514,3 +514,104 @@ struct EmailCodeLifecycleTests {
         #expect(NotificationTarget(encoded: NotificationTarget.emailCode(id: code.id).encoded) == .emailCode(id: code.id))
     }
 }
+
+// MARK: - How fast accounts look
+
+/// Records every wait and how urgent the center was; looks find nothing.
+@MainActor
+final class RecordingMailSource: MailSource {
+    let interval: Duration = .seconds(5)
+    let urgentInterval: Duration = .seconds(2)
+    private(set) var waits: [Bool] = []
+
+    func recentMessages(since: Date) async throws -> [MailMessage] { [] }
+
+    func waitForMail(_ waker: Waker, urgent: Bool) async throws {
+        waits.append(urgent)
+        await waker.wait(.seconds(60))
+    }
+
+    func close() {}
+}
+
+@MainActor
+struct EmailPollingTests {
+    @Test func httpSourcesLookEveryFiveSecondsAndTwoWhenUrgent() {
+        let keeper = TokenKeeper(tokens: OAuthTokens(accessToken: "a", refreshToken: "r", expiresAt: .distantFuture),
+                                 provider: .google, clients: .bundled) { _ in }
+        for source in [GraphMailSource(keeper: keeper), GmailSource(keeper: keeper)] as [any MailSource] {
+            #expect(source.interval == .seconds(5))
+            #expect(source.urgentInterval == .seconds(2))
+        }
+        let imap = IMAPMailSource(settings: IMAPSettings(host: "imap.example.com"), user: "me", password: "pw")
+        #expect(imap.interval == .seconds(30))   // IDLE makes it instant; this is only without it
+        #expect(EmailAccountWorker.backoff(failures: 1, base: .seconds(5)) == .seconds(10))
+    }
+
+    @Test func urgentWhileThePanelIsOpenOrACodeFieldIsFocusedForAWhile() {
+        let center = EmailCodeCenter(vault: MemoryEmailVault())
+        var now = Date(timeIntervalSince1970: 1_000_000)
+        center.clock = { now }
+        #expect(!center.isUrgent)
+        center.setPanelOpen(true)
+        #expect(center.isUrgent)
+        center.setPanelOpen(false)
+        #expect(!center.isUrgent)
+
+        center.setCodeFieldFocused(true)
+        #expect(center.isUrgent)
+        now = now.addingTimeInterval(4 * 60)
+        center.setCodeFieldFocused(true)   // still the same focus: the window doesn't restart
+        #expect(center.isUrgent)
+        now = now.addingTimeInterval(2 * 60)
+        #expect(!center.isUrgent)          // left sitting there: back to the normal cadence
+        center.setCodeFieldFocused(false)
+        center.setCodeFieldFocused(true)
+        #expect(center.isUrgent)
+        center.setCodeFieldFocused(false)
+        #expect(!center.isUrgent)
+    }
+
+    @Test func theWorkerWaitsUrgentlyWhileTheCenterIs() async throws {
+        let center = EmailCodeCenter(vault: MemoryEmailVault())
+        let source = RecordingMailSource()
+        let account = EmailAccount(provider: .google, address: "me@gmail.com")
+        let worker = EmailAccountWorker(account: account, source: source, center: center)
+        center.setPanelOpen(true)
+        worker.start()
+        for _ in 0..<200 where source.waits.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
+        #expect(source.waits == [true])
+        center.setPanelOpen(false)
+        worker.kick()
+        for _ in 0..<200 where source.waits.count < 2 { try await Task.sleep(for: .milliseconds(5)) }
+        #expect(source.waits == [true, false])
+        worker.stop()
+    }
+
+    @Test(arguments: [
+        (["Verification code"], true),
+        (["Bestätigungscode"], true),
+        (["oneTimeCode"], true),
+        (["Enter the 6-digit code"], true),
+        (["otp-input"], true),
+        (["Sicherheitscode eingeben"], true),
+        (["2FA"], true),
+        (["Email"], false),
+        (["ZIP code"], false),
+        (["Promo code"], false),
+        (["Gutscheincode"], false),
+        (["Search"], false),
+        ([], false),
+    ])
+    func codeFieldsByLabel(hints: [String], expected: Bool) {
+        #expect(OneTimeCodeField.matches(hints: hints, width: 240, siblingWidths: []) == expected)
+    }
+
+    @Test func codeFieldsAsDigitBoxes() {
+        #expect(OneTimeCodeField.matches(hints: [], width: 40, siblingWidths: Array(repeating: 40, count: 6)))
+        #expect(OneTimeCodeField.matches(hints: [], width: 44, siblingWidths: [42, 44, 45, 44]))
+        #expect(!OneTimeCodeField.matches(hints: [], width: 40, siblingWidths: [40, 40]))   // a date's day and month
+        #expect(!OneTimeCodeField.matches(hints: [], width: 200, siblingWidths: Array(repeating: 200, count: 6)))
+        #expect(!OneTimeCodeField.matches(hints: [], width: 40, siblingWidths: Array(repeating: 40, count: 12)))
+    }
+}
