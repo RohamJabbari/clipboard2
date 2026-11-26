@@ -40,6 +40,8 @@ nonisolated enum NotificationTarget: Codable, Equatable, Hashable, Sendable {
     case inbox(entryID: String?)
     /// Auth, with this authenticator selected.
     case authenticator(spaceId: String)
+    /// Auth, with this email code selected (phase 4).
+    case emailCode(id: String)
 
     /// Round trip through a notification's `userInfo`.
     var encoded: String {

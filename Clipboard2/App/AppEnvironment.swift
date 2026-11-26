@@ -36,6 +36,8 @@ final class AppEnvironment {
     let sync: SyncAccount
     /// System notifications for what syncs bring (docs/features/notifications-contacts.md).
     let notifications: NotificationHub
+    /// Codes from email accounts (docs/features/auth-autofill.md, phase 4). Never synced.
+    let emailCodes: EmailCodeCenter
     let claudeAccount = SubscriptionAccount(cli: .claude)
     let chatGPTAccount = SubscriptionAccount(cli: .codex)
     let updates = UpdateController()
@@ -81,6 +83,8 @@ final class AppEnvironment {
                            authenticators: authenticators)
         notifications = NotificationHub(prefs: prefs)
         sync.notifications = notifications
+        // Tests never touch the Keychain or any mail account.
+        emailCodes = EmailCodeCenter(vault: Self.isRunningTests ? MemoryEmailVault() : KeychainEmailVault())
     }
 
     /// Every persisted model (the newest store version); tests build in-memory containers from it.
@@ -158,6 +162,11 @@ final class AppEnvironment {
             return self.panel.model.arrivalPlaceShown
         }
         Task { await notifications.refreshPermission() }
+        emailCodes.onNewCode = { [weak self] code in
+            guard let self else { return }
+            self.notifications.postEmailCode(code, showingCode: self.emailCodes.showsCodeInNotification)
+        }
+        emailCodes.start()
         applyAppearance()
         if let storeOpenError {
             // On the stand-in store: no capture, no sync, no sweeps (they'd delete every file).
@@ -675,7 +684,7 @@ final class AppEnvironment {
             }
         case .secret(let ref):
             pasteSecret(ref, into: target)
-        case .folder, .authenticator, .authenticatorSuggestion:
+        case .folder, .authenticator, .authenticatorSuggestion, .emailCode:
             NSSound.beep()   // slots never hold folders or authenticators
         }
     }

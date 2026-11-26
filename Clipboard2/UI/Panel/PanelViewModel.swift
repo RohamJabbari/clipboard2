@@ -67,6 +67,9 @@ enum PanelEntry: Identifiable {
     case authenticator(AuthenticatorItem)
     /// "Add to Authenticator" for a copied link or QR code, at the top of All until added or dismissed.
     case authenticatorSuggestion(OTPAccount)
+    /// A code from an email (Auth, phase 4): in "Email codes" at the top, and again under its
+    /// source when that source is listed (`inSource`).
+    case emailCode(EmailCode, inSource: Bool = false)
 
     var id: String {
         switch self {
@@ -76,6 +79,7 @@ enum PanelEntry: Identifiable {
         case .folder(let folder): "f-" + folder.id.uuidString
         case .authenticator(let item): "a-" + item.id
         case .authenticatorSuggestion: "a-suggestion"
+        case .emailCode(let code, let inSource): (inSource ? "es-" : "e-") + code.id
         }
     }
 
@@ -119,6 +123,7 @@ enum PanelEntry: Identifiable {
         case .folder(let folder): folder.createdAt
         case .authenticator(let item): item.createdAt
         case .authenticatorSuggestion: .now
+        case .emailCode(let code, _): code.receivedAt
         }
     }
 
@@ -128,7 +133,7 @@ enum PanelEntry: Identifiable {
         case .clip(let item): .clip(item.id)
         case .snippet(let snippet): .snippet(snippet.id)
         case .secret(let ref): .secret(ref.id)
-        case .folder, .authenticator, .authenticatorSuggestion: nil
+        case .folder, .authenticator, .authenticatorSuggestion, .emailCode: nil
         }
     }
 }
@@ -1112,6 +1117,7 @@ final class PanelViewModel {
         isCommandHeld = false
         tipIndex &+= 1
         env.sync.periodicSync()
+        env.emailCodes.fetchNow()
         refresh(resetSelection: true)
         focusToken &+= 1
         openToken &+= 1
@@ -1353,6 +1359,8 @@ final class PanelViewModel {
         folderCaptions = [:]
         let savedView = isSavedView
         let authView = groupFilter == nil && filter == .auth
+        // Codes from email (phase 4): live ones only, newest first.
+        let emailCodes = authView ? EmailCodeCenter.live(env.emailCodes.codes, at: .now) : []
         if authView {
             (secrets, authenticators) = authList()
         } else if savedView {
@@ -1421,10 +1429,12 @@ final class PanelViewModel {
             // Grouped by source, the most recently used first; "No website" last.
             let groups = Self.authGroups(secrets: secrets, authenticators: authenticators,
                                          lastUsed: AuthSourceUsage.shared.lastUsed)
-            result = []
+            // "Email codes" first; each code again under its source, when that source is listed.
+            result = emailCodes.map { PanelEntry.emailCode($0) }
             for group in groups {
-                if let first = group.items.first { authStarts[first.id] = AuthSourceHeading(source: group.source) }
-                result += group.items
+                let items = Self.emailCodeEntries(emailCodes, under: group.source) + group.items
+                if let first = items.first { authStarts[first.id] = AuthSourceHeading(source: group.source) }
+                result += items
             }
         } else if q.isEmpty && savedView {
             let kept = clips.map(PanelEntry.clip) + secrets.map(PanelEntry.secret) + snippets.map(PanelEntry.snippet)
@@ -1475,6 +1485,12 @@ final class PanelViewModel {
                     scored.append((.authenticator(item), s + 500, item.createdAt))
                 }
             }
+            for code in emailCodes {
+                // By source only.
+                if let s = FuzzyMatcher.score(query: q, in: code.source) {
+                    scored.append((.emailCode(code), s + 600, code.receivedAt))
+                }
+            }
             scored.sort { $0.1 != $1.1 ? $0.1 > $1.1 : $0.2 > $1.2 }
             result = scored.map(\.0)
         }
@@ -1483,6 +1499,9 @@ final class PanelViewModel {
         authSourceStarts = authStarts
         sectionStarts = q.isEmpty && !authView ? Self.dateSections(entries, date: savedView ? { $0.folder == nil ? $0.savedDate : nil }
                                                                          : { $0.clip?.lastCopiedAt ?? $0.secret?.createdAt }) : [:]
+        if q.isEmpty && authView, let first = emailCodes.first {
+            sectionStarts[PanelEntry.emailCode(first).id] = "Email codes"
+        }
         if resetSelection || !userMovedSelection || !entries.contains(where: { $0.id == selectedID }) {
             selectedID = entries.first?.id
         } else {
@@ -1503,6 +1522,12 @@ final class PanelViewModel {
                            lastUsed: [String: Date]) -> [AuthSourceGroup<PanelEntry>] {
         let entries = secrets.map(PanelEntry.secret) + authenticators.map(PanelEntry.authenticator)
         return AuthSourceGrouping.group(entries, source: authSource(of:), title: authTitle, lastUsed: lastUsed)
+    }
+
+    /// The email codes listed again under a source (none under "No website").
+    static func emailCodeEntries(_ codes: [EmailCode], under source: AuthSource?) -> [PanelEntry] {
+        guard let domain = source?.domain else { return [] }
+        return codes.filter { $0.source == domain }.map { PanelEntry.emailCode($0, inSource: true) }
     }
 
     /// The source a row in Auth sits under.
@@ -1787,6 +1812,8 @@ final class PanelViewModel {
             }
         case .authenticatorSuggestion(let account):
             beginAddAuthenticator(from: account)
+        case .emailCode(let code, _):
+            pasteEmailCode(code)
         }
     }
 
@@ -1822,6 +1849,20 @@ final class PanelViewModel {
             self.onClose()
             self.env.pasteCode(code, into: target)
         }
+    }
+
+    /// An email code into the target app: transient, cleared after 30 s, never in history.
+    func pasteEmailCode(_ code: EmailCode) {
+        AuthSourceUsage.shared.record(code.authSource)
+        let target = targetApp
+        onClose()
+        env.pasteCode(code.code, into: target)
+    }
+
+    func copyEmailCode(_ code: EmailCode) {
+        AuthSourceUsage.shared.record(code.authSource)
+        env.copyCode(code.code)
+        onClose()
     }
 
     /// Copy Code: transient, cleared after 30 s, never in history.
@@ -2046,7 +2087,7 @@ final class PanelViewModel {
         case .clip(let item): labelForm = LabelFormState(target: .clip(item))
         case .secret(let ref): labelForm = LabelFormState(target: .secret(ref))
         case .folder(let folder): labelForm = LabelFormState(target: .folder(folder))
-        case .snippet, .authenticator, .authenticatorSuggestion: return
+        case .snippet, .authenticator, .authenticatorSuggestion, .emailCode: return
         }
         mode = .label
     }
@@ -2088,7 +2129,7 @@ final class PanelViewModel {
         case .clip(let item): !item.isTransient && env.sync.canChange(item)
         case .secret(let ref): env.sync.canChange(itemID: ref.id, spaceID: ref.spaceID)
         case .folder(let folder): canChangeFolder(folder)
-        case .snippet, .authenticator, .authenticatorSuggestion: false
+        case .snippet, .authenticator, .authenticatorSuggestion, .emailCode: false
         }
     }
 
@@ -2860,7 +2901,7 @@ final class PanelViewModel {
             actions += PanelAction.sendToDeviceActions(for: item, multiSelecting: false, targets: DeviceTarget.others(in: env.sync))
             if canSendToContact(item) { actions += contactSendActions(excludingSpace: item.spaceID) }
             actions += [.saveToFolder, .saveToChosenFolder]
-        case .snippet, .folder, .authenticator, .authenticatorSuggestion:
+        case .snippet, .folder, .authenticator, .authenticatorSuggestion, .emailCode:
             break
         case .secret(let ref):
             actions.append(.copy)
@@ -3013,6 +3054,7 @@ final class PanelViewModel {
             case .secret(let ref):
                 noteAuthUse(entry)
                 env.copySecret(ref)
+            case .emailCode(let code, _): copyEmailCode(code)
             case .snippet, .folder, .authenticator, .authenticatorSuggestion: break
             }
             onClose()
@@ -3562,6 +3604,8 @@ final class PanelViewModel {
         case .authenticatorSuggestion:
             dismissSuggestion()
             return
+        case .emailCode:
+            return   // they go by themselves after 10 minutes
         }
         refresh()
         if !entries.isEmpty {
@@ -3935,6 +3979,9 @@ extension PanelViewModel {
             select(.chip(.auth))
             let item = env.authenticators.items.first { $0.owned?.spaceID == spaceId || $0.shared?.spaceId == spaceId }
             focus(item.map { PanelEntry.authenticator($0).id })
+        case .emailCode(let id):
+            select(.chip(.auth))
+            focus(env.emailCodes.code(id: id).map { PanelEntry.emailCode($0).id })
         }
     }
 
@@ -4142,7 +4189,7 @@ extension PanelViewModel {
                 let ids = FolderTree(env.store.folders(inSpace: folder.spaceID)).subtree(of: folder.id)
                 clips += env.store.items(inSpace: folder.spaceID).filter { $0.isPinned && $0.folderID.map(ids.contains) == true }
                 secrets += env.secrets.secrets.filter { $0.spaceID == folder.spaceID && $0.folderID.map(ids.contains) == true }
-            case .snippet, .authenticator, .authenticatorSuggestion:
+            case .snippet, .authenticator, .authenticatorSuggestion, .emailCode:
                 break
             }
         }
