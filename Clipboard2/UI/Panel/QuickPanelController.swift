@@ -848,7 +848,8 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
             let hit = content.hitTest(content.convert(event.locationInWindow, from: nil))
             var view = hit
             while let current = view {
-                if current is SelectableTextView || current is ClipEditorTextView { return }
+                if current is SelectableTextView || current is ClipEditorTextView || current is FileContentsTextView
+                    || current is PasteSelectionButton { return }
                 view = current.superview
             }
             self.model.previewSelection = nil
@@ -976,6 +977,13 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
                     return false
                 }
                 if window.firstResponder is ClipEditorTextView { return self.model.handleEditorKey(event) }
+                if let editor = window.firstResponder as? FileContentsTextView, editor.isEditable {
+                    return self.model.handleFileEditorKey(event)
+                }
+                // The name field's field editor: its delegate is the field.
+                if let editor = window.firstResponder as? NSTextView, editor.delegate is FileNameTextField {
+                    return self.model.handleFileNameKey(event)
+                }
                 return self.model.handleKeyDown(event)
             }
             return handled ? nil : event

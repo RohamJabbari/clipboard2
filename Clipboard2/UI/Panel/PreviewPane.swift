@@ -26,6 +26,15 @@ struct PreviewPane: View {
             }
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .overlay(alignment: .topTrailing) {
+                    // File panes have it in their header, next to Edit.
+                    if let model, model.previewSelection != nil, entry.clip?.kind != .file {
+                        PasteSelectedOnlyButton(model: model)
+                            .fixedSize()
+                            .padding(.top, 8)
+                            .padding(.trailing, 10)
+                    }
+                }
             Divider()
             metadata
                 .padding(.horizontal, 16)
@@ -54,9 +63,20 @@ struct PreviewPane: View {
                 }
             case .file:
                 if let model, item.fileURLs.count > 1 {
-                    FilePreviewView(urls: item.fileURLs, picked: model.pickedFiles,
-                                    onClick: { model.clickFile($0, in: item) },
-                                    onClear: model.clearPickedFiles)
+                    VStack(spacing: 0) {
+                        FilePreviewView(urls: item.fileURLs, picked: model.pickedFiles,
+                                        onClick: { model.clickFile($0, in: item) },
+                                        onClear: model.clearPickedFiles)
+                        // One file picked: its name and contents, as for a single file.
+                        if let url = model.shownFile(of: item) {
+                            Divider()
+                            FileContentsPane(item: item, url: url, model: model)
+                                .id(url)
+                                .frame(maxHeight: .infinity)
+                        }
+                    }
+                } else if let model, let url = model.shownFile(of: item) {
+                    FileContentsPane(item: item, url: url, model: model)
                 } else {
                     FilePreviewView(urls: item.fileURLs)
                 }

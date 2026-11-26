@@ -175,6 +175,10 @@ enum PanelAction: Identifiable, Hashable {
     case transform(Transform)
     case ai(AIAction)
     case saveAsSecret
+    /// A text file's contents, edited into a new copy (the original stays).
+    case editFile
+    /// The file's paste name: a renamed copy (the user's file keeps its name).
+    case renameFile
     case setLabel
     /// Save… (Edit Saved… once saved): the label and where it's kept, in the right pane.
     case save
@@ -218,6 +222,8 @@ enum PanelAction: Identifiable, Hashable {
         case .transform(let t): "transform-" + t.rawValue
         case .ai(let a): "ai-" + a.id
         case .saveAsSecret: "saveAsSecret"
+        case .editFile: "editFile"
+        case .renameFile: "renameFile"
         case .setLabel: "setLabel"
         case .save: "save"
         case .shareToGroup: "shareToGroup"
@@ -257,7 +263,7 @@ enum PanelAction: Identifiable, Hashable {
              .removeFromLabelled: "Saved"
         case .openFolder, .renameFolder, .deleteFolder, .moveFolder, .moveFolderToTop, .newSubfolder: "Folder"
         case .save: "Saved"
-        case .saveAsSecret, .setLabel, .shareToGroup, .clearSlot, .delete: "Item"
+        case .saveAsSecret, .editFile, .renameFile, .setLabel, .shareToGroup, .clearSlot, .delete: "Item"
         case .authenticator: "Authenticator"
         }
     }
@@ -273,6 +279,8 @@ enum PanelAction: Identifiable, Hashable {
         case .ai(.instruction(let text)): "Ask: “\(text)”"
         case .ai(let a): a.title
         case .saveAsSecret: "Save as Secret…"
+        case .editFile: "Edit a Copy of the File"
+        case .renameFile: "Rename File…"
         case .setLabel: "Label…"
         case .save: "Save…"
         case .shareToGroup: "Share to Group…"
@@ -310,6 +318,8 @@ enum PanelAction: Identifiable, Hashable {
         case .transform(let t): t.symbol
         case .ai(let a): a.symbol
         case .saveAsSecret: "key"
+        case .editFile: "pencil"
+        case .renameFile: "character.cursor.ibeam"
         case .setLabel: "tag"
         case .save: "bookmark"
         case .shareToGroup: "person.2"
@@ -343,6 +353,7 @@ enum PanelAction: Identifiable, Hashable {
         case .setLabel: "⌘L"
         case .save: "⌘S"
         case .quickLook: "⌘Y"
+        case .editFile: "⌘E"
         default: nil
         }
     }
@@ -1040,6 +1051,7 @@ final class PanelViewModel {
             if selectedID != oldValue {
                 clearPickedFiles()
                 if previewSelection != nil { previewSelection = nil }
+                if fileEdit != nil { fileEdit = nil }
                 if revealedSecretID != nil { revealedSecretID = nil }
                 if pendingDeleteID != nil { pendingDeleteID = nil }
                 if selectedID != nil, selectedCardID != nil { selectedCardID = nil }
@@ -1219,6 +1231,7 @@ final class PanelViewModel {
         isEditingText = false
         selectionItem = nil
         previewSelection = nil
+        fileEdit = nil
         clearPickedFiles()
         resetMode()
         otpClock.stop()
@@ -1308,9 +1321,20 @@ final class PanelViewModel {
     }
 
     func beginEditing() {
-        guard let item = selectedEntry?.clip, isEditable(item), !isMultiSelecting else { return }
-        editorFocusToken &+= 1
+        guard let item = selectedEntry?.clip, !isMultiSelecting else { return }
+        if isEditable(item) {
+            editorFocusToken &+= 1
+        } else if canEditFile(item) {
+            beginFileEdit()
+        }
     }
+
+    // MARK: A copied file's name and contents (see PanelViewModel+Files)
+
+    /// The shown file's name field and editor; nil until the name is typed into or editing starts.
+    var fileEdit: FileEditState?
+    /// Keyboard focus asked for in the file pane (Rename File…, Edit); the pane takes it once shown.
+    var fileFocusRequest: FileFocus?
 
     /// Saves and hands the keyboard back to the search field and list.
     func endEditing() {
@@ -3090,6 +3114,9 @@ final class PanelViewModel {
                 actions.append(.saveAsSecret)
             } else if item.kind == .image && !item.isConcealed {
                 actions += aiActions.filter { if case .ai(let ai) = $0 { ai.worksOnImages } else { true } }
+            } else if item.kind == .file {
+                if canEditFile(item) { actions.append(.editFile) }
+                if canRenameFile(item) { actions.append(.renameFile) }
             }
             actions += savedActions(for: [item])
             if canShareToGroup { actions.append(.shareToGroup) }
@@ -3281,6 +3308,12 @@ final class PanelViewModel {
         case .saveAsSecret:
             guard let item = entry.clip else { return }
             beginSaveSecret(item)
+        case .editFile:
+            mode = .browse
+            beginFileEdit()
+        case .renameFile:
+            mode = .browse
+            beginRenameFile()
         case .setLabel:
             beginLabel(entry)
         case .save:

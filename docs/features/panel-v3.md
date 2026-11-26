@@ -120,3 +120,26 @@ Replace All · Saved · ‹This App› · Contacts · ‹group chips›.
   - ⌘C copies the selection.
   - Clicking elsewhere or changing the row clears the selection.
 - A partial paste doesn't add a new history item, and it doesn't change the clip.
+
+## 8. Copied files: contents, partial paste, edited copies (Mac, 1.13)
+- **Contents.** When the previewed item is one file (or one file is picked of several), the preview shows the file's name field on top and, when the file is text, its contents below.
+  - Text: a known text extension (`.txt .md .log .csv .tsv .json .xml .yaml/.yml .toml .ini .html .css .js/.ts .py .swift .java .go .rs .c/.h .sh .sql`… and anything `UTType` calls plain text, source code, JSON, XML, YAML, CSV or HTML) or, for other names, a file of up to 1 MB that is valid UTF-8 with no NUL bytes. UTF-16 with a BOM is read; Windows Latin 1 too for known extensions. RTF and Word files are not shown as raw bytes.
+  - Prose (`.txt .md` and no extension) uses the system font; code and data are monospaced.
+  - `.json` is shown pretty-printed only when it's valid (keys in their order), with a note that the file is unchanged. Invalid JSON is shown as it is.
+  - Only the first 1 MB is read. A longer file shows that part with "Showing the first 1 MB of ‹size›"; it can't be edited.
+  - A file clip keeps only the file's path. If nothing is there any more, the pane says so inline, with the path.
+  - Files that look like keys or passwords are never shown: names like `.env`, `.env.*`, `.netrc`, `id_rsa`, `*.pem`, `*.key`, `*.p12`, and any text `SensitiveText` flags (a private key block, a single token). Folders, binaries and unreadable files show the icon and size.
+- **Part of it.** The contents are selectable like §7: with a selection, Return pastes just the selection as plain text and ⌘C copies it. No history item is added.
+- **Paste Selected Only.** For any selectable preview text — a text clip (also while editing it), the recognised text of an image, and file contents (PDF files show their icon: the app has no PDF text yet) — a non-empty selection shows an accent **Paste Selected Only** button at the top right of the preview (in a file's header, next to Edit). It pastes the selection as plain text and goes away when the selection clears. The footer keeps "⏎ Paste Selection".
+- **Edit → new copy.** **Edit** in the file's header, ⌘E, or ⌘K → **Edit a Copy of the File** (text files up to 1 MB).
+  - The contents become editable inline. The name field switches to `‹name›-edited.‹ext›`; if that name is already used by a file item in Copies, `-edited-2`, `-edited-3`… Editing an edited copy doesn't stack suffixes. A name typed before Edit is kept.
+  - **Save as New Copy** (⌘S or ⌘Return) writes the text (UTF-8) to a new file in the app's own storage and adds it to Copies as a new file item, selected. The original item and file are untouched. Pasting the new item pastes the file under its name, as a file URL like any file clip.
+  - **Cancel** discards. esc with unsaved edits first says so in the footer ("⌘S keeps a copy, esc discards"); a second esc discards. Choosing another row discards too.
+  - While editing: plain text only, no smart quotes or autocorrect; ⌘A ⌘C ⌘X ⌘V ⌘Z work, and ⌘C copies as plain text without a history item.
+- **Rename.** The name field is the name the item pastes with. Type a new name and press Return (or **Rename** / **Keep Renamed Copy**); ⌘K → **Rename File…** focuses it with the name selected without its extension. esc puts the name back.
+  - A file Clipboard2 keeps itself (an edited copy, or a file that arrived through sync) in a personal item is renamed in place.
+  - Any other file gets a renamed copy as a new item in Copies. The user's file on disk is never renamed or changed.
+  - Slashes and colons become dashes; an empty name is refused with a beep.
+- **Storage.** Kept files live in `Application Support/‹bundle id›/Synced Files/‹item id›/‹name›`, the folder sync already uses for received files: the file goes when its item is deleted, a group or personal copy gets its own copy, and orphaned folders are cleaned up.
+- **Sync.** No new payload field. A kept file is a normal file clip whose file is uploaded as a `fileBlobs` entry; its name is the blob's `name`, so other devices (Windows ≥ 1.10.2 included) receive it under the edited name. A rename changes the path, so the file is uploaded again under the new name.
+- Secrets and authenticators are never previewed, as before. Backups keep file paths only, as for any file clip.
