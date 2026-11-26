@@ -70,8 +70,9 @@ struct QuickPanelView: View {
             Hairline()
             HintBar(entry: model.selectedEntry, mode: model.mode, notice: model.notice,
                     isEditingText: model.isEditingText,
+                    isEditingFile: model.fileEdit?.isEditing == true,
                     hasTextSelection: model.previewSelection != nil,
-                    canEditText: model.selectedEntry?.clip.map(model.isEditable) ?? false,
+                    canEditText: model.canEditPreview,
                     inFolder: model.openFolder != nil,
                     selectionCount: model.isMultiSelecting ? model.selectedClips.count : nil,
                     pickedFiles: model.pickedFileCount,
@@ -1156,6 +1157,8 @@ struct HintBar: View {
     let mode: PanelMode
     let notice: String?
     var isEditingText = false
+    /// A copied file's contents are being edited into a new copy.
+    var isEditingFile = false
     /// Text is selected in the preview: Return pastes just that.
     var hasTextSelection = false
     var canEditText = false
@@ -1186,6 +1189,10 @@ struct HintBar: View {
                 hint("⏎", "Send… / Accept")
                 hint("⌘N", "Add Contact")
                 hint("⌫", "Remove")
+            case .browse where isEditingFile:
+                hint("⌘S", "Save as New Copy")
+                hint("⌘Z", "Undo")
+                hint("esc", "Cancel")
             case .browse where hasTextSelection && selectionCount == nil:
                 hint("⏎", "Paste Selection")
                 hint("⌘C", "Copy")
@@ -1289,7 +1296,7 @@ struct HintBar: View {
                     .layoutPriority(-1)
                     .help(syncIndicator.offersSyncNow ? "\(syncIndicator.title()) — use Sync Now in the menu bar menu" : syncIndicator.title())
             }
-            if !isEditingText { hint("esc", mode == .browse && !inFolder ? "Close" : "Back") }
+            if !isEditingText && !isEditingFile { hint("esc", mode == .browse && !inFolder ? "Close" : "Back") }
         }
         .font(.caption)
         .foregroundStyle(.secondary)
