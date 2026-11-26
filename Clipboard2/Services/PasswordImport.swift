@@ -1,8 +1,9 @@
 import Foundation
 
-// Settings → Auth → Import CSV…: password exports from Apple Passwords, Chrome and 1Password
-// (`url,username,password,notes`, with or without `title` and `otpauth`). The file is read once
-// and never kept.
+// Settings → Auth → Import: password exports from Apple Passwords, Chrome (and Chromium browsers),
+// Firefox, 1Password and Bitwarden (`url,username,password,notes`, with or without `title` and
+// `otpauth`, under each exporter's own header names). The file is read once and never kept; what's
+// imported is picked in a review list first (PasswordImportReview).
 
 /// RFC 4180 CSV: quoted fields with "" escapes and line breaks inside, CRLF or LF, a BOM.
 nonisolated enum CSV {
@@ -54,6 +55,30 @@ nonisolated struct PasswordCSVRow: Equatable, Sendable {
     var password = ""
     var notes = ""
     var otpauth = ""
+
+    /// Bitwarden writes several URIs into one cell, separated by commas.
+    var urls: [String] {
+        guard !url.isEmpty else { return [] }
+        let parts = url.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        if parts.count > 1, parts.allSatisfy({ !$0.contains(" ") && $0.contains(".") }) { return parts }
+        return [url]
+    }
+
+    /// The one-time-code setup: an `otpauth://` link, or (Bitwarden) a bare base32 key.
+    var authenticator: OTPAccount? {
+        guard !otpauth.isEmpty else { return nil }
+        var account: OTPAccount
+        if case .success(let parsed) = OTPAuthURI.parse(otpauth) {
+            account = parsed
+        } else if !otpauth.contains("://"), let secret = Base32.normalize(otpauth), Base32.decode(secret)?.isEmpty == false {
+            account = OTPAccount(issuer: "", account: "", secret: secret)
+        } else {
+            return nil
+        }
+        if account.issuer.isEmpty { account.issuer = title.isEmpty ? (urls.first.flatMap { AuthSource.domain(ofSite: $0) } ?? "") : title }
+        if account.account.isEmpty { account.account = username }
+        return account
+    }
 }
 
 nonisolated enum PasswordCSV {
@@ -69,7 +94,8 @@ nonisolated enum PasswordCSV {
         case "username", "user", "login", "loginusername", "loginname", "email", "emailaddress", "userid", "account": .username
         case "password", "pass", "loginpassword", "pwd": .password
         case "notes", "note", "comments", "comment", "extra", "loginnotes": .notes
-        case "otpauth", "otp", "totp", "onetimepassword", "loginotp", "otpauthurl", "twofactorsecret", "authenticator": .otpauth
+        case "otpauth", "otp", "totp", "onetimepassword", "loginotp", "logintotp", "otpauthurl", "twofactorsecret",
+             "authenticator": .otpauth
         default: nil
         }
     }
@@ -112,12 +138,16 @@ protocol PasswordImportSink: AnyObject {
     /// Personal passwords and secrets already saved, for skipping duplicates.
     func existingLogins() -> [PasswordImporter.Login]
     func addLogin(name: String, value: String, username: String?, urls: [String], notes: String?) -> Bool
+    /// A "Changed" entry: the saved password (`Login.id`) gets the imported value.
+    func updateLogin(id: String, value: String) -> Bool
     func finishImport()
 }
 
 nonisolated struct PasswordImportSummary: Equatable, Sendable {
     var passwords = 0
     var authenticators = 0
+    /// Saved passwords that got the imported value ("Changed" entries).
+    var updated = 0
     var duplicates = 0
     /// Rows with neither a password nor a usable one-time-code link.
     var unreadable = 0
@@ -126,6 +156,7 @@ nonisolated struct PasswordImportSummary: Equatable, Sendable {
     /// "Imported 42 passwords, 3 authenticators, skipped 2 duplicates".
     var line: String {
         var parts = ["Imported \(BackupSummary.count(passwords, "password"))"]
+        if updated > 0 { parts.append("updated \(updated)") }
         if authenticators > 0 { parts.append(BackupSummary.count(authenticators, "authenticator")) }
         if duplicates > 0 { parts.append("skipped \(BackupSummary.count(duplicates, "duplicate"))") }
         if unreadable > 0 { parts.append("skipped \(BackupSummary.count(unreadable, "empty row"))") }
@@ -140,11 +171,27 @@ enum PasswordImporter {
         var domains: Set<String>
         var username: String
         var value: String
+        /// The saved password it is (not part of what makes two logins the same).
+        var id: String?
 
-        init(urls: [String], username: String?, value: String) {
+        init(urls: [String], username: String?, value: String, id: String? = nil) {
             domains = Set(urls.map { AuthSource.domain(ofSite: $0) ?? $0.lowercased() })
             self.username = (username ?? "").lowercased()
             self.value = value
+            self.id = id
+        }
+
+        /// Same site and username (the password may differ).
+        func isSameAccount(as other: Login) -> Bool { domains == other.domains && username == other.username }
+
+        static func == (lhs: Login, rhs: Login) -> Bool {
+            lhs.domains == rhs.domains && lhs.username == rhs.username && lhs.value == rhs.value
+        }
+
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(domains)
+            hasher.combine(username)
+            hasher.combine(value)
         }
     }
 
@@ -162,7 +209,7 @@ enum PasswordImporter {
         var known = Set(sink.existingLogins())
         var knownCodes = Set((authenticators?.owned ?? []).map { "\($0.secret)|\($0.account)" })
         for row in rows {
-            let urls = row.url.isEmpty ? [] : [row.url]
+            let urls = row.urls
             var used = false
             if !row.password.isEmpty {
                 used = true
@@ -177,10 +224,8 @@ enum PasswordImporter {
                     summary.failed += 1
                 }
             }
-            if !row.otpauth.isEmpty, let authenticators, case .success(var account) = OTPAuthURI.parse(row.otpauth) {
+            if let authenticators, let account = row.authenticator {
                 used = true
-                if account.issuer.isEmpty { account.issuer = row.title.isEmpty ? (AuthSource.domain(ofSite: row.url) ?? "") : row.title }
-                if account.account.isEmpty { account.account = row.username }
                 if !knownCodes.insert("\(account.secret)|\(account.account)").inserted {
                     summary.duplicates += 1
                 } else if authenticators.add(account, urls: urls) != nil {
@@ -198,7 +243,7 @@ enum PasswordImporter {
     /// The export's title, else the site, else the username.
     static func name(for row: PasswordCSVRow) -> String {
         if !row.title.isEmpty { return row.title }
-        if let domain = AuthSource.domain(ofSite: row.url) { return domain }
+        if let domain = row.urls.first.flatMap({ AuthSource.domain(ofSite: $0) }) { return domain }
         if !row.url.isEmpty { return row.url }
         return row.username.isEmpty ? "Imported Password" : row.username
     }
@@ -207,8 +252,14 @@ enum PasswordImporter {
 extension SecretStore: PasswordImportSink {
     func existingLogins() -> [PasswordImporter.Login] {
         secrets.filter { $0.spaceID == nil }.compactMap { ref in
-            SecretVault.value(id: ref.id).map { PasswordImporter.Login(urls: ref.urls, username: ref.username, value: $0) }
+            SecretVault.value(id: ref.id).map { PasswordImporter.Login(urls: ref.urls, username: ref.username, value: $0, id: ref.id) }
         }
+    }
+
+    /// Also LoginSaveStore's (LoginSaveWatcher.swift).
+    func updateLogin(id: String, value: String) -> Bool {
+        guard let ref = secrets.first(where: { $0.id == id }) else { return false }
+        return update(ref, value: value)
     }
 
     func addLogin(name: String, value: String, username: String?, urls: [String], notes: String?) -> Bool {
