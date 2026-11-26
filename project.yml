@@ -49,6 +49,8 @@ targets:
       # Trimmed public suffix list for grouping Auth by site (AuthSources.swift).
       - path: Clipboard2/Resources/PublicSuffixList.dat
         buildPhase: resources
+      # Platform-neutral code shared with the iOS app (docs/features/ios.md).
+      - path: Core
     info:
       path: Clipboard2/Info.plist
       properties:
@@ -142,7 +144,7 @@ targets:
     sources:
       - path: Clipboard2AutoFill
       - path: Clipboard2/Shared
-      - path: Clipboard2/Services/TOTP.swift
+      - path: Core/Auth/TOTP.swift
     info:
       path: Clipboard2AutoFill/Info.plist
       properties:
