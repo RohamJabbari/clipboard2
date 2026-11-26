@@ -36,6 +36,10 @@ nonisolated enum KeychainServices {
     static var secretNotes: String { AutoFillConfig.appBundleID + ".secretnotes" }
     static var authenticators: String { AutoFillConfig.appBundleID + ".authenticators" }
     static var sharedCodes: String { AutoFillConfig.appBundleID + ".sharedcodes" }
+    /// Auth's origins (sites edited by hand): name, domains, icon, notes and the documents' list.
+    static var origins: String { AutoFillConfig.appBundleID + ".origins" }
+    /// The key the origins' documents are encrypted with on this Mac (login Keychain only).
+    static var originDocumentsKey: String { AutoFillConfig.appBundleID + ".origin-documents-key" }
     /// What the extension lists (`AutoFillEntry`s): titles, usernames and domains, never values.
     static var autofillIndex: String { AutoFillConfig.appBundleID + ".autofill-index" }
     /// Until when the app's Touch ID window is open (`AutoFillUnlock`).

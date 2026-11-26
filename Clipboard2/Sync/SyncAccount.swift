@@ -251,6 +251,8 @@ final class SyncAccount {
     @ObservationIgnored private let snippets: SnippetStore
     @ObservationIgnored private let secrets: any SyncSecretSource
     @ObservationIgnored let authenticators: AuthenticatorStore?
+    /// Auth's origins (sites edited by hand); set by the app before signing in.
+    @ObservationIgnored var origins: OriginStore?
     @ObservationIgnored private let makeService: (@escaping @Sendable () async throws -> String) -> any SyncService
 
     @ObservationIgnored private(set) var engine: SyncEngine?
@@ -550,7 +552,8 @@ final class SyncAccount {
     private func activate(_ identity: SyncIdentity, adopting keys: [String: Data] = [:], signingIn: Bool = false) {
         self.engine?.stop()
         let engine = SyncEngine(api: makeAPI(), identity: identity, context: context, store: store,
-                                snippets: snippets, secrets: secrets, authenticators: authenticators, keyPins: session?.spaceKeyPins ?? [:])
+                                snippets: snippets, secrets: secrets, authenticators: authenticators, origins: origins,
+                                keyPins: session?.spaceKeyPins ?? [:])
         engine.deviceId = session?.deviceId
         engine.deviceName = deviceName
         engine.announcesArrivals = !signingIn
@@ -1690,7 +1693,7 @@ final class SyncAccount {
             guard let id = UUID(uuidString: arrival.itemID), let snippet = snippets.snippet(withID: id) else { return nil }
             what = .snippet(snippet.name)
             entryID = PanelEntry.snippet(snippet).id
-        case .folder, .otp:
+        case .folder, .otp, .origin:
             return nil
         }
         return NotificationArrival(entryID: entryID, spaceId: arrival.spaceId, authorUid: arrival.authorUid, what: what)
@@ -1770,14 +1773,14 @@ extension SecretStore: SyncSecretSource {
     func syncNotes(id: String) -> String? { SecretVault.notes(id: id) }
 
     func syncUpsert(id: String, name: String, value: String, spaceID: String?, folderID: UUID?,
-                    username: String?, urls: [String], notes: String?) {
+                    username: String?, urls: [String], notes: String?, origin: String?) {
         if let existing = SecretVault.list().first(where: { $0.id.lowercased() == id.lowercased() }) {
             SecretVault.update(id: existing.id, name: name, value: value,
                                folder: existing.folderID == folderID ? nil : .some(folderID),
-                               username: .some(username), urls: urls, notes: .some(notes))
+                               username: .some(username), urls: urls, notes: .some(notes), origin: .some(origin))
         } else {
             SecretVault.add(name: name, value: value, id: id, spaceID: spaceID, folderID: folderID,
-                            username: username, urls: urls, notes: notes)
+                            username: username, urls: urls, notes: notes, origin: origin)
         }
     }
 

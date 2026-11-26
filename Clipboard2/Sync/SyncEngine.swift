@@ -11,9 +11,10 @@ protocol SyncSecretSource: AnyObject {
     func syncValue(id: String) -> String?
     /// A password's notes (nil when it has none).
     func syncNotes(id: String) -> String?
-    /// Creates the secret with this id, or replaces its name, value, Saved folder, username, sites and notes.
+    /// Creates the secret with this id, or replaces its name, value, Saved folder, username, sites,
+    /// notes and origin.
     func syncUpsert(id: String, name: String, value: String, spaceID: String?, folderID: UUID?,
-                    username: String?, urls: [String], notes: String?)
+                    username: String?, urls: [String], notes: String?, origin: String?)
     func syncDelete(id: String)
     /// Called once after a batch of upserts and deletes.
     func syncDidChange()
@@ -39,6 +40,9 @@ final class SyncEngine {
     let secrets: any SyncSecretSource
     /// Authenticators you own (their `otp` items) and the code batches shared with you.
     let authenticators: AuthenticatorStore?
+    /// Auth's origins (`origin` items, personal space only) and their documents.
+    let origins: OriginStore?
+    private var originsChanged = false
     var now: () -> Date = { .now }
     /// Public keys of people authenticators are shared with, by uid (they don't change).
     private var publicKeys: [String: Data] = [:]
@@ -149,7 +153,7 @@ final class SyncEngine {
 
     init(api: any SyncService, identity: SyncIdentity, context: ModelContext, store: ClipStore,
          snippets: SnippetStore, secrets: any SyncSecretSource, authenticators: AuthenticatorStore? = nil,
-         keyPins: [String: String] = [:]) {
+         origins: OriginStore? = nil, keyPins: [String: String] = [:]) {
         self.api = api
         self.identity = identity
         self.context = context
@@ -157,6 +161,7 @@ final class SyncEngine {
         self.snippets = snippets
         self.secrets = secrets
         self.authenticators = authenticators
+        self.origins = origins
         self.keyPins = keyPins
     }
 
@@ -599,7 +604,54 @@ final class SyncEngine {
             applyFolder(folder, remote: remote, spaceId: spaceId, force: force)
         case .otp(let otp):
             applyOTP(otp, remote: remote, spaceId: spaceId, force: force)
+        case .origin(let origin):
+            try await applyOrigin(origin, remote: remote, spaceId: spaceId, itemKey: itemKey, force: force)
         }
+    }
+
+    /// An origin from another of your devices. Its documents are downloaded first (like a clip's
+    /// files), so the origin never lists one this Mac could have but doesn't.
+    private func applyOrigin(_ payload: OriginPayload, remote: RemoteItem, spaceId: String, itemKey: Data, force: Bool) async throws {
+        guard let origins, spaceId == identity.personalSpaceId else { return }
+        let existing = origins.origin(withID: remote.id)
+        if !force, let existing, let known = meta(for: remote.id),
+           originFingerprint(existing) != known.fingerprint,
+           existing.updatedAt.syncMillis > remote.updatedAt {
+            // Edited here after the server's version: keep ours, the push sends it.
+            known.fingerprint = (try? SyncPayload.origin(payload).fingerprint()) ?? ""
+            known.remoteSeq = remote.seq
+            known.updatedAt = remote.updatedAt
+            known.blobIds = remote.blobIds
+            return
+        }
+        var received = payload
+        var missing: Set<String> = []
+        for document in payload.documents ?? [] where !origins.documents.contains(id: document.id) {
+            do {
+                let data = try await downloadBlob(spaceId: spaceId, blobId: document.id, itemKey: itemKey)
+                try checkActive()
+                origins.syncStoreDocument(data, id: document.id)
+            } catch let error as SyncAPIError where error.status == 404 {
+                Log.sync.notice("A document of \(remote.id, privacy: .public) is gone; skipping it")
+                missing.insert(document.id)
+            }
+            try checkActive()
+        }
+        if !missing.isEmpty { received.documents = received.documents?.filter { !missing.contains($0.id) } }
+        let arrived = now().syncMillis
+        received.createdAt = min(received.createdAt, arrived)
+        received.updatedAt = min(received.updatedAt, arrived)
+        quietly { origins.syncUpsert(id: remote.id, payload: received) }
+        originsChanged = true
+        let stored = AuthOrigin(id: remote.id, payload: received)
+        recordMeta(id: remote.id, spaceId: spaceId, category: .origin,
+                   fingerprint: missing.isEmpty ? originFingerprint(stored) : "",
+                   seq: remote.seq, updatedAt: remote.updatedAt, blobIds: remote.blobIds.filter { !missing.contains($0) },
+                   authorUid: remote.authorUid)
+    }
+
+    private func originFingerprint(_ origin: AuthOrigin) -> String {
+        (try? SyncPayload.origin(origin.payload).fingerprint()) ?? ""
     }
 
     /// Your own authenticator, from another of your devices. Only ever in its authenticator space.
@@ -1146,7 +1198,8 @@ final class SyncEngine {
             // Kept even when that folder isn't here (yet): the secret shows at the root until it is.
             secrets.syncUpsert(id: existing?.id ?? remote.id, name: received.name, value: received.value,
                                spaceID: localSpaceID(spaceId), folderID: received.folder.flatMap(UUID.init(uuidString:)),
-                               username: received.username, urls: received.urls ?? [], notes: received.notes)
+                               username: received.username, urls: received.urls ?? [], notes: received.notes,
+                               origin: received.origin)
         }
         secretsChanged = true
         let ref = secret(withID: remote.id)
@@ -1332,6 +1385,8 @@ final class SyncEngine {
         var toDevice: String?
         /// Read from disk only when sent, so a tick with many files never holds them all in memory.
         var uploads: [(id: String, file: URL)] = []
+        /// An origin's documents to upload first, by id (also their blob ids); read from the vault when sent.
+        var documentUploads: [String] = []
     }
 
     private func push(_ space: SyncSpace, itemKey: Data) async throws {
@@ -1394,6 +1449,21 @@ final class SyncEngine {
             let payload = SyncPayload.snippet(SnippetPayload(snippet: snippet))
             if let job = makeJob(id: id, payload: payload, meta: metaByID[id], sortAt: snippet.updatedAt.syncMillis,
                                  updatedAt: snippet.updatedAt.syncMillis) { jobs.append(job) }
+        }
+        // Origins: personal only. Each lists its documents' blobs; new ones are uploaded first.
+        if space.isPersonal, let origins {
+            for origin in origins.syncOrigins {
+                let id = origin.id
+                let meta = metaByID[id]
+                let payload = SyncPayload.origin(origin.payload)
+                let updatedAt = max(origin.updatedAt.syncMillis, (meta?.updatedAt ?? 0) + 1)
+                guard var job = makeJob(id: id, payload: payload, meta: meta, sortAt: origin.createdAt.syncMillis,
+                                        updatedAt: updatedAt) else { continue }
+                let uploaded = Set(meta?.blobIds ?? [])
+                job.blobIds = origin.documents.map(\.id)
+                job.documentUploads = job.blobIds.filter { !uploaded.contains($0) }
+                jobs.append(job)
+            }
         }
         for ref in secrets.syncSecrets where ref.spaceID == localSpace && !hidesSecrets {
             let id = ref.id.lowercased()
@@ -1560,6 +1630,26 @@ final class SyncEngine {
                 } catch let error as SyncAPIError where error.status == 409 {
                     // An item already references this blob id: it's uploaded.
                     Log.sync.notice("Blob \(upload.id, privacy: .public) is already on the server")
+                }
+                try checkActive()
+            }
+            for documentID in job.documentUploads {
+                guard let data = origins?.documentData(documentID) else {
+                    Log.sync.notice("A document of \(job.id, privacy: .public) isn't on this Mac; not syncing it yet")
+                    rejected[job.id] = Rejection(key: job.rejectKey, quota: false)
+                    return
+                }
+                let sealed = try await Self.seal(data, key: itemKey, aad: SyncCrypto.AAD.blob(spaceId: spaceId, blobId: documentID))
+                try checkActive()
+                guard sealed.count <= SyncConfig.maxBlobCiphertext else {
+                    rejected[job.id] = Rejection(key: job.rejectKey, quota: false)
+                    return
+                }
+                do {
+                    let ticket = try await api.registerBlob(spaceId: spaceId, blobId: documentID, size: sealed.count)
+                    try await api.uploadBlob(ticket, data: sealed)
+                } catch let error as SyncAPIError where error.status == 409 {
+                    Log.sync.notice("Blob \(documentID, privacy: .public) is already on the server")
                 }
                 try checkActive()
             }
@@ -1760,6 +1850,8 @@ final class SyncEngine {
         if ref.isPassword || ref.notesStamp != nil {
             fields += [ref.username ?? "", ref.urls.joined(separator: "\u{1E}"), ref.notesStamp ?? ""]
         }
+        // Its origin likewise.
+        if let origin = ref.originID { fields.append("origin:" + origin) }
         return SyncCrypto.sha256Hex(Data(fields.joined(separator: "\u{1F}").utf8))
     }
 
@@ -1798,6 +1890,8 @@ final class SyncEngine {
             return store.folder(withID: uuid) != nil
         case .otp:
             return authenticators?.authenticator(withID: meta.localId) != nil
+        case .origin:
+            return origins?.origin(withID: meta.localId) != nil
         case nil:
             return false
         }
@@ -1812,6 +1906,7 @@ final class SyncEngine {
         ids.formUnion(store.allFolders().map { $0.id.uuidString.lowercased() })
         ids.formUnion(secrets.syncSecrets.map { $0.id.lowercased() })
         ids.formUnion((authenticators?.owned ?? []).map(\.id))
+        ids.formUnion((origins?.syncOrigins ?? []).map(\.id))
         return ids
     }
 
@@ -1830,6 +1925,10 @@ final class SyncEngine {
         if let authenticators, authenticators.authenticator(withID: id) != nil {
             authenticators.syncDelete(id: id)
             authenticatorsChanged = true
+        }
+        if let origins, origins.origin(withID: id) != nil {
+            origins.syncDelete(id: id)
+            originsChanged = true
         }
     }
 
@@ -1860,6 +1959,10 @@ final class SyncEngine {
         if authenticatorsChanged {
             authenticatorsChanged = false
             authenticators?.syncDidChange()
+        }
+        if originsChanged {
+            originsChanged = false
+            origins?.syncDidChange()
         }
         guard secretsChanged else { return }
         secretsChanged = false

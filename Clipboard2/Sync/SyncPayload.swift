@@ -1,7 +1,7 @@
 import Foundation
 
 nonisolated enum SyncCategory: String, Codable, Sendable, CaseIterable {
-    case history, pinned, snippet, secret, folder, otp
+    case history, pinned, snippet, secret, folder, otp, origin
 
     var isClip: Bool { self == .history || self == .pinned }
 }
@@ -162,10 +162,13 @@ nonisolated struct SecretPayload: Codable, Equatable, Sendable {
     var urls: [String]?
     /// A password's notes (1.11+). Omitted when empty.
     var notes: String?
+    /// The origin (Auth's site edited by hand, an `origin` item) it's filed under (1.13+). Omitted
+    /// when unset: then it's grouped by its sites.
+    var origin: String?
     var rev: Int64?
 
     init(name: String, value: String, createdAt: Int64, folder: String? = nil, username: String? = nil,
-         urls: [String]? = nil, notes: String? = nil) {
+         urls: [String]? = nil, notes: String? = nil, origin: String? = nil) {
         self.name = name
         self.value = value
         self.createdAt = createdAt
@@ -174,11 +177,13 @@ nonisolated struct SecretPayload: Codable, Equatable, Sendable {
         let sites = SecretExtras.cleanURLs(urls ?? [])
         self.urls = sites.isEmpty ? nil : sites
         self.notes = notes?.isEmpty == true ? nil : notes
+        self.origin = origin?.isEmpty == true ? nil : origin?.lowercased()
     }
 
     init(ref: SecretRef, value: String, notes: String? = nil, now: Date = .now) {
         self.init(name: ref.name, value: value, createdAt: (ref.createdAt ?? now).syncMillis,
-                  folder: ref.folderID?.uuidString.lowercased(), username: ref.username, urls: ref.urls, notes: notes)
+                  folder: ref.folderID?.uuidString.lowercased(), username: ref.username, urls: ref.urls, notes: notes,
+                  origin: ref.originID)
     }
 
     init(from decoder: any Decoder) throws {
@@ -192,6 +197,7 @@ nonisolated struct SecretPayload: Codable, Equatable, Sendable {
         username = try? c.decodeIfPresent(String.self, forKey: .username)
         urls = try? c.decodeIfPresent([String].self, forKey: .urls)
         notes = try? c.decodeIfPresent(String.self, forKey: .notes)
+        origin = try? c.decodeIfPresent(String.self, forKey: .origin)
         rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
     }
 }
@@ -246,12 +252,15 @@ nonisolated struct OTPPayload: Codable, Equatable, Sendable {
     var updatedAt: Int64
     /// The sites the user set (Edit → Website, 1.11+). Omitted when empty.
     var urls: [String]?
+    /// The origin it's filed under (1.13+), like a secret's. Omitted when unset.
+    var origin: String?
     var rev: Int64?
 
     init(issuer: String, account: String, secret: String, algorithm: String, digits: Int, period: Int,
-         createdAt: Int64, updatedAt: Int64, urls: [String]? = nil) {
+         createdAt: Int64, updatedAt: Int64, urls: [String]? = nil, origin: String? = nil) {
         let sites = SecretExtras.cleanURLs(urls ?? [])
         self.urls = sites.isEmpty ? nil : sites
+        self.origin = origin?.isEmpty == true ? nil : origin?.lowercased()
         self.issuer = issuer
         self.account = account
         self.secret = secret
@@ -275,8 +284,76 @@ nonisolated struct OTPPayload: Codable, Equatable, Sendable {
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
         updatedAt = try c.decodeIfPresent(Int64.self, forKey: .updatedAt) ?? createdAt
         urls = try? c.decodeIfPresent([String].self, forKey: .urls)
+        origin = try? c.decodeIfPresent(String.self, forKey: .origin)
         rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
     }
+}
+
+/// `type: "origin"` (1.13+): a site in Auth edited by hand. Only in the personal space. Its
+/// documents are blobs of the item, each document's `id` being its blob id.
+nonisolated struct OriginPayload: Codable, Equatable, Sendable {
+    nonisolated struct Note: Codable, Equatable, Hashable, Sendable {
+        var id: String
+        var text: String
+        var createdAt: Int64
+        var updatedAt: Int64
+    }
+
+    nonisolated struct Document: Codable, Equatable, Hashable, Sendable {
+        /// Also its blob's id.
+        var id: String
+        var name: String
+        /// Plaintext bytes.
+        var size: Int64
+        var addedAt: Int64
+    }
+
+    var v = 1
+    var type = "origin"
+    var name: String
+    /// Its sites (hosts or URLs as typed); every registrable domain among them is the origin's.
+    var domains: [String]?
+    /// `favicon:<domain>`, `letter`, `symbol:<SF Symbol>` or `emoji:<text>`; omitted: the first domain's favicon.
+    var icon: String?
+    var notes: [Note]?
+    var documents: [Document]?
+    /// Entries filed here that can't carry an `origin` of their own: `shared:<authenticator space id>`
+    /// and `secret:<id>` for someone else's secret in a group.
+    var entries: [String]?
+    var createdAt: Int64
+    var updatedAt: Int64
+    var rev: Int64?
+
+    init(name: String, domains: [String] = [], icon: String? = nil, notes: [Note] = [], documents: [Document] = [],
+         entries: [String] = [], createdAt: Int64, updatedAt: Int64) {
+        self.name = name
+        let sites = SecretExtras.cleanURLs(domains)
+        self.domains = sites.isEmpty ? nil : sites
+        self.icon = icon?.isEmpty == true ? nil : icon
+        self.notes = notes.isEmpty ? nil : notes
+        self.documents = documents.isEmpty ? nil : documents
+        self.entries = entries.isEmpty ? nil : entries
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        v = try c.decodeIfPresent(Int.self, forKey: .v) ?? 1
+        type = try c.decodeIfPresent(String.self, forKey: .type) ?? "origin"
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        domains = try? c.decodeIfPresent([String].self, forKey: .domains)
+        icon = try? c.decodeIfPresent(String.self, forKey: .icon)
+        notes = try? c.decodeIfPresent([Note].self, forKey: .notes)
+        documents = try? c.decodeIfPresent([Document].self, forKey: .documents)
+        entries = try? c.decodeIfPresent([String].self, forKey: .entries)
+        createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
+        updatedAt = try c.decodeIfPresent(Int64.self, forKey: .updatedAt) ?? createdAt
+        rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
+    }
+
+    /// The documents' blob ids, in order.
+    var blobIds: [String] { (documents ?? []).map(\.id) }
 }
 
 nonisolated enum SyncPayloadError: Error, Equatable {
@@ -289,6 +366,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
     case secret(SecretPayload)
     case folder(FolderPayload)
     case otp(OTPPayload)
+    case origin(OriginPayload)
 
     nonisolated private struct TypeProbe: Decodable { var type: String? }
 
@@ -300,6 +378,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case "secret": return .secret(try decoder.decode(SecretPayload.self, from: data))
         case "folder": return .folder(try decoder.decode(FolderPayload.self, from: data))
         case "otp": return .otp(try decoder.decode(OTPPayload.self, from: data))
+        case "origin": return .origin(try decoder.decode(OriginPayload.self, from: data))
         case let other: throw SyncPayloadError.unknownType(other ?? "nil")
         }
     }
@@ -315,6 +394,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .secret(let p): return try encoder.encode(p)
         case .folder(let p): return try encoder.encode(p)
         case .otp(let p): return try encoder.encode(p)
+        case .origin(let p): return try encoder.encode(p)
         }
     }
 
@@ -344,6 +424,9 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .otp(var p):
             p.rev = nil
             return .otp(p)
+        case .origin(var p):
+            p.rev = nil
+            return .origin(p)
         }
     }
 
@@ -354,6 +437,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .secret(let p): p.rev
         case .folder(let p): p.rev
         case .otp(let p): p.rev
+        case .origin(let p): p.rev
         }
     }
 
@@ -375,6 +459,9 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .otp(var p):
             p.rev = rev
             return .otp(p)
+        case .origin(var p):
+            p.rev = rev
+            return .origin(p)
         }
     }
 
@@ -385,6 +472,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .secret: .secret
         case .folder: .folder
         case .otp: .otp
+        case .origin: .origin
         }
     }
 }

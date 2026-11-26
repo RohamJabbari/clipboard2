@@ -20,6 +20,8 @@ nonisolated struct SecretRef: Identifiable, Hashable, Sendable {
     var urls: [String] = []
     /// Short hash of the notes, if any (the notes themselves live in a Keychain item of their own).
     var notesStamp: String? = nil
+    /// The origin (Auth's site edited by hand) it's filed under; nil: grouped by its sites.
+    var originID: String? = nil
 
     /// A secret with a site or a username is a password.
     var isPassword: Bool { username?.isEmpty == false || !urls.isEmpty }
@@ -36,10 +38,12 @@ nonisolated struct SecretExtras: Codable, Equatable, Sendable {
     /// When it was first saved (Unix ms), kept here once it moved Keychains: a moved item gets a
     /// new creation date, and the creation date is part of what syncs.
     var created: Int64?
+    /// The origin it's filed under (`SecretRef.originID`).
+    var origin: String?
 
     static let plainDescription = "Clipboard2 secret"
 
-    var isEmpty: Bool { username == nil && urls == nil && notes == nil && created == nil }
+    var isEmpty: Bool { username == nil && urls == nil && notes == nil && created == nil && origin == nil }
 
     /// The description attribute for these extras.
     var descriptionValue: String {
@@ -54,15 +58,17 @@ nonisolated struct SecretExtras: Codable, Equatable, Sendable {
         guard let descriptionValue, descriptionValue.hasPrefix("{"),
               let decoded = try? JSONDecoder().decode(SecretExtras.self, from: Data(descriptionValue.utf8))
         else { self.init(); return }
-        self.init(username: decoded.username, urls: decoded.urls, notes: decoded.notes, created: decoded.created)
+        self.init(username: decoded.username, urls: decoded.urls, notes: decoded.notes, created: decoded.created,
+                  origin: decoded.origin)
     }
 
-    init(username: String? = nil, urls: [String]? = nil, notes: String? = nil, created: Int64? = nil) {
+    init(username: String? = nil, urls: [String]? = nil, notes: String? = nil, created: Int64? = nil, origin: String? = nil) {
         self.username = Self.cleanUsername(username)
         let sites = Self.cleanURLs(urls ?? [])
         self.urls = sites.isEmpty ? nil : sites
         self.notes = notes?.isEmpty == true ? nil : notes
         self.created = created
+        self.origin = origin?.isEmpty == true ? nil : origin?.lowercased()
     }
 
     /// A secret's description on its way to the shared Keychain: its creation date joins it.
@@ -126,7 +132,8 @@ nonisolated enum SecretVault {
                 folderID: (attrs[kSecAttrComment as String] as? String).flatMap(UUID.init(uuidString:)),
                 username: extras.username,
                 urls: extras.urls ?? [],
-                notesStamp: extras.notes
+                notesStamp: extras.notes,
+                originID: extras.origin
             )
         }
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -135,8 +142,9 @@ nonisolated enum SecretVault {
     /// `id` is given for secrets that arrive through sync.
     @discardableResult
     static func add(name: String, value: String, id: String = UUID().uuidString, spaceID: String? = nil,
-                    folderID: UUID? = nil, username: String? = nil, urls: [String] = [], notes: String? = nil) -> SecretRef? {
-        let extras = SecretExtras(username: username, urls: urls, notes: SecretExtras.notesStamp(notes))
+                    folderID: UUID? = nil, username: String? = nil, urls: [String] = [], notes: String? = nil,
+                    origin: String? = nil) -> SecretRef? {
+        let extras = SecretExtras(username: username, urls: urls, notes: SecretExtras.notesStamp(notes), origin: origin)
         var attributes: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
@@ -150,22 +158,24 @@ nonisolated enum SecretVault {
         guard keychain.add(attributes) == errSecSuccess else { return nil }
         writeNotes(notes, id: id)
         return SecretRef(id: id, name: name, createdAt: .now, spaceID: spaceID, updatedAt: .now, folderID: folderID,
-                         username: extras.username, urls: extras.urls ?? [], notesStamp: extras.notes)
+                         username: extras.username, urls: extras.urls ?? [], notesStamp: extras.notes, originID: extras.origin)
     }
 
     /// `folder` sets the Saved folder: `.some(nil)` takes the secret out of its folder. `username`,
-    /// `urls` and `notes` replace what's there when given (`.some(nil)` and `[]` clear them).
+    /// `urls`, `notes` and `origin` replace what's there when given (`.some(nil)` and `[]` clear them).
     @discardableResult
     static func update(id: String, name: String? = nil, value: String? = nil, folder: UUID?? = nil,
-                       username: String?? = nil, urls: [String]? = nil, notes: String?? = nil) -> Bool {
+                       username: String?? = nil, urls: [String]? = nil, notes: String?? = nil,
+                       origin: String?? = nil) -> Bool {
         var changes: [CFString: Any] = [:]
         if let name { changes[kSecAttrLabel] = name }
         if let value { changes[kSecValueData] = Data(value.utf8) }
         if let folder { changes[kSecAttrComment] = folder?.uuidString.lowercased() ?? "" }
-        if username != nil || urls != nil || notes != nil {
+        if username != nil || urls != nil || notes != nil || origin != nil {
             let current = extras(id: id)
             let extras = SecretExtras(username: username ?? current.username, urls: urls ?? current.urls,
-                                      notes: notes.map(SecretExtras.notesStamp) ?? current.notes, created: current.created)
+                                      notes: notes.map(SecretExtras.notesStamp) ?? current.notes, created: current.created,
+                                      origin: origin ?? current.origin)
             if extras != current { changes[kSecAttrDescription] = extras.descriptionValue }
             if let notes, SecretExtras.notesStamp(notes) != current.notes { writeNotes(notes, id: id) }
         }
@@ -298,11 +308,19 @@ final class SecretStore {
 
     @discardableResult
     func add(name: String, value: String, spaceID: String? = nil, folderID: UUID? = nil,
-             username: String? = nil, urls: [String] = [], notes: String? = nil) -> SecretRef? {
+             username: String? = nil, urls: [String] = [], notes: String? = nil, origin: String? = nil) -> SecretRef? {
         let ref = SecretVault.add(name: name, value: value, spaceID: spaceID, folderID: folderID,
-                                  username: username, urls: urls, notes: notes)
+                                  username: username, urls: urls, notes: notes, origin: origin)
         reload()
         return ref
+    }
+
+    /// Files secrets under an origin, or (nil) back under their sites. Only the ones that change are written.
+    func setOrigin(_ originID: String?, for refs: [SecretRef]) {
+        let changing = refs.filter { $0.originID != originID }
+        guard !changing.isEmpty else { return }
+        for ref in changing { SecretVault.update(id: ref.id, origin: .some(originID)) }
+        reload()
     }
 
     /// Edit on a password or secret: everything given replaces what's there.
