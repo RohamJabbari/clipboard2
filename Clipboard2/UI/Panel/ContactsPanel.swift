@@ -248,7 +248,7 @@ struct PeopleListView: View {
                 } description: {
                     Text("Add someone by their username or a contact code to send them items.")
                 }
-                .frame(maxHeight: .infinity)
+                .pinnedEmptyState()
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {

@@ -58,7 +58,9 @@ struct QuickPanelView: View {
                     resultsList
                 }
                 .animation(.smooth(duration: 0.3), value: env.sync.downloads.isEmpty)
+                // The header stays at the top however short the list (or its empty state) is.
                 .frame(width: listWidth)
+                .frame(maxHeight: .infinity, alignment: .top)
                 .overlay { listDropHighlight }
                 .onDrop(of: [.fileURL, .clipboard2Clip],
                         delegate: PanelDropDelegate(target: .list, model: model, isTargeted: $listDropTargeted))
@@ -202,8 +204,10 @@ struct QuickPanelView: View {
                          ? "Drag items here, or use Save… (⌘S) in an item's actions."
                          : "Use Save… (⌘S) to keep an item forever.")
                 }
+                .pinnedEmptyState()
             } else if model.filter == .groups && model.groupFilter == nil {
                 NoGroupsView()
+                    .pinnedEmptyState()
             } else if model.entries.isEmpty && model.meCards.isEmpty {
                 let inbox = model.filter == .inbox && model.groupFilter == nil
                 ContentUnavailableView {
@@ -216,6 +220,7 @@ struct QuickPanelView: View {
                             : "Items appear as you copy them.")
                          : "Try fewer letters or another filter.")
                 }
+                .pinnedEmptyState()
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -898,6 +903,17 @@ struct SectionHeading: View {
             .padding(.top, isFirst ? 4 : 12)
             .padding(.bottom, 3)
             .accessibilityAddTraits(.isHeader)
+    }
+}
+
+// MARK: - Empty states
+
+extension View {
+    /// An empty list's message sits just under the list's header, never centred in the pane.
+    func pinnedEmptyState() -> some View {
+        fixedSize(horizontal: false, vertical: true)
+            .padding(.top, 24)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 }
 
