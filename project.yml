@@ -3,6 +3,7 @@ options:
   bundleIdPrefix: at.softmaze
   deploymentTarget:
     macOS: "14.0"
+    iOS: "17.0"
   createIntermediateGroups: true
   groupSortPosition: top
 
@@ -188,6 +189,52 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.ClippyTests
         GENERATE_INFOPLIST_FILE: YES
 
+  # iOS app (docs/features/ios.md). Shares Core/ with the Mac app. Apple Development, automatic
+  # signing: Developer ID can't sign iOS. Simulator builds need no provisioning profile.
+  Clipboard2 iOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: iOS/App
+      - path: iOS/Shared
+      - path: iOS/Resources
+      - path: Core
+      - path: Clipboard2/Resources/PublicSuffixList.dat
+        buildPhase: resources
+    info:
+      path: iOS/App/Info.plist
+      properties:
+        CFBundleDisplayName: Clipboard2
+        CFBundleName: Clipboard2
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.productivity
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        NSFaceIDUsageDescription: Clipboard2 asks for Face ID before showing or copying a password.
+        # Read at run time to name the shared Keychain group (SharedContainer.swift).
+        AppIdentifierPrefix: $(AppIdentifierPrefix)
+        NSHumanReadableCopyright: "© 2026 Softmaze Solutions GmbH"
+    entitlements:
+      path: iOS/App/Clipboard2iOS.entitlements
+      properties:
+        com.apple.security.application-groups: [group.at.softmaze.Clippy.ios]
+        keychain-access-groups: [$(AppIdentifierPrefix)at.softmaze.Clippy.ios.shared]
+    settings:
+      base:
+        PRODUCT_NAME: Clipboard2
+        PRODUCT_MODULE_NAME: Clipboard2iOS
+        PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.ios
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: Apple Development
+        ENABLE_HARDENED_RUNTIME: NO
+
 schemes:
   Clipboard2:
     build:
@@ -200,5 +247,13 @@ schemes:
       config: Debug
       targets:
         - Clipboard2Tests
+    archive:
+      config: Release
+  Clipboard2 iOS:
+    build:
+      targets:
+        Clipboard2 iOS: all
+    run:
+      config: Debug
     archive:
       config: Release
