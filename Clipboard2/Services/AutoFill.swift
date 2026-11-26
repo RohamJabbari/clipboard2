@@ -88,6 +88,42 @@ nonisolated enum FormFieldGuesser {
     }
 }
 
+/// Whether a focused field waits for a one-time code, so email codes are looked for faster.
+/// `autocomplete="one-time-code"`, `inputmode` and `maxlength` aren't visible through
+/// Accessibility, so it goes by the label, placeholder and identifier (English and German), or by
+/// the row of narrow one-digit boxes many sites use.
+nonisolated enum OneTimeCodeField {
+    /// `width`: the field's; `siblingWidths`: the text fields with the same parent, itself included.
+    static func matches(hints: [String], width: CGFloat?, siblingWidths: [CGFloat]) -> Bool {
+        if isDigitBox(width: width, siblingWidths: siblingWidths) { return true }
+        let words = hints.map(FormFieldGuesser.normalized).filter { !$0.isEmpty }
+        guard !words.isEmpty else { return false }
+        let text = " " + words.joined(separator: " ") + " "
+        let tokens = Set(text.split(separator: " ").map(String.init))
+        func has(_ needles: [String]) -> Bool { needles.contains { text.contains($0) } }
+        func word(_ needles: [String]) -> Bool { needles.contains { tokens.contains($0) } }
+        // Codes that aren't one-time codes.
+        if has(["zip", "postal", "postcode", "post code", "postleitzahl", "promo", "coupon", "gutschein", "voucher",
+                "discount", "rabatt", "gift", "country code", "area code", "vorwahl", "ländercode", "landercode",
+                "zip code", "referral", "invite", "einladung", "qr code", "source code", "swift", "bic", "iban",
+                "cvc", "cvv", "card"])
+            || word(["plz"]) { return false }
+        if has(["one time", "onetime", "verification", "verify", "verifizierung", "bestatigungscode", "bestätigungscode",
+                "bestaetigungscode", "sicherheitscode", "security code", "authentication code", "authenticator",
+                "auth code", "login code", "sign in code", "signin code", "anmeldecode", "two factor", "2 factor",
+                "zwei faktor", "passcode", "einmalcode", "einmal code", "confirmation code", "access code"])
+            || word(["otp", "totp", "mfa", "2fa", "tan", "code", "pin"]) { return true }
+        return false
+    }
+
+    /// One of four to eight equally narrow boxes in a row: one digit each.
+    static func isDigitBox(width: CGFloat?, siblingWidths: [CGFloat]) -> Bool {
+        guard let width, width > 0, width <= 64 else { return false }
+        let alike = siblingWidths.filter { abs($0 - width) <= 4 }.count
+        return (4...8).contains(alike)
+    }
+}
+
 // MARK: - Fill plans
 
 /// What the target app's focused field is.

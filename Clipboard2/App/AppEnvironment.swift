@@ -173,6 +173,7 @@ final class AppEnvironment {
             guard let self else { return }
             self.notifications.postEmailCode(code, showingCode: self.emailCodes.showsCodeInNotification)
         }
+        emailCodes.onAccountsChanged = { [weak self] in self?.updateTextFieldIcons() }
         emailCodes.start()
         applyAppearance()
         if let storeOpenError {
@@ -297,7 +298,7 @@ final class AppEnvironment {
         AutoFillIdentities.checkEnabled()   // re-registers once it's turned on in System Settings
         guard storeOpenError == nil else { return }
         store.enforceRetention(maxItems: prefs.maxItems, maxAge: prefs.maxAge)
-        // Sync polls on its own cadence (3 s / 15 s / 60 s).
+        // Sync polls on its own cadence (heads every 2 s / 10 s; see SyncConfig).
         if maintenanceRuns > 0 { imageText.scheduleBacklog() }   // older images; not during launch
         maintenanceRuns &+= 1
         if maintenanceRuns % 30 == 1 {   // directory scans: every ~30 min
@@ -308,19 +309,26 @@ final class AppEnvironment {
 
     // MARK: Icons in other apps' text fields
 
-    /// Watches other apps' text fields while an icon that needs it is on and Accessibility is allowed.
+    /// Watches other apps' text fields while Accessibility is allowed and an icon that needs it is
+    /// on, or an email account is set up (a focused one-time-code field makes it look faster).
     func updateTextFieldIcons() {
-        guard prefs.pasteIcon, AXPermission.isTrusted else {
+        let watchesCodes = !emailCodes.accounts.isEmpty
+        guard prefs.pasteIcon || watchesCodes, AXPermission.isTrusted else {
             textFieldWatcher.stop()
             pasteIcon.hide()
+            emailCodes.setCodeFieldFocused(false)
             return
         }
+        if !prefs.pasteIcon { pasteIcon.hide() }
         textFieldWatcher.onChange = { [weak self] field in self?.textFieldChanged(field) }
+        textFieldWatcher.detectsCodeFields = watchesCodes
+        textFieldWatcher.onCodeFieldChange = { [weak self] isCode in self?.emailCodes.setCodeFieldFocused(isCode) }
         textFieldWatcher.start()
     }
 
     /// A focused field gets the paste icon.
     private func textFieldChanged(_ field: TextFieldWatcher.Field?) {
+        guard prefs.pasteIcon else { return }
         pasteIcon.update(field.flatMap { isTextIconHidden(in: $0.app, hiddenApps: prefs.pasteIconHiddenApps) ? nil : $0 })
     }
 

@@ -145,6 +145,41 @@ nonisolated enum FieldAX {
         return hints
     }
 
+    /// The field waits for a one-time code (OneTimeCodeField): its label, or a row of digit boxes.
+    static func looksLikeOneTimeCode(_ element: AXElement) -> Bool {
+        let width = frame(of: element)?.width
+        let siblingWidths = width.map { $0 <= 64 ? nearbyTextFieldWidths(element) : [] } ?? []
+        return OneTimeCodeField.matches(hints: hints(of: element), width: width, siblingWidths: siblingWidths)
+    }
+
+    /// Widths of the text fields around a narrow one: under its parent, or (boxes each wrapped in
+    /// their own element) under its grandparent, one level down. A few dozen elements at most.
+    private static func nearbyTextFieldWidths(_ element: AXElement) -> [CGFloat] {
+        var ancestor = element.raw
+        for _ in 0..<2 {
+            guard let parent = Self.element(ancestor, kAXParentAttribute) else { break }
+            ancestor = parent
+            var fields: [AXElement] = []
+            var queue: [(AXUIElement, Int)] = [(parent, 0)]
+            var visited = 0
+            while !queue.isEmpty, visited < 40 {
+                let (node, depth) = queue.removeFirst()
+                visited += 1
+                guard let children: [AXUIElement] = value(node, kAXChildrenAttribute) else { continue }
+                for child in children.prefix(24) {
+                    let candidate = AXElement(raw: child)
+                    if isTextField(candidate) {
+                        fields.append(candidate)
+                    } else if depth < 1 {
+                        queue.append((child, depth + 1))
+                    }
+                }
+            }
+            if fields.count >= 4 { return fields.compactMap { frame(of: $0)?.width } }
+        }
+        return []
+    }
+
     static func isEmpty(_ element: AXElement) -> Bool {
         let text: String? = value(element.raw, kAXValueAttribute)
         return text?.isEmpty ?? true

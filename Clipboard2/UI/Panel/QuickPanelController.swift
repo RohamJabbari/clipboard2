@@ -305,6 +305,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         let gen = generation
         env.sync.setPanelOpen(true)
         env.updates.panelDidOpen()
+        env.emailCodes.setPanelOpen(true)
         env.sync.reportActivity()
 
         switch phase {
@@ -365,6 +366,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         quickLook.close()
         model.didClose()
         env.sync.setPanelOpen(false)
+        env.emailCodes.setPanelOpen(false)
         resignWatch?.invalidate()
         resignWatch = nil
         generation &+= 1

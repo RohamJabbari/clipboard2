@@ -14,6 +14,8 @@ export interface Limits {
   membersPerGroup: number;
   historyPerSpace: number;
   requestsPerMinute: number;
+  /** GET /v1/heads, per session (device), outside requestsPerMinute. */
+  headsPerMinute: number;
   authPerMinutePerIp: number;
   authPerMinutePerEmail: number;
   invitesPerMinute: number;
@@ -42,6 +44,7 @@ export const limits = (): Limits => ({
   membersPerGroup: int("LIMIT_MEMBERS_PER_GROUP", 50),
   historyPerSpace: int("HISTORY_PER_SPACE", 200),
   requestsPerMinute: int("RATE_REQUESTS_PER_MINUTE", 120),
+  headsPerMinute: int("RATE_HEADS_PER_MINUTE", 90),
   authPerMinutePerIp: int("RATE_AUTH_PER_MINUTE_PER_IP", 20),
   authPerMinutePerEmail: int("RATE_AUTH_PER_MINUTE_PER_EMAIL", 10),
   invitesPerMinute: int("RATE_INVITES_PER_MINUTE", 20),

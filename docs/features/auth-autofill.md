@@ -112,8 +112,8 @@ Build in phases; each phase ships on its own:
 - Several accounts are allowed. Tokens and passwords go in the Keychain.
 - **Fetching:**
   - Only new messages from the last 10 minutes, in the inbox (and Gmail's Updates category).
-  - Microsoft: delta query every 15 s. Gmail: `history.list` every 15 s. IMAP: IDLE, else every 30 s.
-  - The panel being open fetches immediately.
+  - Microsoft and Gmail: every 5 s; every 2 s while the panel is open or a one-time-code field is focused. IMAP: IDLE, else every 30 s (5 s when urgent).
+  - The panel being open, or focusing a code field, fetches immediately.
 - **What's kept:** only the code, the sender's domain, the account and the time. Never the message body or subject.
   - Codes are kept in memory and in the Keychain for 10 minutes, then deleted.
   - Nothing is synced or sent to the Clipboard2 server.
@@ -136,10 +136,12 @@ Build in phases; each phase ships on its own:
   - Google: redirect `http://127.0.0.1:<port>`, scopes `openid email https://www.googleapis.com/auth/gmail.readonly`, `access_type=offline`, `prompt=consent`. Desktop client; its "secret" is sent as Google requires (it isn't secret).
   - The account's address comes from the id_token. Adding the same address again replaces its tokens (that's also how to reconnect after "Signed out").
 - **Fetching** (decided):
-  - Microsoft: `GET /me/mailFolders/inbox/messages?$filter=receivedDateTime ge <now−10 min>` with `Prefer: outlook.body-content-type="text"`, every 15 s. Not delta: the filter is stateless and returns only the window.
-  - Gmail: `messages.list q="after:<epoch> {in:inbox category:updates}"` every 15 s, then each new id as `format=raw` (parsed by our MIME code). Not `history.list` (needs a stored history id; `newer_than:` only knows days).
+  - Microsoft: `GET /me/mailFolders/inbox/messages?$filter=receivedDateTime ge <now−10 min>` with `Prefer: outlook.body-content-type="text"`. Not delta: the filter is stateless and returns only the window. After the first look the window starts 2 minutes before the newest message seen, so polling doesn't download the same bodies again and again.
+  - Gmail: `messages.list q="after:<epoch> {in:inbox category:updates}"`, then each new id as `format=raw` (parsed by our MIME code). Not `history.list` (needs a stored history id; `newer_than:` only knows days).
   - IMAP: TLS on 993 (plain only if TLS is turned off under Advanced; no STARTTLS). LOGIN, EXAMINE INBOX (read-only), `UID SEARCH` (since yesterday the first time, then `UID n:*`), dates first via `UID FETCH (UID INTERNALDATE)`, then header fields + the first 32 KB of `BODY.PEEK[TEXT]` for the recent ones. IDLE (renewed every 9 min) when offered, else every 30 s.
-  - Opening the panel and waking the Mac look at once. Errors back off ×2 per failure up to 15 min; a revoked sign-in waits 6 h (or until re-added). No accounts: no loops.
+  - **Cadence:** Microsoft and Gmail every 5 s, every 2 s while *urgent*: the quick panel is open, or the frontmost app's focused field looks like it wants a one-time code (for at most 5 minutes per focus). `autocomplete="one-time-code"`, `inputmode` and `maxlength` aren't visible through Accessibility, so a code field is guessed from its label, placeholder or identifier (code, OTP, verification, Bestätigungscode, Sicherheitscode, 2FA, TAN…, but not ZIP, promo or voucher codes) or from a row of 4–8 equally narrow boxes (one digit each). The guess runs in the text field watcher while an email account exists and Accessibility is allowed.
+  - **Request rate:** a Microsoft look is one request (≤ 12/min, ≤ 30/min urgent, per account); Graph allows 10 000 per 10 minutes per mailbox. A Gmail look is one `messages.list` plus one `messages.get` per new message, 5 quota units each (≤ 60 units/min, ≤ 150 urgent); Gmail allows 15 000 units per minute per user. IMAP IDLE costs nothing between messages.
+  - Opening the panel and waking the Mac look at once. Errors back off ×2 per failure (from 10 s) up to 15 min, and at least a minute after a 429; a revoked sign-in waits 6 h (or until re-added). No accounts: no loops.
 - **Kept:** code, sender's registrable domain, account id, time, in memory and one Keychain item (`<bundle id>.email`, account `codes`), dropped after 10 minutes. Accounts and credentials sit in the same small vault type (`EmailVault`) so phase 3 can move it to the shared Keychain.
 - **Recognising:** URLs and addresses are removed first. Candidates: 4–8 digits, 3+3/4+4 digits split by a space or hyphen, or 6–8 capitals and digits with a digit (also `ABC-123`). Keywords additionally include confirm*, authenti*, Verifizierung*, Anmeldecode and any *code word; promo/QR/post/gift codes are negative keywords. Excluded: years 1900–2099, parts of dates/times/amounts/longer numbers, phone/IBAN groups, numbers after order/invoice/customer-number/tracking/phone words or `#`/`+`, numbers next to currencies or units, and anything near promotion words. Score = distance to the nearest keyword (a keyword after the code costs a little more, a code alone on its line a little less).
 - **Shows:** Auth gets an "Email codes" section on top and the same code again as the first row of its source when that source is listed. Return pastes (transient, cleared after 30 s, never in history); the context menu also copies. Search matches the source.

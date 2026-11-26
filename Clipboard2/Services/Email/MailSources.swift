@@ -14,14 +14,29 @@ nonisolated struct MailMessage: Equatable, Sendable {
 protocol MailSource: AnyObject {
     /// How long to wait between looks when there's no push (IDLE).
     var interval: Duration { get }
+    /// The same while a code is probably wanted (the panel is open, a code field is focused).
+    var urgentInterval: Duration { get }
     func recentMessages(since: Date) async throws -> [MailMessage]
-    /// Returns when it's time to look again: new mail (IMAP IDLE), a kick, or `interval` passed.
-    func waitForMail(_ waker: Waker) async throws
+    /// Returns when it's time to look again: new mail (IMAP IDLE), a kick, or the interval passed.
+    func waitForMail(_ waker: Waker, urgent: Bool) async throws
     func close()
 }
 
 extension MailSource {
-    func waitForMail(_ waker: Waker) async throws { await waker.wait(interval) }
+    var urgentInterval: Duration { interval }
+
+    func waitForMail(_ waker: Waker, urgent: Bool) async throws {
+        await waker.wait(urgent ? urgentInterval : interval)
+    }
+}
+
+/// Polling cadence of the HTTP sources. One look is one request (Graph) or one list request plus
+/// one per new message (Gmail): at most 30 a minute per account while urgent, 12 otherwise. Graph
+/// allows 10 000 requests per 10 minutes per mailbox; Gmail 15 000 quota units a minute per user
+/// (a list or get costs 5). Both are far above this.
+nonisolated enum MailPolling {
+    static let interval: Duration = .seconds(5)
+    static let urgentInterval: Duration = .seconds(2)
 }
 
 /// Wakes a waiting loop early (the panel opened, the Mac woke), or after its time.
@@ -132,8 +147,14 @@ nonisolated enum MailSourceError: Error, LocalizedError, Equatable {
 
 /// The inbox's messages received since a time, as plain text (`Prefer: outlook.body-content-type="text"`).
 final class GraphMailSource: MailSource {
-    let interval: Duration = .seconds(15)
+    let interval = MailPolling.interval
+    let urgentInterval = MailPolling.urgentInterval
     private let keeper: TokenKeeper
+    /// The newest message seen: later looks ask only for a little before it, so polling every few
+    /// seconds doesn't download the last 10 minutes' bodies each time.
+    private var newest: Date?
+    /// Mail can show up with a receive time a bit before mail already seen (delivery delays).
+    static let overlap: TimeInterval = 120
 
     init(keeper: TokenKeeper) { self.keeper = keeper }
 
@@ -150,8 +171,11 @@ final class GraphMailSource: MailSource {
     }
 
     func recentMessages(since: Date) async throws -> [MailMessage] {
-        let data = try await keeper.get(Self.url(since: since), headers: ["Prefer": "outlook.body-content-type=\"text\""])
-        return try Self.parse(data)
+        let from = newest.map { max(since, $0.addingTimeInterval(-Self.overlap)) } ?? since
+        let data = try await keeper.get(Self.url(since: from), headers: ["Prefer": "outlook.body-content-type=\"text\""])
+        let messages = try Self.parse(data)
+        if let latest = messages.map(\.receivedAt).max(), latest > (newest ?? .distantPast) { newest = latest }
+        return messages
     }
 
     static func parse(_ data: Data) throws -> [MailMessage] {
@@ -182,7 +206,8 @@ final class GraphMailSource: MailSource {
 
 /// `messages.list` with `after:<epoch>` in the inbox or Updates, then each new one as raw MIME.
 final class GmailSource: MailSource {
-    let interval: Duration = .seconds(15)
+    let interval = MailPolling.interval
+    let urgentInterval = MailPolling.urgentInterval
     private let keeper: TokenKeeper
     /// Messages already read (Gmail lists them again on every look).
     private var read: [String: Date] = [:]
@@ -229,6 +254,8 @@ final class GmailSource: MailSource {
 /// server has it, else a look every 30 s.
 final class IMAPMailSource: MailSource {
     let interval: Duration = .seconds(30)
+    /// Without IDLE only; with it, new mail arrives at once anyway.
+    let urgentInterval: Duration = .seconds(5)
     private let settings: IMAPSettings
     private let user: String
     private let password: String
@@ -291,9 +318,9 @@ final class IMAPMailSource: MailSource {
                            receivedAt: fetched.internalDate ?? mime.date ?? .now)
     }
 
-    func waitForMail(_ waker: Waker) async throws {
+    func waitForMail(_ waker: Waker, urgent: Bool) async throws {
         guard let client, await client.supportsIdle else {
-            await waker.wait(interval)
+            await waker.wait(urgent ? urgentInterval : interval)
             return
         }
         if waker.takePending() { return }

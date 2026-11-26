@@ -957,6 +957,36 @@ actor FakeSyncServer {
         .sorted { $0.createdAt < $1.createdAt }
     }
 
+    /// false behaves like a server from before heads: `GET /v1/heads` is `404`.
+    private(set) var supportsHeads = true
+    private(set) var headsRequests = 0
+
+    func setSupportsHeads(_ value: Bool) { supportsHeads = value }
+
+    /// `GET /v1/heads`: newest visible seq per membership, and revisions of what else a tick reads.
+    func heads(uid: String) throws -> RemoteHeads {
+        headsRequests += 1
+        guard supportsHeads else { throw Self.error(404, "not_found") }
+        var heads: [String: Int64] = [:]
+        for space in spaces.values where space.members[uid] != nil {
+            let hidesSecrets = !access(space: space.id, uid: uid).secrets
+            heads[space.id] = (items[space.id] ?? [:]).values.filter { !(hidesSecrets && $0.category == "secret") }.map(\.seq).max() ?? 0
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let digest = { (data: Data?) in SyncCrypto.sha256Hex(data ?? Data()) }
+        let listed = spaces.values.filter { $0.members[uid] != nil }.map(\.id).sorted()
+        let shareState = shares.sorted { $0.key < $1.key }.flatMap { id, byRecipient in
+            byRecipient.sorted { $0.key < $1.key }.filter { $0.key == uid || spaces[id]?.owner == uid }
+                .map { "\(id)|\($0.key)|\($0.value.codesUntil ?? -1)|\($0.value.updatedAt)" }
+        }
+        return RemoteHeads(
+            heads: heads,
+            spaces: digest(try? encoder.encode(spaces(for: uid).sorted { $0.id < $1.id })) + listed.joined(),
+            codes: digest(Data(shareState.joined(separator: ";").utf8)),
+            contacts: digest(try? encoder.encode([contactRequests(uid: uid)])) + digest(try? encoder.encode(contactCodes(uid: uid))))
+    }
+
     func changes(space: String, since: Int64, limit: Int, full: Bool = false, uid: String? = nil) throws -> ChangesPage {
         if resetNext.contains(space) && since > 0 && !full {
             resetNext.remove(space)
@@ -1117,6 +1147,7 @@ nonisolated struct FakeClient: SyncService {
     }
 
     func spaces() async throws -> [RemoteSpace] { await server.spaces(for: try await caller()) }
+    func heads() async throws -> RemoteHeads { try await server.heads(uid: try await caller()) }
     func createGroup(id: String, encryptedName: Data, wrappedKey: Data) async throws -> RemoteSpace {
         let uid = try await caller()
         await server.createSpace(id: id, kind: "group", owner: uid, wrappedKey: wrappedKey, encryptedName: encryptedName)
@@ -2673,18 +2704,116 @@ struct SyncHardeningTests {
 
         var now = Date.now.addingTimeInterval(86_400)
         mac.account.clock = { now }
-        #expect(mac.account.pollInterval == .seconds(60))
+        #expect(mac.account.pollInterval == .seconds(10))
         mac.account.reportActivity()
-        #expect(mac.account.pollInterval == .seconds(15))
+        #expect(mac.account.pollInterval == .seconds(2))
         now = now.addingTimeInterval(4 * 60)
-        #expect(mac.account.pollInterval == .seconds(15))
+        #expect(mac.account.pollInterval == .seconds(2))
         now = now.addingTimeInterval(2 * 60)
+        #expect(mac.account.pollInterval == .seconds(10))
+        mac.account.setPanelOpen(true)
+        #expect(mac.account.pollInterval == .seconds(2))
+        mac.account.setPanelOpen(false)
+        #expect(mac.account.pollInterval == .seconds(2))   // opening the panel was activity
+        await mac.settle()
+
+        // A server without heads: full syncs at the old cadence.
+        await server.setSupportsHeads(false)
+        #expect(await mac.account.poll())
+        #expect(!mac.account.usesHeads)
+        #expect(mac.account.pollInterval == .seconds(15))
+        now = now.addingTimeInterval(6 * 60)
         #expect(mac.account.pollInterval == .seconds(60))
         mac.account.setPanelOpen(true)
         #expect(mac.account.pollInterval == .seconds(3))
         mac.account.setPanelOpen(false)
-        #expect(mac.account.pollInterval == .seconds(15))   // opening the panel was activity
         await mac.settle()
+    }
+
+    /// Waits until no tick is running or about to (a poll's tick starts on its own task).
+    private func idle(_ mac: AccountHarness) async {
+        for _ in 0..<50 { await Task.yield() }
+        for _ in 0..<1000 where mac.account.isSyncing { try? await Task.sleep(for: .milliseconds(5)) }
+    }
+
+    @Test func headsPollsSyncOnlyWhenSomethingChanged() async throws {
+        let server = FakeSyncServer()
+        let mac1 = try AccountHarness(server), mac2 = try AccountHarness(server)
+        await mac1.account.signUp(email: "a@x.at", password: "a password", username: "usera")
+        await mac2.account.signIn(email: "a@x.at", password: "a password")
+        await mac1.settle()
+        await mac2.settle()
+
+        // Nothing changed: heads only, no tick.
+        let ticks = mac2.account.ticksStarted
+        let headsBefore = await server.headsRequests
+        #expect(await mac2.account.poll() == false)
+        #expect(await mac2.account.poll() == false)
+        #expect(mac2.account.ticksStarted == ticks)
+        #expect(await server.headsRequests == headsBefore + 2)
+
+        // Another device copies something: the next poll syncs and it arrives.
+        mac1.store.ingest(.text("from mac1"))
+        await mac1.settle()
+        #expect(await mac2.account.poll())
+        await idle(mac2)
+        #expect(mac2.account.ticksStarted > ticks)
+        #expect(mac2.store.allItems().map(\.text) == ["from mac1"])
+        // …and once it has, polls are quiet again.
+        let after = mac2.account.ticksStarted
+        #expect(await mac2.account.poll() == false)
+        #expect(mac2.account.ticksStarted == after)
+
+        // A group rename (no item) is a change too.
+        let group = try await mac1.account.createGroup(named: "Team")
+        await mac1.settle()
+        #expect(await mac2.account.poll())
+        await idle(mac2)
+        #expect(mac2.account.groups.map(\.name) == ["Team"])
+        try await mac1.account.renameGroup(group, to: "Crew")
+        #expect(await mac2.account.poll())
+        await idle(mac2)
+        #expect(mac2.account.groups.map(\.name) == ["Crew"])
+
+        // At least every 5 minutes it syncs regardless.
+        var now = Date.now.addingTimeInterval(6 * 60)
+        mac2.account.clock = { now }
+        #expect(await mac2.account.poll())
+        await idle(mac2)
+        now = now.addingTimeInterval(1)
+        #expect(await mac2.account.poll() == false)
+    }
+
+    @Test func headsFallBackToFullSyncsOnAnOlderServer() async throws {
+        let server = FakeSyncServer()
+        await server.setSupportsHeads(false)
+        let mac1 = try AccountHarness(server), mac2 = try AccountHarness(server)
+        await mac1.account.signUp(email: "a@x.at", password: "a password", username: "usera")
+        await mac2.account.signIn(email: "a@x.at", password: "a password")
+        await mac2.settle()
+        #expect(!mac2.account.usesHeads)
+        #expect(mac2.account.lastHeads == nil)
+
+        // Every poll is a full sync, as before heads.
+        let ticks = mac2.account.ticksStarted
+        #expect(await mac2.account.poll())
+        await idle(mac2)
+        #expect(mac2.account.ticksStarted == ticks + 1)
+        mac1.store.ingest(.text("still syncs"))
+        await mac1.settle()
+        #expect(await mac2.account.poll())
+        await idle(mac2)
+        #expect(mac2.store.allItems().map(\.text) == ["still syncs"])
+
+        // An hour later it asks again and picks up a server that has heads by now.
+        await server.setSupportsHeads(true)
+        var now = Date.now.addingTimeInterval(3601)
+        mac2.account.clock = { now }
+        #expect(mac2.account.usesHeads)
+        await mac2.settle()
+        #expect(mac2.account.lastHeads != nil)
+        now = now.addingTimeInterval(1)
+        #expect(await mac2.account.poll() == false)
     }
 }
 

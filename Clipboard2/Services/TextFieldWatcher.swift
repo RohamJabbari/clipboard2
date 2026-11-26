@@ -21,6 +21,12 @@ final class TextFieldWatcher {
 
     /// Called on the main thread whenever the focused field changes (nil: none).
     var onChange: (Field?) -> Void = { _ in }
+    /// Called on the main thread when the focused field starts or stops looking like it waits for
+    /// a one-time code (email codes are looked for faster meanwhile). Digit boxes too small for an
+    /// icon count.
+    var onCodeFieldChange: (Bool) -> Void = { _ in }
+    /// Off: no one-time-code guessing (a few more Accessibility reads per focus change).
+    var detectsCodeFields = false
 
     private var app: NSRunningApplication?
     private var appElement: AXUIElement?
@@ -29,6 +35,7 @@ final class TextFieldWatcher {
     private var monitors: [Any] = []
     private var pending: DispatchWorkItem?
     private var reported: Field?
+    private var reportedCodeField = false
     private let ownPID = ProcessInfo.processInfo.processIdentifier
     private(set) var isRunning = false
 
@@ -65,6 +72,7 @@ final class TextFieldWatcher {
         monitors = []
         detach()
         report(nil)
+        reportCodeField(false)
     }
 
     // MARK: Observing one app
@@ -131,6 +139,7 @@ final class TextFieldWatcher {
         guard isRunning, let app, let appElement else { return }
         guard let element = Self.element(appElement, kAXFocusedUIElementAttribute) else {
             report(nil)
+            reportCodeField(false)
             return
         }
         let subrole: String? = Self.value(element, kAXSubroleAttribute)
@@ -138,8 +147,10 @@ final class TextFieldWatcher {
         let secure = subrole == (kAXSecureTextFieldSubrole as String) || role == "AXSecureTextField"
         guard secure || Self.isEditable(element) else {
             report(nil)
+            reportCodeField(false)
             return
         }
+        reportCodeField(detectsCodeFields && !secure && FieldAX.looksLikeOneTimeCode(AXElement(raw: element)))
         report(Self.visibleFrame(of: element).map { Field(frame: $0, app: app, isSecure: secure, element: AXElement(raw: element)) })
     }
 
@@ -147,6 +158,12 @@ final class TextFieldWatcher {
         guard reported != field else { return }
         reported = field
         onChange(field)
+    }
+
+    private func reportCodeField(_ isCode: Bool) {
+        guard reportedCodeField != isCode else { return }
+        reportedCodeField = isCode
+        onCodeFieldChange(isCode)
     }
 
     private static func isEditable(_ element: AXUIElement) -> Bool {

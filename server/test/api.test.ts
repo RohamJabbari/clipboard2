@@ -2220,3 +2220,123 @@ function shareCodes(owner: TestUser, spaceId: string, to: TestUser, opts: { seal
     sealedCodes: b64(opts.sealedCodes ?? randomBytes(1000)),
   });
 }
+
+describe("heads", () => {
+  type Heads = { heads: Record<string, number>; spaces: string; codes: string; contacts: string };
+  const heads = async (user: TestUser): Promise<Heads> => {
+    const res = await call(user, "GET", "/v1/heads");
+    expect(res.status).toBe(200);
+    return res.body;
+  };
+
+  it("moves a space's head with every write, and nothing else", async () => {
+    const alice = await signUp("alice");
+    const start = await heads(alice);
+    expect(start.heads).toEqual({ [alice.personalSpaceId]: 0 });
+    expect(await heads(alice)).toEqual(start);
+
+    const put = await putItem(alice, alice.personalSpaceId, alice.personalKey);
+    expect(put.status).toBe(200);
+    const after = await heads(alice);
+    const seq = (await call(alice, "GET", `/v1/spaces/${alice.personalSpaceId}/changes?since=0`)).body.nextSince;
+    expect(after.heads[alice.personalSpaceId]).toBe(seq);
+    expect({ ...after, heads: start.heads }).toEqual(start);
+
+    expect((await call(alice, "DELETE", `/v1/spaces/${alice.personalSpaceId}/items/${put.id}?updatedAt=${Date.now()}`)).status).toBe(200);
+    expect((await heads(alice)).heads[alice.personalSpaceId]).toBeGreaterThan(seq);
+  });
+
+  it("changes the spaces revision for membership, names, members' names and access", async () => {
+    const alice = await signUp("alice");
+    const bob = await signUp("bob");
+    const group = await createGroup(alice);
+    const a0 = await heads(alice);
+    expect(Object.keys(a0.heads).sort()).toEqual([alice.personalSpaceId, group.id].sort());
+
+    await invite(alice, group, bob);
+    expect((await heads(alice)).spaces).not.toBe(a0.spaces);
+    const b1 = await heads(bob);
+    expect(b1.heads).toHaveProperty(group.id);
+
+    const renamed = await call(alice, "PATCH", `/v1/groups/${group.id}`, {
+      encryptedName: b64(cc.aeadSeal(cc.nameKey(group.sk), Buffer.from("Renamed"), cc.aad.name(group.id))),
+    });
+    expect(renamed.status).toBe(204);
+    const b2 = await heads(bob);
+    expect(b2.spaces).not.toBe(b1.spaces);
+
+    expect((await call(alice, "PUT", "/v1/account/username", { username: "alicia" })).status).toBe(200);
+    const b3 = await heads(bob);
+    expect(b3.spaces).not.toBe(b2.spaces);
+
+    expect((await call(alice, "PATCH", `/v1/groups/${group.id}/members/${bob.uid}`, { canSend: false })).status).toBe(200);
+    const b4 = await heads(bob);
+    expect(b4.spaces).not.toBe(b3.spaces);
+    expect(b4.heads).toEqual(b3.heads);
+
+    expect((await call(alice, "DELETE", `/v1/groups/${group.id}/members/${bob.uid}`)).status).toBe(204);
+    const b5 = await heads(bob);
+    expect(b5.heads).not.toHaveProperty(group.id);
+    expect(b5.spaces).not.toBe(b4.spaces);
+  });
+
+  it("doesn't move the head for secrets a member can't see", async () => {
+    const alice = await signUp("alice");
+    const bob = await signUp("bob");
+    const group = await createGroup(alice);
+    await invite(alice, group, bob);
+    expect((await call(alice, "PATCH", `/v1/groups/${group.id}/members/${bob.uid}`, { canSeeSecrets: false })).status).toBe(200);
+    expect((await putItem(alice, group.id, group.sk)).status).toBe(200);
+    const before = await heads(bob);
+    const aliceBefore = await heads(alice);
+    expect((await putItem(alice, group.id, group.sk, { category: "secret" })).status).toBe(200);
+    expect((await heads(bob)).heads[group.id]).toBe(before.heads[group.id]);
+    expect((await heads(alice)).heads[group.id]).toBeGreaterThan(aliceBefore.heads[group.id]!);
+    expect((await putItem(alice, group.id, group.sk)).status).toBe(200);
+    expect((await heads(bob)).heads[group.id]).toBeGreaterThan(before.heads[group.id]!);
+  });
+
+  it("changes the contacts and codes revisions for requests, codes and shared batches", async () => {
+    const alice = await person("Alice");
+    const bob = await person("Bob");
+    const a0 = await heads(alice);
+    const b0 = await heads(bob);
+    const req = await requestContact(alice, "Bob");
+    expect(req.status).toBe(201);
+    const b1 = await heads(bob);
+    expect(b1.contacts).not.toBe(b0.contacts);
+    expect((await heads(alice)).contacts).not.toBe(a0.contacts);
+
+    expect((await call(bob, "POST", `/v1/contacts/requests/${req.spaceId}/accept`)).status).toBe(201);
+    const b2 = await heads(bob);
+    expect(b2.contacts).toBe(b0.contacts); // nothing pending any more…
+    expect(b2.spaces).not.toBe(b1.spaces); // …but there's a contact
+
+    const a1 = await heads(alice);
+    expect((await contactCode(alice)).status).toBe(201);
+    const a2 = await heads(alice);
+    expect(a2.contacts).not.toBe(a1.contacts);
+
+    const auth = await createAuthenticator(alice);
+    expect(auth.status).toBe(201);
+    const a3 = await heads(alice);
+    expect(a3.codes).toBe(a2.codes);
+    expect((await shareCodes(alice, auth.id, bob)).status).toBe(200);
+    const b3 = await heads(bob);
+    expect(b3.codes).not.toBe(b2.codes);
+    expect((await heads(alice)).codes).not.toBe(a3.codes); // the owner's other devices see the share
+    expect((await shareCodes(alice, auth.id, bob)).status).toBe(200);
+    expect((await heads(bob)).codes).not.toBe(b3.codes);
+  });
+
+  it("is limited per session, apart from other requests", async () => {
+    rebuild({ requestsPerMinute: 2, headsPerMinute: 3 });
+    const alice = await signUp("alice");
+    for (let i = 0; i < 3; i++) expect((await call(alice, "GET", "/v1/heads")).status).toBe(200);
+    expect((await call(alice, "GET", "/v1/heads")).status).toBe(429);
+    expect((await call(alice, "GET", "/v1/account")).status).toBe(200);
+    const second = await logIn(alice.email, alice.password);
+    expect((await call(second.body.token, "GET", "/v1/heads")).status).toBe(200);
+    expect((await call(null, "GET", "/v1/heads")).status).toBe(401);
+  });
+});

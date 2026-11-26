@@ -31,6 +31,15 @@ final class EmailCodeCenter {
     @ObservationIgnored private var seen: [String: Date] = [:]
     /// A new code arrived (for the notification).
     @ObservationIgnored var onNewCode: (EmailCode) -> Void = { _ in }
+    /// An account was added or removed.
+    @ObservationIgnored var onAccountsChanged: () -> Void = {}
+    @ObservationIgnored private var isPanelOpen = false
+    /// A focused one-time-code field makes accounts look fast until then (it may sit there unused).
+    @ObservationIgnored private var codeFieldUntil: Date?
+    /// The time source for `isUrgent` (tests move it).
+    @ObservationIgnored var clock: () -> Date = { .now }
+    /// How long a focused code field keeps the fast cadence.
+    static let codeFieldWindow: TimeInterval = 5 * 60
 
     static let notifyKey = "emailCodesNotify"
     static let showCodeKey = "emailCodesShowInNotification"
@@ -74,6 +83,24 @@ final class EmailCodeCenter {
         for worker in workers.values { worker.kick() }
     }
 
+    /// A code is probably wanted right now: the panel is open, or a one-time-code field has had
+    /// focus for less than `codeFieldWindow`. Polling accounts look every 2 s instead of 5 s.
+    var isUrgent: Bool {
+        isPanelOpen || codeFieldUntil.map { clock() < $0 } ?? false
+    }
+
+    /// The quick panel opened or closed (opening also calls `fetchNow`).
+    func setPanelOpen(_ open: Bool) {
+        isPanelOpen = open
+    }
+
+    /// The frontmost app's focused field looks like it waits for a one-time code (or no longer).
+    func setCodeFieldFocused(_ focused: Bool) {
+        guard focused != (codeFieldUntil != nil) else { return }
+        codeFieldUntil = focused ? clock().addingTimeInterval(Self.codeFieldWindow) : nil
+        if focused { fetchNow() }
+    }
+
     // MARK: Accounts
 
     /// Adds an account, or replaces the credential of the same address and provider.
@@ -90,6 +117,7 @@ final class EmailCodeCenter {
         saveAccounts()
         status[account.id] = EmailAccountStatus()
         if started { startWorker(for: account) }
+        onAccountsChanged()
     }
 
     func remove(_ account: EmailAccount) {
@@ -101,6 +129,7 @@ final class EmailCodeCenter {
         let before = codes.count
         codes.removeAll { $0.accountID == account.id }
         if codes.count != before { codesChanged() }
+        onAccountsChanged()
     }
 
     private func saveAccounts() { vault.encode(accounts, EmailVaultKey.accounts) }
@@ -212,8 +241,9 @@ final class EmailCodeCenter {
     }
 }
 
-/// One account's reading loop: look, wait (IDLE, a kick or the interval), look again. Errors back
-/// off (15 s, 30 s, 1 min… up to 15 min); a lost sign-in waits for the account to be added again.
+/// One account's reading loop: look, wait (IDLE, a kick or the interval: shorter while the center
+/// is urgent), look again. Errors back off (twice the interval, doubling up to 15 min; at least a
+/// minute after a 429); a lost sign-in waits for the account to be added again.
 final class EmailAccountWorker {
     let account: EmailAccount
     private let source: MailSource
@@ -253,13 +283,15 @@ final class EmailAccountWorker {
                 guard !Task.isCancelled else { break }
                 center?.looked(account, found: messages)
                 failures = 0
-                try await source.waitForMail(waker)
+                try await source.waitForMail(waker, urgent: center?.isUrgent ?? false)
             } catch {
                 guard !Task.isCancelled else { break }
                 failures += 1
                 center?.failed(account, error)
                 if case OAuthError.needsSignIn = error {
                     await waker.wait(.seconds(6 * 3600))
+                } else if case MailSourceError.http(429, _) = error {
+                    await waker.wait(max(.seconds(60), Self.backoff(failures: failures, base: source.interval)))
                 } else {
                     await waker.wait(Self.backoff(failures: failures, base: source.interval))
                 }
