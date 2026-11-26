@@ -12,6 +12,11 @@ INSTALL_DIR := /Applications
 DEVID_APP := $(shell security find-identity -v -p codesigning 2>/dev/null | grep -c "Developer ID Application")
 ifneq ($(DEVID_APP),0)
 SIGN_ARGS := CODE_SIGN_IDENTITY="Developer ID Application" DEVELOPMENT_TEAM=XWTH2647FF CODE_SIGN_STYLE=Manual OTHER_CODE_SIGN_FLAGS=--timestamp
+# System AutoFill when both provisioning profiles are in ~/.clipboard2/profiles
+# (docs/features/autofill-setup.md); otherwise one line says it was skipped. Only read by `build`.
+AUTOFILL_ARGS = $(shell scripts/autofill-profiles.sh)
+else
+AUTOFILL_ARGS = $(info   AutoFill: skipped (needs a Developer ID Application certificate))
 endif
 
 all: build
@@ -21,7 +26,7 @@ generate:
 
 build: generate
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -configuration Release \
-		-derivedDataPath $(DERIVED) -destination 'platform=macOS' build -quiet $(SIGN_ARGS)
+		-derivedDataPath $(DERIVED) -destination 'platform=macOS' build -quiet $(SIGN_ARGS) $(AUTOFILL_ARGS)
 
 debug: generate
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -configuration Debug \

@@ -45,7 +45,7 @@ Build in phases; each phase ships on its own:
   - Both are part of the fingerprint.
   - Unknown-field rules: older clients must keep fields they don't know when they rewrite a payload. Check the Windows client before shipping: if it drops them, a Windows edit would wipe `username` and `urls`. In that case, ship Windows 1.10.x preserving unknown fields first.
 - Storage moves from the login Keychain to the **data protection Keychain** in a shared access group, `XWTH2647FF.at.softmaze.Clippy.shared`, so the autofill extension (phase 3) can read it.
-  - **TODO: moved to phase 3.** It needs provisioning profiles we don't have yet; phase 1 keeps the login Keychain (username and sites in the item's description, notes in a second item).
+  - **Done in phase 3, AutoFill builds only** (`CLIPBOARD2_AUTOFILL=1`, docs/features/autofill-setup.md). Other builds keep the login Keychain (username and sites in the item's description, notes in a second item). A moved secret keeps its creation date in the description (`created`), since the new item gets a new one and the creation date syncs.
   - Migrate once at launch: copy, verify, then delete the old items.
   - Keep reading the old location if the copy failed.
 - Member access is unchanged: groups without Secrets access never see passwords either.
@@ -80,7 +80,12 @@ Build in phases; each phase ships on its own:
   - Update them on every change and on sync.
 - Filling from the system UI asks for Touch ID inside the extension, unless the app's unlock window is still open.
 - Settings → Auth shows whether Clipboard2 is enabled as an autofill provider. If it isn't, it gives one line and **Open AutoFill Settings** (System Settings → General → AutoFill & Passwords). No dialogs.
-- **Check first:** confirm that a Developer ID build can carry `com.apple.developer.authentication-services.autofill-credential-provider` (provisioning profile with the AutoFill capability). If it can't, stop and report back before building the rest of this phase.
+- **Checked:** Developer ID supports the AutoFill Credential Provider, Keychain Sharing and App Groups capabilities, with Developer ID provisioning profiles. Until those exist, builds leave AutoFill out (docs/features/autofill-setup.md).
+- How it's built:
+  - Target "Clipboard2 AutoFill" (`at.softmaze.Clippy.autofill`), embedded only with `CLIPBOARD2_AUTOFILL=1`. It compiles `Clipboard2/Shared/` and `TOTP.swift` with the app.
+  - The app writes an index to the shared Keychain (titles, usernames, registrable domains; never values). The extension matches a site by host suffix against those domains, and reads values only after Touch ID.
+  - The unlock window is shared as an end time in the shared Keychain. It only counts while the app runs, and is never trusted beyond a week.
+  - Email codes (phase 4) are handed over with `AutoFillIdentities.update(codes:)`, which does nothing without AutoFill.
 
 ## Phase 4: email codes
 - Settings → Auth → **Email accounts** → Add:
