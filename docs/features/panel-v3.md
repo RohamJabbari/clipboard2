@@ -45,7 +45,17 @@ Replace All · Saved · ‹This App› · Contacts · ‹group chips›.
 
 ### Saved
 - Everything you saved (§6): clips, snippets and folders. Secrets move to Auth.
-- Folders work as today.
+- **Folders expand in place (a tree)**, here and in a group's Saved. There's no "open folder" level or breadcrumb any more.
+  - Each folder row has a disclosure chevron. Click, Return or → expands it; click, Return or ← collapses it.
+  - An expanded folder's subfolders (by name), then its items, follow right under it, indented one step per level.
+  - → on an expanded folder steps into its first row; ← on a row inside a folder selects that folder. ↑↓ walk the visible rows.
+  - Collapsing a folder that holds the selection selects the folder.
+  - Which folders are expanded is remembered per space (yours, each group) until the app quits.
+  - Search flattens the tree: every match, captioned with its folder path. Picking a folder from the results clears the search and reveals it, expanded.
+  - The folder preview offers **Expand/Collapse**, Rename… and Label….
+  - **+** and **New Folder** go inside the selected folder when a folder row is selected, else to the top level; the new folder's parent expands.
+  - The "Saved" title above the list is a drop target for "move to the top level". Dragging onto folder rows works as before.
+- The header stays at the top of the list pane; an empty state sits right under it (every chip).
 
 ### Auth
 - Passwords, secrets, authenticator codes and email codes, grouped by source. See `auth-autofill.md`.

@@ -404,7 +404,7 @@ struct FolderPanelTests {
                          characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code)!
     }
 
-    @Test func savedListsFoldersFirstAndOpensAndClosesThem() {
+    @Test func savedListsFoldersFirstAndExpandsAndCollapsesThem() {
         let tag = UUID().uuidString
         let folder = env.store.createFolder(named: "AAA \(tag)", inSpace: nil)
         let inside = env.store.ingest(.text("inside \(tag)"))
@@ -435,20 +435,21 @@ struct FolderPanelTests {
         #expect(model.folderCaptions[PanelEntry.clip(inside).id] == folder.name)
         model.query = ""
 
-        // Return opens the selected folder; esc goes back instead of closing.
+        // Return expands the selected folder in place: its clip follows it, one level in.
         model.selectedID = folderRow
         #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
-        #expect(model.openFolder?.id == folder.id)
-        #expect(model.entries.map(\.clip?.id) == [inside.id])
-        var closed = false
-        model.onClose = { closed = true }
-        #expect(model.handleKeyDown(key(KeyCode.escape, "\u{1b}")))
-        #expect(model.openFolder == nil && !closed && model.selectedID == folderRow)
+        #expect(model.isExpanded(folder) && model.selectedID == folderRow)
+        let row = try? #require(model.entries.firstIndex { $0.id == folderRow })
+        #expect(row.map { model.entries[$0 + 1].clip?.id } == inside.id)
+        #expect(model.entryDepths[PanelEntry.clip(inside).id] == 1)
 
-        // ← goes back too.
-        model.openFolder(folder)
+        // ← collapses it again; Return toggles too.
         #expect(model.handleKeyDown(key(KeyCode.leftArrow)))
-        #expect(model.openFolder == nil)
+        #expect(!model.isExpanded(folder) && !model.entries.contains { $0.clip?.id == inside.id })
+        #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
+        #expect(model.isExpanded(folder))
+        #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
+        #expect(!model.isExpanded(folder))
     }
 
     @Test func saveIntoANewFolderAndDeleteFolderFromThePanel() {

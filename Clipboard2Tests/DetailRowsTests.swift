@@ -104,7 +104,7 @@ struct DetailRowsTests {
         #expect(item.isPinned && item.folderID == nil)
     }
 
-    @Test func addItemsSavesTickedHistoryIntoTheOpenFolder() throws {
+    @Test func addItemsSavesTickedHistoryIntoTheSelectedFolder() throws {
         let tag = UUID().uuidString
         let folder = env.store.createFolder(named: "Inbox \(tag)", inSpace: nil)
         let a = env.store.ingest(.text("alpha \(tag)"))
@@ -116,7 +116,7 @@ struct DetailRowsTests {
             env.store.deleteFolder(folder)
         }
         model.filter = .labelled
-        model.openFolder(folder)
+        model.selectedID = PanelEntry.folder(folder).id   // + adds into the selected folder
         model.beginAddItems()
         let form = try #require(model.addItemsForm)
         #expect(model.mode == .addItems)

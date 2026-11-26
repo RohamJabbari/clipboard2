@@ -288,7 +288,7 @@ enum PanelAction: Identifiable, Hashable {
         case .moveToNewFolder: "Move to New Folder…"
         case .copyToNewFolder: "Save a Copy to New Folder…"
         case .removeFromFolder: "Move to Top Level"
-        case .openFolder: "Open"
+        case .openFolder: "Expand"
         case .renameFolder: "Rename…"
         case .deleteFolder: "Delete Folder"
         case .moveFolder(let folder): "Move to “\(folder.name)”"
@@ -868,7 +868,6 @@ final class PanelViewModel {
     var filter: PanelFilter = .copies {
         didSet {
             guard filter != oldValue else { return }
-            openFolderID = nil
             // Groups shows one group at a time: the last one, else the first.
             if filter == .groups, groupFilter == nil {
                 groupFilter = rememberedGroupID
@@ -886,7 +885,6 @@ final class PanelViewModel {
     var groupFilter: String? {
         didSet {
             guard groupFilter != oldValue else { return }
-            openFolderID = nil
             if let groupFilter {
                 UserDefaults.standard.set(groupFilter, forKey: "panelLastGroup")
                 if filter != .groups { filter = .groups }
@@ -911,14 +909,17 @@ final class PanelViewModel {
 
     // MARK: Saved and folders
 
-    /// The folder open in the Saved list (nil: its root).
-    private(set) var openFolderID: UUID?
+    /// Expanded Saved folders, per space ("" is your own Saved); kept for the session.
+    private(set) var expandedFolders: [String: Set<UUID>] = [:]
+    /// How deep each row of the Saved tree sits (0: the top level; search results are flat).
+    private(set) var entryDepths: [String: Int] = [:]
+    /// The folder each nested row of the Saved tree is listed under.
+    private(set) var entryParents: [String: UUID] = [:]
     /// Number of saved clips and secrets in each folder of the Saved list being shown.
     private(set) var folderCounts: [UUID: Int] = [:]
     /// Number of subfolders in each folder of the Saved list being shown.
     private(set) var subfolderCounts: [UUID: Int] = [:]
-    /// Search results below the open folder (or the root), by entry id: their folder's path
-    /// relative to where you are ("Work › Clients"), shown under them.
+    /// Saved search results, by entry id: their folder's path ("Work › Clients"), shown under them.
     private(set) var folderCaptions: [String: String] = [:]
     /// The folders of the Saved list being shown, as a tree (refreshed with the list).
     private(set) var savedTree = FolderTree(nodes: [])
@@ -934,7 +935,6 @@ final class PanelViewModel {
             guard let groupFilter, newValue != groupShowsSaved else { return }
             if newValue { groupsShowingSaved.insert(groupFilter) } else { groupsShowingSaved.remove(groupFilter) }
             UserDefaults.standard.set(Array(groupsShowingSaved).sorted(), forKey: "panelGroupsShowingSaved")
-            openFolderID = nil
             refresh(resetSelection: true)
         }
     }
@@ -950,48 +950,81 @@ final class PanelViewModel {
     /// The space whose Saved items are shown (nil: personal).
     var savedSpaceID: String? { groupFilter }
 
-    var openFolder: ClipFolder? {
-        guard isSavedView, let openFolderID, let folder = env.store.folder(withID: openFolderID),
-              folder.spaceID == savedSpaceID else { return nil }
-        return folder
-    }
+    private var expansionKey: String { savedSpaceID ?? "" }
 
-    func openFolder(_ folder: ClipFolder) {
-        guard isSavedView, folder.spaceID == savedSpaceID else { return }
-        openFolderID = folder.id
-        query = ""
-        refresh(resetSelection: true)
-        userMovedSelection = false
-    }
+    /// The expanded folders of the Saved list being shown.
+    var expandedHere: Set<UUID> { expandedFolders[expansionKey] ?? [] }
 
-    /// Up one level (to the parent folder, or the root of Saved), with the folder selected.
-    func closeFolder() {
-        guard let id = openFolderID else { return }
-        openFolderID = savedTree.parent(of: id)
-        query = ""
-        refresh(resetSelection: true)
-        if entries.contains(where: { $0.id == "f-" + id.uuidString }) { selectedID = "f-" + id.uuidString }
-    }
+    func isExpanded(_ folder: ClipFolder) -> Bool { expandedHere.contains(folder.id) }
 
-    /// Jumps to a breadcrumb segment: a folder of the path, or (nil) the root of Saved.
-    func showLevel(_ folderID: UUID?) {
-        guard isSavedView, folderID != openFolderID else { return }
-        let from = openFolderID
-        openFolderID = folderID
-        query = ""
-        refresh(resetSelection: true)
-        // The child on the way back down is selected, like going up one level.
-        if let from, let child = savedTree.path(to: from).first(where: { savedTree.parent(of: $0.id) == folderID }) {
-            let id = "f-" + child.id.uuidString
-            if entries.contains(where: { $0.id == id }) { selectedID = id }
+    /// Shows or hides a folder's contents under it. Collapsing one that holds the selection
+    /// selects the folder.
+    func setExpanded(_ folder: ClipFolder, _ expanded: Bool) {
+        guard isSavedView, folder.spaceID == savedSpaceID, isExpanded(folder) != expanded else { return }
+        let key = expansionKey
+        if expanded {
+            expandedFolders[key, default: []].insert(folder.id)
+        } else {
+            expandedFolders[key]?.remove(folder.id)
+        }
+        let selected = selectedID
+        userMovedSelection = true   // the selection stays where it is
+        refresh()
+        let row = PanelEntry.folder(folder).id
+        if !expanded, let selected, selected != row, !entries.contains(where: { $0.id == selected }) {
+            selectedID = row
         }
     }
 
-    /// The open folder's path from the top level ("Work", "Clients").
-    var openFolderPath: [ClipFolder] {
-        guard isSavedView, let openFolderID else { return [] }
-        return savedTree.path(to: openFolderID).compactMap { env.store.folder(withID: $0.id) }
+    /// Click, Return and Expand/Collapse on a folder. From search results it clears the search
+    /// and shows the folder open in its place in the tree.
+    func toggleFolder(_ folder: ClipFolder) {
+        guard query.isEmpty else { return reveal(folder) }
+        setExpanded(folder, !isExpanded(folder))
     }
+
+    /// Expands a folder and every folder above it, clears the search and selects it.
+    func reveal(_ folder: ClipFolder) {
+        guard isSavedView, folder.spaceID == savedSpaceID else { return }
+        expandedFolders[expansionKey, default: []].formUnion(savedTree.path(to: folder.id).map(\.id))
+        query = ""
+        refresh()
+        userMovedSelection = true
+        selectedID = PanelEntry.folder(folder).id
+    }
+
+    /// The selected folder row of the Saved list being shown (New Folder and + go inside it).
+    var selectedFolderHere: ClipFolder? {
+        guard isSavedView, !isMultiSelecting, let folder = selectedEntry?.folder, folder.spaceID == savedSpaceID else { return nil }
+        return folder
+    }
+
+    /// → on a folder: expands it, or (already expanded) steps into its first row.
+    private func expandOrEnterSelected() {
+        guard let folder = selectedEntry?.folder else { return }
+        if !isExpanded(folder) {
+            setExpanded(folder, true)
+        } else if let index = selectedIndex, entries.indices.contains(index + 1),
+                  entryParents[entries[index + 1].id] == folder.id {
+            userMovedSelection = true
+            selectedID = entries[index + 1].id
+        }
+    }
+
+    /// ← collapses the selected folder, or else selects the folder the row is in. False when
+    /// there's nothing to do.
+    private func collapseOrLeaveSelected() -> Bool {
+        guard let entry = selectedEntry else { return false }
+        if let folder = entry.folder, isExpanded(folder) {
+            setExpanded(folder, false)
+            return true
+        }
+        guard let parent = entryParents[entry.id] else { return false }
+        userMovedSelection = true
+        selectedID = "f-" + parent.uuidString
+        return true
+    }
+
     private(set) var entries: [PanelEntry] = []
     /// Date headings ("Today", "Yesterday"…) keyed by the first row under each; empty while searching.
     private(set) var sectionStarts: [String: String] = [:]
@@ -1130,7 +1163,6 @@ final class PanelViewModel {
             filter = .copies
             onlyThisApp = false
         }
-        openFolderID = nil
         userMovedSelection = false
         isCommandHeld = false
         tipIndex &+= 1
@@ -1377,6 +1409,8 @@ final class PanelViewModel {
         var secrets: [SecretRef] = []
         var authenticators: [AuthenticatorItem] = []
         folderCaptions = [:]
+        entryDepths = [:]
+        entryParents = [:]
         let savedView = isSavedView
         let authView = groupFilter == nil && filter == .auth
         // Codes from email (phase 4): live ones only, newest first.
@@ -1384,9 +1418,9 @@ final class PanelViewModel {
         if authView {
             (secrets, authenticators) = authList()
         } else if savedView {
-            // Saved: everything one space keeps. Folder rows first (by name), then its saved clips,
-            // secrets and snippets mixed, newest first; inside a folder only its clips and secrets.
-            // Searching from the root finds what's in folders too, captioned with the folder's name.
+            // Saved: everything one space keeps, as a tree. Each level lists its folders (by name),
+            // then its items newest first; an expanded folder's level follows under it, indented.
+            // Searching flattens it: everything matching, captioned with its folder's path.
             let all = env.store.folders(inSpace: savedSpaceID)
             let byID = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             let tree = FolderTree(all)
@@ -1394,7 +1428,6 @@ final class PanelViewModel {
             let saved = env.store.items(inSpace: savedSpaceID).filter(\.isPinned)
             // Your own secrets live in Auth; a group's Saved still lists the group's.
             let spaceSecrets = savedSpaceID == nil ? [] : env.secrets.secrets.filter { $0.spaceID == savedSpaceID }
-            if let open = openFolderID, byID[open] == nil { openFolderID = nil }   // deleted meanwhile
             // The folder something shows in: nil (the root) when it has none or one that isn't here.
             let place = { (id: UUID?) -> UUID? in id.flatMap { byID[$0] != nil ? $0 : nil } }
             var counts: [UUID: Int] = [:]
@@ -1403,27 +1436,12 @@ final class PanelViewModel {
             }
             folderCounts = counts
             subfolderCounts = Dictionary(all.map { ($0.id, tree.children(of: $0.id).count) }, uniquingKeysWith: { first, _ in first })
-            let open = openFolderID
-            if open == nil { snippets = env.snippets.snippets(inSpace: savedSpaceID) }
-            if q.isEmpty {
-                // This level: its subfolders (by name), then its items.
-                folders = tree.children(of: open).compactMap { byID[$0.id] }
-                clips = saved.filter { place($0.folderID) == open }
-                secrets = spaceSecrets.filter { place($0.folderID) == open }
-            } else {
-                // The whole subtree below where you are, each result captioned with its path from here.
-                let scope: Set<UUID>? = open.map { tree.descendants(of: $0) }
-                let inScope = { (folder: UUID?) -> Bool in
-                    guard let scope else { return true }
-                    return folder == open || folder.map(scope.contains) == true
-                }
-                folders = all.filter { scope?.contains($0.id) ?? true }
-                clips = saved.filter { inScope(place($0.folderID)) }
-                secrets = spaceSecrets.filter { inScope(place($0.folderID)) }
-                let caption = { (folder: UUID?) -> String? in
-                    guard let folder, folder != open else { return nil }
-                    return tree.pathName(of: folder, relativeTo: open)
-                }
+            snippets = env.snippets.snippets(inSpace: savedSpaceID)
+            folders = all
+            clips = saved
+            secrets = spaceSecrets
+            if !q.isEmpty {
+                let caption = { (folder: UUID?) -> String? in folder.map { tree.pathName(of: $0) } }
                 for item in clips { folderCaptions[PanelEntry.clip(item).id] = caption(place(item.folderID)) }
                 for ref in secrets { folderCaptions[PanelEntry.secret(ref).id] = caption(place(ref.folderID)) }
                 for folder in folders { folderCaptions[PanelEntry.folder(folder).id] = caption(tree.parent(of: folder.id)) }
@@ -1469,9 +1487,21 @@ final class PanelViewModel {
                 result += items
             }
         } else if q.isEmpty && savedView {
-            let kept = clips.map(PanelEntry.clip) + secrets.map(PanelEntry.secret) + snippets.map(PanelEntry.snippet)
-                + authenticators.map(PanelEntry.authenticator)
-            result = folders.map(PanelEntry.folder) + kept.sorted { $0.savedDate > $1.savedDate }
+            let byID = Dictionary(folders.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let place = { (id: UUID?) -> UUID? in id.flatMap { byID[$0] != nil ? $0 : nil } }
+            // Snippets have no folder: they stay at the top level.
+            let kept = clips.map { (PanelEntry.clip($0), place($0.folderID)) }
+                + secrets.map { (PanelEntry.secret($0), place($0.folderID)) }
+                + snippets.map { (PanelEntry.snippet($0), nil as UUID?) }
+                + authenticators.map { (PanelEntry.authenticator($0), nil as UUID?) }
+            let levels = Dictionary(grouping: kept.sorted { $0.0.savedDate > $1.0.savedDate }, by: \.1).mapValues { $0.map(\.0) }
+            let rows = SavedTreeLayout.rows(tree: savedTree, folder: { byID[$0].map(PanelEntry.folder) }, items: levels,
+                                            expanded: expandedHere)
+            result = rows.map(\.item)
+            for row in rows where row.depth > 0 {
+                entryDepths[row.item.id] = row.depth
+                if let parent = row.parent { entryParents[row.item.id] = parent }
+            }
         } else if q.isEmpty && groupFilter == nil && filter == .inbox {
             // What contacts sent, newest first, secrets among the clips.
             let dated = clips.map { (PanelEntry.clip($0), $0.lastCopiedAt) } + secrets.map { (PanelEntry.secret($0), $0.createdAt ?? .distantPast) }
@@ -1529,7 +1559,7 @@ final class PanelViewModel {
 
         entries = Array(result.prefix(Self.maxEntries))
         authSourceStarts = authStarts
-        sectionStarts = q.isEmpty && !authView ? Self.dateSections(entries, date: savedView ? { $0.folder == nil ? $0.savedDate : nil }
+        sectionStarts = q.isEmpty && !authView ? Self.dateSections(entries, date: savedView ? { $0.folder == nil && self.entryDepths[$0.id] == nil ? $0.savedDate : nil }
                                                                          : { $0.clip?.lastCopiedAt ?? $0.secret?.createdAt }) : [:]
         if q.isEmpty && authView, let first = emailCodes.first {
             sectionStarts[PanelEntry.emailCode(first).id] = "Email codes"
@@ -1877,7 +1907,7 @@ final class PanelViewModel {
             onClose()
             env.pasteSecret(ref, into: target)
         case .folder(let folder):
-            openFolder(folder)
+            toggleFolder(folder)
         case .authenticator(let item):
             if pendingDeleteID == item.id, case .owned(let authenticator) = item {
                 confirmDelete(authenticator)
@@ -2283,13 +2313,13 @@ final class PanelViewModel {
 
     // MARK: Add Items (Saved header)
 
-    /// The inline picker of recent history to save here (into the open folder, if any).
+    /// The inline picker of recent history to save here (into the selected folder, if any).
     func beginAddItems() {
         guard isSavedView else { return }
         let space = savedSpaceID
         guard env.sync.canSend(to: space) else { return refuseSend(to: space) }
         let candidates = env.store.items(inSpace: space).filter { !$0.isPinned && env.sync.canChange($0) }
-        addItemsForm = AddItemsState(candidates: candidates, folder: openFolder)
+        addItemsForm = AddItemsState(candidates: candidates, folder: selectedFolderHere)
         mode = .addItems
     }
 
@@ -3093,6 +3123,7 @@ final class PanelViewModel {
 
     /// An action's title for the current selection.
     func title(for action: PanelAction) -> String {
+        if action == .openFolder, let folder = selectedEntry?.folder, isExpanded(folder) { return "Collapse" }
         if selectedEntry?.authenticator != nil && !isMultiSelecting {
             if action == .paste { return "Fill Code" }
             if action == .copy { return "Copy Code" }
@@ -3244,7 +3275,7 @@ final class PanelViewModel {
             removeFromFolder(entry.clip.map { [$0] } ?? [], secrets: entry.secret.map { [$0] } ?? [])
         case .openFolder:
             mode = .browse
-            if let folder = entry.folder { openFolder(folder) }
+            if let folder = entry.folder { toggleFolder(folder) }
         case .renameFolder:
             if let folder = entry.folder { beginRename(folder) }
         case .deleteFolder:
@@ -3637,8 +3668,8 @@ final class PanelViewModel {
 
     /// Names a new folder in the panel; `moving` clips and `secrets` go into it (Move to Folder ▸
     /// New Folder…). `personal`: a personal folder, taking copies of group items.
-    /// `parent`: the level it's created at (a folder of that space); without one, the open
-    /// folder when nothing moves into it (New Folder inside an open folder makes a subfolder).
+    /// `parent`: the level it's created at (a folder of that space); without one, the selected
+    /// folder when nothing moves into it (New Folder with a folder selected makes a subfolder).
     func beginNewFolder(moving clips: [ClipItem] = [], secrets: [SecretRef] = [], personal: Bool = false,
                         parent: ClipFolder? = nil) {
         let space = personal ? nil : clips.first?.spaceID ?? secrets.first?.spaceID ?? (clips.isEmpty && secrets.isEmpty ? savedSpaceID : nil)
@@ -3651,7 +3682,7 @@ final class PanelViewModel {
             if space != nil && menu.group == nil { return }
         }
         var level = parent.flatMap { $0.spaceID == space ? $0 : nil }
-        if parent == nil, clips.isEmpty, secrets.isEmpty, space == savedSpaceID { level = openFolder }
+        if parent == nil, clips.isEmpty, secrets.isEmpty, space == savedSpaceID { level = selectedFolderHere }
         if let level, !env.store.tree(inSpace: space).canCreate(in: level.id) {
             NSSound.beep()
             showNotice("Folders go at most \(FolderTree.maxDepth) levels deep")
@@ -3684,6 +3715,10 @@ final class PanelViewModel {
         case .create(let space, let moving, let secrets):
             let folder = env.store.createFolder(named: name, inSpace: space, parent: form.parent)
             resetMode()
+            // Its parent opens, so the new folder shows (and can be selected) in the tree.
+            if let parent = form.parent, space == savedSpaceID, isSavedView {
+                expandedFolders[expansionKey, default: []].insert(parent.id)
+            }
             if moving.isEmpty && secrets.isEmpty {
                 refresh()
                 let id = PanelEntry.folder(folder).id
@@ -3703,7 +3738,6 @@ final class PanelViewModel {
         let tree = env.store.tree(inSpace: folder.spaceID)
         let parentID = tree.parent(of: folder.id)
         let parent = parentID.flatMap(env.store.folder(withID:))
-        if let open = openFolderID, tree.subtree(of: folder.id).contains(open) { openFolderID = parentID }
         // Its secrets go up a level too (and re-sync with the new place), like its clips.
         let secrets = env.secrets.secrets(inFolder: folder)
         env.secrets.setFolder(parentID, for: secrets)
@@ -3828,7 +3862,7 @@ final class PanelViewModel {
 
         switch event.keyCode {
         case KeyCode.escape:
-            // Quick Look closes first, then an open folder; the panel on the next press.
+            // Quick Look closes first; the panel on the next press.
             if isQuickLookOpen() {
                 onQuickLook(false)
             } else if pendingDeleteID != nil {
@@ -3837,19 +3871,16 @@ final class PanelViewModel {
                 hideSecret()
             } else if entries.first?.isSuggestion == true {
                 dismissSuggestion()
-            } else if openFolderID != nil {
-                closeFolder()
             } else if previewSelection != nil {
                 previewSelection = nil
             } else if !isPinned {
                 onClose()   // kept open, esc at the top level does nothing
             }
             return true
-        case KeyCode.leftArrow where openFolderID != nil && query.isEmpty && !command && !shift:
-            closeFolder()
-            return true
+        case KeyCode.leftArrow where isSavedView && query.isEmpty && !command && !shift && !isMultiSelecting:
+            return collapseOrLeaveSelected()
         case KeyCode.rightArrow where query.isEmpty && !command && !shift && selectedEntry?.folder != nil && !isMultiSelecting:
-            activate(selectedEntry)
+            expandOrEnterSelected()
             return true
         case KeyCode.upArrow:
             moveSelection(by: -1, extending: shift)
@@ -3879,11 +3910,6 @@ final class PanelViewModel {
             // With text in the search field every delete variant edits the text
             // (⌥⌫ deletes a word, ⌘⌫ the line); only an empty field deletes items.
             guard query.isEmpty else { return false }
-            // Inside a folder, ⌫ goes up one level (like esc and ←); ⌘K → Delete still deletes.
-            if event.keyCode == KeyCode.delete, openFolderID != nil, !command {
-                closeFolder()
-                return true
-            }
             if isMultiSelecting { deleteSelectedClips() } else { deleteSelection() }
             return true
         default:

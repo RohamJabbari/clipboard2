@@ -123,11 +123,12 @@ struct SavedMixingTests {
         #expect(model.folderCounts[folder.id] == 1)
 
         // The folder holds its clips, never snippets or secrets.
-        model.openFolder(folder)
-        #expect(model.entries.map(\.id) == [PanelEntry.clip(inFolder).id])
+        model.setExpanded(folder, true)
+        let nested = model.entries.filter { model.entryParents[$0.id] == folder.id }.map(\.id)
+        #expect(nested == [PanelEntry.clip(inFolder).id])
+        model.setExpanded(folder, false)
 
-        // Searching from the root finds the clip in the folder, captioned; never a secret.
-        model.closeFolder()
+        // Searching finds the clip in the folder, captioned; never a secret.
         model.query = "in folder \(tag)"
         let hit = PanelEntry.clip(inFolder).id
         #expect(model.entries.contains { $0.id == hit })

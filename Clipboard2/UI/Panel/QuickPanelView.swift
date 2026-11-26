@@ -74,7 +74,7 @@ struct QuickPanelView: View {
                     isEditingText: model.isEditingText,
                     hasTextSelection: model.previewSelection != nil,
                     canEditText: model.selectedEntry?.clip.map(model.isEditable) ?? false,
-                    inFolder: model.openFolder != nil,
+                    folderExpanded: model.selectedEntry?.folder.map(model.isExpanded),
                     selectionCount: model.isMultiSelecting ? model.selectedClips.count : nil,
                     pickedFiles: model.pickedFileCount,
                     canQuickLook: model.canQuickLook,
@@ -197,12 +197,9 @@ struct QuickPanelView: View {
                 PeopleListView(model: model)
             } else if model.entries.isEmpty && model.isSavedView && model.query.isEmpty {
                 ContentUnavailableView {
-                    Label(model.openFolder != nil ? "This Folder Is Empty" : "Nothing Saved Yet",
-                          systemImage: model.openFolder != nil ? "folder" : "bookmark")
+                    Label("Nothing Saved Yet", systemImage: "bookmark")
                 } description: {
-                    Text(model.openFolder != nil
-                         ? "Drag items here, or use Save… (⌘S) in an item's actions."
-                         : "Use Save… (⌘S) to keep an item forever.")
+                    Text("Use Save… (⌘S) to keep an item forever.")
                 }
                 .pinnedEmptyState()
             } else if model.filter == .groups && model.groupFilter == nil {
@@ -295,7 +292,9 @@ struct QuickPanelView: View {
                  commandHeld: model.isCommandHeld,
                  sharing: sharing(for: entry),
                  badge: entry.clip.flatMap(env.sync.badge),
-                 folderCaption: model.folderCaptions[entry.id])
+                 folderCaption: model.folderCaptions[entry.id],
+                 depth: model.entryDepths[entry.id] ?? 0,
+                 disclosure: model.isSavedView && model.query.isEmpty ? .leaf : nil)
             .id(entry.id)
             // One recogniser reading AppKit's click count: SwiftUI's stacked
             // count:2 / count:1 gestures miss double-clicks in a non-activating panel.
@@ -485,7 +484,7 @@ struct QuickPanelView: View {
 
     @ViewBuilder
     private func folderContextMenu(_ folder: ClipFolder) -> some View {
-        Button("Open") { model.openFolder(folder) }
+        Button(model.isExpanded(folder) ? "Collapse" : "Expand") { model.toggleFolder(folder) }
         Button("Rename…") { model.beginRename(folder) }
         Button(folder.label == nil ? "Label…" : "Edit Label…") { model.beginLabel(.folder(folder)) }
         if model.canChangeFolder(folder) {
@@ -919,6 +918,14 @@ extension View {
 
 // MARK: - Row
 
+/// A row's place in the Saved tree's disclosure column.
+enum RowDisclosure {
+    /// Not a folder: the column stays empty, so names line up.
+    case leaf
+    case collapsed
+    case expanded
+}
+
 struct PanelRow: View {
     let entry: PanelEntry
     let shortcut: (number: Int, isSlot: Bool)?
@@ -940,10 +947,26 @@ struct PanelRow: View {
     var subfolderCount = 0
     /// Something droppable hovers over this folder row.
     var dropHighlighted = false
+    /// How deep it sits in the Saved tree; each level indents it.
+    var depth = 0
+    /// The Saved tree's disclosure column (nil: a flat list without one).
+    var disclosure: RowDisclosure?
     @State private var hovering = false
+
+    static let indentPerLevel: CGFloat = 18
 
     var body: some View {
         HStack(spacing: 10) {
+            if let disclosure {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .rotationEffect(.degrees(disclosure == .expanded ? 90 : 0))
+                    .opacity(disclosure == .leaf ? 0 : 1)
+                    .foregroundStyle(isSelected ? AnyShapeStyle(.white.opacity(0.85)) : AnyShapeStyle(.secondary))
+                    .frame(width: 10)
+                    .padding(.trailing, -4)
+                    .accessibilityHidden(true)
+            }
             if showsCheckmark {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                     .font(.system(size: 15))
@@ -998,6 +1021,7 @@ struct PanelRow: View {
                     .accessibilityHidden(true)
             }
         }
+        .padding(.leading, CGFloat(depth) * Self.indentPerLevel)
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background { rowBackground }
@@ -1006,7 +1030,8 @@ struct PanelRow: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(fullAccessibilityLabel)
         .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : .isButton)
-        .accessibilityHint(entry.folder == nil ? "Double-click or press Return to paste" : "Click or press Return to open")
+        .accessibilityHint(entry.folder == nil ? "Double-click or press Return to paste"
+                           : disclosure == .expanded ? "Click or press Return to collapse" : "Click or press Return to expand")
     }
 
     @ViewBuilder
@@ -1175,8 +1200,8 @@ struct HintBar: View {
     /// Text is selected in the preview: Return pastes just that.
     var hasTextSelection = false
     var canEditText = false
-    /// A Saved folder is open: esc goes back to the root.
-    var inFolder = false
+    /// The selected Saved folder is expanded (nil: no folder selected).
+    var folderExpanded: Bool?
     var selectionCount: Int?
     /// Some files of a multi-file item are picked in the preview: Return pastes only those.
     var pickedFiles: (picked: Int, total: Int)?
@@ -1218,7 +1243,7 @@ struct HintBar: View {
                 hint("⌘S", "Save")
                 hint("⌫", "Delete")
             case .browse where entry?.folder != nil:
-                hint("⏎", "Open")
+                hint("⏎", folderExpanded == true ? "Collapse" : "Expand")
                 hint("⌘K", "Actions")
             case .browse where entry?.authenticator != nil:
                 hint("⏎", "Fill Code")
@@ -1305,7 +1330,7 @@ struct HintBar: View {
                     .layoutPriority(-1)
                     .help(syncIndicator.offersSyncNow ? "\(syncIndicator.title()) — use Sync Now in the menu bar menu" : syncIndicator.title())
             }
-            if !isEditingText { hint("esc", mode == .browse && !inFolder ? "Close" : "Back") }
+            if !isEditingText { hint("esc", mode == .browse ? "Close" : "Back") }
         }
         .font(.caption)
         .foregroundStyle(.secondary)

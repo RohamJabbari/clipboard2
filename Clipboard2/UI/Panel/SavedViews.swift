@@ -1,22 +1,13 @@
 import SwiftUI
 
-/// The full path above the Saved list ("Saved › Work › Clients") and the New menu. Every
-/// segment opens that level and takes dropped items and folders.
+/// The title above the Saved list (a drop target: dropped items and folders move to the top
+/// level) and the New buttons.
 struct SavedHeader: View {
     let model: PanelViewModel
 
     var body: some View {
         HStack(spacing: 4) {
-            let path = model.openFolderPath
-            BreadcrumbSegment(title: "Saved", symbol: path.isEmpty ? "bookmark.fill" : "chevron.left",
-                              isCurrent: path.isEmpty, target: .savedRoot, model: model) { model.showLevel(nil) }
-            ForEach(Array(path.enumerated()), id: \.element.id) { index, folder in
-                Text("›").foregroundStyle(.tertiary)
-                BreadcrumbSegment(title: folder.name, symbol: index == path.count - 1 ? "folder.fill" : nil,
-                                  isCurrent: index == path.count - 1, target: .folder(folder.id), model: model) {
-                    model.showLevel(folder.id)
-                }
-            }
+            BreadcrumbSegment(title: "Saved", symbol: "bookmark.fill", isCurrent: true, target: .savedRoot, model: model) {}
             Spacer(minLength: 4)
             // A group this account can't send to takes nothing new (it still reads and pastes).
             if model.canAddHere { newMenu }
@@ -30,14 +21,14 @@ struct SavedHeader: View {
 
     @ViewBuilder
     private var newMenu: some View {
-        let inFolder = model.openFolder != nil
+        let selected = model.selectedFolderHere
         Button {
             model.beginAddItems()
         } label: {
             Image(systemName: "plus")
         }
         .buttonStyle(.borderless)
-        .help("Add from clipboard history")
+        .help(selected.map { "Add from clipboard history into “\($0.name)”" } ?? "Add from clipboard history")
         .accessibilityLabel("Add Items")
         Button {
             model.beginNewFolder()
@@ -45,8 +36,8 @@ struct SavedHeader: View {
             Image(systemName: "folder.badge.plus")
         }
         .buttonStyle(.borderless)
-        .help(inFolder ? "New Folder Inside" : "New Folder")
-        .accessibilityLabel(inFolder ? "New Folder Inside" : "New Folder")
+        .help(selected.map { "New Folder Inside “\($0.name)”" } ?? "New Folder")
+        .accessibilityLabel(selected != nil ? "New Folder Inside" : "New Folder")
     }
 }
 
@@ -84,7 +75,7 @@ struct AuthHeader: View {
     }
 }
 
-/// One level of the Saved path: click opens it; dropped items and folders move into it.
+/// The Saved title: dropped items and folders move to its top level.
 private struct BreadcrumbSegment: View {
     let title: String
     let symbol: String?
@@ -121,12 +112,12 @@ private struct BreadcrumbSegment: View {
         .foregroundStyle(isCurrent ? AnyShapeStyle(.primary) : AnyShapeStyle(.tint))
         .disabled(isCurrent && !targeted)
         .onDrop(of: [.clipboard2Clip], delegate: PanelDropDelegate(target: target, model: model, isTargeted: $targeted))
-        .help(isCurrent ? title : "Go to \(title) (esc goes up one level). Drop items or folders here to move them.")
+        .help("Drop items or folders here to move them to the top level of \(title).")
     }
 }
 
-/// A folder row in the Saved list: click opens it; dragged clips, secrets and folders drop into
-/// it, and it can be dragged into another folder or onto the path above.
+/// A folder row in the Saved tree: click expands or collapses it; dragged clips, secrets and
+/// folders drop into it, and it can be dragged into another folder or onto the title above.
 struct FolderDropRow: View {
     let entry: PanelEntry
     let folder: ClipFolder
@@ -137,13 +128,16 @@ struct FolderDropRow: View {
         PanelRow(entry: entry, shortcut: nil, isSelected: model.isSelected(entry), showsCheckmark: model.isMultiSelecting,
                  query: model.query, folderCaption: model.folderCaptions[entry.id],
                  folderCount: model.folderCounts[folder.id] ?? 0, subfolderCount: model.subfolderCounts[folder.id] ?? 0,
-                 dropHighlighted: targeted)
+                 dropHighlighted: targeted, depth: model.entryDepths[entry.id] ?? 0,
+                 disclosure: model.query.isEmpty ? (model.isExpanded(folder) ? .expanded : .collapsed) : nil)
             .onTapGesture {
                 let flags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
                 if flags.contains(.command) || flags.contains(.shift) {
                     model.click(entry)
-                } else {
-                    model.openFolder(folder)
+                } else if (NSApp.currentEvent?.clickCount ?? 1) < 2 {
+                    // A double-click's second click doesn't undo its first.
+                    model.click(entry)
+                    model.toggleFolder(folder)
                 }
             }
             .onDrag {
@@ -274,7 +268,7 @@ struct FolderPreview: View {
                     .foregroundStyle(.secondary)
             }
             HStack {
-                Button("Open") { model.openFolder(folder) }
+                Button(model.isExpanded(folder) ? "Collapse" : "Expand") { model.toggleFolder(folder) }
                     .buttonStyle(.borderedProminent)
                 Button("Rename…") { model.beginRename(folder) }
                 Button(folder.label == nil ? "Label…" : "Edit Label…") { model.beginLabel(.folder(folder)) }
