@@ -53,6 +53,10 @@ final class AppEnvironment {
     @ObservationIgnored private(set) lazy var contextMenu = ContextMenuController(env: self)
     @ObservationIgnored private(set) lazy var textFieldWatcher = TextFieldWatcher()
     @ObservationIgnored private(set) lazy var pasteIcon = PasteIconController(env: self)
+    /// Offers to save logins whose password was pasted (docs/features/auth-autofill.md → Saving logins).
+    @ObservationIgnored private(set) lazy var loginSaver = LoginSaveWatcher(env: self)
+    /// Settings → Auth → Import: watching for an export, its review list, the Trash's Undo.
+    @ObservationIgnored private(set) lazy var passwordImport = PasswordImportCenter(sink: secrets, authenticators: authenticators)
     @ObservationIgnored private var maintenanceRuns = 0
     /// On-device text recognition for image items (search finds screenshots by their words).
     @ObservationIgnored private(set) lazy var imageText = ImageTextIndexer(store: store, blobs: blobs)
@@ -313,21 +317,30 @@ final class AppEnvironment {
     /// on, or an email account is set up (a focused one-time-code field makes it look faster).
     func updateTextFieldIcons() {
         let watchesCodes = !emailCodes.accounts.isEmpty
-        guard prefs.pasteIcon || watchesCodes, AXPermission.isTrusted else {
+        guard prefs.pasteIcon || watchesCodes || prefs.offerToSavePasswords, AXPermission.isTrusted else {
             textFieldWatcher.stop()
+            loginSaver.stop()
             pasteIcon.hide()
             emailCodes.setCodeFieldFocused(false)
             return
         }
         if !prefs.pasteIcon { pasteIcon.hide() }
+        if prefs.offerToSavePasswords {
+            loginSaver.start()
+            paste.willPostPaste = { [weak self] in self?.loginSaver.willPostPaste() }
+        } else {
+            loginSaver.stop()
+            paste.willPostPaste = nil
+        }
         textFieldWatcher.onChange = { [weak self] field in self?.textFieldChanged(field) }
         textFieldWatcher.detectsCodeFields = watchesCodes
         textFieldWatcher.onCodeFieldChange = { [weak self] isCode in self?.emailCodes.setCodeFieldFocused(isCode) }
         textFieldWatcher.start()
     }
 
-    /// A focused field gets the paste icon.
+    /// A focused field gets the paste icon; a password field is watched for pastes.
     private func textFieldChanged(_ field: TextFieldWatcher.Field?) {
+        if prefs.offerToSavePasswords { loginSaver.fieldChanged(field) }
         guard prefs.pasteIcon else { return }
         pasteIcon.update(field.flatMap { isTextIconHidden(in: $0.app, hiddenApps: prefs.pasteIconHiddenApps) ? nil : $0 })
     }

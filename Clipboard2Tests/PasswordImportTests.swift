@@ -9,10 +9,15 @@ final class FakeLoginSink: PasswordImportSink {
     var logins: [(name: String, value: String, username: String?, urls: [String], notes: String?)] = []
     var existing: [PasswordImporter.Login] = []
     var finished = 0
+    var updates: [(id: String, value: String)] = []
 
     func existingLogins() -> [PasswordImporter.Login] { existing }
     func addLogin(name: String, value: String, username: String?, urls: [String], notes: String?) -> Bool {
         logins.append((name, value, username, urls, notes))
+        return true
+    }
+    func updateLogin(id: String, value: String) -> Bool {
+        updates.append((id, value))
         return true
     }
     func finishImport() { finished += 1 }
