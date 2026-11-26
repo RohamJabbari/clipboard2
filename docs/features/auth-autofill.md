@@ -109,6 +109,36 @@ Build in phases; each phase ships on its own:
   - A notification "Code from ‹Source›". It never contains the code unless the user turns on "Show codes in notifications".
 - **Matching the sender to a source:** the sender's domain (e.g. `accounts.google.com` → google.com, `no-reply@microsoft.com` → microsoft.com).
 
+### As built (1.11)
+- Code: `Clipboard2/Services/Email/` (extractor, MIME, IMAP client and parser, OAuth, sources, `EmailCodeCenter`), `UI/Panel/EmailCodeViews.swift`, `UI/Settings/EmailAccountsSection.swift`. Tests: `Clipboard2Tests/EmailCodesTests.swift` (41-sample corpus).
+- **Client ids** live in `Clipboard2/Resources/OAuthClients.plist` (`MicrosoftClientID`, `GoogleClientID`, `GoogleClientSecret`). It ships empty: an empty id hides that provider's Add button; IMAP is always offered.
+- **Sign-in:** `ASWebAuthenticationSession` (ephemeral, so no "wants to sign in" alert) with a **loopback redirect** for both providers. The app listens on the loopback interface at a random port for that one request, then closes the sheet.
+  - Microsoft: authority `common`, redirect `http://localhost:<port>`, scopes `openid email offline_access https://graph.microsoft.com/Mail.Read`. Public client, no secret.
+  - Google: redirect `http://127.0.0.1:<port>`, scopes `openid email https://www.googleapis.com/auth/gmail.readonly`, `access_type=offline`, `prompt=consent`. Desktop client; its "secret" is sent as Google requires (it isn't secret).
+  - The account's address comes from the id_token. Adding the same address again replaces its tokens (that's also how to reconnect after "Signed out").
+- **Fetching** (decided):
+  - Microsoft: `GET /me/mailFolders/inbox/messages?$filter=receivedDateTime ge <now−10 min>` with `Prefer: outlook.body-content-type="text"`, every 15 s. Not delta: the filter is stateless and returns only the window.
+  - Gmail: `messages.list q="after:<epoch> {in:inbox category:updates}"` every 15 s, then each new id as `format=raw` (parsed by our MIME code). Not `history.list` (needs a stored history id; `newer_than:` only knows days).
+  - IMAP: TLS on 993 (plain only if TLS is turned off under Advanced; no STARTTLS). LOGIN, EXAMINE INBOX (read-only), `UID SEARCH` (since yesterday the first time, then `UID n:*`), dates first via `UID FETCH (UID INTERNALDATE)`, then header fields + the first 32 KB of `BODY.PEEK[TEXT]` for the recent ones. IDLE (renewed every 9 min) when offered, else every 30 s.
+  - Opening the panel and waking the Mac look at once. Errors back off ×2 per failure up to 15 min; a revoked sign-in waits 6 h (or until re-added). No accounts: no loops.
+- **Kept:** code, sender's registrable domain, account id, time, in memory and one Keychain item (`<bundle id>.email`, account `codes`), dropped after 10 minutes. Accounts and credentials sit in the same small vault type (`EmailVault`) so phase 3 can move it to the shared Keychain.
+- **Recognising:** URLs and addresses are removed first. Candidates: 4–8 digits, 3+3/4+4 digits split by a space or hyphen, or 6–8 capitals and digits with a digit (also `ABC-123`). Keywords additionally include confirm*, authenti*, Verifizierung*, Anmeldecode and any *code word; promo/QR/post/gift codes are negative keywords. Excluded: years 1900–2099, parts of dates/times/amounts/longer numbers, phone/IBAN groups, numbers after order/invoice/customer-number/tracking/phone words or `#`/`+`, numbers next to currencies or units, and anything near promotion words. Score = distance to the nearest keyword (a keyword after the code costs a little more, a code alone on its line a little less).
+- **Shows:** Auth gets an "Email codes" section on top and the same code again as the first row of its source when that source is listed. Return pastes (transient, cleared after 30 s, never in history); the context menu also copies. Search matches the source.
+- **Notifications:** "Code from ‹domain›", body "Open Auth to paste it" (or the code with Settings → Auth → Email accounts → "Show codes in notifications"); "Notify when a code arrives" turns them off. They follow the system permission and Focus, not the Sync notification switches. Clicking opens Auth with the code selected.
+- **AutoFill hook:** `EmailCodeCenter.codesChanged()` has the one TODO to call `AutoFillIdentities.update(codes:)` once phase 3 lands.
+
+### What the owner registers
+- **Microsoft (Azure portal → Microsoft Entra ID → App registrations → New registration):**
+  - Supported account types: "Accounts in any organizational directory and personal Microsoft accounts".
+  - Platform: **Mobile and desktop applications**, redirect URI `http://localhost` (any port is accepted for localhost).
+  - API permissions: Microsoft Graph, delegated: `Mail.Read`, `offline_access`, `openid`, `email` (no admin consent needed for personal accounts; some work tenants require it).
+  - No client secret. Copy the Application (client) ID into `MicrosoftClientID`.
+- **Google (Google Cloud console):**
+  - Enable the **Gmail API**.
+  - OAuth consent screen: External; app name, support email, developer contact; scopes `openid`, `.../auth/userinfo.email`, `https://www.googleapis.com/auth/gmail.readonly` (restricted).
+  - Publishing status **In production** (Testing expires refresh tokens after 7 days). Don't submit for verification: unverified, up to 100 users, each sees Google's warning once.
+  - Credentials → Create OAuth client ID → **Desktop app**. Nothing to register for the redirect (loopback `http://127.0.0.1:<port>` is allowed for desktop clients). Copy Client ID and Client secret into `GoogleClientID` / `GoogleClientSecret`.
+
 ## Not in scope
 - Passkeys.
 - Windows.
