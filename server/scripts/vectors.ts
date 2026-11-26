@@ -21,6 +21,13 @@ import {
   passwordKeys,
   unwrapSpaceKey,
   wrapSpaceKey,
+  wrapTo,
+  unwrapFrom,
+  deviceWrap,
+  recoveryShareWrap,
+  recoveryDeviceWrap,
+  matchNumber,
+  combineShares,
 } from "../src/clientCrypto.js";
 
 const fixed = (label: string, length = 32) =>
@@ -171,6 +178,58 @@ const invite = {
 };
 for (const bad of invite.invalidCodes) if (parseInviteCode(bad)) throw new Error("accepted invalid code " + bad);
 
+// Passwordless (docs/features/passwordless.md → Cryptography).
+const requestId = "5d2c9e1a-7b3f-4c6d-8e9f-0a1b2c3d4e5f";
+const device = keyPair(fixed("device-priv"));
+const deviceEph = keyPair(fixed("device-eph"));
+const deviceNonce = fixed("device-nonce", 12);
+const deviceAK = fixed("device-ak");
+const deviceWrapped = wrapTo(device.pub, deviceAK, deviceWrap.info(requestId), deviceWrap.aad(uid, requestId), deviceEph, deviceNonce);
+if (!unwrapFrom(device, deviceWrapped, deviceWrap.info(requestId), deviceWrap.aad(uid, requestId)).equals(deviceAK)) throw new Error("device wrap");
+const setupId = "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d";
+const contact = keyPair(fixed("contact-priv"));
+const shareEph = keyPair(fixed("share-eph"));
+const shareNonce = fixed("share-nonce", 12);
+const shareSecrets = [fixed("share-1"), fixed("share-2")];
+const lastShare = combineShares([deviceAK, ...shareSecrets]);
+const passwordless = {
+  deviceWrap: {
+    requestId,
+    uid,
+    devicePriv: b64(device.priv),
+    devicePub: b64(device.pub),
+    ephPriv: b64(deviceEph.priv),
+    nonce: b64(deviceNonce),
+    accountKey: b64(deviceAK),
+    info: deviceWrap.info(requestId),
+    aad: deviceWrap.aad(uid, requestId),
+    wrapped: b64(deviceWrapped),
+  },
+  numbers: [0, 1, 2, 3, 4].map((i) => {
+    const pub = keyPair(fixed(`number-${i}`)).pub;
+    const id = `00000000-0000-4000-8000-00000000000${i}`;
+    return { requestId: id, devicePub: b64(pub), number: matchNumber(id, pub) };
+  }),
+  shares: {
+    secret: b64(deviceAK),
+    shares: [...shareSecrets, lastShare].map(b64),
+  },
+  recoveryShare: {
+    setupId,
+    contactUid: uid,
+    contactPriv: b64(contact.priv),
+    contactPub: b64(contact.pub),
+    ephPriv: b64(shareEph.priv),
+    nonce: b64(shareNonce),
+    share: b64(shareSecrets[0]!),
+    info: recoveryShareWrap.info(setupId),
+    aad: recoveryShareWrap.aad(setupId, uid),
+    wrapped: b64(wrapTo(contact.pub, shareSecrets[0]!, recoveryShareWrap.info(setupId), recoveryShareWrap.aad(setupId, uid), shareEph, shareNonce)),
+    deviceInfo: recoveryDeviceWrap.info(requestId),
+    deviceAad: recoveryDeviceWrap.aad(requestId, uid),
+  },
+};
+
 // Self-check every sealed value opens again.
 for (const v of aeadVectors) aeadOpen(Buffer.from(v.key, "base64"), Buffer.from(v.sealed, "base64"), v.aad);
 
@@ -188,6 +247,7 @@ const out = {
   blob,
   groupName,
   invite,
+  passwordless,
 };
 
 const target = fileURLToPath(new URL("../../docs/sync/test-vectors.json", import.meta.url));

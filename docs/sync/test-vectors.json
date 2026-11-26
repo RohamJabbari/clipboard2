@@ -139,5 +139,68 @@
     "spaceKey": "jJThtPHZ4EYkMXbqaLyK4MkKDACoQCO8SYluLXRcjC8=",
     "nonce": "0wEh1yW1zhEX3IMj",
     "sealedKey": "AdMBIdcltc4RF9yDIx+S1Wz/sG+z7FV8p19O7a+iJQnD3P7DaHGmhhQ0F12ulII6lsssKn7Irj0xX9vHYg=="
+  },
+  "passwordless": {
+    "deviceWrap": {
+      "requestId": "5d2c9e1a-7b3f-4c6d-8e9f-0a1b2c3d4e5f",
+      "uid": "vHn3bq0ZtWQ2dXo9JpL7cA1sR4e2",
+      "devicePriv": "qaZmcQIFTsksK6rNLTA3IsG8D3a0AhtOCq4ZegBxHpw=",
+      "devicePub": "BLs9gkVfwoHycwelv5Mia4H8gQjb7PwQpIhffPSoZ/n0I0XNghWxxhmY29u4fM7jL97cgNJXCLnjdbQ50THcPVo=",
+      "ephPriv": "UsrxtoDHdvkj9K0cSj540Z6eTwHl901nRYvUJ7Yw/Mw=",
+      "nonce": "rPHx1TrXd6ceawPs",
+      "accountKey": "c2XEZLue68fOb+KCgG58XA8arB14zAizqX0lYDFP3+w=",
+      "info": "c2/device/v1/5d2c9e1a-7b3f-4c6d-8e9f-0a1b2c3d4e5f",
+      "aad": "c2/device/v1/vHn3bq0ZtWQ2dXo9JpL7cA1sR4e2/5d2c9e1a-7b3f-4c6d-8e9f-0a1b2c3d4e5f",
+      "wrapped": "BCQFx8QLL+wBV8UO2YQXeLS/1FnWq8LwnD6MuAeGuK101O5uoLIIxztJCAy0EM5xkNQe8qfKsk6s5TDNa3hFisUBrPHx1TrXd6ceawPsolXtcXAduBptagSUS+ed8CbTEyGb57y4DjC0Ty+1z65q6ChVbQPFMab5TxB6+iXY"
+    },
+    "numbers": [
+      {
+        "requestId": "00000000-0000-4000-8000-000000000000",
+        "devicePub": "BLb7+tq3Qf9fhM+yIPzMEKJl4MD+fiKgocbKAFpocIlIMQ3F9VL5bejKGMNJOt7jMzBtadXD2DTiofrhqomF914=",
+        "number": 70
+      },
+      {
+        "requestId": "00000000-0000-4000-8000-000000000001",
+        "devicePub": "BMGWNMu6HHLjpnwBDaxlueiMegbCmONvpqBTn/BFevYpl53hZvpGCh0POz9ONPKOVoXoOJ9FOMM+zRNPHh7crT4=",
+        "number": 94
+      },
+      {
+        "requestId": "00000000-0000-4000-8000-000000000002",
+        "devicePub": "BPq1PTXbKF5Q+tc7ZY7WuwCKf+SMtZzy/+2wlzGTz4iKTglwjFBpNAqPe8EtCbRFfx2hQi+O/bP0IfWg9pwLZP4=",
+        "number": 72
+      },
+      {
+        "requestId": "00000000-0000-4000-8000-000000000003",
+        "devicePub": "BJwD1FGmq3ExmWpZx2g3HHr+5V77HuFIABxLN4pu6EQZTEQidzn0wbqRUmE6QiklknBbL3X4qIwjrOl3Tms8bTY=",
+        "number": 41
+      },
+      {
+        "requestId": "00000000-0000-4000-8000-000000000004",
+        "devicePub": "BLXglpJc3bRIx2k0ONgixEI4qhwVI+aFIEki53fmgBVLhbgU4E1H6gsUWz4WfHJ9n1T2VpMXPTfGoPPi0GZteH4=",
+        "number": 14
+      }
+    ],
+    "shares": {
+      "secret": "c2XEZLue68fOb+KCgG58XA8arB14zAizqX0lYDFP3+w=",
+      "shares": [
+        "3qio3MOjOYyOwTuc24aj35zOb7l8fH7tenyOhWQeo8s=",
+        "UpBHFCR6jMetzC3d39SiVqsGZ37oxxsBQ1a7vq4GBaA=",
+        "/10rrFxHXoztYvTDhDx91TjSpNrsd21fkFcQW/tXeYc="
+      ]
+    },
+    "recoveryShare": {
+      "setupId": "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d",
+      "contactUid": "vHn3bq0ZtWQ2dXo9JpL7cA1sR4e2",
+      "contactPriv": "TBi8vYp6KNE+6NRRI24zb6KiaMW2hrnK4v1zFFzgR1s=",
+      "contactPub": "BPlosn3f+TBToVySVs9iGUWNDZfJuSgUVvg0iBtSBeHZP++V+ULWXkdU+sxLmyDNxzzQUlEYChP0KLlyW0YFc0o=",
+      "ephPriv": "dEyACsv5/3098WvnK9IWPs6qijHdFsUsjo3/KOZ+IUg=",
+      "nonce": "ZGHHvUYsMB4yRZld",
+      "share": "3qio3MOjOYyOwTuc24aj35zOb7l8fH7tenyOhWQeo8s=",
+      "info": "c2/recshare/v1/9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d",
+      "aad": "c2/recshare/v1/9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d/vHn3bq0ZtWQ2dXo9JpL7cA1sR4e2",
+      "wrapped": "BP6AFVuGYkxl37b14uD81I0bX/RTHWcnhZdd+zabesZn4+ErUAGBvFftMMMzyMhq7PaT0TsdMCqrv9k9DxHhPlQBZGHHvUYsMB4yRZldzFCW3pgvlElilQ9Ynhc8rq5RoR19fhLYaka7Pr63UpB8A+rZ5hLjavvid7vFgGYE",
+      "deviceInfo": "c2/recdev/v1/5d2c9e1a-7b3f-4c6d-8e9f-0a1b2c3d4e5f",
+      "deviceAad": "c2/recdev/v1/5d2c9e1a-7b3f-4c6d-8e9f-0a1b2c3d4e5f/vHn3bq0ZtWQ2dXo9JpL7cA1sR4e2"
+    }
   }
 }

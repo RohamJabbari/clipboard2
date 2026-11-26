@@ -138,6 +138,54 @@ export function parseInviteCode(typed: string): Buffer | null {
   return Buffer.from(out);
 }
 
+// MARK: Passwordless (docs/features/passwordless.md → Cryptography)
+
+/** `eph.pub ‖ AEAD(HKDF(ECDH(eph, pub), eph.pub ‖ pub, info), secret, aad)`. */
+export function wrapTo(pub: Buffer, secret: Buffer, info: string, aadText: string, eph: KeyPair = keyPair(), nonce?: Buffer): Buffer {
+  const k = hkdf(ecdh(eph.priv, pub), Buffer.concat([eph.pub, pub]), info);
+  return Buffer.concat([eph.pub, aeadSeal(k, secret, aadText, nonce)]);
+}
+
+export function unwrapFrom(me: KeyPair, wrapped: Buffer, info: string, aadText: string): Buffer {
+  const ephPub = wrapped.subarray(0, 65);
+  const k = hkdf(ecdh(me.priv, ephPub), Buffer.concat([ephPub, me.pub]), info);
+  return aeadOpen(k, wrapped.subarray(65), aadText);
+}
+
+export const deviceWrap = {
+  info: (requestId: string) => `c2/device/v1/${requestId}`,
+  aad: (uid: string, requestId: string) => `c2/device/v1/${uid}/${requestId}`,
+};
+export const recoveryShareWrap = {
+  info: (setupId: string) => `c2/recshare/v1/${setupId}`,
+  aad: (setupId: string, contactUid: string) => `c2/recshare/v1/${setupId}/${contactUid}`,
+};
+export const recoveryDeviceWrap = {
+  info: (recoveryId: string) => `c2/recdev/v1/${recoveryId}`,
+  aad: (recoveryId: string, holder: string) => `c2/recdev/v1/${recoveryId}/${holder}`,
+};
+
+/** 10…99, from the new device's public key: both sides derive it. */
+export function matchNumber(requestId: string, devicePub: Buffer): number {
+  const digest = createHash("sha256").update("c2/number/v1", "utf8").update(requestId, "utf8").update(devicePub).digest();
+  return 10 + (digest.readUInt32BE(0) % 90);
+}
+
+/** XOR n-of-n: n-1 random shares, the last makes them add up to `secret`. */
+export function splitShares(secret: Buffer, n: number, random: (size: number) => Buffer = randomBytes): Buffer[] {
+  const shares = Array.from({ length: n - 1 }, () => random(secret.length));
+  return [...shares, combineShares([secret, ...shares])];
+}
+
+export function combineShares(shares: Buffer[]): Buffer {
+  const out = Buffer.alloc(shares[0]!.length);
+  for (const share of shares) for (let i = 0; i < out.length; i++) out[i]! ^= share[i]!;
+  return out;
+}
+
+export const recoveryCodeKey = (code: Buffer) => hkdf(code, Buffer.alloc(0), "c2/reccode/v1");
+export const recoveryCodeAad = (setupId: string) => `c2/reccode/v1/${setupId}`;
+
 export const inviteId = (codeBytes: Buffer) => sha256Hex(codeBytes);
 export const inviteKey = (codeBytes: Buffer) => hkdf(codeBytes, Buffer.alloc(0), "clipboard2 invite");
 export const inviteAad = (spaceId: string) => `c2/invite/v1/${spaceId}`;

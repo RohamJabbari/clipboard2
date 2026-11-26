@@ -2024,10 +2024,34 @@ final class SyncEngine {
     // MARK: Sign-out
 
     /// Deletes group data, sync metadata and cursors. Personal history stays.
+    /// `includingPersonal`: also deletes what the personal space synced here (a passwordless
+    /// device whose window ended, or that was signed out elsewhere: nothing of the account stays).
     static func wipeLocalState(context: ModelContext, store: ClipStore, snippets: SnippetStore,
-                               secrets: any SyncSecretSource, authenticators: AuthenticatorStore? = nil) {
-        authenticators?.detachForSignOut()
+                               secrets: any SyncSecretSource, authenticators: AuthenticatorStore? = nil,
+                               includingPersonal: Bool = false) {
         let spaces = (try? context.fetch(FetchDescriptor<SyncSpace>())) ?? []
+        if includingPersonal {
+            let personal = Set(spaces.filter(\.isPersonal).map(\.id))
+            let synced = ((try? context.fetch(FetchDescriptor<SyncMeta>())) ?? []).filter { personal.contains($0.spaceId) }
+            var removedSecret = false
+            for meta in synced {
+                let id = meta.localId
+                if let uuid = UUID(uuidString: id) {
+                    if let item = store.item(withID: uuid) { store.removeSynced(item) }
+                    if let snippet = snippets.snippet(withID: uuid) { snippets.removeSynced(snippet) }
+                    if let folder = store.folder(withID: uuid) { store.removeSynced(folder) }
+                }
+                if secrets.syncSecrets.contains(where: { $0.id == id }) {
+                    secrets.syncDelete(id: id)
+                    removedSecret = true
+                }
+                if let authenticators, authenticators.authenticator(withID: id) != nil { authenticators.syncDelete(id: id) }
+            }
+            if removedSecret { secrets.syncDidChange() }
+            store.commitSynced()
+            snippets.commitSynced()
+        }
+        authenticators?.detachForSignOut()
         var groupIDs = Set(spaces.filter { !$0.isPersonal }.map(\.id))
         groupIDs.formUnion(store.allItems().compactMap(\.spaceID))
         groupIDs.formUnion(((try? context.fetch(FetchDescriptor<Snippet>())) ?? []).compactMap(\.spaceID))

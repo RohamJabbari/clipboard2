@@ -65,7 +65,9 @@ nonisolated struct PasswordSignIn: Sendable {
     /// Opens the account key and identity key of a fresh `Account`.
     static func unlock(_ remote: RemoteSession, wrapKey: Data, previous: MobileSession? = nil) throws -> MobileSession {
         let account = remote.account
-        let ak = try SyncCrypto.open(account.wrappedAccountKey, key: wrapKey, aad: SyncCrypto.AAD.accountKey(uid: account.uid))
+        // A passwordless account has no password-wrapped key: it signs in by approval from another device.
+        guard let wrappedAccountKey = account.wrappedAccountKey else { throw SignInError.notAvailable }
+        let ak = try SyncCrypto.open(wrappedAccountKey, key: wrapKey, aad: SyncCrypto.AAD.accountKey(uid: account.uid))
         let priv = try SyncCrypto.open(account.wrappedPrivateKey, key: ak, aad: SyncCrypto.AAD.privateKey(uid: account.uid))
         return MobileSession(uid: account.uid, email: account.email, token: remote.token, accountKey: ak, privateKey: priv,
                              personalSpaceId: account.personalSpaceId, username: account.username,
