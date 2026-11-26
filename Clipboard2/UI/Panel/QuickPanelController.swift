@@ -767,6 +767,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         quickLook.onEnd = { [weak self] in
             guard let self else { return }
             self.model.quickLookFiles.removeAll()
+            self.model.quickLookOverride = nil
             // Quick Look may have had the keyboard: hand it back to the panel.
             // Not after a kept-open panel stepped aside for a paste.
             if let panel = self.panel, self.isVisible, !panel.isKeyWindow, !self.steppedAside { panel.makeKey() }

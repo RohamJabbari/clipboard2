@@ -430,6 +430,9 @@ struct AuthenticatorSuggestionPreview: View {
 struct AuthenticatorFormView: View {
     @Bindable var form: AuthenticatorFormState
     let onSubmit: () -> Void
+    /// Scan QR on Screen / From Image… (when adding by hand).
+    var onScanScreen: (() -> Void)?
+    var onChooseImage: (() -> Void)?
     @FocusState private var focus: Field?
 
     private enum Field { case issuer, secret }
@@ -451,9 +454,34 @@ struct AuthenticatorFormView: View {
                 TextField("Account", text: $form.account, prompt: Text("e.g. me@example.com"))
                 TextField("Website", text: $form.website, prompt: Text("Optional, e.g. github.com"))
                 if form.asksForSecret {
-                    TextField("Setup key", text: $form.secret, prompt: Text("Base32, e.g. JBSW Y3DP EHPK 3PXP"))
+                    TextField("Setup key", text: $form.secret, prompt: Text("Base32 key or otpauth:// link"))
                         .font(.body.monospaced())
                         .focused($focus, equals: .secret)
+                        .onChange(of: form.secret) { _, text in
+                            // A pasted link carries the key and the settings.
+                            if OTPAuthURI.isSecretLink(text.trimmingCharacters(in: .whitespacesAndNewlines)) { form.useLink(text) }
+                        }
+                } else if form.scanned != nil {
+                    LabeledContent("Setup key") {
+                        HStack(spacing: 6) {
+                            Label("From the link or QR code", systemImage: "checkmark.seal.fill")
+                                .foregroundStyle(.secondary)
+                            Button("Clear") { form.scanned = nil }
+                                .controlSize(.small)
+                        }
+                    }
+                }
+                if form.offersScanning, let onScanScreen {
+                    LabeledContent("QR code") {
+                        HStack(spacing: 6) {
+                            Button("Scan on Screen", action: onScanScreen)
+                                .help("Drag over the QR code the site shows")
+                            if let onChooseImage {
+                                Button("From Image…", action: onChooseImage)
+                                    .help("Reads the QR code in an image file")
+                            }
+                        }
+                    }
                 }
                 if !form.isRename {
                     DisclosureGroup("Advanced", isExpanded: $form.showsAdvanced) {

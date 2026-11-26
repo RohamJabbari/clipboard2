@@ -206,7 +206,7 @@ struct QuickPanelView: View {
             } else if model.filter == .groups && model.groupFilter == nil {
                 NoGroupsView()
                     .pinnedEmptyState()
-            } else if model.entries.isEmpty && model.meCards.isEmpty {
+            } else if model.entries.isEmpty && model.meCards.isEmpty && model.emptyOrigins.isEmpty {
                 let inbox = model.filter == .inbox && model.groupFilter == nil
                 ContentUnavailableView {
                     Label(model.query.isEmpty ? (inbox ? "Your Inbox Is Empty" : "Nothing Here Yet") : "No Matches",
@@ -227,7 +227,9 @@ struct QuickPanelView: View {
                                 if let title = model.sectionStarts[entry.id] {
                                     SectionHeading(title: title, isFirst: index == 0)
                                 } else if let heading = model.authSourceStarts[entry.id] {
-                                    AuthSourceHeader(heading: heading, isFirst: index == 0)
+                                    AuthSourceHeader(heading: heading, isFirst: index == 0,
+                                                     isSelected: heading.key != nil && model.originPage?.key == heading.key,
+                                                     onSelect: heading.key.map { key in { model.openOriginPage(key) } })
                                 }
                                 if let folder = entry.folder {
                                     FolderDropRow(entry: entry, folder: folder, model: model)
@@ -259,6 +261,9 @@ struct QuickPanelView: View {
                                 } else {
                                     row(for: entry, at: index)
                                 }
+                            }
+                            if model.isAuthView, !model.emptyOrigins.isEmpty {
+                                OriginsSection(model: model, origins: model.emptyOrigins)
                             }
                             if model.isAuthView, !model.meCards.isEmpty {
                                 MeSection(model: model, cards: model.meCards)
@@ -543,6 +548,10 @@ struct QuickPanelView: View {
             if let form = model.cardForm {
                 CardFormView(form: form) { model.submitCardForm() }
             }
+        case .originPage:
+            if let page = model.originPage {
+                OriginPageView(page: page, model: model)
+            }
         case .shareToGroup:
             if let form = model.shareForm {
                 ShareToGroupView(form: form) { model.submitShare() }
@@ -557,7 +566,9 @@ struct QuickPanelView: View {
             }
         case .authenticatorForm:
             if let form = model.authenticatorForm {
-                AuthenticatorFormView(form: form) { model.submitAuthenticatorForm() }
+                AuthenticatorFormView(form: form, onSubmit: { model.submitAuthenticatorForm() },
+                                      onScanScreen: { model.scanQRCodeOnScreen() },
+                                      onChooseImage: { model.chooseQRImage() })
             }
         case .authenticatorPeople:
             if let form = model.peopleForm {
@@ -1281,6 +1292,8 @@ struct HintBar: View {
                 hint("⏎", "Paste")
             case .saveSecret, .label, .editSecret, .folderName, .authenticatorForm, .cardForm:
                 hint("⏎", "Save")
+            case .originPage:
+                hint("esc", "Back to the List")
             case .authenticatorPeople, .folderPicker:
                 hint("↑↓", "Choose")
                 hint("⏎", "Choose")

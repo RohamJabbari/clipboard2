@@ -1263,10 +1263,11 @@ final class FakeSecrets: SyncSecretSource {
     func syncValue(id: String) -> String? { values[id] }
     func syncNotes(id: String) -> String? { notes[id] }
     func syncUpsert(id: String, name: String, value: String, spaceID: String?, folderID: UUID?,
-                    username: String?, urls: [String], notes: String?) {
+                    username: String?, urls: [String], notes: String?, origin: String?) {
         let created = refs[id]?.createdAt ?? Date(timeIntervalSince1970: 1_000)
         refs[id] = SecretRef(id: id, name: name, createdAt: created, spaceID: refs[id]?.spaceID ?? spaceID, updatedAt: .now,
-                             folderID: folderID, username: username, urls: urls, notesStamp: SecretExtras.notesStamp(notes))
+                             folderID: folderID, username: username, urls: urls, notesStamp: SecretExtras.notesStamp(notes),
+                             originID: origin)
         values[id] = value
         self.notes[id] = notes
     }
@@ -1325,6 +1326,7 @@ final class FakeDevice {
     let snippets: SnippetStore
     let secrets = FakeSecrets()
     let authenticators = AuthenticatorStore(backing: MemoryAuthenticatorBacking())
+    let origins = OriginStore(backing: MemoryOriginBacking(), documents: MemoryDocumentVault())
     let engine: SyncEngine
 
     init(_ user: FakeUser) throws {
@@ -1336,7 +1338,7 @@ final class FakeDevice {
         let token = user.token
         engine = SyncEngine(api: FakeClient(server: user.server, token: { token }), identity: user.identity,
                             context: container.mainContext, store: store, snippets: snippets, secrets: secrets,
-                            authenticators: authenticators)
+                            authenticators: authenticators, origins: origins)
         // Like the app (SyncAccount.localChange): local commits ask the next tick to upload.
         let engine = self.engine
         let noteChange = { [weak engine] in
@@ -1347,6 +1349,7 @@ final class FakeDevice {
         snippets.onCommit = noteChange
         secrets.onChange = noteChange
         authenticators.onChange = noteChange
+        origins.onChange = noteChange
     }
 
     func texts(inSpace space: String? = nil) -> Set<String> { Set(store.items(inSpace: space).map(\.text)) }

@@ -25,6 +25,8 @@ nonisolated struct Authenticator: Identifiable, Hashable, Sendable {
     var spaceID: String?
     /// Sites set with Edit → Website; they pick its source in Auth over the issuer.
     var urls: [String] = []
+    /// The origin (Auth's site edited by hand) it's filed under; nil: grouped by its sites or issuer.
+    var originID: String? = nil
 
     init(id: String = SyncCrypto.newID(), account: OTPAccount, createdAt: Date = .now, spaceID: String? = nil) {
         self.id = id
@@ -54,11 +56,13 @@ nonisolated struct Authenticator: Identifiable, Hashable, Sendable {
         updatedAt = Date(syncMillis: payload.updatedAt)
         self.spaceID = spaceID
         urls = SecretExtras.cleanURLs(payload.urls ?? [])
+        originID = payload.origin
     }
 
     var payload: OTPPayload {
         OTPPayload(issuer: issuer, account: account, secret: secret, algorithm: algorithm.rawValue, digits: digits,
-                   period: period, createdAt: createdAt.syncMillis, updatedAt: updatedAt.syncMillis, urls: urls)
+                   period: period, createdAt: createdAt.syncMillis, updatedAt: updatedAt.syncMillis, urls: urls,
+                   origin: originID)
     }
 
     var otpAccount: OTPAccount {
@@ -252,6 +256,9 @@ nonisolated enum AuthenticatorItem: Identifiable, Hashable, Sendable {
 
     /// Sites the owner set (Edit → Website); shared ones have none (their source comes from the issuer).
     var urls: [String] { owned?.urls ?? [] }
+
+    /// The origin it's filed under: only your own carry one (shared ones are filed by the origin's `entries`).
+    var originID: String? { owned?.originID }
 }
 
 // MARK: - Storage
@@ -397,9 +404,10 @@ final class AuthenticatorStore {
     // MARK: Local changes
 
     @discardableResult
-    func add(_ account: OTPAccount, urls: [String] = [], now: Date = .now) -> Authenticator? {
+    func add(_ account: OTPAccount, urls: [String] = [], origin: String? = nil, now: Date = .now) -> Authenticator? {
         var authenticator = Authenticator(account: account, createdAt: now)
         authenticator.urls = SecretExtras.cleanURLs(urls)
+        authenticator.originID = origin
         guard backing.saveOwned(authenticator) else { return nil }
         if suggestion?.secret == account.secret { suggestion = nil }
         changed()
@@ -412,6 +420,15 @@ final class AuthenticatorStore {
         authenticator.issuer = issuer
         authenticator.account = account
         if let urls { authenticator.urls = SecretExtras.cleanURLs(urls) }
+        authenticator.updatedAt = max(now, authenticator.updatedAt.addingTimeInterval(0.001))
+        backing.saveOwned(authenticator)
+        changed()
+    }
+
+    /// Files it under an origin, or (nil) back under its sites or issuer.
+    func setOrigin(_ originID: String?, id: String, now: Date = .now) {
+        guard var authenticator = authenticator(withID: id), authenticator.originID != originID else { return }
+        authenticator.originID = originID
         authenticator.updatedAt = max(now, authenticator.updatedAt.addingTimeInterval(0.001))
         backing.saveOwned(authenticator)
         changed()

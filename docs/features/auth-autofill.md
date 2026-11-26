@@ -215,6 +215,28 @@ Build in phases; each phase ships on its own:
 - **Trash:** `FileManager.trashItem`; Undo moves the file back. A file that isn't a password export is left where it is, with the reason.
 - The flow lives in `AppEnvironment.passwordImport`, so watching and the review survive switching Settings tabs.
 
+## Origins: editing a site by hand (1.13, Mac)
+- Auth groups everything by **origin**. By default that's the automatic source above (registrable domain, issuer, or "No website"). An origin can also be **edited by hand**: renamed, given several websites (`google.com` and `accounts.google.com`), or be a name without a site ("PJ Logistik").
+- **Opening a site's page:** click a source heading in Auth (it highlights, with a chevron on hover), or ⌘K → **Edit Site…** on any password, secret, authenticator or email code. + → **New Site…** starts an empty one. The page replaces the preview in the right pane, inline; esc (or ✕) goes back to the list, and picking a row in the list leaves it too.
+- **On the page**, top to bottom:
+  - **Site:** name, websites (one row each, + / −) and icon: the website's favicon (default), another of its websites' favicons, the first letter, an SF Symbol, or an emoji. **Save** (or Return in a field) writes them. A website another site already claims is refused with "… belongs to ‹site›. Use Merge Into to join the two."
+  - **Logins, secrets and authenticators** filed here, each with **Edit** (the existing forms, after Touch ID for passwords, as before), **Move** (to any other site or automatic group, or "Group by Its Website Again") and **Delete** (inline confirm). **New Login… / New Secret… / New Authenticator…** open the usual forms with the site filled in; what's saved is filed here and the page comes back (esc in the form comes back too).
+    - The password generator is the existing one: "Letters & digits" (no special characters) and "With symbols", side by side.
+    - New Authenticator takes a base32 key, or an `otpauth://` link pasted into the key field, or a QR code: **Scan on Screen** (the screenshot crosshair; the clipboard is restored) or **From Image…**.
+  - **Notes:** free text, any number; Edit and Delete each, **Add Note** (⌘Return). Notes aren't secrets (no Touch ID); they sync end-to-end encrypted with the site.
+  - **Documents:** drop files on the page or **Add Files…** (the system file chooser). Each is encrypted on this Mac (AES-GCM, key in the login Keychain) and syncs as an encrypted blob. **Open** (default app), **Quick Look**, **Paste** (as a file into the app the panel opened over), **Remove** (inline confirm). At most 12 per site, 95 MB each. Open, Quick Look and Paste use a decrypted copy in the app's temporary folder, removed at the next launch.
+  - **Manage:** **Merge Into ‹site›** (inline confirm) moves every entry, website, note and document into the other site and deletes this one. **Delete Site** (inline confirm) deletes the site, its notes and documents; its entries stay, grouped automatically again.
+- **Automatic groups become origins on first edit:** renaming a domain group, adding a note or document, etc. creates an origin claiming that domain (nothing on its entries changes). An issuer group ("Acme Corp") becomes an origin of that name with its entries filed under it.
+- **Filing** (PROTOCOL.md → Origins): an entry's own `origin` reference, else the origin's list of entries it can't rewrite (authenticators shared with you, other people's group secrets), else an origin claiming one of its domains, else an origin named like its issuer, else automatic. Moving a password or your own authenticator sets its reference; moving a shared one lists it on the origin.
+- Origins with nothing filed under them are listed under **Sites** after the groups (before Me). Search matches a site's name and websites, and finds entries by their site's name.
+- **"For ‹site›"** also lists what's filed under an origin claiming the page's domain.
+- Touch ID gating is unchanged: revealing, copying, filling or pasting a password still asks, from the list or the edit form.
+
+### As built (1.13)
+- Code: `Services/Origins.swift` (model, `OriginDirectory` filing rules, `AuthOriginGrouping`, `OriginStore`, the Keychain backing and `EncryptedFileDocumentVault`), `UI/Panel/OriginPanel.swift` (page state and actions on `PanelViewModel`), `UI/Panel/OriginViews.swift` (`OriginPageView`, `OriginsSection`), `SyncEngine.applyOrigin` / the origin push. Server: category `origin` (migration `008_origins.sql`), personal space only. Tests: `Clipboard2Tests/OriginsTests.swift`.
+- Storage: one login-Keychain item per origin (service `<bundle id>.origins`, the payload as its value). It never moves to the shared Keychain: the AutoFill extension doesn't read origins. Documents: `Application Support/…/Origin Documents/<id>.c2doc`, sealed with a 256-bit key in the login Keychain (`<bundle id>.origin-documents-key`); the document id is the AAD.
+- Not yet: Windows; backups (`docs/BACKUP-FORMAT.md` has no origins); system AutoFill and the paste icon still match by each password's own sites, not an origin's other websites; origins in groups.
+
 ## Not in scope
 - Passkeys.
 - Windows.

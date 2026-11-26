@@ -152,11 +152,15 @@ nonisolated enum AuthSource: Hashable, Sendable, Comparable {
 
 /// One source and its items, in list order.
 nonisolated struct AuthSourceGroup<Item> {
-    /// Nil is "No website".
+    /// Nil is "No website" (unless it's an origin's group).
     var source: AuthSource?
     var items: [Item]
+    /// The origin these are filed under (an origin edited by hand); its domain is `source`.
+    var origin: AuthOrigin? = nil
 
-    var title: String { source?.name ?? "No website" }
+    var title: String { origin?.title ?? source?.name ?? "No website" }
+
+    var key: AuthGroupKey { origin.map { .origin($0.id) } ?? AuthGroupKey(source) }
 }
 
 /// A source row above its items in Auth.
@@ -165,9 +169,18 @@ nonisolated struct AuthSourceHeading: Hashable, Sendable {
     var source: AuthSource?
     /// "For ‹site›": the page the panel opened over (phase 2).
     var isSuggestion = false
+    /// The origin edited by hand these items are filed under.
+    var origin: AuthOrigin? = nil
+
     var title: String {
         if isSuggestion, let source { return "For \(source.name)" }
-        return source?.name ?? "No website"
+        return origin?.title ?? source?.name ?? "No website"
+    }
+
+    /// What selecting the heading opens (nil for "For ‹site›").
+    var key: AuthGroupKey? {
+        if isSuggestion { return nil }
+        return origin.map { .origin($0.id) } ?? AuthGroupKey(source)
     }
 }
 
@@ -213,7 +226,13 @@ final class AuthSourceUsage {
 
     func record(_ source: AuthSource?, at date: Date = .now) {
         guard let source else { return }
-        lastUsed[source.key] = date
+        record(key: source.key, at: date)
+    }
+
+    /// A group's usage key (`AuthGroupKey.usageKey`): a source's key or `origin:<id>`.
+    func record(key groupKey: String, at date: Date = .now) {
+        guard !groupKey.isEmpty else { return }
+        lastUsed[groupKey] = date
         defaults.set(lastUsed.mapValues(\.timeIntervalSince1970), forKey: key)
     }
 }

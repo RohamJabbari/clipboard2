@@ -33,6 +33,8 @@ final class AppEnvironment {
     let secrets: SecretStore
     let slots: QuickSlots
     let authenticators: AuthenticatorStore
+    /// Auth's origins: sites edited by hand, with notes and documents (docs/features/auth-autofill.md → Origins).
+    let origins: OriginStore
     let sync: SyncAccount
     /// System notifications for what syncs bring (docs/features/notifications-contacts.md).
     let notifications: NotificationHub
@@ -87,8 +89,12 @@ final class AppEnvironment {
         slots = QuickSlots(defaults: .standard, store: store, snippets: snippets, secrets: secrets)
         // Tests never touch the login keychain's authenticators.
         authenticators = AuthenticatorStore(backing: Self.isRunningTests ? MemoryAuthenticatorBacking() : KeychainAuthenticatorBacking())
+        origins = Self.isRunningTests
+            ? OriginStore(backing: MemoryOriginBacking(), documents: MemoryDocumentVault())
+            : OriginStore(backing: KeychainOriginBacking(), documents: EncryptedFileDocumentVault.standard())
         sync = SyncAccount(prefs: prefs, context: container.mainContext, store: store, snippets: snippets, secrets: secrets,
                            authenticators: authenticators)
+        sync.origins = origins
         notifications = NotificationHub(prefs: prefs)
         sync.notifications = notifications
         // Tests never touch the Keychain or any mail account.
@@ -149,6 +155,9 @@ final class AppEnvironment {
         monitor.onAuthenticatorLink = { [weak self] link in self?.authenticatorLinkFound(link, inImage: false) }
         imageText.onAuthenticatorLink = { [weak self] link in self?.authenticatorLinkFound(link, inImage: true) }
         authenticators.onChange = { [weak self] in self?.sync.localChange() }
+        origins.onChange = { [weak self] in self?.sync.localChange() }
+        // Decrypted copies opened or pasted last time.
+        OriginDocumentFiles.removeAll()
         paste.onPaste = { [weak self] in self?.sync.reportActivity() }
         secrets.onChange = { [weak self] in
             guard let self else { return }

@@ -165,6 +165,8 @@ enum PanelMode: Equatable {
     case save
     /// New Card… / Edit on a personal info card (Auth → Me).
     case cardForm
+    /// An origin's page in Auth: everything for one site, edited inline.
+    case originPage
 }
 
 enum PanelAction: Identifiable, Hashable {
@@ -212,6 +214,8 @@ enum PanelAction: Identifiable, Hashable {
     case delete
     /// Rename, Share…, People…, Transfer, Show Secret, Delete or Leave on an authenticator.
     case authenticator(AuthenticatorAction)
+    /// Auth: the page of the site the entry is listed under.
+    case editSite
 
     var id: String {
         switch self {
@@ -249,6 +253,7 @@ enum PanelAction: Identifiable, Hashable {
         case .saveToChosenFolder: "saveToChosenFolder"
         case .delete: "delete"
         case .authenticator(let action): "authenticator-" + action.rawValue
+        case .editSite: "editSite"
         }
     }
 
@@ -265,6 +270,7 @@ enum PanelAction: Identifiable, Hashable {
         case .save: "Saved"
         case .saveAsSecret, .editFile, .renameFile, .setLabel, .shareToGroup, .clearSlot, .delete: "Item"
         case .authenticator: "Authenticator"
+        case .editSite: "Site"
         }
     }
 
@@ -306,6 +312,7 @@ enum PanelAction: Identifiable, Hashable {
         case .saveToChosenFolder: "Save to…"
         case .delete: "Delete"
         case .authenticator(let action): action.title
+        case .editSite: "Edit Site…"
         }
     }
 
@@ -344,6 +351,7 @@ enum PanelAction: Identifiable, Hashable {
         case .saveToChosenFolder: "folder"
         case .delete: "trash"
         case .authenticator(let action): action.symbol
+        case .editSite: "globe"
         }
     }
 
@@ -432,6 +440,10 @@ final class AuthenticatorFormState {
     var error: String?
     /// The one-time "keep your important codes on your phone too" note.
     let showsTip: Bool
+    /// From a link pasted into the setup key, or a QR code scanned on screen or read from an image.
+    var scanned: OTPAccount?
+    /// Opened from a site's page: what's added is filed there, and the page comes back.
+    var siteKey: AuthGroupKey?
 
     init(purpose: Purpose, showsTip: Bool = false) {
         self.purpose = purpose
@@ -465,14 +477,18 @@ final class AuthenticatorFormState {
     }
 
     var isRename: Bool { if case .rename = purpose { true } else { false } }
-    /// Typed by hand: the form asks for the secret.
-    var asksForSecret: Bool { purpose == .add(from: nil) }
+    /// Typed by hand: the form asks for the secret (until a link or QR code gave one).
+    var asksForSecret: Bool { purpose == .add(from: nil) && scanned == nil }
+
+    /// Added by hand, so a link can be pasted or a QR code scanned instead of the key.
+    var offersScanning: Bool { purpose == .add(from: nil) }
 
     /// The account to add, or an error for the form.
     struct Problem: Error, Equatable { var message: String }
 
     func makeAccount() -> Result<OTPAccount, Problem> {
-        guard case .add(let from) = purpose else { return .failure(Problem(message: "")) }
+        guard case .add(let given) = purpose else { return .failure(Problem(message: "")) }
+        let from = given ?? scanned
         let issuer = issuer.trimmingCharacters(in: .whitespacesAndNewlines)
         let account = account.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !issuer.isEmpty || !account.isEmpty else { return .failure(Problem(message: "Enter an issuer or an account.")) }
@@ -564,6 +580,8 @@ final class EditSecretState {
     /// Generate's two options, side by side until one is picked.
     var suggestions: PasswordGenerator.Suggestions?
     var error: String?
+    /// Opened from a site's page: what's saved is filed there, and the page comes back.
+    var siteKey: AuthGroupKey?
 
     init(ref: SecretRef, value: String, notes: String? = nil) {
         self.ref = ref
@@ -1087,6 +1105,14 @@ final class PanelViewModel {
     private(set) var peopleForm: AuthenticatorPeopleState?
     /// New Card… / Edit on a personal info card (Auth → Me).
     private(set) var cardForm: CardFormState?
+    /// The origin page (mode `.originPage`), or the page a form opened from it goes back to.
+    var originPage: OriginPageState?
+    /// A form opened from the origin page returns to this site when it's done or cancelled.
+    var siteReturn: AuthGroupKey?
+    /// Origins with nothing listed under them, shown on their own after Auth's groups.
+    private(set) var emptyOrigins: [AuthOrigin] = []
+    /// Quick Look of a site's document (instead of the selection's files) while set.
+    @ObservationIgnored var quickLookOverride: [URL]?
     /// The personal info card shown in the right pane (Auth → Me); a list row being selected clears it.
     var selectedCardID: UUID?
     private(set) var folderPicker: FolderPickerState?
@@ -1164,6 +1190,8 @@ final class PanelViewModel {
     /// group, search, expanded folders, selection and scroll position.
     func prepareForOpen(target: NSRunningApplication?) {
         selectionItem = nil
+        siteReturn = nil
+        originPage = nil
         resetMode()
         notice = nil
         let sameTarget = target?.bundleIdentifier == targetApp?.bundleIdentifier
@@ -1431,6 +1459,13 @@ final class PanelViewModel {
         actionQuery = ""
         actionSelection = 0
         mode = .browse
+        if let key = siteReturn {
+            // A form opened from a site's page: back to the page.
+            siteReturn = nil
+            if isAuthView { openOriginPage(key) }
+        } else if originPage != nil {
+            originPage = nil
+        }
         focusToken &+= 1
     }
 
@@ -1521,11 +1556,13 @@ final class PanelViewModel {
 
         var result: [PanelEntry]
         var authStarts: [String: AuthSourceHeading] = [:]
+        if !(q.isEmpty && authView) { emptyOrigins = authView ? Self.matchingOrigins(env.origins.origins, query: q) : [] }
         if q.isEmpty && authView {
             result = []
             // Over a browser: "For ‹site›" first, with that site's items (phase 2).
             if let site = pageSite {
-                let suggested = Self.authSuggestions(secrets: secrets, authenticators: authenticators, site: site)
+                let suggested = Self.authSuggestions(secrets: secrets, authenticators: authenticators, site: site,
+                                                     origins: env.origins.directory)
                 if let first = suggested.first {
                     authStarts[first.id] = AuthSourceHeading(source: .domain(site), isSuggestion: true)
                     result += suggested
@@ -1534,16 +1571,22 @@ final class PanelViewModel {
                     authenticators.removeAll { taken.contains(PanelEntry.authenticator($0).id) }
                 }
             }
-            // Grouped by source, the most recently used first; "No website" last.
+            // Grouped by origin or source, the most recently used first; "No website" last.
+            let origins = env.origins.directory
             let groups = Self.authGroups(secrets: secrets, authenticators: authenticators,
-                                         lastUsed: AuthSourceUsage.shared.lastUsed)
+                                         lastUsed: AuthSourceUsage.shared.lastUsed, origins: origins)
             // "Email codes" first (before "For ‹site›"); each code again under its source, when that source is listed.
             result = emailCodes.map { PanelEntry.emailCode($0) } + result
             for group in groups {
-                let items = Self.emailCodeEntries(emailCodes, under: group.source) + group.items
-                if let first = items.first { authStarts[first.id] = AuthSourceHeading(source: group.source) }
+                let items = Self.emailCodeEntries(emailCodes, under: group.key, origins: origins) + group.items
+                if let first = items.first {
+                    authStarts[first.id] = AuthSourceHeading(source: group.source, origin: group.origin)
+                }
                 result += items
             }
+            // Origins with nothing listed (a named site with only notes or documents): on their own.
+            let listed = Set(groups.map(\.key))
+            emptyOrigins = AuthOriginGrouping.emptyOrigins(origins, used: listed)
         } else if q.isEmpty && savedView {
             let byID = Dictionary(folders.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             let place = { (id: UUID?) -> UUID? in id.flatMap { byID[$0] != nil ? $0 : nil } }
@@ -1593,15 +1636,19 @@ final class PanelViewModel {
                     scored.append((.snippet(snippet), 10_000, snippet.updatedAt))
                 }
             }
+            let origins = authView ? env.origins.directory : .empty
+            func siteName(_ key: AuthGroupKey) -> String {
+                key.originID.flatMap { origins.origin(withID: $0)?.title } ?? ""
+            }
             for secret in secrets {
                 // Names, usernames and sites only — values never leave the keychain for search.
-                if let s = FuzzyMatcher.score(query: q, in: Self.authSearchText(secret)) {
+                if let s = FuzzyMatcher.score(query: q, in: Self.authSearchText(secret) + " " + siteName(origins.key(of: secret))) {
                     scored.append((.secret(secret), s + 500, secret.createdAt ?? .distantPast))
                 }
             }
             for item in authenticators {
                 // Issuer, account and sites only; never the secret.
-                if let s = FuzzyMatcher.score(query: q, in: Self.authSearchText(item)) {
+                if let s = FuzzyMatcher.score(query: q, in: Self.authSearchText(item) + " " + siteName(origins.key(of: item))) {
                     scored.append((.authenticator(item), s + 500, item.createdAt))
                 }
             }
@@ -1639,17 +1686,40 @@ final class PanelViewModel {
         return (secrets, env.authenticators.items)
     }
 
-    /// Auth's rows by source (docs/features/auth-autofill.md → Sources).
+    /// Auth's rows by origin or source (docs/features/auth-autofill.md → Sources, Origins).
     static func authGroups(secrets: [SecretRef], authenticators: [AuthenticatorItem],
-                           lastUsed: [String: Date]) -> [AuthSourceGroup<PanelEntry>] {
+                           lastUsed: [String: Date], origins: OriginDirectory = .empty) -> [AuthSourceGroup<PanelEntry>] {
         let entries = secrets.map(PanelEntry.secret) + authenticators.map(PanelEntry.authenticator)
-        return AuthSourceGrouping.group(entries, source: authSource(of:), title: authTitle, lastUsed: lastUsed)
+        return AuthOriginGrouping.group(entries, key: { authGroupKey(of: $0, origins: origins) }, title: authTitle,
+                                        lastUsed: lastUsed, origins: origins)
     }
 
-    /// The email codes listed again under a source (none under "No website").
+    /// The group a row in Auth sits under.
+    static func authGroupKey(of entry: PanelEntry, origins: OriginDirectory) -> AuthGroupKey {
+        switch entry {
+        case .secret(let ref): origins.key(of: ref)
+        case .authenticator(let item): origins.key(of: item)
+        case .emailCode(let code, _): origins.key(ofCodeFrom: code.source)
+        default: .none
+        }
+    }
+
+    /// The email codes listed again under a group (none under "No website").
+    static func emailCodeEntries(_ codes: [EmailCode], under key: AuthGroupKey, origins: OriginDirectory = .empty) -> [PanelEntry] {
+        guard key != .none else { return [] }
+        return codes.filter { origins.key(ofCodeFrom: $0.source) == key }.map { PanelEntry.emailCode($0, inSource: true) }
+    }
+
+    /// The email codes listed again under an automatic source (none under "No website").
     static func emailCodeEntries(_ codes: [EmailCode], under source: AuthSource?) -> [PanelEntry] {
-        guard let domain = source?.domain else { return [] }
-        return codes.filter { $0.source == domain }.map { PanelEntry.emailCode($0, inSource: true) }
+        emailCodeEntries(codes, under: AuthGroupKey(source))
+    }
+
+    /// Sites whose name or domains match the search (Auth only).
+    static func matchingOrigins(_ origins: [AuthOrigin], query: String) -> [AuthOrigin] {
+        guard !query.isEmpty else { return [] }
+        return origins.filter { FuzzyMatcher.score(query: query, in: ([$0.title] + $0.domains).joined(separator: " ")) != nil }
+            .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
     }
 
     /// The source a row in Auth sits under.
@@ -1681,10 +1751,13 @@ final class PanelViewModel {
     }
 
     /// "For ‹site›": passwords with that site, and authenticators for it. Passwords first.
-    static func authSuggestions(secrets: [SecretRef], authenticators: [AuthenticatorItem], site: String) -> [PanelEntry] {
-        let passwords = secrets.filter { SiteMatch.matches($0, domain: site) }
+    /// An origin claiming the site brings everything filed under it (its other websites' too).
+    static func authSuggestions(secrets: [SecretRef], authenticators: [AuthenticatorItem], site: String,
+                                origins: OriginDirectory = .empty) -> [PanelEntry] {
+        let claimed = origins.origin(claiming: site).map { AuthGroupKey.origin($0.id) }
+        let passwords = secrets.filter { SiteMatch.matches($0, domain: site) || (claimed != nil && origins.key(of: $0) == claimed) }
             .sorted { ($0.username ?? $0.name).localizedStandardCompare($1.username ?? $1.name) == .orderedAscending }
-        let codes = authenticators.filter { SiteMatch.matches($0, domain: site) }
+        let codes = authenticators.filter { SiteMatch.matches($0, domain: site) || (claimed != nil && origins.key(of: $0) == claimed) }
             .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
         return passwords.map(PanelEntry.secret) + codes.map(PanelEntry.authenticator)
     }
@@ -1718,9 +1791,14 @@ final class PanelViewModel {
         }
     }
 
-    /// Pasting or copying from a source moves it to the top of Auth.
+    /// Pasting or copying from a source (or an origin) moves it to the top of Auth.
     func noteAuthUse(_ entry: PanelEntry) {
-        AuthSourceUsage.shared.record(Self.authSource(of: entry))
+        let key = Self.authGroupKey(of: entry, origins: env.origins.directory)
+        if case .origin = key {
+            AuthSourceUsage.shared.record(key: key.usageKey)
+        } else {
+            AuthSourceUsage.shared.record(Self.authSource(of: entry))
+        }
     }
 
     /// Today, Yesterday, This Week, Earlier: the first row of each, in list (newest-first) order.
@@ -1754,6 +1832,7 @@ final class PanelViewModel {
     func moveSelection(by delta: Int, extending: Bool = false) {
         guard !entries.isEmpty else { return }
         userMovedSelection = true
+        leaveOriginPageForList()
         let current = selectedIndex ?? (delta > 0 ? -1 : entries.count)
         let next = min(max(current + delta, 0), entries.count - 1)
         if extending {
@@ -1779,9 +1858,33 @@ final class PanelViewModel {
 
     func isSelected(_ entry: PanelEntry) -> Bool { selectedIDs.contains(entry.id) }
 
+    /// The origin page (OriginPanel.swift) shows `originPage`.
+    func presentOriginPage() { mode = .originPage }
+
+    /// A form opened from the origin page.
+    func presentEditSecret(_ form: EditSecretState) {
+        editSecretForm = form
+        mode = .editSecret
+    }
+
+    func presentAuthenticatorForm(_ form: AuthenticatorFormState) {
+        authenticatorForm = form
+        mode = .authenticatorForm
+    }
+
+    /// Picking a row in the list leaves the origin page for that row.
+    func leaveOriginPageForList() {
+        quickLookOverride = nil
+        guard mode == .originPage || originPage != nil else { return }
+        siteReturn = nil
+        originPage = nil
+        if mode == .originPage { mode = .browse }
+    }
+
     /// Mouse selection following macOS conventions: ⌘ toggles, ⇧ selects a range.
     func click(_ entry: PanelEntry) {
         userMovedSelection = true
+        leaveOriginPageForList()
         let flags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if flags.contains(.command) {
             toggleSelection(entry.id)
@@ -2087,6 +2190,7 @@ final class PanelViewModel {
                     form.error = "Couldn't save to the Keychain."
                     return
                 }
+                if form.siteKey != nil { fileNewEntry(.authenticator(.owned(added)), under: form.siteKey) }
                 hasSeenAuthenticatorTip = true
                 if env.authenticators.suggestion?.secret == account.secret { env.authenticators.suggestion = nil }
                 resetMode()
@@ -2506,6 +2610,9 @@ final class PanelViewModel {
                 return
             }
             savedID = added.id
+            if form.siteKey != nil, let ref = env.secrets.secrets.first(where: { $0.id == added.id }) {
+                fileNewEntry(.secret(ref), under: form.siteKey)
+            }
         }
         resetMode()
         refresh()
@@ -2794,7 +2901,7 @@ final class PanelViewModel {
     // MARK: Save to folder
 
     /// True while the folder picker is up, so the panel doesn't close when it loses focus.
-    @ObservationIgnored private(set) var isChoosingFolder = false
+    @ObservationIgnored var isChoosingFolder = false
     /// Set by the controller: makes the panel key again (after the folder picker).
     @ObservationIgnored var onRefocus: () -> Void = {}
 
@@ -2875,7 +2982,8 @@ final class PanelViewModel {
     /// of a multi-file item. Text, links and colours (a selection from another app too) are
     /// written to temporary files.
     func quickLookURLs() -> [URL] {
-        quickLookFiles.urls(for: quickLookEntries) { self.pickedFileURLs(for: $0) ?? $0.fileURLs }
+        if let quickLookOverride { return quickLookOverride }
+        return quickLookFiles.urls(for: quickLookEntries) { self.pickedFileURLs(for: $0) ?? $0.fileURLs }
     }
 
     /// ⌘Y: opens Quick Look on the selection, or closes it.
@@ -3080,7 +3188,9 @@ final class PanelViewModel {
         guard let entry = selectedEntry else { return [] }
         if let item = entry.authenticator {
             return PanelAction.authenticatorActions(for: item, signedIn: env.sync.isSignedIn, shareCount: shareCount(of: item))
+                + (isAuthView ? [.editSite] : [])
         }
+        if case .emailCode = entry, isAuthView { return [.paste, .copy, .editSite] }
         if entry.isSuggestion { return [] }
         if case .folder(let folder) = entry {
             var actions: [PanelAction] = [.openFolder, .renameFolder]
@@ -3131,6 +3241,7 @@ final class PanelViewModel {
             actions += savedActions(for: [], secrets: [ref])
             if canShareToGroup && !shareGroups(for: ref).isEmpty { actions.append(.shareToGroup) }
             if canSendToContact(ref) { actions += contactSendActions(excludingSpace: ref.spaceID) }
+            if isAuthView { actions.append(.editSite) }
         }
         if let target = entry.slotTarget, let slot = env.slots.slot(for: target) {
             actions.append(.clearSlot(slot))
@@ -3262,11 +3373,14 @@ final class PanelViewModel {
                 pasteCode(of: item)
             case .copy: copyCode(of: item)
             case .authenticator(let action): perform(action, on: item)
+            case .editSite: openOriginPage(for: entry)
             default: break
             }
             return
         }
         switch action {
+        case .editSite:
+            openOriginPage(for: entry)
         case .paste:
             activate(entry)
         case .pastePlain:
@@ -3854,6 +3968,7 @@ final class PanelViewModel {
         case .browse: handleBrowseKey(event)
         case .actions: handleActionKey(event)
         case .snippetForm, .saveSecret, .label, .editSecret, .folderName, .authenticatorForm, .cardForm: handleFormKey(event)
+        case .originPage: handleOriginPageKey(event)
         case .shareToGroup: handleShareKey(event)
         case .ai: handleAIKey(event)
         case .authenticatorPeople: handlePeopleKey(event)
@@ -4055,6 +4170,22 @@ final class PanelViewModel {
             guard flags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "k" else { return false }
             mode = .browse
         }
+        return true
+    }
+
+    /// The page's fields take every key; esc closes the page.
+    private func handleOriginPageKey(_ event: NSEvent) -> Bool {
+        guard event.keyCode == KeyCode.escape else { return false }
+        if let page = originPage, page.confirmingDelete || page.mergeTarget != nil || page.confirmingDocumentID != nil
+            || page.confirmingEntryID != nil || page.editingNoteID != nil {
+            page.confirmingDelete = false
+            page.mergeTarget = nil
+            page.confirmingDocumentID = nil
+            page.confirmingEntryID = nil
+            page.editingNoteID = nil
+            return true
+        }
+        closeOriginPage()
         return true
     }
 
