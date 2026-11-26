@@ -166,6 +166,7 @@ final class AppEnvironment {
         restoreSendToGroupDefault()
         sync.onSessionChange = { [weak self] active in self?.setSendToGroupShortcut(active: active) }
         sync.onItemSentHere = { device in HUD.show("Sent from \(device)", symbol: "arrow.down.circle.fill") }
+        sync.onSecurityAlert = { [weak self] text in self?.notifications.postSecurityAlert(text) }
         // System notifications; the HUD bubbles for contacts only when they're off or not allowed.
         notifications.poster = SystemNotifier { [weak self] target in self?.open(target) }
         notifications.showing = { [weak self] in

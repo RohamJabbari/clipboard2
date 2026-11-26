@@ -12,7 +12,13 @@ struct SyncSettingsView: View {
             SyncMessages(sync: sync)
             switch sync.state {
             case .signedOut:
-                SyncSignInSection(sync: sync)
+                if let progress = sync.deviceLogin {
+                    DeviceLoginWaitingSection(sync: sync, progress: progress)
+                } else if let progress = sync.recovery {
+                    RecoveryWaitingSection(sync: sync, progress: progress)
+                } else {
+                    SyncSignInSection(sync: sync)
+                }
             case .working(let text):
                 Section {
                     HStack(spacing: 8) {
@@ -23,12 +29,14 @@ struct SyncSettingsView: View {
             case .needsPassword(let email):
                 NeedsPasswordSection(sync: sync, email: email)
             case .signedIn(let email):
+                SecurityAlertsSection(sync: sync)
                 SyncStatusSection(sync: sync, email: email)
                 NotificationsSection()
                 SyncGroupsSection(sync: sync)
                 GroupSafetySection()
                 SyncContactsSection(sync: sync)
                 SyncDevicesSection(sync: sync)
+                RecoverySection(sync: sync)
                 InviteSomeoneSection(sync: sync)
                 SyncAccountSection(sync: sync)
             }
@@ -75,6 +83,10 @@ private struct LostPasswordWarning: View {
 
 private struct SyncSignInSection: View {
     let sync: SyncAccount
+    private enum Mode: Hashable { case create, signIn, recover }
+    @State private var mode: Mode = .create
+    /// Password accounts are still there for Windows; passwordless is the default on the Mac.
+    @State private var usePassword = false
     @State private var creating = true
     @State private var email = ""
     @State private var username = ""
@@ -100,12 +112,47 @@ private struct SyncSignInSection: View {
 
     var body: some View {
         Section {
-            Picker("Account", selection: $creating) {
-                Text("Create Account").tag(true)
-                Text("Sign In").tag(false)
+            Picker("Account", selection: Binding(get: { mode }, set: {
+                mode = $0
+                creating = $0 == .create
+            })) {
+                Text("Create Account").tag(Mode.create)
+                Text("Sign In").tag(Mode.signIn)
+                Text("Recover").tag(Mode.recover)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
+            if mode != .recover {
+                Toggle(mode == .create ? "Use a password instead (needed for Windows)" : "Sign in with my password", isOn: $usePassword)
+            }
+            if mode == .recover {
+                DeviceSignInForm(sync: sync, recovering: true)
+            } else if !usePassword {
+                if mode == .create {
+                    PasswordlessCreateForm(sync: sync)
+                } else {
+                    DeviceSignInForm(sync: sync)
+                }
+            } else {
+                passwordFields
+            }
+        } header: {
+            Text("Sync")
+        } footer: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Keeps recent history (newest 200 items), saved items, snippets and secrets in step across your Macs and PCs, and shares items with groups. Everything is encrypted on this Mac before upload — the server can't read it. New accounts need an invite code: a sign-up code, or a group's invite code (you join that group right away).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if creating {
+                    PrivacyNoticeLink()
+                }
+            }
+        }
+        .onChange(of: mode) { sync.clearMessages() }
+    }
+
+    @ViewBuilder
+    private var passwordFields: some View {
             if creating {
                 TextField("Invite code", text: $inviteCode, prompt: Text("From someone who uses Sync"))
                     .font(.body.monospaced())
@@ -134,19 +181,6 @@ private struct SyncSignInSection: View {
                     .keyboardShortcut(.defaultAction)
                     .disabled(problem != nil)
             }
-        } header: {
-            Text("Sync")
-        } footer: {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Keeps recent history (newest 200 items), saved items, snippets and secrets in step across your Macs and PCs, and shares items with groups. Everything is encrypted on this Mac before upload — the server can't read it. New accounts need an invite code: a sign-up code, or a group's invite code (you join that group right away).")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if creating {
-                    PrivacyNoticeLink()
-                }
-            }
-        }
-        .onChange(of: creating) { sync.clearMessages() }
     }
 
     private func submit() {
@@ -926,6 +960,7 @@ private struct SyncDevicesSection: View {
                     Button("Sign Out…") { confirming = device }
                 }
                 .accessibilityElement(children: .combine)
+                DeviceWindowRow(sync: sync, device: device)
             }
             if let error {
                 Text(error).font(.caption).foregroundStyle(.orange)
@@ -1050,11 +1085,14 @@ private struct SyncAccountSection: View {
 
     var body: some View {
         Section {
+            PasswordlessAccountRows(sync: sync)
             HStack {
-                Button("Change Password…") { changingPassword = true }
+                if sync.accountHasPassword != false {
+                    Button("Change Password…") { changingPassword = true }
+                }
                 Spacer()
                 Button("Sign Out…") { confirmSignOut = true }
-                Button("Delete Account…", role: .destructive) { deleting = true }
+                if sync.accountHasPassword != false { Button("Delete Account…", role: .destructive) { deleting = true } }
             }
         } header: {
             Text("Account")

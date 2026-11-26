@@ -109,6 +109,21 @@ nonisolated struct OAuthEndpoints: Equatable, Sendable {
             nil
         }
     }
+
+    static let gmailReadOnly = "https://www.googleapis.com/auth/gmail.readonly"
+
+    /// Continue with Google (docs/features/passwordless.md): `openid email` for the ID token that
+    /// verifies the address, plus Gmail read-only when offered. Google shows a checkbox per scope
+    /// (granular consent), so the user may decline Gmail and still sign in; `include_granted_scopes`
+    /// keeps scopes granted earlier (incremental auth).
+    static func googleIdentity(offerGmail: Bool) -> OAuthEndpoints {
+        OAuthEndpoints(authorize: URL(string: "https://accounts.google.com/o/oauth2/v2/auth")!,
+                       token: URL(string: "https://oauth2.googleapis.com/token")!,
+                       scopes: ["openid", "email"] + (offerGmail ? [gmailReadOnly] : []),
+                       redirectHost: "127.0.0.1",
+                       extraAuthorizeParameters: [("access_type", "offline"), ("prompt", "consent"),
+                                                  ("include_granted_scopes", "true")])
+    }
 }
 
 // MARK: - PKCE and requests
@@ -226,6 +241,8 @@ nonisolated struct TokenResponse: Decodable, Sendable {
     var refresh_token: String?
     var expires_in: Double?
     var id_token: String?
+    /// The scopes actually granted, space-separated (Google: what the user ticked).
+    var scope: String?
     var error: String?
     var error_description: String?
 }
@@ -300,10 +317,15 @@ final class OAuthSignIn: NSObject, ASWebAuthenticationPresentationContextProvidi
     struct Result {
         var tokens: OAuthTokens
         var email: String?
+        /// The raw ID token (Continue with Google sends it to the sync server to verify the email).
+        var idToken: String? = nil
+        var grantedScopes: Set<String> = []
     }
 
-    func run(_ provider: EmailProvider, clients: OAuthClients, loginHint: String? = nil) async throws -> Result {
-        guard let endpoints = OAuthEndpoints.of(provider), !clients.clientID(for: provider).isEmpty else {
+    /// `endpoints` overrides the provider's (Continue with Google asks for other scopes).
+    func run(_ provider: EmailProvider, clients: OAuthClients, loginHint: String? = nil,
+             endpoints override: OAuthEndpoints? = nil) async throws -> Result {
+        guard let endpoints = override ?? OAuthEndpoints.of(provider), !clients.clientID(for: provider).isEmpty else {
             throw OAuthError.notConfigured
         }
         let clientID = clients.clientID(for: provider)
@@ -347,7 +369,9 @@ final class OAuthSignIn: NSObject, ASWebAuthenticationPresentationContextProvidi
                                                  code: code, redirectURI: redirect, verifier: verifier)
         let (data, response) = try await EmailHTTP.session.data(for: request)
         let (tokens, idToken) = try OAuthTokenClient.tokens(from: data, status: (response as? HTTPURLResponse)?.statusCode ?? 0)
-        return Result(tokens: tokens, email: idToken.flatMap(OAuthRequests.email(fromIDToken:)))
+        let granted = (try? JSONDecoder().decode(TokenResponse.self, from: data))?.scope ?? endpoints.scopes.joined(separator: " ")
+        return Result(tokens: tokens, email: idToken.flatMap(OAuthRequests.email(fromIDToken:)), idToken: idToken,
+                      grantedScopes: Set(granted.split(separator: " ").map(String.init)))
     }
 
     nonisolated func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
