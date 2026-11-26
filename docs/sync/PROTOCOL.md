@@ -129,11 +129,19 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
 {"v":1,"type":"snippet","name":"…","keyword":"…","body":"…","createdAt":0,"updatedAt":0}
 // type "secret"
 {"v":1,"type":"secret","name":"…","value":"…","createdAt":0,"folder":"<folder item id>",
- "username":"me@example.com","urls":["https://accounts.google.com","youtube.com"],"notes":"…"}
+ "username":"me@example.com","urls":["https://accounts.google.com","youtube.com"],"notes":"…",
+ "origin":"<origin item id>"}
 // type "otp" (category "otp", only in authenticator spaces; never sent to anyone but the owner)
 {"v":1,"type":"otp","issuer":"GitHub","account":"me@example.com","secret":"<base32, no padding>",
  "algorithm":"SHA1|SHA256|SHA512","digits":6,"period":30,"createdAt":0,"updatedAt":0,
- "urls":["github.com"]}
+ "urls":["github.com"],"origin":"<origin item id>"}
+// type "origin" (category "origin", only in the personal space)
+{"v":1,"type":"origin","name":"Google","domains":["google.com","accounts.google.com"],
+ "icon":"favicon:<host>|letter|symbol:<SF Symbol>|emoji:<text>",
+ "notes":[{"id":"<uuid>","text":"…","createdAt":0,"updatedAt":0}],
+ "documents":[{"id":"<blob uuid>","name":"Contract.pdf","size":0,"addedAt":0}],
+ "entries":["shared:<authenticator space id>","secret:<secret item id>"],
+ "createdAt":0,"updatedAt":0}
 ```
 
 - **Passwords (1.11+):** a password is a `secret` with a site or a username. All three fields are optional and omitted when empty, so plain secrets keep their bytes and fingerprints:
@@ -141,6 +149,7 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
   - `urls`: the sites, as typed or imported (a full URL or a bare host), trimmed, empty ones and case-insensitive duplicates dropped, order kept. The first one picks the password's source in Auth (its registrable domain).
   - `notes`: free text.
 - **Authenticator sites (1.11+):** `urls` on `otp`, same rules; set with Edit → Website. Optional, omitted when empty.
+- **Origins (1.13+, Mac):** see [Origins](#origins). `origin` on `secret` and `otp` is the lowercase id of the `origin` item the entry is filed under; omitted when unset, so other payloads keep their bytes and fingerprints.
 - These fields are content: they're part of the fingerprint like every other field.
 - **Unknown fields:** readers ignore them, but a client that rewrites a payload must keep the fields it doesn't know. Clients up to 1.10 (Mac) and 1.10.1 (Windows) rebuild the payload from the fields they know, so editing a password there wipes its `username`, `urls` and `notes` (and an authenticator's `urls`).
   - **Windows ≥ 1.10.2 preserves unknown fields** of every payload type (`clip`, `folder`, `snippet`, `secret`, `otp`): every top-level field it doesn't write itself (except the per-write `rev`, `toDevice`, `fromDevice`) is kept with the item — a secret's in Credential Manager next to its value, an authenticator's in its protected entry, the rest in the local database — and merged back into every payload it pushes. An unchanged item renders to the same canonical JSON (and fingerprint) as received, so it's never pushed back. Secrets and authenticators synced by an older Windows lost theirs on the way in; on upgrade they're applied once more from the server, which restores them without a push.
@@ -157,6 +166,7 @@ The plaintext inside `item` is one compact JSON object. Readers ignore unknown f
 | `secret` | secret | `createdAt` |
 | `folder` | folder | `createdAt` |
 | `otp` | otp | `createdAt` |
+| `origin` | origin | `createdAt` |
 
 Pinning or unpinning changes the category, and the category is part of the AAD, so the client re-encrypts and `PUT`s again.
 
@@ -165,6 +175,23 @@ Pinning or unpinning changes the category, and the category is part of the AAD, 
 - A `folder` id the reader doesn't have (deleted, or not pulled yet) means the clip sits at the root of Saved.
 - Deleting a folder deletes only the folder: each member's client moves its clips to the root lazily (they already read as root, above), and the device that deleted it re-pushes its clips without `folder`.
 - Clients before 1.6 skip the `folder` category and drop the unknown `folder` field when they re-push a clip, which moves it to the root.
+
+### Origins
+
+An **origin** is a site in Auth edited by hand (docs/features/auth-autofill.md → Origins): a name, its
+websites, an icon, notes and documents. Mac 1.13+ only; Windows doesn't show them yet.
+
+- **Where:** category `origin`, in the **personal space only**. The server refuses it elsewhere (`400 invalid`), and older servers refuse the category altogether (`400 invalid`): the client keeps the origin locally and retries once it changes, like any refused item.
+- **Fields:** `name` (may be empty when `domains` isn't); `domains`: sites as typed (hosts or URLs), trimmed, empty ones and case-insensitive duplicates dropped; every registrable domain among them is the origin's. `icon`: omitted means the first domain's favicon. `notes`: free text, in order. `entries`: see below. Empty arrays and a default icon are omitted.
+- **Documents:** each `documents[i].id` is also the id of an encrypted blob of the item (`blob = AEAD(itemKey, bytes, "c2/blob/v1/" + spaceId + "/" + id)`, like a clip's files), and the item's `blobIds` lists exactly those ids. At most 12 per origin (the `blobIds` limit), each at most 95 MB plaintext. A document is never re-pointed: moving one to another origin (a merge) gives it a new id and uploads it again, so deleting the old origin (which deletes its blobs) can't take it away. Readers download each blob they don't have before applying the item; one the server no longer has (`404`) is dropped from the list.
+- **Filing entries under an origin**, first match wins:
+  1. the entry's own `origin` (on `secret` and `otp`), when that origin exists;
+  2. an origin whose `entries` lists it: `shared:<space id>` for an authenticator shared with you, `secret:<id>` for someone else's secret in a group (entries you can't rewrite);
+  3. an origin claiming one of the entry's sites' registrable domains (several origins claiming one: the oldest by `createdAt`, then id);
+  4. for an authenticator grouped by its issuer, an origin with that name (case-insensitive, trimmed);
+  5. otherwise automatic grouping by site, as before.
+  An `origin` naming an origin this device doesn't have (deleted, not synced yet, or someone else's in a group) is ignored.
+- **Older clients:** they skip the unknown category (Mac ≤ 1.12 and Windows ignore items whose type they don't know, and never record them, so they never delete them). `origin` on `secret`/`otp` is an unknown field to them: Windows ≥ 1.10.2 keeps it; Mac ≤ 1.12 drops it when it rewrites the entry (an edit there), after which the entry is filed by its domains again (rules 3–5).
 
 ## API
 
@@ -469,12 +496,12 @@ idle, each a few milliseconds of database time.
 - The writer becomes the item's `authorUid`.
 
 ```jsonc
-Item = {"id","category":"history|pinned|snippet|secret|folder|otp","seq","sortAt","updatedAt",
+Item = {"id","category":"history|pinned|snippet|secret|folder|otp|origin","seq","sortAt","updatedAt",
         "deleted":null|"user"|"trimmed","ciphertext":null|"<b64>","blobIds":[],"authorUid"}
 ```
 
 **Retention:**
-- `pinned`, `snippet`, `secret`, `folder` and `otp` items stay until deleted.
+- `pinned`, `snippet`, `secret`, `folder`, `otp` and `origin` items stay until deleted.
 - After any `history` upsert, the server keeps the newest **200** `history` items in that space by `sortAt`, ties broken by `id`. All others become `trimmed` tombstones, their blobs are deleted, and the `PUT` response lists them.
 - Tombstones are kept for **90 days**. A `since` older than the space's purge horizon returns `{resetRequired: true}`, and the client re-syncs from `since=0`. While re-walking from 0, the client sends `full=1` so pages below the horizon don't ask for another reset.
 
@@ -529,7 +556,7 @@ Item = {"id","category":"history|pinned|snippet|secret|folder|otp","seq","sortAt
 Request logs record method, URL and status only: no IPs or emails. Members see each other's
 username or email local part (`name`), never the email.
 
-**Never visible to the server:** the password, `wrapKey`, invite codes, item contents, group names, snippet and secret names and values, and every key except public keys.
+**Never visible to the server:** the password, `wrapKey`, invite codes, item contents, group names, snippet and secret names and values, origins' names, sites, notes and documents, and every key except public keys.
 
 ## Client sync rules
 
