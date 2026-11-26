@@ -297,7 +297,7 @@ final class AppEnvironment {
         AutoFillIdentities.checkEnabled()   // re-registers once it's turned on in System Settings
         guard storeOpenError == nil else { return }
         store.enforceRetention(maxItems: prefs.maxItems, maxAge: prefs.maxAge)
-        // Sync polls on its own cadence (3 s / 15 s / 60 s).
+        // Sync polls on its own cadence (heads every 2 s / 10 s; see SyncConfig).
         if maintenanceRuns > 0 { imageText.scheduleBacklog() }   // older images; not during launch
         maintenanceRuns &+= 1
         if maintenanceRuns % 30 == 1 {   // directory scans: every ~30 min
