@@ -583,32 +583,15 @@ struct SecretsSettingsView: View {
     @State private var editValue = ""
     @State private var confirmDelete: SecretRef?
     @State private var revealed: [String: String] = [:]
-    /// The last import's one-line result (or why it failed).
-    @State private var importResult: String?
 
     var body: some View {
         @Bindable var prefs = env.prefs
         Form {
             AutoFillSettingsSection()
 
-            Section {
-                HStack {
-                    Text("Passwords from Apple Passwords, Chrome or 1Password (a CSV export).")
-                    Spacer()
-                    Button("Import CSV…") { importCSV() }
-                }
-                if let importResult {
-                    Text(importResult)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-            } header: {
-                Text("Import")
-            } footer: {
-                Text("The file is read once and not kept. Delete the export afterwards: it isn't encrypted.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            SavingPasswordsSection()
+
+            PasswordImportSection(center: env.passwordImport)
 
             EmailAccountsSection()
 
@@ -733,24 +716,6 @@ struct SecretsSettingsView: View {
             }
         } message: {
             Text("The value is removed from your Keychain.")
-        }
-    }
-
-    private func importCSV() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.commaSeparatedText, .plainText]
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Import"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        // Read once into memory; nothing is copied or remembered.
-        guard let data = try? Data(contentsOf: url),
-              let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else {
-            importResult = "Couldn't read that file."
-            return
-        }
-        switch PasswordImporter.run(text, into: env.secrets, authenticators: env.authenticators) {
-        case .success(let summary): importResult = summary.line
-        case .failure(let problem): importResult = problem.message
         }
     }
 }

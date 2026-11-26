@@ -128,6 +128,10 @@ extension AppEnvironment {
             let focused = target.map { FieldAX.focusedFieldKind(pid: $0.processIdentifier) } ?? .unknown
             let steps = FillPlanner.plan(.password(username: ref.username, password: value), focused: focused)
             await FieldFiller(paste: paste, clearAfter: prefs.secretClearSeconds).run(steps, into: target)
+            // Saved already: a paste of the same value right after doesn't offer to save it.
+            if let target, let field = FieldAX.focusedElement(pid: target.processIdentifier), FieldAX.isSecure(field) {
+                loginSaver.filled(value, field: field, in: target)
+            }
         }
     }
 
@@ -167,6 +171,7 @@ extension AppEnvironment {
             let context = PasswordFieldContext(site: site, username: FieldAX.usernameAbove(field))
             let filler = LivePasswordFieldFiller(filler: FieldFiller(paste: paste), field: field, target: target)
             let result = await StrongPasswordFlow.run(password: password, context: context, filler: filler, saver: secrets)
+            if result.saved != nil { loginSaver.filled(password, field: field, in: target) }
             if result.saved == nil {
                 HUD.show(result.notice, symbol: "exclamationmark.triangle.fill")
                 return
