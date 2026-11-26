@@ -99,6 +99,7 @@ struct QuickPanelView: View {
         .onChange(of: env.authenticators.suggestion) { model.refresh() }
         .onChange(of: env.snippets.revision) { model.refresh() }
         .onChange(of: env.secrets.revision) { model.refresh() }
+        .onChange(of: env.emailCodes.revision) { model.refresh() }
     }
 
     private var listWidth: CGFloat {
@@ -236,6 +237,14 @@ struct QuickPanelView: View {
                                         .id(entry.id)
                                         .onTapGesture { tap(entry) }
                                         .contextMenu { authenticatorContextMenu(item) }
+                                } else if case .emailCode(let code, _) = entry {
+                                    EmailCodeRow(code: code, isSelected: model.isSelected(entry))
+                                        .id(entry.id)
+                                        .onTapGesture { tap(entry) }
+                                        .contextMenu {
+                                            Button("Paste Code") { model.pasteEmailCode(code) }
+                                            Button("Copy Code") { model.copyEmailCode(code) }
+                                        }
                                 } else if case .authenticatorSuggestion(let account) = entry {
                                     AuthenticatorSuggestionRow(account: account, isSelected: model.isSelected(entry))
                                         .id(entry.id)
@@ -589,6 +598,9 @@ struct QuickPanelView: View {
                     .id(item.id)
             } else if case .authenticatorSuggestion(let account) = model.selectedEntry {
                 AuthenticatorSuggestionPreview(account: account, model: model)
+            } else if case .emailCode(let code, _) = model.selectedEntry {
+                EmailCodePreview(code: code, model: model)
+                    .id(code.id)
             } else if let entry = model.selectedEntry {
                 PreviewPane(entry: entry, sharing: sharing(for: entry), onEditSecret: model.beginEditSecret,
                             onPasteText: model.pasteText, onSaveAsSecret: model.beginSaveSecret, model: model)
@@ -1027,7 +1039,7 @@ struct PanelRow: View {
         case .snippet: .snippet
         case .secret: .secret
         case .folder: .folder
-        case .authenticator, .authenticatorSuggestion: .authenticator
+        case .authenticator, .authenticatorSuggestion, .emailCode: .authenticator
         }
     }
 
@@ -1048,6 +1060,7 @@ struct PanelRow: View {
         case .folder(let folder): return folder.name
         case .authenticator(let item): return item.title
         case .authenticatorSuggestion: return "Add to Authenticator"
+        case .emailCode(let code, _): return code.code
         }
     }
 
@@ -1111,6 +1124,7 @@ struct PanelRow: View {
             return FolderCaption.text(folders: subfolderCount, items: folderCount)
         case .authenticator(let item): return item.subtitle
         case .authenticatorSuggestion(let account): return account.issuer
+        case .emailCode(let code, _): return code.source
         }
     }
 
@@ -1130,6 +1144,7 @@ struct PanelRow: View {
                 + ", " + FolderCaption.text(folders: subfolderCount, items: folderCount)
         case .authenticator(let item): return "Authenticator \(item.title)"
         case .authenticatorSuggestion: return "Add to Authenticator"
+        case .emailCode(let code, _): return "Email code from \(code.source)"
         }
     }
 }

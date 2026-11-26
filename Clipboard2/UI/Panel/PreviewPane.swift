@@ -72,7 +72,7 @@ struct PreviewPane: View {
             } else {
                 SecretPreviewView(ref: ref, onEdit: onEditSecret.map { edit in { edit(ref) } })
             }
-        case .folder, .authenticator, .authenticatorSuggestion:
+        case .folder, .authenticator, .authenticatorSuggestion, .emailCode:
             EmptyView()   // these have their own previews (FolderPreview, AuthenticatorPreview)
         }
     }
@@ -165,6 +165,8 @@ struct PreviewPane: View {
                 row("Authenticator", item.title)
             case .authenticatorSuggestion:
                 row("Authenticator", "Not added yet")
+            case .emailCode(let code, _):
+                row("Email code", code.source)
             }
         }
         .font(.caption)

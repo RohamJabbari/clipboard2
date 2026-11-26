@@ -608,6 +608,8 @@ struct SecretsSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            EmailAccountsSection()
+
             Section {
                 if env.secrets.secrets.isEmpty {
                     Text("No secrets yet. Add one below, or select a copied password in the quick panel and press ⌘K → Save as Secret.")
