@@ -5,7 +5,7 @@ DERIVED    := build
 RELEASE_APP := $(DERIVED)/Build/Products/Release/$(APP_NAME).app
 INSTALL_DIR := /Applications
 
-.PHONY: all generate build debug test install run icon pkg release windows-test windows-release server-test server-deploy clean
+.PHONY: all generate build debug test install run icon pkg release ios-build ios-test windows-test windows-release server-test server-deploy clean
 
 # Sign with Developer ID when that certificate exists, so local installs and the .pkg share one
 # signature (Accessibility/Keychain grants are tied to it). Otherwise Apple Development.
@@ -55,6 +55,19 @@ pkg:
 release:
 	@test -n "$(VERSION)" || (echo "usage: make release VERSION=x.y.z" && exit 1)
 	scripts/release.sh $(VERSION)
+
+# iOS app (docs/features/ios.md): Simulator builds and tests, Apple Development signing (no profile
+# needed for the Simulator). `make ios-test IOS_SIM="iPhone 17 Pro"` picks another simulator.
+IOS_SCHEME := $(APP_NAME) iOS
+IOS_SIM ?= iPhone 17
+
+ios-build: generate
+	xcodebuild -project $(PROJECT) -scheme "$(IOS_SCHEME)" -configuration Debug \
+		-derivedDataPath $(DERIVED) -destination 'generic/platform=iOS Simulator' build -quiet
+
+ios-test: generate
+	xcodebuild -project $(PROJECT) -scheme "$(IOS_SCHEME)" -configuration Debug \
+		-derivedDataPath $(DERIVED) -destination 'platform=iOS Simulator,name=$(IOS_SIM)' test -quiet
 
 # Windows version: tests run locally with .NET 10; the installer is built on GitHub's Windows servers.
 windows-test:
