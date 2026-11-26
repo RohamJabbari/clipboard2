@@ -29,12 +29,16 @@ nonisolated enum UpdatePolicy: String, CaseIterable, Identifiable, Sendable {
 /// bar menu, the quick panel's footer and Settings show inline:
 /// - Automatic (default): updates download in the background and install when the app quits;
 ///   "Restart to Update" applies one right away.
-/// - Notify: "Update available" in the menu; clicking it downloads and relaunches.
+/// - Notify: "Update available" in the menu and the panel footer; clicking it downloads, then
+///   "Restart to Update" asks before relaunching.
 /// - Check Now reports "Up to date", progress, or "Restart to Update" in place.
+/// Besides Sparkle's hourly schedule, quiet probes (`checkForUpdateInformation`, no UI) run at
+/// launch, hourly, and when the quick panel opens (at most every 2 minutes) so a new version shows
+/// up quickly; they read the appcast pinned to its latest commit (see `PinnedFeed`).
 /// Every update is still verified (EdDSA signature + Apple notarization) by Sparkle.
 @Observable
 final class UpdateController: NSObject, SPUUpdaterDelegate, SPUUserDriver {
-    enum Phase: Equatable {
+    nonisolated enum Phase: Equatable, Sendable {
         case idle
         case checking
         case upToDate
@@ -61,6 +65,14 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, SPUUserDriver {
     @ObservationIgnored private var receivedBytes: UInt64 = 0
     @ObservationIgnored private var userInitiated = false
     @ObservationIgnored private var offeredVersion: String?
+    @ObservationIgnored private var throttle = UpdateCheckThrottle()
+    /// When the running probe started; one that never reported back stops counting after a minute.
+    @ObservationIgnored private var probeStarted: Date?
+    private var probing: Bool { probeStarted.map { Date.now.timeIntervalSince($0) < 60 } ?? false }
+    @ObservationIgnored private var probeFound: (version: String, infoOnly: Bool)?
+    @ObservationIgnored private var hourly: Timer?
+    @ObservationIgnored private lazy var feed = FeedResolver(
+        feedURL: (Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String).flatMap(URL.init(string:)))
 
     func start() {
         guard updater == nil else { return }
@@ -73,6 +85,56 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, SPUUserDriver {
         self.updater = updater
         policy = Self.policy(checks: updater.automaticallyChecksForUpdates, downloads: updater.automaticallyDownloadsUpdates)
         lastCheck = updater.lastUpdateCheckDate
+        // At launch (once the app has settled), then hourly; each only sets the indicator.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.probe() }
+        hourly = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.probe(ignoringThrottle: true) }
+        }
+    }
+
+    /// The quick panel opened: look for a new version, at most once every 2 minutes.
+    func panelDidOpen() {
+        probe()
+    }
+
+    /// What the quick panel footer shows.
+    var indicator: UpdateIndicator { UpdateIndicator(phase) }
+
+    /// A silent look at the appcast: sets the indicator (and "Up to date" in Settings), never a window.
+    private func probe(ignoringThrottle: Bool = false) {
+        guard policy != .off, let updater, !updater.sessionInProgress, !probing else { return }
+        switch phase {
+        case .idle, .upToDate, .failed, .available: break
+        case .checking, .downloading, .preparing, .ready, .installing: return
+        }
+        guard ignoringThrottle || throttle.isDue() else { return }
+        throttle.record()
+        probeStarted = .now
+        Task {
+            await feed.resolve()
+            guard !updater.sessionInProgress else {
+                probeStarted = nil
+                return
+            }
+            probeFound = nil
+            updater.checkForUpdateInformation()
+        }
+    }
+
+    /// Runs a real (user-initiated) check against a freshly resolved feed.
+    private func checkNow(_ updater: SPUUpdater) {
+        throttle.record()
+        Task {
+            await feed.resolve()
+            guard updater.canCheckForUpdates else {
+                switch phase {
+                case .checking, .downloading: phase = .idle
+                default: break
+                }
+                return
+            }
+            updater.checkForUpdates()
+        }
     }
 
     private static func policy(checks: Bool, downloads: Bool) -> UpdatePolicy {
@@ -108,13 +170,15 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, SPUUserDriver {
     func checkForUpdates() {
         guard let updater else { return }
         if readyVersion != nil || availableVersion != nil { return }
-        guard updater.canCheckForUpdates else { return }
+        guard updater.canCheckForUpdates, !probing else { return }
         userInitiated = true
-        updater.checkForUpdates()
+        phase = .checking
+        checkNow(updater)
     }
 
-    /// Restart to Update / Install: applies a downloaded update (relaunching), or downloads one that
-    /// was only announced and relaunches when it's ready.
+    /// Restart to Update / Update available: applies a downloaded update (relaunching), or downloads
+    /// one that was only announced. After that download, "Install automatically" relaunches right
+    /// away; "Tell me" shows "Restart to Update" and waits for the click.
     func installNow() {
         if case .available(_, true) = phase {
             NSWorkspace.shared.open(releaseNotesURL)
@@ -127,24 +191,72 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, SPUUserDriver {
         }
         if let pendingChoice {
             self.pendingChoice = nil
-            installWhenReady = true
-            phase = readyVersion != nil ? .installing : .downloading(fraction: nil)
+            let downloaded = readyVersion != nil
+            installWhenReady = downloaded || policy == .automatic
+            phase = downloaded ? .installing : .downloading(fraction: nil)
             pendingChoice(.install)
+            return
+        }
+        if availableVersion != nil, let updater, !updater.sessionInProgress, !probing {
+            // Found by a quiet probe: run the real check, which downloads it.
+            installWhenReady = policy == .automatic
+            userInitiated = true
+            phase = .downloading(fraction: nil)
+            checkNow(updater)
         }
     }
 
     // MARK: SPUUpdaterDelegate
 
+    func feedURLString(for updater: SPUUpdater) -> String? {
+        feed.feedURLString()
+    }
+
+    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        guard probing else { return }
+        offer(item)
+        probeFound = (item.displayVersionString, item.isInformationOnlyUpdate)
+    }
+
     func updater(_ updater: SPUUpdater, willInstallUpdateOnQuit item: SUAppcastItem, immediateInstallationBlock immediateInstallHandler: @escaping () -> Void) -> Bool {
         // Downloaded in the background (Automatic). It installs on quit anyway; offer it now too.
         offer(item)
         immediateInstall = immediateInstallHandler
+        if installWhenReady {
+            // "Update available" was clicked while it downloaded quietly.
+            installWhenReady = false
+            phase = .installing
+            immediateInstallHandler()
+            return true
+        }
         phase = .ready(version: item.displayVersionString)
         return true
     }
 
     func updater(_ updater: SPUUpdater, didFinishUpdateCycleFor updateCheck: SPUUpdateCheck, error: (any Error)?) {
         lastCheck = updater.lastUpdateCheckDate ?? lastCheck
+        if updateCheck == .updateInformation {
+            probeStarted = nil
+            let found = probeFound
+            probeFound = nil
+            // "No update" also ends with an error (SUNoUpdateError); real failures stay silent.
+            let noUpdate = (error as NSError?).map { $0.domain == SUSparkleErrorDomain && $0.code == Int(SUError.noUpdateError.rawValue) } ?? true
+            guard found != nil || noUpdate else {
+                Log.updates.notice("Update probe failed: \(error?.localizedDescription ?? "", privacy: .public)")
+                return
+            }
+            lastCheck = .now
+            phase = phase.afterProbe(found: found)
+            if let found, !found.infoOnly, policy == .automatic {
+                // Install automatically: fetch it quietly now, then "Restart to Update".
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, !updater.sessionInProgress, case .available = self.phase else { return }
+                    self.phase = .downloading(fraction: nil)
+                    updater.checkForUpdatesInBackground()
+                }
+            }
+            return
+        }
         if let error { Log.updates.notice("Update cycle ended: \(error.localizedDescription, privacy: .public)") }
     }
 
@@ -156,6 +268,8 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, SPUUserDriver {
     }
 
     func showUserInitiatedUpdateCheck(cancellation: @escaping () -> Void) {
+        // An "Update available" click already shows the download starting.
+        if case .downloading = phase { return }
         phase = .checking
     }
 

@@ -77,7 +77,7 @@ struct QuickPanelView: View {
                     pickedFiles: model.pickedFileCount,
                     canQuickLook: model.canQuickLook,
                     canLabel: model.selectedEntry.map { $0.clip.map { model.canSave([$0]) } ?? model.canLabel($0) } ?? false,
-                    updateVersion: env.updates.readyVersion,
+                    update: env.updates.indicator,
                     syncIndicator: env.sync.indicator,
                     onUpdate: { env.updates.installNow() },
                     tip: tips.isEmpty ? nil : tips[model.tipIndex % tips.count],
@@ -1168,8 +1168,8 @@ struct HintBar: View {
     var canQuickLook = false
     /// The selection can be labelled (⌘L).
     var canLabel = false
-    /// A downloaded update waiting for a relaunch: shown quietly at the trailing end.
-    var updateVersion: String?
+    /// A new version (found, downloading, or waiting for a relaunch): one small button at the trailing end.
+    var update: UpdateIndicator = .none
     /// Sync state, shown as a dot and a few words at the trailing end while signed in.
     var syncIndicator: SyncIndicator = .hidden
     var onUpdate: () -> Void = {}
@@ -1263,14 +1263,8 @@ struct HintBar: View {
                 Text(notice)
                     .foregroundStyle(.primary)
                     .transition(.opacity)
-            } else if let updateVersion, mode == .browse {
-                Button(action: onUpdate) {
-                    Label("Restart to Update", systemImage: "arrow.down.circle")
-                        .labelStyle(.titleAndIcon)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.tint)
-                .help("Clipboard2 \(updateVersion) is ready. Relaunches in a second; your history stays.")
+            } else if update != .none, mode == .browse {
+                UpdateFooterButton(update: update, action: onUpdate)
             } else if let tip, mode == .browse, selectionCount == nil, !syncIndicator.isVisible {
                 Button(action: onNextTip) {
                     HStack(spacing: 6) {
@@ -1314,6 +1308,47 @@ struct HintBar: View {
             Text(label)
         }
         .fixedSize()
+    }
+}
+
+/// The footer's update indicator: "Update available" → "Updating…" → "Restart to Update".
+struct UpdateFooterButton: View {
+    let update: UpdateIndicator
+    let action: () -> Void
+
+    var body: some View {
+        switch update {
+        case .none:
+            EmptyView()
+        case .available(let version):
+            pill("Update available", systemImage: "arrow.down.circle")
+                .help("Clipboard2 \(version) is out. Click to update; your history stays.")
+        case .downloading:
+            HStack(spacing: 5) {
+                ProgressView().controlSize(.mini)
+                Text("Updating…")
+            }
+            .fixedSize()
+            .help("Downloading the new version")
+        case .ready(let version):
+            pill("Restart to Update", systemImage: "arrow.clockwise.circle")
+                .help("Clipboard2 \(version) is ready. Relaunches in a second; your history stays.")
+        }
+    }
+
+    private func pill(_ title: String, systemImage: String) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .labelStyle(.titleAndIcon)
+                .fontWeight(.medium)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(Color.accentColor.opacity(0.14), in: Capsule())
+                .contentShape(Capsule())
+                .fixedSize()
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.tint)
     }
 }
 

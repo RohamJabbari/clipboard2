@@ -101,6 +101,7 @@ struct UpdatesSection: View {
             Text("Checking…").foregroundStyle(.secondary)
         case .upToDate:
             Label("Up to date", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                .help(updates.lastCheck.map { "Checked \($0.formatted(.relative(presentation: .named)))" } ?? "")
         case .available(let version, _):
             Text("\(version) available").foregroundStyle(.secondary)
         case .downloading(let fraction):

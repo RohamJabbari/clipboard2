@@ -304,6 +304,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         generation &+= 1
         let gen = generation
         env.sync.setPanelOpen(true)
+        env.updates.panelDidOpen()
         env.sync.reportActivity()
 
         switch phase {
