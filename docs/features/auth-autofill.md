@@ -41,7 +41,7 @@ Build in phases; each phase ships on its own:
   - **Letters & digits:** Apple's style, `xxxxxx-xxxxxx-xxxxxx`, with one uppercase, one lowercase and one digit guaranteed.
   - **With symbols:** no hyphens, at least one uppercase, lowercase, digit and symbol. Symbols are `!#$%&*+.=?@^_~` only: no quotes, backslash, backtick or space, which commonly break sites and shells.
   - The same two options appear wherever a strong password is suggested (Suggest Strong Password, phase 2).
-- Import: CSV from Apple Passwords, Chrome or 1Password export (`url,username,password,notes`). Settings → Auth → Import…. The file is read once and never kept.
+- Import: CSV from Apple Passwords, Chrome or 1Password export (`url,username,password,notes`). Settings → Auth → Import…. The file is read once and never kept. Replaced by the guided import with a review list (see "Guided import").
 
 ### Sync and storage
 - The secret payload gets `username` (string, optional) and `urls` (string array, optional), and the authenticator payload gets `urls`. Document both in `docs/sync/PROTOCOL.md`.
@@ -157,6 +157,61 @@ Build in phases; each phase ships on its own:
   - OAuth consent screen: External; app name, support email, developer contact; scopes `openid`, `.../auth/userinfo.email`, `https://www.googleapis.com/auth/gmail.readonly` (restricted).
   - Publishing status **In production** (Testing expires refresh tokens after 7 days). Don't submit for verification: unverified, up to 100 users, each sees Google's warning once.
   - Credentials → Create OAuth client ID → **Desktop app**. Nothing to register for the redirect (loopback `http://127.0.0.1:<port>` is allowed for desktop clients). Copy Client ID and Client secret into `GoogleClientID` / `GoogleClientSecret`.
+
+## Saving logins (1.13)
+- Clipboard2 offers to save a login when it knows the password:
+  - it filled or generated it (Fill, Suggest Strong Password). Those are saved already, so no offer.
+  - the user **pasted** it into a password field (`AXSecureTextField`), with ⌘V or Clipboard2's paste. The value is read from the pasteboard at paste time, never from Accessibility.
+- When the login is submitted, and no saved password for that site and username has the same value, a toast (never a dialog) asks:
+  - **"Save password for ‹site›?"**, with the username: Save · Not now · Never for this site.
+  - **"Update password for ‹site›?"** when a password for that site and username has another value: Update · Not now.
+  - It goes after 20 s. Saving needs no Touch ID.
+- Submitted means: Return in the form, the password field losing focus to a button or the page, or the page URL / window title changing within ~10 s.
+- The username is the nearest text field above the password field (its AX value).
+- Site: the page's domain in browsers; in apps, the app (bundle id, named after the app) when there's no URL.
+- The captured value is kept only while the toast lives, then zeroed.
+- Settings → Auth → **Saving passwords**: "Offer to save passwords" (on by default) and the "Never" sites, each with a remove button.
+
+### As built (1.13)
+- Code: `Services/LoginSaving.swift` (pure: `LoginSite`, `SensitiveValue`, `SaveOfferPolicy`, `SubmitDetector`, `LoginSaveCoordinator`), `Services/LoginSaveWatcher.swift` (Accessibility, pasteboard, toast), `UI/Settings/PasswordImportSettings.swift` (`SavingPasswordsSection`). `ActionToast` takes several buttons, a detail line and an `onDismiss`. Tests: `Clipboard2Tests/LoginSavingTests.swift`.
+- **Seeing a paste.** A password field turns on Secure Event Input, which hides key presses from every other app, so the user's ⌘V can't be seen as a key there. Instead:
+  - Clipboard2's own paste calls `PasteService.willPostPaste` right before it sends ⌘V; if the focused element is a password field, the pasteboard text is captured. Exact.
+  - Any other paste: while a password field is focused, `AXValueChanged` is observed on that field. Only its **length** is read (`AXNumberOfCharacters`, else the length of the bullets browsers report as its value). A paste is a change that grows the field by exactly the clipboard text's length in one step, or replaces it with a text that long (`PasteGuess`; single-line, 4–256 characters). Then the pasteboard text is captured.
+  - A global ⌘V key monitor covers fields without Secure Event Input.
+  - If the field's length later stops fitting the captured value (typed into after the paste), the capture is dropped.
+- **Submit** (`SubmitDetector`): Return (global key monitor, so only where keys are visible); focus leaving the field for a button, link or the page (checked on the text field watcher's focus change and 350 ms after any click); not when it moves to another text field (a confirm field) or another app. While a capture is pending, the front window's title + `AXDocument` is polled every second; a change within 10 s of the field last being used counts.
+- **Decision** (`SaveOfferPolicy`, in order): turned off → nothing; filled/generated → nothing; "Never" site → nothing; any of the site's passwords holds the value → nothing; one with the same username (case-insensitive) → Update; no username known and the site has exactly one password → Update that one; the value is a saved secret's (pasted from Auth) → nothing; else Save.
+- Saved passwords match the site by domain (`SiteMatch`); for an app, a password with no sites named after the app. Save names the password after the site (or app) with the site as its only URL (apps: none).
+- **The value:** `SensitiveValue` keeps the only long-lived copy as bytes, overwritten with zeros when the offer is answered or times out, when another paste replaces it, when the field is typed into, and when nothing is submitted within 2 minutes. Swift strings made from it to compare or save are short-lived copies.
+- Password managers on the ignored-apps list, and Clipboard2 itself, are never watched. A browser page whose address can't be read gets no offer.
+- The text field watcher now runs when either the paste icon or "Offer to save passwords" is on.
+
+## Guided import (1.13)
+- Settings → Auth → **Import**: buttons for **Apple Passwords / Safari**, **Chrome** (and Arc, Brave, Edge), **Firefox**, **1Password**, **Bitwarden** and **Other CSV**.
+- Each shows its export steps in a line or two and an **Open** button for the right app or page:
+  - Passwords app: File → Export All Passwords… (macOS 14: Safari → File → Export → Passwords…)
+  - Chrome: chrome://password-manager/settings → Export passwords
+  - Firefox: about:logins → ⋯ → Export Logins…
+  - 1Password: File → Export → CSV
+  - Bitwarden: File → Export vault → .csv
+- Then it watches ~/Downloads and the Desktop for a new matching CSV for 10 minutes. The file can also be dropped on the section or picked with **Choose File…** (the system file chooser, the only window it opens).
+- Nothing is imported straight away. The export's entries show in a **review list**, inline (no dialog):
+  - each entry: site, username, the password masked (never revealed) and a status tag: **New**, **Duplicate** (same site, username and password saved already), **Changed** (same site and username, another password) or **Authenticator**
+  - a checkbox each: New, Changed and Authenticator checked; Duplicates unchecked and greyed
+  - above: a search field, **Select all / none**, a filter (All / New / Changed / Duplicates)
+  - below: **Import N** and **Cancel**
+- Only checked entries are imported; Changed ones update the saved password.
+- After Import or Cancel the CSV is moved to the **Trash**, with a line saying so and **Undo** (puts it back). The one-line result shows above it.
+- The parsed values are dropped from memory when the review closes.
+
+### As built (1.13)
+- Code: `Services/PasswordExportImport.swift` (`PasswordExportSource` with steps and file-name patterns, `ExportOpener`, `ExportFileMatcher`, `FolderChangeWatcher`, `FileTrashing`, `PasswordImportCenter`), `Services/PasswordImportReview.swift`, `UI/Settings/PasswordImportSettings.swift`. Tests: `Clipboard2Tests/GuidedImportTests.swift`.
+- **Watching:** a `DispatchSource` file-system source (write/rename/link) on each folder; a change is looked at 0.7 s later, when a download has settled. A file counts when it's a non-empty `.csv`, created at most 5 s before watching started, and its name fits the source: `Passwords*.csv` (Apple), `*Passwords*.csv` (Chromium: "Chrome Passwords.csv", "Microsoft Edge Passwords.csv"…), `logins*.csv` (Firefox), `*1Password*.csv`, `bitwarden*.csv`; Other CSV takes any CSV. The newest wins. Watching stops when a file is found, after 10 minutes, or with **Stop**. The first look into Downloads/Desktop may bring up macOS's own folder-access prompt.
+- **Open:** each installed app gets a button (Passwords and Safari; Chrome, Arc, Brave, Edge; Firefox; 1Password 8/7; Bitwarden, else its web vault). Browsers get their password page as a URL (`chrome://password-manager/settings`, `brave://…`, `edge://…`, `about:logins`).
+- **Parser additions:** Bitwarden's `login_totp` (an `otpauth://` link or a bare base32 key, named after the item) and several comma-separated URIs in `login_uri`; Firefox's columns needed nothing new (its extra columns are ignored).
+- **Statuses:** a password row is Duplicate when the same domains, username (case-insensitive) and password are saved or appeared earlier in the file; Changed when a saved password has the same domains and username. An `otpauth` setup is Authenticator, or Duplicate when the same secret and account is saved. Duplicates can't be checked; Select all / none act on the entries shown.
+- **Trash:** `FileManager.trashItem`; Undo moves the file back. A file that isn't a password export is left where it is, with the reason.
+- The flow lives in `AppEnvironment.passwordImport`, so watching and the review survive switching Settings tabs.
 
 ## Not in scope
 - Passkeys.
