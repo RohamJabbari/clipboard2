@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>clipboard2-test</string>
+	<string>clipboard2-origin</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -13,7 +13,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>clipboard2-test</string>
+	<string>clipboard2-origin</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -45,12 +45,12 @@
 			<key>NSMenuItem</key>
 			<dict>
 				<key>default</key>
-				<string>clipboard2-test Actions…</string>
+				<string>clipboard2-origin Actions…</string>
 			</dict>
 			<key>NSMessage</key>
 			<string>clippyActions</string>
 			<key>NSPortName</key>
-			<string>clipboard2-test</string>
+			<string>clipboard2-origin</string>
 			<key>NSRequiredContext</key>
 			<dict/>
 			<key>NSSendTypes</key>
@@ -68,7 +68,7 @@
 			<key>NSMessage</key>
 			<string>pasteTextFromImage</string>
 			<key>NSPortName</key>
-			<string>clipboard2-test</string>
+			<string>clipboard2-origin</string>
 			<key>NSRequiredContext</key>
 			<dict/>
 			<key>NSReturnTypes</key>
@@ -85,7 +85,7 @@
 	<key>SUEnableAutomaticChecks</key>
 	<false/>
 	<key>SUFeedURL</key>
-	<string>https://localhost/clipboard2-test-has-no-updates</string>
+	<string>https://localhost/clipboard2-origin-has-no-updates</string>
 	<key>SUPublicEDKey</key>
 	<string>EYXl4+z6FlFfMyGuKf4+WHXcB3c8WHA6ThmEj4pPwwI=</string>
 	<key>SUScheduledCheckInterval</key>

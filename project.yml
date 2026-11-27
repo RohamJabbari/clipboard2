@@ -55,8 +55,8 @@ targets:
     info:
       path: Clipboard2/Info.plist
       properties:
-        CFBundleDisplayName: clipboard2-test
-        CFBundleName: clipboard2-test
+        CFBundleDisplayName: clipboard2-origin
+        CFBundleName: clipboard2-origin
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSUIElement: true
@@ -79,7 +79,7 @@ targets:
             UTTypeConformsTo: [public.data]
         # Sparkle is switched off in this flavour: the released feed would replace this
         # test build with the released app. The feed address is a deliberate dead end.
-        SUFeedURL: https://localhost/clipboard2-test-has-no-updates
+        SUFeedURL: https://localhost/clipboard2-origin-has-no-updates
         SUPublicEDKey: EYXl4+z6FlFfMyGuKf4+WHXcB3c8WHA6ThmEj4pPwwI=
         SUEnableAutomaticChecks: false
         SUScheduledCheckInterval: 3600
@@ -89,24 +89,25 @@ targets:
         SUVerifyUpdateBeforeExtraction: true
         NSServices:
           - NSMenuItem:
-              default: clipboard2-test Actions…
+              default: clipboard2-origin Actions…
             NSMessage: clippyActions
-            NSPortName: clipboard2-test
+            NSPortName: clipboard2-origin
             NSSendTypes: [public.utf8-plain-text, NSStringPboardType]
             NSRequiredContext: {}
           - NSMenuItem:
               default: Paste Text from Clipboard Image (test)
             NSMessage: pasteTextFromImage
-            NSPortName: clipboard2-test
+            NSPortName: clipboard2-origin
             NSReturnTypes: [public.utf8-plain-text, NSStringPboardType]
             NSRequiredContext: {}
     settings:
       base:
         # A separate app: its own name, bundle id, data folder and keychain entries, so it
         # installs next to the released Clipboard2 without touching it.
-        PRODUCT_NAME: clipboard2-test
+        PRODUCT_NAME: clipboard2-origin
         # The Swift module keeps its name: code and tests refer to `Clipboard2.`.
         PRODUCT_MODULE_NAME: Clipboard2
+        # Keeps the id from when it was called clipboard2-test: data and sign-in live under it.
         PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.test
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ENABLE_APP_SANDBOX: NO
@@ -193,8 +194,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.ClippyTests
         GENERATE_INFOPLIST_FILE: YES
-        # The host app is named clipboard2-test in this flavour, not after its target.
-        TEST_HOST: $(BUILT_PRODUCTS_DIR)/clipboard2-test.app/Contents/MacOS/clipboard2-test
+        # The host app is named clipboard2-origin in this flavour, not after its target.
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/clipboard2-origin.app/Contents/MacOS/clipboard2-origin
         BUNDLE_LOADER: $(TEST_HOST)
 
   # iOS app (docs/features/ios.md). Shares Core/ with the Mac app. Apple Development, automatic

@@ -1,6 +1,6 @@
 APP_NAME   := Clipboard2
 # This branch builds a separate test flavour that talks to the origin server.
-PRODUCT    := clipboard2-test
+PRODUCT    := clipboard2-origin
 BUNDLE_ID  := at.softmaze.Clippy.test
 PROJECT    := $(APP_NAME).xcodeproj
 SCHEME     := $(APP_NAME)
@@ -17,7 +17,7 @@ ifneq ($(DEVID_APP),0)
 SIGN_ARGS := CODE_SIGN_IDENTITY="Developer ID Application" DEVELOPMENT_TEAM=XWTH2647FF CODE_SIGN_STYLE=Manual OTHER_CODE_SIGN_FLAGS=--timestamp
 # No system AutoFill in this flavour: its profiles are for the released app's ids, and the
 # extension would share the released app's Keychain group.
-AUTOFILL_ARGS = $(info   AutoFill: off in the clipboard2-test flavour)
+AUTOFILL_ARGS = $(info   AutoFill: off in the clipboard2-origin flavour)
 else
 AUTOFILL_ARGS = $(info   AutoFill: skipped (needs a Developer ID Application certificate))
 endif
@@ -43,7 +43,8 @@ install: build
 	@osascript -e 'tell application id "$(BUNDLE_ID)" to quit' >/dev/null 2>&1 || true
 	@sleep 1
 	@pkill -x $(PRODUCT) >/dev/null 2>&1 || true
-	rm -rf "$(INSTALL_DIR)/$(PRODUCT).app"
+	@pkill -x clipboard2-test >/dev/null 2>&1 || true
+	rm -rf "$(INSTALL_DIR)/$(PRODUCT).app" "$(INSTALL_DIR)/clipboard2-test.app"
 	cp -R "$(RELEASE_APP)" "$(INSTALL_DIR)/"
 	codesign --verify --strict "$(INSTALL_DIR)/$(PRODUCT).app"
 	open "$(INSTALL_DIR)/$(PRODUCT).app"
