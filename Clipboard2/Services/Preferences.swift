@@ -250,7 +250,7 @@ final class Preferences {
             Key.secretClearSeconds: 30,
             Key.contextMenuEnabled: true,
             Key.contextMenuModifier: ContextMenuModifier.command.rawValue,
-            Key.confirmGroupSends: true,
+            Key.confirmGroupSends: false,
             Key.pasteIcon: true,
             Key.offerToSavePasswords: true,
             Key.blockSensitiveGroupSends: true,
