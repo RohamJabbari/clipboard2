@@ -1045,6 +1045,17 @@ actor FakeSyncServer {
 
     func setSupportsHeads(_ value: Bool) { supportsHeads = value }
 
+    /// true: heads carry `rev` and polls may wait (this fake answers at once, like a write landed).
+    private(set) var waits = false
+    /// The `rev` of each waiting poll, in order.
+    private(set) var waitedOn: [String] = []
+    func setWaits(_ value: Bool) { waits = value }
+
+    func heads(uid: String, after rev: String) throws -> RemoteHeads {
+        waitedOn.append(rev)
+        return try heads(uid: uid)
+    }
+
     /// `GET /v1/heads`: newest visible seq per membership, and revisions of what else a tick reads.
     func heads(uid: String) throws -> RemoteHeads {
         headsRequests += 1
@@ -1062,11 +1073,13 @@ actor FakeSyncServer {
             byRecipient.sorted { $0.key < $1.key }.filter { $0.key == uid || spaces[id]?.owner == uid }
                 .map { "\(id)|\($0.key)|\($0.value.codesUntil ?? -1)|\($0.value.updatedAt)" }
         }
-        return RemoteHeads(
+        var result = RemoteHeads(
             heads: heads,
             spaces: digest(try? encoder.encode(spaces(for: uid).sorted { $0.id < $1.id })) + listed.joined(),
             codes: digest(Data(shareState.joined(separator: ";").utf8)),
             contacts: digest(try? encoder.encode([contactRequests(uid: uid)])) + digest(try? encoder.encode(contactCodes(uid: uid))))
+        if waits { result.rev = digest(try? encoder.encode(result)) }
+        return result
     }
 
     func changes(space: String, since: Int64, limit: Int, full: Bool = false, uid: String? = nil) throws -> ChangesPage {
@@ -1238,6 +1251,7 @@ nonisolated struct FakeClient: SyncService {
 
     func spaces() async throws -> [RemoteSpace] { await server.spaces(for: try await caller()) }
     func heads() async throws -> RemoteHeads { try await server.heads(uid: try await caller()) }
+    func heads(after rev: String) async throws -> RemoteHeads { try await server.heads(uid: try await caller(), after: rev) }
     func createGroup(id: String, encryptedName: Data, wrappedKey: Data) async throws -> RemoteSpace {
         let uid = try await caller()
         await server.createSpace(id: id, kind: "group", owner: uid, wrappedKey: wrappedKey, encryptedName: encryptedName)
@@ -2876,6 +2890,42 @@ struct SyncHardeningTests {
         await idle(mac2)
         now = now.addingTimeInterval(1)
         #expect(await mac2.account.poll() == false)
+    }
+
+    @Test func aServerThatWaitsIsPolledBackToBackWithWhatWasHandled() async throws {
+        let server = FakeSyncServer()
+        await server.setWaits(true)
+        let mac1 = try AccountHarness(server), mac2 = try AccountHarness(server)
+        await mac1.account.signUp(email: "a@x.at", password: "a password", username: "usera")
+        await mac2.account.signIn(email: "a@x.at", password: "a password")
+        await mac1.settle()
+        await mac2.settle()
+
+        // The first poll learns the server waits; from then on polls don't sleep in between.
+        #expect(await mac2.account.poll() == false)
+        #expect(mac2.account.serverWaits)
+        #expect(mac2.account.pollInterval == .zero)
+        let handled = try #require(mac2.account.handledRev)
+
+        // Each poll waits on what this device has handled.
+        #expect(await mac2.account.poll() == false)
+        #expect(await server.waitedOn.last == handled)
+
+        // Another device copies something: the waiting poll answers with it and a tick syncs it.
+        mac1.store.ingest(.text("right away"))
+        await mac1.settle()
+        #expect(await mac2.account.poll())
+        await idle(mac2)
+        #expect(mac2.store.allItems().map(\.text) == ["right away"])
+        #expect(mac2.account.handledRev != handled)
+        #expect(await mac2.account.poll() == false)
+        #expect(await server.waitedOn.last == mac2.account.handledRev)
+
+        // A server that stops waiting (an older one) is polled at the heads cadence again.
+        await server.setWaits(false)
+        _ = await mac2.account.poll()
+        #expect(!mac2.account.serverWaits)
+        #expect(mac2.account.pollInterval != .zero)
     }
 
     @Test func headsFallBackToFullSyncsOnAnOlderServer() async throws {

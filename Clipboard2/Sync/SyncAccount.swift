@@ -367,6 +367,11 @@ final class SyncAccount {
     @ObservationIgnored private var lastActivity: Date = .distantPast
     /// Heads as of the start of the last successful tick; a poll that sees others syncs.
     @ObservationIgnored private(set) var lastHeads: RemoteHeads?
+    /// The `rev` of the newest heads this device has acted on: a waiting poll is answered once the
+    /// server's differs. Set after a successful tick, or by a poll that needed no tick.
+    @ObservationIgnored private(set) var handledRev: String?
+    /// The server's heads carry `rev`, so polls wait for changes instead of sleeping between.
+    @ObservationIgnored private(set) var serverWaits = false
     @ObservationIgnored private var lastContactsRevision: String?
     /// When the last tick finished; a full sync runs at least every `fullSyncInterval`.
     @ObservationIgnored private var lastTickAt: Date?
@@ -1146,15 +1151,16 @@ final class SyncAccount {
         headsUnsupportedUntil.map { clock() >= $0 } ?? true
     }
 
-    /// With heads: 2 s while the panel is open or after recent activity, otherwise 10 s, backing
-    /// off after failed polls. Without: full ticks every 3 s / 15 s / 60 s.
+    /// With a server that waits: none, each poll is held open until something changes. With
+    /// heads: 2 s while the panel is open or after recent activity, otherwise 10 s. Both back off
+    /// after failed polls. Without heads: full ticks every 3 s / 15 s / 60 s.
     var pollInterval: Duration {
         let active = isPanelOpen || clock().timeIntervalSince(lastActivity) < SyncConfig.activeWindow
         guard usesHeads else {
             if isPanelOpen { return SyncConfig.pollWhilePanelOpen }
             return active ? SyncConfig.pollWhileActive : SyncConfig.pollWhileIdle
         }
-        let base = active ? SyncConfig.headsWhileActive : SyncConfig.headsWhileIdle
+        let base = serverWaits ? .zero : active ? SyncConfig.headsWhileActive : SyncConfig.headsWhileIdle
         guard headsFailures > 0 else { return base }
         return max(base, min(SyncConfig.headsMaxBackoff, .seconds(1 << min(headsFailures, 6))))
     }
@@ -1167,7 +1173,11 @@ final class SyncAccount {
                 guard let interval = self?.pollInterval else { return }
                 try? await Task.sleep(for: interval)
                 guard !Task.isCancelled, let self, self.engine != nil else { return }
+                let started = ContinuousClock.now
                 await self.poll()
+                // A waiting poll that answered at once (a change, or a tick still running): don't spin.
+                let took = ContinuousClock.now - started
+                if took < SyncConfig.headsMinGap { try? await Task.sleep(for: SyncConfig.headsMinGap - took) }
             }
         }
     }
@@ -1190,12 +1200,19 @@ final class SyncAccount {
         }
         let heads: RemoteHeads
         do {
-            heads = try await engine.api.heads()
+            // Held open by the server until something moves past what this device has handled.
+            if serverWaits, let handledRev {
+                heads = try await engine.api.heads(after: handledRev)
+            } else {
+                heads = try await engine.api.heads()
+            }
         } catch {
-            guard self.engine === engine else { return false }
+            // Polling restarted (the panel opened, a new session) while the server held this one.
+            guard self.engine === engine, !Task.isCancelled else { return false }
             return headsFailed(error)
         }
         guard self.engine === engine else { return false }
+        serverWaits = heads.rev != nil
         headsFailures = 0
         if isOffline { isOffline = false }
         if heads.contacts != lastContactsRevision {
@@ -1207,7 +1224,12 @@ final class SyncAccount {
             lastSecurityRevision = security
             Task { await refreshSecurity() }
         }
-        guard heads.needsSync(since: lastHeads), !isTicking else { return false }
+        guard heads.needsSync(since: lastHeads) else {
+            handledRev = heads.rev
+            return false
+        }
+        // A tick already running records its own heads; this change gets the next poll's answer.
+        guard !isTicking else { return false }
         startTick()
         return true
     }
@@ -1249,6 +1271,8 @@ final class SyncAccount {
 
     private func resetHeads() {
         lastHeads = nil
+        handledRev = nil
+        serverWaits = false
         lastContactsRevision = nil
         lastTickAt = nil
         headsUnsupportedUntil = nil
@@ -1318,7 +1342,10 @@ final class SyncAccount {
             do {
                 let heads = await headsBeforeTick(engine)
                 try await engine.tick()
-                if let heads { lastHeads = heads }
+                if let heads {
+                    lastHeads = heads
+                    handledRev = heads.rev
+                }
                 lastTickAt = clock()
                 headsFailures = 0
                 engine.announcesArrivals = true   // from the second sync after signing in on

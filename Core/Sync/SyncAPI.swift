@@ -243,6 +243,8 @@ nonisolated struct RemoteHeads: Codable, Sendable, Equatable {
     var contacts: String
     /// Device requests, recoveries and sessions (PROTOCOL.md → Heads); nil from older servers.
     var security: String? = nil
+    /// All of the above in one value, for `heads(after:)`; nil from servers that can't wait.
+    var rev: String? = nil
 
     /// Something a full sync fetches moved since `old` (contacts are reloaded on their own).
     func needsSync(since old: RemoteHeads?) -> Bool {
@@ -440,6 +442,9 @@ nonisolated protocol SyncService: PasswordlessService {
     func spaces() async throws -> [RemoteSpace]
     /// `404` from a server without it (PROTOCOL.md → Heads).
     func heads() async throws -> RemoteHeads
+    /// Heads once they differ from `rev`, held open by the server until something is written or
+    /// its wait ends (PROTOCOL.md → Heads, `wait`). Only for a `rev` the server gave.
+    func heads(after rev: String) async throws -> RemoteHeads
     func createGroup(id: String, encryptedName: Data, wrappedKey: Data) async throws -> RemoteSpace
     func renameGroup(id: String, encryptedName: Data) async throws
     func deleteGroup(id: String) async throws
@@ -499,6 +504,11 @@ extension SyncService {
     /// Services that don't know heads behave like an older server.
     func heads() async throws -> RemoteHeads {
         throw SyncAPIError.server(status: 404, code: "not_found", message: "", retryAfter: nil)
+    }
+
+    /// Services that can't wait answer at once.
+    func heads(after rev: String) async throws -> RemoteHeads {
+        try await heads()
     }
 
     func downloadBlob(spaceId: String, blobId: String, progress: @escaping DownloadProgress) async throws -> Data {
@@ -619,6 +629,11 @@ nonisolated struct SyncAPI: SyncService {
 
     func heads() async throws -> RemoteHeads {
         try await send("GET", "v1/heads", as: RemoteHeads.self)
+    }
+
+    func heads(after rev: String) async throws -> RemoteHeads {
+        try await send("GET", "v1/heads", query: ["wait": String(SyncConfig.headsWaitSeconds), "rev": rev],
+                       as: RemoteHeads.self)
     }
 
     func createGroup(id: String, encryptedName: Data, wrappedKey: Data) async throws -> RemoteSpace {

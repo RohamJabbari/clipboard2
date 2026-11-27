@@ -34,6 +34,12 @@ nonisolated enum SyncConfig {
     /// sync runs only when heads moved, or after `fullSyncInterval` regardless.
     static let headsWhileActive: Duration = .seconds(2)
     static let headsWhileIdle: Duration = .seconds(10)
+    /// A server that can wait (heads carry `rev`) holds each poll open until something changes, up
+    /// to this long, and the next poll starts right after, so changes arrive as they're written.
+    /// Well under the request timeout, and under the server's own cap it is clamped to.
+    static let headsWaitSeconds = 25
+    /// Never poll more often than this, even when waits answer at once (a tick is running).
+    static let headsMinGap: Duration = .seconds(1)
     /// After failed polls the wait doubles from 2 s up to this.
     static let headsMaxBackoff: Duration = .seconds(60)
     static let fullSyncInterval: TimeInterval = 5 * 60
