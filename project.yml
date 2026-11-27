@@ -193,6 +193,9 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.ClippyTests
         GENERATE_INFOPLIST_FILE: YES
+        # The host app is named clipboard2-test in this flavour, not after its target.
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/clipboard2-test.app/Contents/MacOS/clipboard2-test
+        BUNDLE_LOADER: $(TEST_HOST)
 
   # iOS app (docs/features/ios.md). Shares Core/ with the Mac app. Apple Development, automatic
   # signing: Developer ID can't sign iOS. Simulator builds need no provisioning profile.
