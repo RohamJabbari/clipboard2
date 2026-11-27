@@ -2,6 +2,7 @@ import { buildApp } from "./app.js";
 import { config, features, googleClientIds, limits, serverSecret } from "./config.js";
 import { migrate, openPool } from "./db.js";
 import { diskStorage } from "./diskStorage.js";
+import { postgresChanges } from "./changes.js";
 import { gcsStorage } from "./services.js";
 import { migrateEmails, serverKeys } from "./keys.js";
 import { googleVerifier } from "./google.js";
@@ -13,6 +14,7 @@ const keys = serverKeys(serverSecret());
 const { pool, close } = await openPool();
 const applied = await migrate(pool);
 const emails = await migrateEmails(pool, keys);
+const changes = await postgresChanges(pool, (error) => console.error("change feed:", error));
 
 // Cloud Run keeps blobs in a bucket; a self-hosted server keeps them on its own disk.
 const disk = c.blobDir ? diskStorage({ dir: c.blobDir, publicUrl: required("PUBLIC_URL", c.publicUrl), signingKey: required("BLOB_SIGNING_KEY", c.blobSigningKey), maxBytes: l.blobBytes }) : undefined;
@@ -24,6 +26,7 @@ const app = buildApp({
   keys,
   features: features(),
   google: googleVerifier({ clientIds: googleClientIds() }),
+  changes,
 });
 await disk?.routes(app);
 if (applied.length) app.log.info({ applied }, "migrations applied");
@@ -31,6 +34,7 @@ if (emails) app.log.info({ emails }, "emails encrypted");
 
 const shutdown = async () => {
   await app.close();
+  await changes.close();
   await close();
   process.exit(0);
 };

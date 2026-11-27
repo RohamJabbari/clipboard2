@@ -7,6 +7,7 @@ import { join } from "node:path";
 import EmbeddedPostgres from "embedded-postgres";
 import pg from "pg";
 import type { FastifyInstance } from "fastify";
+import { postgresChanges } from "../src/changes.js";
 import { buildApp } from "../src/app.js";
 import { limits as defaultLimits, type Limits } from "../src/config.js";
 import { migrate } from "../src/db.js";
@@ -2254,7 +2255,7 @@ function shareCodes(owner: TestUser, spaceId: string, to: TestUser, opts: { seal
 }
 
 describe("heads", () => {
-  type Heads = { heads: Record<string, number>; spaces: string; codes: string; contacts: string };
+  type Heads = { heads: Record<string, number>; spaces: string; codes: string; contacts: string; rev: string };
   const heads = async (user: TestUser): Promise<Heads> => {
     const res = await call(user, "GET", "/v1/heads");
     expect(res.status).toBe(200);
@@ -2272,7 +2273,8 @@ describe("heads", () => {
     const after = await heads(alice);
     const seq = (await call(alice, "GET", `/v1/spaces/${alice.personalSpaceId}/changes?since=0`)).body.nextSince;
     expect(after.heads[alice.personalSpaceId]).toBe(seq);
-    expect({ ...after, heads: start.heads }).toEqual(start);
+    expect({ ...after, heads: start.heads, rev: start.rev }).toEqual(start);
+    expect(after.rev).not.toBe(start.rev);
 
     expect((await call(alice, "DELETE", `/v1/spaces/${alice.personalSpaceId}/items/${put.id}?updatedAt=${Date.now()}`)).status).toBe(200);
     expect((await heads(alice)).heads[alice.personalSpaceId]).toBeGreaterThan(seq);
@@ -2359,6 +2361,131 @@ describe("heads", () => {
     expect((await heads(alice)).codes).not.toBe(a3.codes); // the owner's other devices see the share
     expect((await shareCodes(alice, auth.id, bob)).status).toBe(200);
     expect((await heads(bob)).codes).not.toBe(b3.codes);
+  });
+
+  describe("waiting for a change", () => {
+    const waitFor = (user: TestUser, rev: string, wait = 10) => {
+      const started = Date.now();
+      return call(user, "GET", `/v1/heads?wait=${wait}&rev=${rev}`).then((res) => ({ ...res, ms: Date.now() - started }));
+    };
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 100));
+
+    it("answers at once when the client's revision is already behind, or without one", async () => {
+      const alice = await signUp("alice");
+      const before = await heads(alice);
+      expect((await putItem(alice, alice.personalSpaceId, alice.personalKey)).status).toBe(200);
+      const res = await waitFor(alice, before.rev);
+      expect(res.status).toBe(200);
+      expect(res.body.rev).not.toBe(before.rev);
+      expect(res.ms).toBeLessThan(1000);
+      expect((await call(alice, "GET", "/v1/heads?wait=10")).body.rev).toBe(res.body.rev);
+    });
+
+    it("answers as soon as something is copied to a group", async () => {
+      const alice = await signUp("alice");
+      const bob = await signUp("bob");
+      const group = await createGroup(alice);
+      await invite(alice, group, bob);
+      const before = await heads(bob);
+      const waiting = waitFor(bob, before.rev);
+      await settle();
+      expect((await putItem(alice, group.id, group.sk)).status).toBe(200);
+      const res = await waiting;
+      expect(res.status).toBe(200);
+      expect(res.body.heads[group.id]).toBeGreaterThan(before.heads[group.id]!);
+      expect(res.ms).toBeLessThan(2000);
+    });
+
+    it("answers as soon as something is sent to a contact", async () => {
+      const alice = await person("alice");
+      const bob = await person("bob");
+      const req = await requestContact(alice, "bob");
+      await call(bob, "POST", `/v1/contacts/requests/${req.spaceId}/accept`);
+      const before = await heads(bob);
+      const waiting = waitFor(bob, before.rev);
+      await settle();
+      expect((await putItem(alice, req.spaceId, req.sk, { category: "pinned" })).status).toBe(200);
+      const res = await waiting;
+      expect(res.body.heads[req.spaceId]).toBeGreaterThan(before.heads[req.spaceId] ?? 0);
+      expect(res.ms).toBeLessThan(2000);
+    });
+
+    it("keeps waiting through other people's writes, up to the server's cap", async () => {
+      rebuild({ headsWaitSeconds: 1 });
+      const alice = await signUp("alice");
+      const bob = await signUp("bob");
+      const before = await heads(bob);
+      const waiting = waitFor(bob, before.rev, 60);
+      await settle();
+      expect((await putItem(alice, alice.personalSpaceId, alice.personalKey)).status).toBe(200);
+      const res = await waiting;
+      expect(res.status).toBe(200);
+      expect(res.body.rev).toBe(before.rev);
+      expect(res.ms).toBeGreaterThanOrEqual(950);
+      expect(res.ms).toBeLessThan(3000);
+    });
+
+    it("hears writes made on another instance (LISTEN/NOTIFY)", async () => {
+      const feeds = [await postgresChanges(pool, () => {}), await postgresChanges(pool, () => {})];
+      const [one, two] = feeds.map((changes) => buildApp({ pool, storage, limits: currentLimits, keys: testKeys, changes }));
+      try {
+        const alice = await signUp("alice");
+        const bob = await signUp("bob");
+        const group = await createGroup(alice);
+        await invite(alice, group, bob);
+        const before = await heads(bob);
+        const started = Date.now();
+        const waiting = one!.inject({ method: "GET", url: `/v1/heads?wait=10&rev=${before.rev}`, headers: { authorization: `Bearer ${bob.token}` } });
+        await settle();
+        app = two!;
+        expect((await putItem(alice, group.id, group.sk)).status).toBe(200);
+        const res = await waiting;
+        expect(res.json().heads[group.id]).toBeGreaterThan(before.heads[group.id]!);
+        expect(Date.now() - started).toBeLessThan(2000);
+      } finally {
+        await Promise.all([one!.close(), two!.close()]);
+        await Promise.all(feeds.map((f) => f.close()));
+      }
+    });
+
+    it("holds a real HTTP request open until the write, and lets a client hang up", async () => {
+      const alice = await signUp("alice");
+      const bob = await signUp("bob");
+      const group = await createGroup(alice);
+      await invite(alice, group, bob);
+      const before = await heads(bob);
+      const base = await app.listen({ host: "127.0.0.1", port: 0 });
+      const url = `${base}/v1/heads?wait=10&rev=${before.rev}`;
+      const headers = { authorization: `Bearer ${bob.token}` };
+
+      // A client that gives up: the server stops waiting for it.
+      const gaveUp = new AbortController();
+      const abandoned = fetch(url, { headers, signal: gaveUp.signal }).catch((error: Error) => error.name);
+      await settle();
+      gaveUp.abort();
+      expect(await abandoned).toBe("AbortError");
+
+      const started = Date.now();
+      const waiting = fetch(url, { headers }).then(async (res) => ({ status: res.status, body: await res.json(), ms: Date.now() - started }));
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect((await putItem(alice, group.id, group.sk)).status).toBe(200);
+      const res = await waiting;
+      expect(res.status).toBe(200);
+      expect(res.body.heads[group.id]).toBeGreaterThan(before.heads[group.id]!);
+      expect(res.ms).toBeGreaterThanOrEqual(450);
+      expect(res.ms).toBeLessThan(2000);
+    });
+
+    it("lets the server close without waiting out a held request", async () => {
+      const alice = await signUp("alice");
+      const before = await heads(alice);
+      const waiting = waitFor(alice, before.rev, 25);
+      await settle();
+      const started = Date.now();
+      await app.close();
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect((await waiting).body.rev).toBe(before.rev);
+    });
   });
 
   it("is limited per session, apart from other requests", async () => {

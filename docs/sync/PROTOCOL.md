@@ -453,7 +453,8 @@ polling the full sync.
 
 | Request | Response |
 |---|---|
-| `GET /v1/heads` | `{heads: {<spaceId>: <seq>}, spaces, codes, contacts, security}` |
+| `GET /v1/heads` | `{heads: {<spaceId>: <seq>}, spaces, codes, contacts, security, rev}` |
+| `GET /v1/heads?wait=<s>&rev=<rev>` | The same, held open until its `rev` differs from the one given or `wait` seconds pass (capped by the server, 25 s by default). |
 
 - **`heads`:** every space the caller is a member of (all kinds, pending contacts included), with
   the highest `seq` the caller could get from its `changes` (`0` when empty). Any write or
@@ -472,6 +473,13 @@ polling the full sync.
   device requests (`GET /v1/device-requests`) and recoveries of the account
   (`GET /v1/account/recoveries`), recoveries and invitations where the caller is a recovery contact,
   the account's recovery setup, and its sessions and their windows. Older clients ignore it.
+
+- **`rev`:** one opaque revision of all of the above. **Waiting:** a client that sends the `rev`
+  it last acted on gets the answer as soon as anything moves it, so changes arrive as they are
+  written instead of at the next poll; it polls again right away. Any successful write wakes the
+  waiting requests (across instances through Postgres `LISTEN`/`NOTIFY`), which recompute and keep
+  waiting when theirs didn't move; time-based changes (an expired code) show at the end of the
+  wait. Servers without `rev` answer at once; clients then poll on the cadence below.
 
 Compare values for equality only; they carry no order and change format freely. Everything is
 computed in one statement: one index probe per membership plus hashes over the caller's few

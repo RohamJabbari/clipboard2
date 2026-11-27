@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import { z } from "zod";
 import type pg from "pg";
@@ -10,6 +11,7 @@ import { decryptEmail, emailIndex, encryptEmail, type ServerKeys } from "./keys.
 import type { GoogleVerifier } from "./google.js";
 import { registerPasswordless, type Geo, sessionJson, SESSION_COLUMNS, INDEFINITE_YEARS, SECURITY_REVISION } from "./passwordless.js";
 import { RateLimiter, Semaphore } from "./rateLimit.js";
+import { localChanges, type ChangeFeed } from "./changes.js";
 import {
   burnScrypt,
   FAKE_KDF_ITERATIONS,
@@ -51,6 +53,8 @@ export interface Deps {
   mailer?: Mailer;
   /** Approximate location of a request; null when unknown. Defaults to trusted LB headers when `features.geoHeaders`. */
   geo?: (request: FastifyRequest) => Geo | null;
+  /** Wakes heads requests waiting for a change; one process only when not given. */
+  changes?: ChangeFeed;
 }
 
 declare module "fastify" {
@@ -369,6 +373,7 @@ async function dropBlobs(db: Queryable, spaceId: string, blobIds: string[]): Pro
 
 export function buildApp(deps: Deps): FastifyInstance {
   const { pool, storage, limits, keys } = deps;
+  const changes = deps.changes ?? localChanges();
   const feature = { emailCodes: false, geoHeaders: false, ...deps.features };
   // Request logs carry method and URL only: no IPs, and no route takes an email in its URL.
   const logger = deps.logger
@@ -415,6 +420,12 @@ export function buildApp(deps: Deps): FastifyInstance {
     if (paths.length === 0) return;
     await storage.delete(paths).catch((error) => request.log.warn({ error, count: paths.length }, "blob delete failed"));
   };
+
+  // Every successful write wakes the heads requests waiting for one (GET /v1/heads, `wait`).
+  // The response is only sent once its transaction committed, so a woken request sees the write.
+  app.addHook("onResponse", async (request, reply) => {
+    if (request.method !== "GET" && request.method !== "HEAD" && reply.statusCode < 400 && request.url.startsWith("/v1/")) changes.publish();
+  });
 
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof ApiError) {
@@ -966,7 +977,7 @@ export function buildApp(deps: Deps): FastifyInstance {
    * items_changes; the revisions hash the few rows that feed /v1/spaces, /v1/shared-codes, the
    * owner's share lists and the contact lists. Secrets a member can't see never move their head.
    */
-  app.get("/v1/heads", async (request) => {
+  const headsOf = async (uid: string) => {
     const { rows } = await pool.query<{ heads: Record<string, number | null>; spaces: string; codes: string; contacts: string; security: string }>(
       `WITH mine AS (
          SELECT m.space_id, m.role, m.can_send, m.can_see_secrets, m.wrapped_key, s.kind, s.owner_uid, s.encrypted_name
@@ -997,12 +1008,49 @@ export function buildApp(deps: Deps): FastifyInstance {
            (SELECT string_agg(i.id, ';' ORDER BY i.id) FROM invites i JOIN spaces s ON s.id = i.space_id
               WHERE i.created_by = $1 AND s.kind = 'direct' AND i.expires_at > now()))) AS contacts,
          ${SECURITY_REVISION} AS security`,
-      [request.caller.uid],
+      [uid],
     );
     const row = rows[0]!;
     // An empty space has head 0, like a cursor that has seen nothing.
     const heads = Object.fromEntries(Object.entries(row.heads).map(([id, seq]) => [id, Number(seq ?? 0)]));
-    return { heads, spaces: row.spaces, codes: row.codes, contacts: row.contacts, security: row.security };
+    const value = { heads, spaces: row.spaces, codes: row.codes, contacts: row.contacts, security: row.security };
+    return { ...value, rev: headsRevision(value) };
+  };
+
+  /**
+   * With `wait` and the `rev` the client last saw, the answer is held until something moves or
+   * `wait` seconds pass (capped), so a device hears of a change as soon as it's written instead
+   * of at its next poll. Any write wakes every waiter, which recomputes and waits again when its
+   * own heads didn't move. Clients without `wait` get the answer at once, as before.
+   */
+  const headsQuery = z.object({ wait: z.coerce.number().int().min(0).max(3600).optional(), rev: z.string().max(64).optional() });
+  // Shutting down: waiting heads requests answer at once instead of holding app.close() up.
+  const closing = new AbortController();
+  app.addHook("preClose", async () => closing.abort());
+  app.get("/v1/heads", async (request, reply) => {
+    const { wait, rev } = headsQuery.parse(request.query);
+    const { uid } = request.caller;
+    let current = await headsOf(uid);
+    if (!wait || !rev || current.rev !== rev) return current;
+    const deadline = Date.now() + Math.min(wait, limits.headsWaitSeconds) * 1000;
+    // The client hung up (or the server is closing): stop waiting.
+    const gone = new AbortController();
+    const onClose = () => gone.abort();
+    reply.raw.once("close", onClose);
+    closing.signal.addEventListener("abort", onClose, { once: true });
+    try {
+      for (let left = deadline - Date.now(); left > 0 && !gone.signal.aborted; left = deadline - Date.now()) {
+        await changes.next(left, gone.signal);
+        if (gone.signal.aborted) break;
+        // After a write or the timeout (which covers time-based changes, such as an expired code).
+        current = await headsOf(uid);
+        if (current.rev !== rev) break;
+      }
+    } finally {
+      reply.raw.off("close", onClose);
+      closing.signal.removeEventListener("abort", onClose);
+    }
+    return current;
   });
 
   app.post("/v1/groups", async (request, reply) => {
@@ -1821,4 +1869,10 @@ export function buildApp(deps: Deps): FastifyInstance {
   });
 
   return app;
+}
+
+/** Equal for equal heads, whatever order Postgres aggregated them in. */
+function headsRevision(value: { heads: Record<string, number>; spaces: string; codes: string; contacts: string; security: string }): string {
+  const heads = Object.keys(value.heads).sort().map((id) => `${id}=${value.heads[id]}`).join(",");
+  return createHash("md5").update([heads, value.spaces, value.codes, value.contacts, value.security].join("|")).digest("hex");
 }
