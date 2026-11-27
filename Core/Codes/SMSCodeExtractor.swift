@@ -71,7 +71,7 @@ nonisolated enum SMSCodeExtractor {
         guard !keywords.isEmpty else { return nil }
         var best: (code: String, distance: Double)?
         for candidate in EmailCodeExtractor.findCandidates(chars)
-        where candidate.isDigits && !EmailCodeExtractor.isExcluded(candidate, in: chars)
+        where candidate.isDigits && !candidate.needsOwnLine && !EmailCodeExtractor.isExcluded(candidate, in: chars)
             && !EmailCodeExtractor.inPromotion(candidate, chars) {
             guard let (_, distance) = EmailCodeExtractor.nearest(keywords, to: candidate),
                   distance <= Double(smsMaxDistance) else { continue }

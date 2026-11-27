@@ -90,6 +90,20 @@ nonisolated enum EmailCorpus {
                    body: "Bestellnummer: 30219988\nIhr Bestätigungscode lautet 664120.", code: "664120"),
         CodeSample(name: "Code after date line", subject: "Login code",
                    body: "Requested on 26.11.2026 at 10:42.\nYour login code is 118204.", code: "118204"),
+        // Shapes only taken alone on their line
+        CodeSample(name: "Steam Guard", subject: "Your Steam account: Access from new computer",
+                   body: "Dear user,\nHere is the Steam Guard code you need to login to account user:\n\nF4K9P\n\nThis email was generated because of a login attempt from a web or mobile device located at 84.115.12.4 (AT).",
+                   code: "F4K9P"),
+        CodeSample(name: "Lowercase X code", subject: "Your X confirmation code is j7k2mq9p",
+                   body: "Please enter this verification code to get started on X:\n\nj7k2mq9p\n\nVerification codes expire after two hours.", code: "j7k2mq9p"),
+        CodeSample(name: "Digits in table cells", subject: "Sign in to Acme",
+                   body: "Sign in to Acme\n \n Your code \n \n 6 1 9 2 0 4 \n \n Expires at 14:30 on 27.11.2026", code: "619204"),
+        CodeSample(name: "Promo alone on its line", subject: "Weekend sale",
+                   body: "Use code\n\nsave20\n\nfor 20% off everything.", code: nil),
+        CodeSample(name: "Error code alone on its line", subject: "Sync failed",
+                   body: "Your device reported an error code:\n\nE1234x\n\nContact support.", code: nil),
+        CodeSample(name: "Spaced digits inside a sentence", subject: "Your code",
+                   body: "Your code is in the steps 1 2 3 4 below.", code: nil),
 
         // Negatives
         CodeSample(name: "Newsletter promo", subject: "Nur heute: 20 % auf alles",

@@ -16,6 +16,9 @@ nonisolated enum EmailCodeExtractor {
         var start: Int
         var end: Int
         var isDigits: Bool
+        /// Only a code when it stands alone on its line: looser shapes ("F4K9P", "j7k2mq9p",
+        /// "6 1 9 2 0 4") that would too often be something else inside a sentence.
+        var needsOwnLine = false
     }
 
     struct Keyword: Equatable {
@@ -32,7 +35,8 @@ nonisolated enum EmailCodeExtractor {
         let keywords = findKeywords(chars)
         guard keywords.contains(where: { !$0.negative }) else { return nil }
         var best: (code: String, score: Double)?
-        for candidate in findCandidates(chars) where !isExcluded(candidate, in: chars) {
+        for candidate in findCandidates(chars) where !isExcluded(candidate, in: chars)
+            && (!candidate.needsOwnLine || isAloneOnLine(candidate, chars)) {
             guard let (keyword, distance) = nearest(keywords, to: candidate), !keyword.negative else { continue }
             guard distance <= Double(candidate.isDigits ? maxDistance : maxAlphanumericDistance) else { continue }
             guard !inPromotion(candidate, chars) else { continue }
@@ -135,6 +139,7 @@ nonisolated enum EmailCodeExtractor {
     // MARK: Candidates
 
     /// 4–8 digits ("123456", or "123 456" / "123-456"), or 6–8 capitals and digits with at least one digit.
+    /// Alone on a line also 5–8 letters and digits in either case, and 4–8 digits spaced one by one.
     static func findCandidates(_ chars: [Character]) -> [Candidate] {
         var candidates: [Candidate] = []
         var i = 0
@@ -153,6 +158,20 @@ nonisolated enum EmailCodeExtractor {
             if start > 0, chars[start - 1].isLetter || chars[start - 1].isNumber { continue }
             if end < chars.count, chars[end].isLetter || chars[end].isNumber { continue }
             let token = String(chars[start..<end])
+            // Digits spaced one by one, as in a table cell each: "6 1 9 2 0 4".
+            if token.count == 1, token.first!.isNumber {
+                var digits = token, last = end
+                while last + 1 < chars.count, chars[last] == " ", chars[last + 1].isASCII, chars[last + 1].isNumber,
+                      last + 2 >= chars.count || !(chars[last + 2].isLetter || chars[last + 2].isNumber) {
+                    digits.append(chars[last + 1])
+                    last += 2
+                }
+                if (4...8).contains(digits.count) {
+                    candidates.append(Candidate(code: digits, start: start, end: last, isDigits: true, needsOwnLine: true))
+                    i = last
+                    continue
+                }
+            }
             let digitsOnly = token.allSatisfy(\.isNumber)
             let isCodeChars = token.allSatisfy { $0.isNumber || $0.isUppercase }
             // Two halves: "123 456", "1234-5678", "Q5G-B3T".
@@ -179,6 +198,8 @@ nonisolated enum EmailCodeExtractor {
                 candidates.append(Candidate(code: token, start: start, end: end, isDigits: true))
             } else if !digitsOnly, isCodeChars, (6...8).contains(token.count), token.contains(where: \.isNumber) {
                 candidates.append(Candidate(code: token, start: start, end: end, isDigits: false))
+            } else if !digitsOnly, (5...8).contains(token.count), token.contains(where: \.isNumber) {
+                candidates.append(Candidate(code: token, start: start, end: end, isDigits: false, needsOwnLine: true))
             }
         }
         return candidates
