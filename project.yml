@@ -86,6 +86,8 @@ targets:
         SUAllowsAutomaticUpdates: false
         # Updates download quietly and install on quit (Settings → General → Updates).
         SUAutomaticallyUpdate: false
+        # Hides Updates in Settings and never starts Sparkle (UpdateController.isAvailable).
+        Clipboard2UpdatesOff: true
         SUVerifyUpdateBeforeExtraction: true
         NSServices:
           - NSMenuItem:

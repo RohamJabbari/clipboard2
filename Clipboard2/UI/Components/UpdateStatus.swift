@@ -61,36 +61,51 @@ struct UpdatesSection: View {
 
     var body: some View {
         let updates = env.updates
-        Section {
-            Picker("When there's a new version", selection: Binding(get: { updates.policy }, set: { updates.setPolicy($0) })) {
-                ForEach(UpdatePolicy.allCases) { Text($0.title).tag($0) }
-            }
-            .pickerStyle(.menu)
-            LabeledContent {
-                HStack(spacing: 10) {
-                    status(updates)
-                    actionButton(updates)
+        if !UpdateController.isAvailable {
+            Section {
+                LabeledContent {
+                    EmptyView()
+                } label: {
+                    Text(versionLine)
+                    Text("This build talks to the origin server and has no automatic updates. A new version is installed from the origin-server branch with make install.")
                 }
-            } label: {
-                Text(versionLine)
-                Text(updates.policy.summary)
+            } header: {
+                Text("Updates")
             }
-        } header: {
-            Text("Updates")
-        } footer: {
-            HStack(spacing: 4) {
-                Text("Verified and installed in place; your history stays.")
-                Link("Release notes", destination: updates.releaseNotesURL)
+        } else {
+            Section {
+                Picker("When there's a new version", selection: Binding(get: { updates.policy }, set: { updates.setPolicy($0) })) {
+                    ForEach(UpdatePolicy.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.menu)
+                LabeledContent {
+                    HStack(spacing: 10) {
+                        status(updates)
+                        actionButton(updates)
+                    }
+                } label: {
+                    Text(versionLine)
+                    Text(updates.policy.summary)
+                }
+            } header: {
+                Text("Updates")
+            } footer: {
+                HStack(spacing: 4) {
+                    Text("Verified and installed in place; your history stays.")
+                    Link("Release notes", destination: updates.releaseNotesURL)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
         }
     }
 
+    /// The app's own name, so a build flavour (clipboard2-origin) says which one it is.
     private var versionLine: String {
         let info = Bundle.main.infoDictionary
         let short = info?["CFBundleShortVersionString"] as? String ?? "–"
-        return "Clipboard2 \(short)"
+        let name = info?["CFBundleDisplayName"] as? String ?? info?["CFBundleName"] as? String ?? "Clipboard2"
+        return "\(name) \(short)"
     }
 
     @ViewBuilder

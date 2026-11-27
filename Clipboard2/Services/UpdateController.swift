@@ -74,8 +74,12 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, SPUUserDriver {
     @ObservationIgnored private lazy var feed = FeedResolver(
         feedURL: (Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String).flatMap(URL.init(string:)))
 
+    /// Builds without an update feed (the clipboard2-origin flavour, `Clipboard2UpdatesOff` in
+    /// Info.plist) never start Sparkle: there is nothing to check, only an error to show.
+    static let isAvailable = Bundle.main.object(forInfoDictionaryKey: "Clipboard2UpdatesOff") as? Bool != true
+
     func start() {
-        guard updater == nil else { return }
+        guard Self.isAvailable, updater == nil else { return }
         let updater = SPUUpdater(hostBundle: .main, applicationBundle: .main, userDriver: self, delegate: self)
         do {
             try updater.start()
