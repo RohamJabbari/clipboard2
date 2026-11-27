@@ -304,7 +304,9 @@ public sealed class ImageTextTests : IDisposable
             db.Open();
             using var cmd = db.CreateCommand();
             cmd.CommandText = "ALTER TABLE clips DROP COLUMN ocr_text; ALTER TABLE clips DROP COLUMN folder_id; DROP TABLE folders; ALTER TABLE sync_cursor DROP COLUMN resync; "
-                + "DROP TABLE sync_resync_seen; DROP TABLE sync_rejected; PRAGMA user_version = 2;";
+                + "DROP TABLE sync_resync_seen; DROP TABLE sync_rejected; "
+                + "ALTER TABLE sync_spaces DROP COLUMN can_send; ALTER TABLE sync_spaces DROP COLUMN can_see_secrets; "
+                + "ALTER TABLE clips DROP COLUMN extras; ALTER TABLE snippets DROP COLUMN extras; PRAGMA user_version = 2;";
             cmd.ExecuteNonQuery();
         }
         using var migrated = new ClipStore(path, new BlobStore(Path.Combine(_dir, "B")));

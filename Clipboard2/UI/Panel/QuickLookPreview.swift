@@ -26,15 +26,26 @@ final class QuickLookPreview: NSObject, QLPreviewPanelDataSource, QLPreviewPanel
         QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared()?.isVisible == true
     }
 
+    /// The Quick Look panel while it shows our items.
+    private var fedPanel: QLPreviewPanel? {
+        if let controlled { return controlled }
+        guard isVisible, let panel = QLPreviewPanel.shared(), panel.dataSource === self else { return nil }
+        return panel
+    }
+
     var isKey: Bool {
         QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared()?.isKeyWindow == true
     }
 
-    /// Opens Quick Look above `window` (which must be key, so Quick Look finds us through it).
-    func show(above window: NSWindow) {
+    /// Opens Quick Look above `window` (which must be key, so Quick Look finds us through it),
+    /// at `frame` (centred over the quick panel) rather than wherever it last was.
+    func show(above window: NSWindow, frame: CGRect? = nil) {
         guard let panel = QLPreviewPanel.shared() else { return }
         urls = urlsProvider()
-        guard !urls.isEmpty else { return }
+        guard !urls.isEmpty else {
+            NSSound.beep()
+            return
+        }
         // Clipboard2 usually isn't the active app (the quick panel doesn't activate it); Quick Look
         // must stay up regardless, and above the floating quick panel.
         panel.hidesOnDeactivate = false
@@ -42,24 +53,40 @@ final class QuickLookPreview: NSObject, QLPreviewPanelDataSource, QLPreviewPanel
             panel.level = NSWindow.Level(rawValue: window.level.rawValue + 1)
         }
         panel.updateController()
+        // If Quick Look didn't hand control to us (it looks along the key window's responder
+        // chain, and the app isn't active), feed it anyway: without a data source it shows
+        // "No item selected".
+        if panel.dataSource !== self {
+            panel.dataSource = self
+            panel.delegate = self
+        }
+        panel.reloadData()
+        panel.currentPreviewItemIndex = 0
+        if let frame { panel.setFrame(frame, display: false) }
         // Front without taking key: the quick panel keeps the keyboard.
         panel.orderFrontRegardless()
-        panel.reloadData()
     }
 
     func close() {
-        guard isVisible else { return }
-        QLPreviewPanel.shared()?.orderOut(nil)
+        guard isVisible, let panel = QLPreviewPanel.shared() else { return }
+        panel.orderOut(nil)
+        // Fed without control (see `show`): Quick Look won't call endControl, so end here.
+        if controlled == nil, panel.dataSource === self {
+            panel.dataSource = nil
+            panel.delegate = nil
+            urls = []
+            onEnd()
+        }
     }
 
     /// The selection changed: show what's selected now (coalesced; several changes arrive per move).
     func selectionChanged() {
-        guard controlled != nil, !reloadPending else { return }
+        guard fedPanel != nil, !reloadPending else { return }
         reloadPending = true
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.reloadPending = false
-            guard let panel = self.controlled else { return }
+            guard let panel = self.fedPanel else { return }
             let next = self.urlsProvider()
             guard next != self.urls else { return }
             self.urls = next

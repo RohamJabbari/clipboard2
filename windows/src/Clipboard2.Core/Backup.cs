@@ -302,7 +302,9 @@ public static class Backup
             var existingSnippets = store.AllSnippets().Where(s => s.SpaceId is null).Select(s => (s.Name, s.Body)).ToHashSet();
             foreach (var entry in Entries(root, "snippets").OfType<JsonObject>())
             {
-                if (SyncPayload.Parse(Encoding.UTF8.GetBytes(entry.ToJsonString()), Guid.NewGuid(), null) is not ItemPayload.SnippetPayload { Snippet: var snippet })
+                var copy = entry.DeepClone().AsObject();
+                copy.Remove("id");   // the backup's, not a payload field to keep
+                if (SyncPayload.Parse(Encoding.UTF8.GetBytes(copy.ToJsonString()), Guid.NewGuid(), null) is not ItemPayload.SnippetPayload { Snippet: var snippet })
                 {
                     unreadable++;
                     continue;

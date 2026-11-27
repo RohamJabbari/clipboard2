@@ -37,6 +37,16 @@ final class ClipStore {
         return (try? context.fetch(descriptor))?.first?.lastCopiedAt
     }
 
+    /// The newest item of a space (nil = personal: Copies' newest).
+    func newestItem(inSpace spaceID: String?) -> ClipItem? {
+        var descriptor = FetchDescriptor<ClipItem>(
+            predicate: #Predicate { $0.spaceID == spaceID },
+            sortBy: [SortDescriptor(\.lastCopiedAt, order: .reverse)]
+        )
+        descriptor.fetchLimit = 1
+        return (try? context.fetch(descriptor))?.first
+    }
+
     /// Items of one space (nil = personal), newest first.
     func items(inSpace spaceID: String?) -> [ClipItem] {
         let descriptor = FetchDescriptor<ClipItem>(
@@ -538,6 +548,67 @@ final class ClipStore {
     /// Removes the folder of files sync received for an item (only ever inside Synced Files).
     func removeSyncedFiles(of id: UUID) {
         try? FileManager.default.removeItem(at: AppPaths.syncedFilesFolder(for: id))
+    }
+
+    // MARK: Files kept by Clipboard2
+
+    /// A new personal file clip whose one file Clipboard2 keeps itself, in the item's own folder
+    /// (`directory/<id>/<name>`, the same place synced files live, so it syncs, is copied and is
+    /// deleted with the item like those). The file is `contents`, or a copy of `source`. `original`
+    /// lends its source app. Nothing on disk outside `directory` changes.
+    @discardableResult
+    func addKeptFile(named name: String, contents: Data? = nil, copying source: URL? = nil, like original: ClipItem? = nil,
+                     directory: URL = AppPaths.syncedFilesDirectory, now: Date = .now) throws -> ClipItem {
+        let id = UUID()
+        let folder = directory.appending(path: id.uuidString.lowercased(), directoryHint: .isDirectory)
+        let url: URL
+        if let contents {
+            url = try TextFileContents.write(contents, named: name, into: folder)
+        } else if let source {
+            url = try TextFileContents.copy(source, named: name, into: folder)
+        } else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let size = TextFileContents.regularFileSize(url) ?? contents?.count ?? 0
+        let capture = ProcessedCapture(kind: .file, text: url.path, preview: name, fileURLs: [url], source: original?.source,
+                                       hash: ContentHasher.hash(fileURLs: [url]), byteCount: size)
+        let item = ClipItem(capture: capture, now: now)
+        item.id = id
+        context.insert(item)
+        commit()
+        return item
+    }
+
+    /// Whether every file of `item` is one Clipboard2 keeps in the item's own folder (an edited or
+    /// renamed copy, or files that arrived through sync), so it may be renamed in place.
+    func keepsFiles(of item: ClipItem, directory: URL = AppPaths.syncedFilesDirectory) -> Bool {
+        let folder = directory.appending(path: item.id.uuidString.lowercased(), directoryHint: .isDirectory).standardizedFileURL.path
+        return item.kind == .file && !item.fileURLs.isEmpty
+            && item.fileURLs.allSatisfy { $0.standardizedFileURL.deletingLastPathComponent().path == folder }
+    }
+
+    /// Renames the one kept file of `item` (see `keepsFiles`) and points the item at it.
+    func renameKeptFile(of item: ClipItem, to name: String, directory: URL = AppPaths.syncedFilesDirectory) throws {
+        guard keepsFiles(of: item, directory: directory), item.fileURLs.count == 1, let old = item.fileURLs.first else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        let new = old.deletingLastPathComponent().appending(path: name, directoryHint: .notDirectory)
+        guard new.path != old.path else { return }
+        let fm = FileManager.default
+        if old.lastPathComponent.lowercased() == name.lowercased() {
+            // Only the case changes: go through a temporary name (the file system ignores case).
+            let temporary = old.deletingLastPathComponent().appending(path: UUID().uuidString)
+            try fm.moveItem(at: old, to: temporary)
+            try fm.moveItem(at: temporary, to: new)
+        } else {
+            if fm.fileExists(atPath: new.path) { try fm.removeItem(at: new) }
+            try fm.moveItem(at: old, to: new)
+        }
+        item.fileURLStrings = [new.absoluteString]
+        item.text = new.path
+        item.preview = name
+        item.contentHash = ContentHasher.hash(fileURLs: [new])
+        commit()
     }
 
     /// Saves personal copies of (group) items: new ids in the personal space, saved, in `folder`

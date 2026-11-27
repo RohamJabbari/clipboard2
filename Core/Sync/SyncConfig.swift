@@ -29,8 +29,17 @@ nonisolated enum SyncConfig {
     static let maxFilesPerItem = 10
     static let changesPageSize = 500
     static let debounce: Duration = .seconds(3)
-    /// Polling cadence: while the quick panel is open, while the user was active in the last
-    /// `activeWindow` (a copy, paste, panel or menu), and otherwise.
+    /// Polling `GET /v1/heads` (PROTOCOL.md → Heads): while the quick panel is open or the user
+    /// was active in the last `activeWindow` (a copy, paste, panel or menu), and otherwise. A full
+    /// sync runs only when heads moved, or after `fullSyncInterval` regardless.
+    static let headsWhileActive: Duration = .seconds(2)
+    static let headsWhileIdle: Duration = .seconds(10)
+    /// After failed polls the wait doubles from 2 s up to this.
+    static let headsMaxBackoff: Duration = .seconds(60)
+    static let fullSyncInterval: TimeInterval = 5 * 60
+    /// A server without heads (`404`) is asked again after this.
+    static let headsRetryInterval: TimeInterval = 60 * 60
+    /// Without heads (an older server) every poll is a full sync, at this cadence instead.
     static let pollWhilePanelOpen: Duration = .seconds(3)
     static let pollWhileActive: Duration = .seconds(15)
     static let pollWhileIdle: Duration = .seconds(60)

@@ -1,7 +1,7 @@
 import Foundation
 
 nonisolated enum SyncCategory: String, Codable, Sendable, CaseIterable {
-    case history, pinned, snippet, secret, folder, otp
+    case history, pinned, snippet, secret, folder, otp, origin
 
     var isClip: Bool { self == .history || self == .pinned }
 }
@@ -156,18 +156,28 @@ nonisolated struct SecretPayload: Codable, Equatable, Sendable {
     var createdAt: Int64
     /// The id of the Saved folder (a `folder` item) the secret is in, like a clip's.
     var folder: String?
+    /// A password's username (1.11+). Omitted when empty, so plain secrets keep their fingerprints.
+    var username: String?
+    /// A password's sites (1.11+). Omitted when empty.
+    var urls: [String]?
+    /// A password's notes (1.11+). Omitted when empty.
+    var notes: String?
+    /// The origin (Auth's site edited by hand, an `origin` item) it's filed under (1.13+). Omitted
+    /// when unset: then it's grouped by its sites.
+    var origin: String?
     var rev: Int64?
 
-    init(name: String, value: String, createdAt: Int64, folder: String? = nil) {
+    init(name: String, value: String, createdAt: Int64, folder: String? = nil, username: String? = nil,
+         urls: [String]? = nil, notes: String? = nil, origin: String? = nil) {
         self.name = name
         self.value = value
         self.createdAt = createdAt
         self.folder = folder
-    }
-
-    init(ref: SecretRef, value: String, now: Date = .now) {
-        self.init(name: ref.name, value: value, createdAt: (ref.createdAt ?? now).syncMillis,
-                  folder: ref.folderID?.uuidString.lowercased())
+        self.username = SecretExtras.cleanUsername(username)
+        let sites = SecretExtras.cleanURLs(urls ?? [])
+        self.urls = sites.isEmpty ? nil : sites
+        self.notes = notes?.isEmpty == true ? nil : notes
+        self.origin = origin?.isEmpty == true ? nil : origin?.lowercased()
     }
 
     init(from decoder: any Decoder) throws {
@@ -178,6 +188,10 @@ nonisolated struct SecretPayload: Codable, Equatable, Sendable {
         value = try c.decodeIfPresent(String.self, forKey: .value) ?? ""
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
         folder = try c.decodeIfPresent(String.self, forKey: .folder)
+        username = try? c.decodeIfPresent(String.self, forKey: .username)
+        urls = try? c.decodeIfPresent([String].self, forKey: .urls)
+        notes = try? c.decodeIfPresent(String.self, forKey: .notes)
+        origin = try? c.decodeIfPresent(String.self, forKey: .origin)
         rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
     }
 }
@@ -230,10 +244,17 @@ nonisolated struct OTPPayload: Codable, Equatable, Sendable {
     var period: Int
     var createdAt: Int64
     var updatedAt: Int64
+    /// The sites the user set (Edit → Website, 1.11+). Omitted when empty.
+    var urls: [String]?
+    /// The origin it's filed under (1.13+), like a secret's. Omitted when unset.
+    var origin: String?
     var rev: Int64?
 
     init(issuer: String, account: String, secret: String, algorithm: String, digits: Int, period: Int,
-         createdAt: Int64, updatedAt: Int64) {
+         createdAt: Int64, updatedAt: Int64, urls: [String]? = nil, origin: String? = nil) {
+        let sites = SecretExtras.cleanURLs(urls ?? [])
+        self.urls = sites.isEmpty ? nil : sites
+        self.origin = origin?.isEmpty == true ? nil : origin?.lowercased()
         self.issuer = issuer
         self.account = account
         self.secret = secret
@@ -256,8 +277,77 @@ nonisolated struct OTPPayload: Codable, Equatable, Sendable {
         period = try c.decodeIfPresent(Int.self, forKey: .period) ?? 30
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
         updatedAt = try c.decodeIfPresent(Int64.self, forKey: .updatedAt) ?? createdAt
+        urls = try? c.decodeIfPresent([String].self, forKey: .urls)
+        origin = try? c.decodeIfPresent(String.self, forKey: .origin)
         rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
     }
+}
+
+/// `type: "origin"` (1.13+): a site in Auth edited by hand. Only in the personal space. Its
+/// documents are blobs of the item, each document's `id` being its blob id.
+nonisolated struct OriginPayload: Codable, Equatable, Sendable {
+    nonisolated struct Note: Codable, Equatable, Hashable, Sendable {
+        var id: String
+        var text: String
+        var createdAt: Int64
+        var updatedAt: Int64
+    }
+
+    nonisolated struct Document: Codable, Equatable, Hashable, Sendable {
+        /// Also its blob's id.
+        var id: String
+        var name: String
+        /// Plaintext bytes.
+        var size: Int64
+        var addedAt: Int64
+    }
+
+    var v = 1
+    var type = "origin"
+    var name: String
+    /// Its sites (hosts or URLs as typed); every registrable domain among them is the origin's.
+    var domains: [String]?
+    /// `favicon:<domain>`, `letter`, `symbol:<SF Symbol>` or `emoji:<text>`; omitted: the first domain's favicon.
+    var icon: String?
+    var notes: [Note]?
+    var documents: [Document]?
+    /// Entries filed here that can't carry an `origin` of their own: `shared:<authenticator space id>`
+    /// and `secret:<id>` for someone else's secret in a group.
+    var entries: [String]?
+    var createdAt: Int64
+    var updatedAt: Int64
+    var rev: Int64?
+
+    init(name: String, domains: [String] = [], icon: String? = nil, notes: [Note] = [], documents: [Document] = [],
+         entries: [String] = [], createdAt: Int64, updatedAt: Int64) {
+        self.name = name
+        let sites = SecretExtras.cleanURLs(domains)
+        self.domains = sites.isEmpty ? nil : sites
+        self.icon = icon?.isEmpty == true ? nil : icon
+        self.notes = notes.isEmpty ? nil : notes
+        self.documents = documents.isEmpty ? nil : documents
+        self.entries = entries.isEmpty ? nil : entries
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        v = try c.decodeIfPresent(Int.self, forKey: .v) ?? 1
+        type = try c.decodeIfPresent(String.self, forKey: .type) ?? "origin"
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        domains = try? c.decodeIfPresent([String].self, forKey: .domains)
+        icon = try? c.decodeIfPresent(String.self, forKey: .icon)
+        notes = try? c.decodeIfPresent([Note].self, forKey: .notes)
+        documents = try? c.decodeIfPresent([Document].self, forKey: .documents)
+        entries = try? c.decodeIfPresent([String].self, forKey: .entries)
+        createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
+        updatedAt = try c.decodeIfPresent(Int64.self, forKey: .updatedAt) ?? createdAt
+        rev = try c.decodeIfPresent(Int64.self, forKey: .rev)
+    }
+
+    /// The documents' blob ids, in order.
+    var blobIds: [String] { (documents ?? []).map(\.id) }
 }
 
 nonisolated enum SyncPayloadError: Error, Equatable {
@@ -270,6 +360,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
     case secret(SecretPayload)
     case folder(FolderPayload)
     case otp(OTPPayload)
+    case origin(OriginPayload)
 
     nonisolated private struct TypeProbe: Decodable { var type: String? }
 
@@ -281,6 +372,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case "secret": return .secret(try decoder.decode(SecretPayload.self, from: data))
         case "folder": return .folder(try decoder.decode(FolderPayload.self, from: data))
         case "otp": return .otp(try decoder.decode(OTPPayload.self, from: data))
+        case "origin": return .origin(try decoder.decode(OriginPayload.self, from: data))
         case let other: throw SyncPayloadError.unknownType(other ?? "nil")
         }
     }
@@ -296,6 +388,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .secret(let p): return try encoder.encode(p)
         case .folder(let p): return try encoder.encode(p)
         case .otp(let p): return try encoder.encode(p)
+        case .origin(let p): return try encoder.encode(p)
         }
     }
 
@@ -325,6 +418,9 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .otp(var p):
             p.rev = nil
             return .otp(p)
+        case .origin(var p):
+            p.rev = nil
+            return .origin(p)
         }
     }
 
@@ -335,6 +431,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .secret(let p): p.rev
         case .folder(let p): p.rev
         case .otp(let p): p.rev
+        case .origin(let p): p.rev
         }
     }
 
@@ -356,6 +453,9 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .otp(var p):
             p.rev = rev
             return .otp(p)
+        case .origin(var p):
+            p.rev = rev
+            return .origin(p)
         }
     }
 
@@ -366,140 +466,7 @@ nonisolated enum SyncPayload: Equatable, Sendable {
         case .secret: .secret
         case .folder: .folder
         case .otp: .otp
+        case .origin: .origin
         }
-    }
-}
-
-// MARK: - Mapping to and from the local models
-
-extension ClipPayload {
-    /// The payload for a local item. `blobs` are the server ids of its image and thumbnail, or of its files.
-    init(item: ClipItem, imageBlob: String? = nil, thumbBlob: String? = nil, fileBlobs: [FileBlob] = []) {
-        self.init(kind: item.kind.rawValue, text: item.text, preview: item.preview, isPinned: item.isPinned,
-                  copyCount: item.copyCount, createdAt: item.createdAt.syncMillis,
-                  lastCopiedAt: item.lastCopiedAt.syncMillis, contentHash: item.contentHash)
-        rtf = item.rtfData
-        html = item.htmlData
-        files = item.fileURLStrings.isEmpty ? nil : item.fileURLStrings
-        if item.kind == .file && !fileBlobs.isEmpty { self.fileBlobs = fileBlobs }
-        if item.kind == .image {
-            self.imageBlob = imageBlob
-            self.thumbBlob = thumbBlob
-            imageWidth = item.imageWidth
-            imageHeight = item.imageHeight
-        }
-        byteCount = item.byteCount > 0 ? item.byteCount : nil
-        sourceId = item.sourceBundleID
-        sourceName = item.sourceAppName
-        pinnedAt = item.isPinned ? item.pinnedAt?.syncMillis : nil
-        label = item.label
-        folder = item.isPinned ? item.folderID?.uuidString.lowercased() : nil
-    }
-
-    /// Without rich text, for items whose RTF/HTML would push the ciphertext past the limit.
-    var withoutRichText: ClipPayload {
-        var copy = self
-        copy.rtf = nil
-        copy.html = nil
-        if copy.kind == ClipKind.richText.rawValue { copy.kind = ClipKind.text.rawValue }
-        return copy
-    }
-
-    /// Writes the payload into a local item. Image files are set by the caller. A file clip stays a
-    /// file clip when its contents arrived (`localFiles`); otherwise it arrives as the names, as text.
-    /// Times are clamped to `arrivedAt`, so an item can't claim to come from the future.
-    func apply(to item: ClipItem, localFiles: [URL] = [], arrivedAt: Date = .now) {
-        var kind = ClipKind(rawValue: self.kind) ?? .text
-        item.text = text ?? ""
-        item.preview = preview ?? TextPreview.make(item.text)
-        item.contentHash = contentHash
-        item.fileURLStrings = []
-        if kind == .file && !localFiles.isEmpty {
-            item.fileURLStrings = localFiles.map(\.absoluteString)
-            item.text = localFiles.map(\.path).joined(separator: "\n")
-            if preview == nil { item.preview = TextPreview.make(localFiles.map(\.lastPathComponent).joined(separator: ", ")) }
-        } else if kind == .file {
-            kind = .text
-            if item.text.isEmpty { item.text = (files ?? []).compactMap { URL(string: $0)?.path }.joined(separator: "\n") }
-            if item.preview.isEmpty { item.preview = TextPreview.make(item.text) }
-            item.contentHash = ContentHasher.hash(text: item.text)
-        }
-        if kind == .image && imageBlob == nil { kind = .text }
-        item.kind = kind
-        item.rtfData = kind == .richText ? rtf : nil
-        item.htmlData = kind == .richText ? html : nil
-        item.imageWidth = imageWidth ?? 0
-        item.imageHeight = imageHeight ?? 0
-        item.byteCount = byteCount ?? item.text.utf8.count
-        item.sourceBundleID = sourceId
-        item.sourceAppName = sourceName
-        item.isPinned = isPinned
-        item.pinnedAt = isPinned ? pinnedAt.map(Date.init(syncMillis:)) ?? item.pinnedAt ?? .now : nil
-        item.label = label
-        // Kept even when that folder isn't here (yet): the clip shows at the root until it is.
-        item.folderID = isPinned ? folder.flatMap(UUID.init(uuidString:)) : nil
-        item.copyCount = max(1, copyCount)
-        let arrived = arrivedAt.syncMillis
-        item.createdAt = Date(syncMillis: min(createdAt, arrived))
-        item.lastCopiedAt = Date(syncMillis: min(lastCopiedAt, arrived))
-    }
-}
-
-extension SnippetPayload {
-    init(snippet: Snippet) {
-        self.init(name: snippet.name, keyword: snippet.keyword, body: snippet.body,
-                  createdAt: snippet.createdAt.syncMillis, updatedAt: snippet.updatedAt.syncMillis)
-    }
-
-    func apply(to snippet: Snippet, arrivedAt: Date = .now) {
-        let arrived = arrivedAt.syncMillis
-        snippet.name = name
-        snippet.keyword = keyword
-        snippet.body = body
-        snippet.createdAt = Date(syncMillis: min(createdAt, arrived))
-        snippet.updatedAt = Date(syncMillis: min(updatedAt, arrived))
-    }
-}
-
-extension FolderPayload {
-    init(folder: ClipFolder) {
-        self.init(name: folder.name, label: folder.label, parent: folder.parentID?.uuidString.lowercased(),
-                  createdAt: folder.createdAt.syncMillis, updatedAt: folder.updatedAt.syncMillis)
-    }
-
-    func apply(to folder: ClipFolder, arrivedAt: Date = .now) {
-        let arrived = arrivedAt.syncMillis
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        folder.name = trimmed.isEmpty ? "Folder" : trimmed
-        folder.label = label?.isEmpty == true ? nil : label
-        // Kept even when that folder isn't here (yet): it shows at the top level until it is.
-        folder.parentID = parent.flatMap(UUID.init(uuidString:))
-        folder.createdAt = Date(syncMillis: min(createdAt, arrived))
-        folder.updatedAt = Date(syncMillis: min(updatedAt, arrived))
-    }
-}
-
-extension ClipFolder {
-    convenience init(syncID: UUID, spaceID: String?) {
-        self.init(name: "")
-        id = syncID
-        self.spaceID = spaceID
-    }
-}
-
-extension ClipItem {
-    /// An empty item with a given id, filled in from a sync payload.
-    convenience init(syncID: UUID, spaceID: String?) {
-        self.init(capture: .text(""))
-        id = syncID
-        self.spaceID = spaceID
-    }
-}
-
-extension Snippet {
-    convenience init(syncID: UUID, spaceID: String?) {
-        self.init(name: "")
-        id = syncID
-        self.spaceID = spaceID
     }
 }

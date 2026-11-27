@@ -12,6 +12,8 @@ final class PasteService {
     var onAccessibilityMissing: (() -> Void)?
     /// Called on every paste (sync polls more often while the user is active).
     var onPaste: (() -> Void)?
+    /// Called right before ⌘V is sent, with the target active (offering to save a pasted password).
+    var willPostPaste: (() -> Void)?
 
     init(store: ClipStore, prefs: Preferences, tracker: FrontmostAppTracker, pasteboard: NSPasteboard = .general) {
         self.store = store
@@ -215,6 +217,7 @@ final class PasteService {
         Task {
             // Give the target app a moment to become key after our panel/popover closes.
             try? await Task.sleep(for: .milliseconds(90))
+            self.willPostPaste?()
             Self.postKey(9, flags: .maskCommand)            // kVK_ANSI_V
             if cursorOffsetFromEnd > 0 {
                 try? await Task.sleep(for: .milliseconds(60))

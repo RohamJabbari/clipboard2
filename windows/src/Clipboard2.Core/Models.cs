@@ -66,6 +66,9 @@ public sealed class ClipItem
     /// <summary>Images: text recognised on this PC (local only, never synced). Null until the image has been read;
     /// empty when it has no text.</summary>
     public string? OcrText { get; set; }
+    /// <summary>Payload fields synced by other clients that this one doesn't manage (a compact JSON object, or null),
+    /// written back unchanged on every push (<see cref="Sync.SyncPayload.ExtrasOf"/>).</summary>
+    public string? Extras { get; set; }
 
     public AppRef? Source => SourceId is null ? null : new AppRef(SourceId, SourceName ?? SourceId);
 
@@ -114,6 +117,9 @@ public sealed class Snippet
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
     /// <summary>Sync group id, or null for the personal space.</summary>
     public string? SpaceId { get; set; }
+    /// <summary>Payload fields synced by other clients that this one doesn't manage (a compact JSON object, or null),
+    /// written back unchanged on every push (<see cref="Sync.SyncPayload.ExtrasOf"/>).</summary>
+    public string? Extras { get; set; }
 }
 
 /// <summary>A folder in Saved: groups saved clips of one space (personal or a group), one level deep. Unrelated to
@@ -131,6 +137,9 @@ public sealed class ClipFolder
     /// <summary>The folder it sits in (same space), or null at the top level. As stored: <see cref="FolderTree"/> says
     /// how it reads (an unknown parent, a cycle or too deep is the top level).</summary>
     public Guid? ParentId { get; set; }
+    /// <summary>Payload fields synced by other clients that this one doesn't manage (a compact JSON object, or null),
+    /// written back unchanged on every push (<see cref="Sync.SyncPayload.ExtrasOf"/>).</summary>
+    public string? Extras { get; set; }
 }
 
 /// <summary>A clipboard capture after hashing / image encoding, ready to store.</summary>
@@ -196,8 +205,11 @@ public sealed record SyncMeta(string SpaceId, string LocalId, string Category, s
 /// <param name="Name">A group's decrypted name; for a contact (a "direct" space), the other person's name.</param>
 /// <param name="Members">Member uid → display name (username, or the email's part before @); null when the server
 /// doesn't send members.</param>
+/// <param name="CanSend">This user may add to the group (docs/features/member-access.md). True for anything but a
+/// group whose owner turned it off, and on servers that don't send it.</param>
+/// <param name="CanSeeSecrets">This user gets the group's secrets; true likewise.</param>
 public sealed record SpaceRecord(string Id, string Kind, string Role, string? Name, string OwnerUid, int MemberCount,
-                                 IReadOnlyDictionary<string, string>? Members = null)
+                                 IReadOnlyDictionary<string, string>? Members = null, bool CanSend = true, bool CanSeeSecrets = true)
 {
     public bool IsGroup => Kind == "group";
     /// <summary>A contact: a two-person space without a name (docs/sync/PROTOCOL.md → Contacts).</summary>
@@ -218,9 +230,10 @@ public sealed record SpaceRecord(string Id, string Kind, string Role, string? Na
 
     public bool Equals(SpaceRecord? other) =>
         other is not null && Id == other.Id && Kind == other.Kind && Role == other.Role && Name == other.Name && OwnerUid == other.OwnerUid
-        && MemberCount == other.MemberCount && SameMembers(Members, other.Members);
+        && MemberCount == other.MemberCount && SameMembers(Members, other.Members)
+        && CanSend == other.CanSend && CanSeeSecrets == other.CanSeeSecrets;
 
-    public override int GetHashCode() => HashCode.Combine(Id, Kind, Role, Name, OwnerUid, MemberCount, Members?.Count);
+    public override int GetHashCode() => HashCode.Combine(Id, Kind, Role, Name, OwnerUid, MemberCount, Members?.Count, (CanSend, CanSeeSecrets));
 
     private static bool SameMembers(IReadOnlyDictionary<string, string>? a, IReadOnlyDictionary<string, string>? b) =>
         a is null || b is null ? a is null && b is null

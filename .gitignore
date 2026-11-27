@@ -8,3 +8,6 @@ windows/**/bin/
 windows/**/obj/
 .claude/worktrees/
 .tools/
+
+# OAuth client secrets: bundled into the app, never committed (public repo).
+Clipboard2/Resources/OAuthSecrets.plist

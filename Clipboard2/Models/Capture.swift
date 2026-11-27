@@ -56,22 +56,3 @@ nonisolated struct ProcessedCapture: Sendable {
         )
     }
 }
-
-nonisolated enum TextPreview {
-    static func make(_ text: String, limit: Int = 300) -> String {
-        var out = ""
-        out.reserveCapacity(min(limit, text.count))
-        var lastWasSpace = false
-        for ch in text.prefix(limit * 4) {
-            if ch.isWhitespace {
-                if !lastWasSpace && !out.isEmpty { out.append(" ") }
-                lastWasSpace = true
-            } else {
-                out.append(ch)
-                lastWasSpace = false
-            }
-            if out.count >= limit { break }
-        }
-        return out.trimmingCharacters(in: .whitespaces)
-    }
-}

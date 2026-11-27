@@ -32,6 +32,23 @@ final class QuickPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
+    /// Set by the controller: whether the panel can be moved or resized now (it's at rest).
+    var canMove: () -> Bool = { false }
+    /// Every mouse-down in the panel, before it's handled.
+    var onMouseDown: (NSEvent) -> Void = { _ in }
+
+    /// Drags the panel with the mouse (the grip and the top bar); false when it can't move now.
+    func beginMove(with event: NSEvent) -> Bool {
+        guard canMove() else { return false }
+        performDrag(with: event)
+        return true
+    }
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown { onMouseDown(event) }
+        super.sendEvent(event)
+    }
+
     // Quick Look looks for its controller along the key window's responder chain.
     weak var quickLook: QuickLookPreview?
 
@@ -110,7 +127,22 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
     private let ambientShadow = CALayer()
     private let contactShadow = CALayer()
 
+    private var resizeHandles: [PanelResizeHandle] = []
+    private var activationObserver: NSObjectProtocol?
+
     private var geometry: PanelGeometry?
+    /// The panel's frame inside the window as last laid out.
+    private var panelInWindow: CGRect = .zero
+    /// The window is shrunk to the panel and its shadow (open and still); see `restingWindow`.
+    private var isResting = false
+    /// Our own frame changes, which aren't the user moving the panel.
+    private var isLayingOut = false
+    /// The visible frame of the screen the panel is on.
+    private var visibleFrame = CGRect(x: 0, y: 0, width: 1440, height: 900)
+    private var resizeStart: CGRect?
+    /// Kept open, the panel handed the keyboard to the app underneath (for a paste); nothing
+    /// takes it back until the user clicks the panel again.
+    private var steppedAside = false
     private var motion: Motion?
     /// Bumped on every open and close; stale completions and deferred work check it.
     private var generation = 0
@@ -141,7 +173,17 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         self.env = env
         self.model = PanelViewModel(env: env)
         super.init()
-        model.onClose = { [weak self] in self?.close() }
+        // Kept open, the panel steps aside instead of closing (a paste still reaches the app).
+        model.onClose = { [weak self] in self?.dismiss() }
+        // Kept open, "Pastes into" follows whichever app the user was last in.
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isVisible, self.model.isPinned else { return }
+                self.model.retarget(self.env.appTracker.targetApp)
+            }
+        }
         // A drag from Finder makes Finder key on the way in; take focus back once the drop lands.
         model.onDropFinished = { [weak self] in
             guard let self, let panel = self.panel, self.isVisible else { return }
@@ -157,7 +199,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         // Touch ID takes key focus; take it back afterwards if the panel is still meant to be up.
         authObserver = NotificationCenter.default.addObserver(forName: SecretStore.authenticationEnded, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, let panel = self.panel, self.isVisible, !panel.isKeyWindow else { return }
+                guard let self, let panel = self.panel, self.isVisible, !panel.isKeyWindow, !self.steppedAside else { return }
                 panel.makeKey()
             }
         }
@@ -167,7 +209,36 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
     var isVisible: Bool { phase == .opening || phase == .open }
 
     func toggle() {
-        isVisible ? close() : show()
+        if isVisible && model.isPinned {
+            bringToFront()
+        } else {
+            isVisible ? close() : show()
+        }
+    }
+
+    /// Kept open: ⇧⌘V brings the panel to the front and focuses search instead of closing it.
+    private func bringToFront() {
+        guard let panel else { return }
+        model.retarget(env.appTracker.targetApp)
+        panel.orderFrontRegardless()
+        panel.makeKey()
+        model.focusSearch()
+    }
+
+    /// The model is done (a paste, an action, esc): close, or when kept open, hand the keyboard
+    /// back to the app underneath and stay on screen.
+    private func dismiss() {
+        guard model.isPinned, isVisible, let panel else {
+            close()
+            return
+        }
+        steppedAside = true
+        quickLook.close()
+        if model.mode != .browse { model.resetMode() }
+        if panel.isKeyWindow {
+            panel.orderOut(nil)
+            panel.orderFront(nil)
+        }
     }
 
     /// Opens the panel. `then` runs once the list is ready (the list is filled just after the
@@ -195,8 +266,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         let panel = makePanel()
         self.panel = panel
         model.refresh(resetSelection: true)
-        let visible = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        layout(for: PanelGeometry.make(origin: env.prefs.panelOrigin, size: env.prefs.panelSize.size, visible: visible))
+        layout(for: openingGeometry(on: NSScreen.main ?? NSScreen.screens.first))
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         apply(progress: 1)
@@ -234,6 +304,8 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         generation &+= 1
         let gen = generation
         env.sync.setPanelOpen(true)
+        env.updates.panelDidOpen()
+        env.emailCodes.setPanelOpen(true)
         env.sync.reportActivity()
 
         switch phase {
@@ -246,9 +318,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
             phase = .opening
             updateShellIfNeeded()
             let screen = ScreenLocator.screen(forActiveWindowOf: target?.processIdentifier)
-            let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-            let geometry = PanelGeometry.make(origin: env.prefs.panelOrigin, size: env.prefs.panelSize.size, visible: visible)
-            layout(for: geometry)
+            layout(for: openingGeometry(on: screen))
             setInitialState()
         }
 
@@ -285,10 +355,18 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
             if phase == .hidden { model.didClose() }
             return
         }
+        model.isPinned = false
+        steppedAside = false
+        endResize()
+        // The close travels back to the origin's edge from wherever the panel is now.
+        if isResting, let geometry {
+            layout(for: PanelGeometry.make(origin: env.prefs.panelOrigin, frame: geometry.panel, visible: visibleFrame))
+        }
         removeKeyMonitor()
         quickLook.close()
         model.didClose()
         env.sync.setPanelOpen(false)
+        env.emailCodes.setPanelOpen(false)
         resignWatch?.invalidate()
         resignWatch = nil
         generation &+= 1
@@ -437,6 +515,8 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
                 CATransaction.setDisableActions(true)
                 self.morphView?.layer?.mask = nil
                 CATransaction.commit()
+                // Shrink the window to the panel so it can be dragged anywhere.
+                if let geometry = self.geometry { self.layout(for: geometry, resting: true) }
             } else if self.phase == .closing {
                 self.finishClose()
             }
@@ -517,24 +597,104 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
 
     // MARK: Layout
 
-    private func layout(for geometry: PanelGeometry) {
+    /// Sizes the window for `geometry`: with room for the open/close travel, or `resting`
+    /// (just the panel and its shadow).
+    private func layout(for geometry: PanelGeometry, resting: Bool = false) {
         guard let panel, let shadowView, let morphView, let shell else { return }
         self.geometry = geometry
-        let panelFrame = geometry.panelInWindow
+        isResting = resting
+        let window = resting ? geometry.restingWindow : geometry.window
+        let panelFrame = geometry.panel.offsetBy(dx: -window.minX, dy: -window.minY)
+        panelInWindow = panelFrame
+        isLayingOut = true
+        defer { isLayingOut = false }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        if panel.frame != geometry.window {
-            panel.setFrame(geometry.window, display: false)
+        if panel.frame != window {
+            panel.setFrame(window, display: false)
         }
         if shadowView.frame != panelFrame { shadowView.frame = panelFrame }
         if morphView.frame != panelFrame {
             morphView.frame = panelFrame
             shell.frame = morphView.bounds
         }
+        PanelResizeHandle.layout(resizeHandles, in: morphView.bounds)
         ambientShadow.frame = shadowView.bounds
         contactShadow.frame = shadowView.bounds
         updateShadowAppearance()
         CATransaction.commit()
+    }
+
+    /// Where the panel opens on `screen`: its remembered place there (if still fully visible),
+    /// else where the origin setting puts it; at the remembered size, or the first-open size.
+    private func openingGeometry(on screen: NSScreen?) -> PanelGeometry {
+        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        visibleFrame = visible
+        let prefs = env.prefs
+        let size = PanelLayout.size(remembered: prefs.panelFrameSize, seed: prefs.panelSizeSeed, visible: visible)
+        if let screen,
+           let frame = PanelLayout.restoredFrame(topLeft: prefs.panelPosition(forScreen: Self.key(for: screen)), size: size, visible: visible) {
+            return PanelGeometry.make(origin: prefs.panelOrigin, frame: frame, visible: visible)
+        }
+        return PanelGeometry.make(origin: prefs.panelOrigin, size: size, visible: visible)
+    }
+
+    /// A stable name for a display, for remembering the panel's place on it.
+    static func key(for screen: NSScreen) -> String {
+        guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            return screen.localizedName
+        }
+        if let uuid = CGDisplayCreateUUIDFromDisplayID(number.uint32Value)?.takeRetainedValue(),
+           let string = CFUUIDCreateString(nil, uuid) {
+            return string as String
+        }
+        return "display-\(number.uint32Value)"
+    }
+
+    /// Remembers the panel's place on the screen it's on now.
+    private func rememberPosition() {
+        guard let panel, let geometry, let screen = panel.screen else { return }
+        env.prefs.setPanelPosition(CGPoint(x: geometry.panel.minX, y: geometry.panel.maxY), forScreen: Self.key(for: screen))
+    }
+
+    // MARK: Moving and resizing
+
+    private var canMoveOrResize: Bool { phase == .open && isResting }
+
+    func windowDidMove(_ notification: Notification) {
+        guard !isLayingOut, canMoveOrResize, let panel else { return }
+        // The user dragged it: the panel sits at the same place inside the window.
+        let frame = panelInWindow.offsetBy(dx: panel.frame.minX, dy: panel.frame.minY)
+        if let screen = panel.screen { visibleFrame = screen.visibleFrame }
+        geometry = PanelGeometry.make(origin: env.prefs.panelOrigin, frame: frame, visible: visibleFrame)
+        rememberPosition()
+    }
+
+    private func beginResize() -> Bool {
+        guard canMoveOrResize, let geometry else { return false }
+        if let screen = panel?.screen { visibleFrame = screen.visibleFrame }
+        resizeStart = geometry.panel
+        return true
+    }
+
+    private func resize(by delta: CGVector, edges: PanelResizeEdges) {
+        guard let start = resizeStart, canMoveOrResize else { return }
+        let frame = PanelLayout.resize(start, edges: edges, by: delta, visible: visibleFrame)
+        guard frame != geometry?.panel else { return }
+        layout(for: PanelGeometry.make(origin: env.prefs.panelOrigin, frame: frame, visible: visibleFrame), resting: true)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        apply(progress: 1)
+        CATransaction.commit()
+        panel?.displayIfNeeded()
+    }
+
+    private func endResize() {
+        guard resizeStart != nil else { return }
+        resizeStart = nil
+        guard let geometry else { return }
+        env.prefs.panelFrameSize = geometry.panel.size
+        rememberPosition()
     }
 
     private func updateShadowAppearance() {
@@ -567,6 +727,16 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         // The Touch ID / password sheet steals focus; that isn't the user leaving the panel.
         if env.secrets.isAuthenticating || model.isChoosingFolder { return }
         guard isVisible else { return }
+        // Just after a password prompt, macOS hands focus back to the app underneath: take it back.
+        if let ended = env.secrets.authenticationEndedAt, Date.now.timeIntervalSince(ended) < 2 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                guard let self, let panel = self.panel, self.isVisible, !panel.isKeyWindow, !self.steppedAside else { return }
+                panel.makeKeyAndOrderFront(nil)
+            }
+            return
+        }
+        // Kept open: it stays on screen whatever takes focus.
+        if model.isPinned { return }
         // Quick Look taking key isn't the user leaving the panel; leaving both of them is.
         if quickLook.isVisible {
             closeIfFocusLeft()
@@ -582,6 +752,12 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         close()
     }
 
+    func windowDidBecomeKey(_ notification: Notification) {
+        steppedAside = false
+        // Kept open and clicked again: pastes go to the app the user just came from.
+        if model.isPinned { model.retarget(env.appTracker.targetApp) }
+    }
+
     // MARK: Quick Look
 
     private func setUpQuickLook() {
@@ -591,8 +767,10 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         quickLook.onEnd = { [weak self] in
             guard let self else { return }
             self.model.quickLookFiles.removeAll()
+            self.model.quickLookOverride = nil
             // Quick Look may have had the keyboard: hand it back to the panel.
-            if let panel = self.panel, self.isVisible, !panel.isKeyWindow { panel.makeKey() }
+            // Not after a kept-open panel stepped aside for a paste.
+            if let panel = self.panel, self.isVisible, !panel.isKeyWindow, !self.steppedAside { panel.makeKey() }
         }
         quickLook.onResignKey = { [weak self] in self?.closeIfFocusLeft() }
         model.isQuickLookOpen = { [quickLook] in quickLook.isVisible }
@@ -601,7 +779,8 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
             if open {
                 guard let panel = self.panel, self.isVisible else { return }
                 panel.makeKey()   // Quick Look finds its controller through the key window
-                self.quickLook.show(above: panel)
+                let frame = self.geometry.map { PanelLayout.quickLookFrame(panel: $0.panel, visible: self.visibleFrame) }
+                self.quickLook.show(above: panel, frame: frame)
             } else {
                 self.quickLook.close()
             }
@@ -616,6 +795,7 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
             guard let self, self.isVisible, let panel = self.panel, !panel.isKeyWindow, !self.quickLook.isKey else { return }
             if self.env.secrets.isAuthenticating || self.model.isChoosingFolder { return }
             if self.quickLook.isVisible {
+                if self.model.isPinned { return }   // kept open: both stay
                 Log.panel.debug("panel and Quick Look lost key focus; closing")
                 self.close()
             } else {
@@ -657,14 +837,31 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         let root = PanelRootView(frame: NSRect(origin: .zero, size: panel.frame.size))
         root.wantsLayer = true
         root.autoresizingMask = [.width, .height]
-        root.onClickOutside = { [weak self] in self?.close() }
+        root.onClickOutside = { [weak self] in
+            guard let self, !self.model.isPinned else { return }
+            self.close()
+        }
+        panel.canMove = { [weak self] in self?.canMoveOrResize ?? false }
+        // A click anywhere outside the preview's text clears what's selected in it.
+        panel.onMouseDown = { [weak self, weak panel] event in
+            guard let self, let panel, self.model.previewSelection != nil,
+                  let content = panel.contentView else { return }
+            let hit = content.hitTest(content.convert(event.locationInWindow, from: nil))
+            var view = hit
+            while let current = view {
+                if current is SelectableTextView || current is ClipEditorTextView || current is FileContentsTextView
+                    || current is PasteSelectionButton { return }
+                view = current.superview
+            }
+            self.model.previewSelection = nil
+        }
         root.panelShape = { [weak self] in
             guard let self, let geometry = self.geometry, self.phase != .hidden else { return nil }
             // At rest, the panel's frame and corners; mid-animation, wherever its shape is now.
             let progress = self.motion?.state(at: CACurrentMediaTime()).progress ?? (self.phase == .closing ? 0 : 1)
             let shape = geometry.shape(at: progress)
             let offset = geometry.offset(at: progress)
-            let rect = shape.rect.offsetBy(dx: geometry.panelInWindow.minX + offset.dx, dy: geometry.panelInWindow.minY + offset.dy)
+            let rect = shape.rect.offsetBy(dx: self.panelInWindow.minX + offset.dx, dy: self.panelInWindow.minY + offset.dy)
             return Self.path(rect, shape.radius)
         }
 
@@ -691,6 +888,15 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         root.addSubview(shadowView)
         root.addSubview(morphView)
         panel.contentView = root
+
+        resizeHandles = PanelResizeHandle.allEdges.map { edges in
+            let handle = PanelResizeHandle(edges: edges)
+            handle.onBegin = { [weak self] in self?.beginResize() ?? false }
+            handle.onDrag = { [weak self] delta in self?.resize(by: delta, edges: edges) }
+            handle.onEnd = { [weak self] in self?.endResize() }
+            morphView.addSubview(handle)
+            return handle
+        }
 
         self.root = root
         self.shadowView = shadowView
@@ -754,7 +960,8 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
         shell.frame = morphView.bounds
         shell.autoresizingMask = [.width, .height]
         hosting.frame = shell.bounds
-        morphView.addSubview(shell)
+        // Under the resize handles.
+        morphView.addSubview(shell, positioned: .below, relativeTo: nil)
         self.shell = shell
     }
 
@@ -771,6 +978,13 @@ final class QuickPanelController: NSObject, NSWindowDelegate {
                     return false
                 }
                 if window.firstResponder is ClipEditorTextView { return self.model.handleEditorKey(event) }
+                if let editor = window.firstResponder as? FileContentsTextView, editor.isEditable {
+                    return self.model.handleFileEditorKey(event)
+                }
+                // The name field's field editor: its delegate is the field.
+                if let editor = window.firstResponder as? NSTextView, editor.delegate is FileNameTextField {
+                    return self.model.handleFileNameKey(event)
+                }
                 return self.model.handleKeyDown(event)
             }
             return handled ? nil : event

@@ -404,7 +404,7 @@ struct FolderPanelTests {
                          characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code)!
     }
 
-    @Test func savedListsFoldersFirstAndOpensAndClosesThem() {
+    @Test func savedListsFoldersFirstAndExpandsAndCollapsesThem() {
         let tag = UUID().uuidString
         let folder = env.store.createFolder(named: "AAA \(tag)", inSpace: nil)
         let inside = env.store.ingest(.text("inside \(tag)"))
@@ -435,37 +435,42 @@ struct FolderPanelTests {
         #expect(model.folderCaptions[PanelEntry.clip(inside).id] == folder.name)
         model.query = ""
 
-        // Return opens the selected folder; esc goes back instead of closing.
+        // Return expands the selected folder in place: its clip follows it, one level in.
         model.selectedID = folderRow
         #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
-        #expect(model.openFolder?.id == folder.id)
-        #expect(model.entries.map(\.clip?.id) == [inside.id])
-        var closed = false
-        model.onClose = { closed = true }
-        #expect(model.handleKeyDown(key(KeyCode.escape, "\u{1b}")))
-        #expect(model.openFolder == nil && !closed && model.selectedID == folderRow)
+        #expect(model.isExpanded(folder) && model.selectedID == folderRow)
+        let row = try? #require(model.entries.firstIndex { $0.id == folderRow })
+        #expect(row.map { model.entries[$0 + 1].clip?.id } == inside.id)
+        #expect(model.entryDepths[PanelEntry.clip(inside).id] == 1)
 
-        // ← goes back too.
-        model.openFolder(folder)
+        // ← collapses it again; Return toggles too.
         #expect(model.handleKeyDown(key(KeyCode.leftArrow)))
-        #expect(model.openFolder == nil)
+        #expect(!model.isExpanded(folder) && !model.entries.contains { $0.clip?.id == inside.id })
+        #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
+        #expect(model.isExpanded(folder))
+        #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
+        #expect(!model.isExpanded(folder))
     }
 
-    @Test func moveToNewFolderAndDeleteFolderFromThePanel() {
+    @Test func saveIntoANewFolderAndDeleteFolderFromThePanel() {
         let tag = UUID().uuidString
         let a = env.store.ingest(.text("newfolder-a \(tag)"))
         let b = env.store.ingest(.text("newfolder-b \(tag)"))
         defer { [a, b].forEach(env.store.delete) }
         model.query = tag
         model.selectAll()
-        #expect(model.availableActions.contains(.addToSaved))
-        #expect(model.availableActions.contains(.moveToNewFolder))
+        #expect(model.availableActions.contains(.save))
+        #expect(!model.availableActions.contains(.addToSaved) && !model.availableActions.contains(.moveToNewFolder))
 
-        model.perform(.moveToNewFolder)
-        #expect(model.mode == .folderName)
-        model.folderNameForm?.name = "Batch \(tag)"
+        // Save… → New Folder under My folders: named inline, created and picked; Return saves.
+        model.perform(.save)
+        #expect(model.mode == .save)
+        model.beginSaveFormFolder(.mine)
+        model.saveForm?.newFolderName = "Batch \(tag)"
         #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
         let folder = try? #require(env.store.folders(inSpace: nil).first { $0.name == "Batch \(tag)" })
+        #expect(model.mode == .save && model.saveForm?.destination == .mine(folder?.id))
+        #expect(model.handleKeyDown(key(KeyCode.returnKey, "\r")))
         #expect(a.isPinned && a.folderID == folder?.id && b.folderID == folder?.id)
 
         model.query = ""

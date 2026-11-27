@@ -166,36 +166,141 @@ struct SaveSecretView: View {
     }
 }
 
-/// Changes a secret's name and value in place (the value is shown only after Touch ID).
+/// New Password…, New Secret… and Edit, in the right pane (an existing value shows only after Touch ID).
 struct EditSecretView: View {
     @Bindable var form: EditSecretState
     let onSubmit: () -> Void
-    @FocusState private var valueFocused: Bool
+    @FocusState private var focus: Field?
+
+    private enum Field: Hashable { case name, site(Int), username, value }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Label("Edit Secret", systemImage: "key.fill")
+        VStack(alignment: .leading, spacing: 12) {
+            Label(form.title, systemImage: form.kind == .password ? "person.badge.key.fill" : "key.fill")
                 .font(.headline)
-            Text("Changes are saved to your Keychain.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
             Form {
-                TextField("Name", text: $form.name)
-                TextField("Value", text: $form.value)
-                    .font(.body.monospaced())
-                    .focused($valueFocused)
+                if form.showsPasswordFields {
+                    sites
+                    TextField("Username", text: $form.username, prompt: Text("Optional"))
+                        .focused($focus, equals: .username)
+                }
+                passwordField
+                TextField("Name", text: $form.name,
+                          prompt: Text(form.showsPasswordFields ? "Optional, e.g. Work account" : "e.g. Prod DB password"))
+                    .focused($focus, equals: .name)
+                if form.showsPasswordFields || !form.notes.isEmpty {
+                    TextField("Notes", text: $form.notes, prompt: Text("Optional"), axis: .vertical)
+                        .lineLimit(1...4)
+                }
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
+            if let error = form.error {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
             HStack {
+                Text("Saved to your Keychain.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Spacer()
                 Button("Save", action: onSubmit)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(form.name.trimmingCharacters(in: .whitespaces).isEmpty || form.value.isEmpty)
+                    .disabled(!form.canSave)
             }
         }
         .padding(16)
-        .onAppear { valueFocused = true }
+        .onAppear {
+            focus = form.isNew ? (form.showsPasswordFields ? .site(0) : .name) : .value
+        }
+    }
+
+    @ViewBuilder
+    private var sites: some View {
+        ForEach(Array(form.sites.enumerated()), id: \.offset) { index, _ in
+            HStack(spacing: 6) {
+                TextField(index == 0 ? "Website" : "", text: Binding(
+                    get: { form.sites.indices.contains(index) ? form.sites[index] : "" },
+                    set: { if form.sites.indices.contains(index) { form.sites[index] = $0 } }
+                ), prompt: Text(index == 0 ? "e.g. google.com" : "Another site"))
+                .focused($focus, equals: .site(index))
+                if form.sites.count > 1 {
+                    Button {
+                        form.removeSite(at: index)
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Remove this site")
+                    .accessibilityLabel("Remove site")
+                }
+                if index == form.sites.count - 1 {
+                    Button {
+                        form.addSite()
+                        focus = .site(form.sites.count - 1)
+                    } label: {
+                        Image(systemName: "plus.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Add another site")
+                    .accessibilityLabel("Add site")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var passwordField: some View {
+        HStack(spacing: 6) {
+            TextField(form.kind == .password ? "Password" : "Value", text: $form.value)
+                .font(.body.monospaced())
+                .focused($focus, equals: .value)
+            if form.showsPasswordFields {
+                Button("Generate") { form.generate() }
+                    .help("Suggests two strong passwords")
+            }
+        }
+        if form.showsPasswordFields, let suggestions = form.suggestions {
+            PasswordSuggestionsView(suggestions: suggestions) { form.use($0) }
+        }
+    }
+}
+
+/// Two strong passwords side by side, one without and one with symbols; clicking one uses it.
+struct PasswordSuggestionsView: View {
+    let suggestions: PasswordGenerator.Suggestions
+    var compact = false
+    let onPick: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            option("Letters & digits", suggestions.plain)
+            option("With symbols", suggestions.symbols)
+        }
+    }
+
+    private func option(_ title: String, _ password: String) -> some View {
+        Button { onPick(password) } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(password)
+                    .font(.system(size: compact ? 10.5 : 12, design: .monospaced))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .foregroundStyle(.primary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help("Use this password")
+        .accessibilityLabel("Use password, \(title.lowercased())")
     }
 }
 
@@ -247,8 +352,10 @@ struct ShareToGroupView: View {
                     }
                     .contentShape(Rectangle())
                     .onTapGesture {
+                        // A group with folders is picked first, so its "Into" menu can be used.
+                        let hasFolders = !(form.foldersByGroup[group.id] ?? []).isEmpty
                         form.selection = index
-                        onSubmit()
+                        if !hasFolders || selected { onSubmit() }
                     }
                     .accessibilityElement(children: .combine)
                     .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)

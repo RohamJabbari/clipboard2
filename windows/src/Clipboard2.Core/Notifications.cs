@@ -80,6 +80,9 @@ public static class NotificationText
     public const string Secret = "a secret";
     public const string Snippet = "a snippet";
 
+    public static string SendAccess(bool canSend) => canSend ? "You can send again" : "You can no longer send";
+    public static string SecretsAccess(bool canSee) => canSee ? "You can see secrets again" : "You can no longer see secrets";
+
     /// <summary>"anna", "anna and ben", "anna and 3 others".</summary>
     public static string Names(IReadOnlyList<string> names) => names.Count switch
     {
@@ -185,6 +188,11 @@ public sealed class ActivityDetector
             // Renaming is owner-only: an owner's rename is their own.
             if (!group.IsOwner && was.Name is { Length: > 0 } oldName && group.Name is { Length: > 0 } newName && oldName != newName)
                 notes.Add(new(NotificationKind.GroupActivity, newName, $"{oldName} was renamed", new NotificationTarget.Group(id), id));
+            // This user's own access, changed by the owner (docs/features/member-access.md).
+            if (was.CanSend != group.CanSend)
+                notes.Add(new(NotificationKind.GroupMembers, group.DisplayName, NotificationText.SendAccess(group.CanSend), new NotificationTarget.Group(id), id));
+            if (was.CanSeeSecrets != group.CanSeeSecrets)
+                notes.Add(new(NotificationKind.GroupMembers, group.DisplayName, NotificationText.SecretsAccess(group.CanSeeSecrets), new NotificationTarget.Group(id), id));
             if (was.Members is not { } oldMembers || group.Members is not { } newMembers) continue;
             var joined = newMembers.Where(m => m.Key != self && !oldMembers.ContainsKey(m.Key)).Select(m => m.Value).ToList();
             var left = oldMembers.Where(m => m.Key != self && !newMembers.ContainsKey(m.Key) && !_expectedRemoved.Contains((id, m.Key)))

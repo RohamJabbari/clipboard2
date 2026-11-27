@@ -4,7 +4,11 @@ import type pg from "pg";
 import type { Db } from "./db.js";
 import { tx } from "./db.js";
 import type { Limits } from "./config.js";
-import type { BlobStorage } from "./services.js";
+import type { BlobStorage, Mailer } from "./services.js";
+import type { Features } from "./config.js";
+import { decryptEmail, emailIndex, encryptEmail, type ServerKeys } from "./keys.js";
+import type { GoogleVerifier } from "./google.js";
+import { registerPasswordless, type Geo, sessionJson, SESSION_COLUMNS, INDEFINITE_YEARS, SECURITY_REVISION } from "./passwordless.js";
 import { RateLimiter, Semaphore } from "./rateLimit.js";
 import {
   burnScrypt,
@@ -24,8 +28,11 @@ import {
 
 export interface Caller {
   uid: string;
-  email: string;
   tokenHash: Buffer;
+  /** The session's public id. */
+  sessionId: string;
+  /** `password` (logged in with a password) or `device` (passwordless device session). */
+  sessionKind: string;
 }
 
 export interface Deps {
@@ -35,6 +42,15 @@ export interface Deps {
   logger?: boolean;
   /** Where log lines go when logging (tests); stdout otherwise. */
   logStream?: { write(line: string): void };
+  /** From SERVER_SECRET: email index/encryption and the recovery escrow key. */
+  keys: ServerKeys;
+  features?: Partial<Features>;
+  /** Continue with Google; without it Google ID tokens are refused. */
+  google?: GoogleVerifier;
+  /** Sends email (codes). None yet: the email features stay off without it. */
+  mailer?: Mailer;
+  /** Approximate location of a request; null when unknown. Defaults to trusted LB headers when `features.geoHeaders`. */
+  geo?: (request: FastifyRequest) => Geo | null;
 }
 
 declare module "fastify" {
@@ -75,7 +91,7 @@ const b64 = (maxBytes: number) =>
     .transform((s) => Buffer.from(s, "base64"))
     .refine((b) => b.length <= maxBytes, `at most ${maxBytes} bytes`);
 const millis = z.number().int().nonnegative().max(8.64e15);
-const category = z.enum(["history", "pinned", "snippet", "secret", "folder", "otp"]);
+const category = z.enum(["history", "pinned", "snippet", "secret", "folder", "otp", "origin"]);
 const kdf = z.object({ salt: b64(64).refine((b) => b.length >= 16, "salt too short"), iterations: z.number().int().min(100_000).max(10_000_000) });
 const sealed = b64(4096);
 const publicKey = b64(65).refine((b) => b.length === 65 && b[0] === 0x04, "X9.63 uncompressed P-256 key");
@@ -105,9 +121,10 @@ const signupBody = z.object({
   personalSpace: z.object({ id: uuid, wrappedKey: sealed }),
   deviceName,
 });
-const loginBody = z.object({ email, authKey, deviceName });
+const platform = z.string().trim().max(20).optional();
+const loginBody = z.object({ email, authKey, deviceName, platform });
 const passwordBody = z.object({ authKey, newAuthKey: authKey, kdf, wrappedAccountKey: sealed });
-const reauthBody = z.object({ authKey });
+const deleteAccountBody = z.object({ authKey: authKey.optional(), confirm: z.string().max(100).optional() });
 const usernameBody = z.object({ username });
 const groupBody = z.object({ id: uuid, encryptedName: sealed, wrappedKey: sealed });
 const renameBody = z.object({ encryptedName: sealed });
@@ -119,6 +136,9 @@ const authenticatorBody = z.object({ id: uuid, wrappedKey: sealed });
 /** A day of codes is ~30 KB of JSON at 30 s; 128 KiB fits 8 digits at a 15 s period (~63 KB) twice over. */
 const codesBody = z.object({ codesUntil: millis, sealedCodes: b64(128 * 1024).refine((b) => b.length > 0, "empty") });
 const transferBody = z.object({ uid: uuid, wrappedKey: sealed });
+const memberAccessBody = z
+  .object({ canSend: z.boolean().optional(), canSeeSecrets: z.boolean().optional() })
+  .refine((b) => b.canSend !== undefined || b.canSeeSecrets !== undefined, "canSend or canSeeSecrets");
 /** Batches cover 24 h from the current step; an hour of slack for clocks and slow uploads. */
 const MAX_CODES_AHEAD_MS = 25 * 60 * 60 * 1000;
 /**
@@ -134,6 +154,34 @@ const changesQuery = z.object({
 });
 const blobBody = z.object({ id: uuid, size: z.number().int().positive(), ifGenerationMatch: z.boolean().optional() });
 const deleteQuery = z.object({ updatedAt: z.coerce.number().int().nonnegative() });
+
+/** The account that signs in with a password at this address: its own, or one a verified claim took it from. */
+const PASSWORD_USER_BY_EMAIL = `SELECT * FROM users WHERE (email_index = $1 OR email_released_index = $1) AND auth_hash IS NOT NULL
+  ORDER BY (email_index = $1) DESC NULLS LAST LIMIT 1`;
+
+interface UserRow {
+  uid: string;
+  email: string | null;
+  email_enc: Buffer | null;
+  email_index: Buffer | null;
+  email_verified: boolean;
+  username: string | null;
+  kdf_salt: Buffer | null;
+  kdf_iterations: number | null;
+  wrapped_account_key: Buffer | null;
+  public_key: Buffer;
+  wrapped_private_key: Buffer;
+  personal_space_id: string;
+}
+
+interface SessionOptions {
+  kind?: "password" | "device";
+  platform?: string | null;
+  devicePublicKey?: Buffer | null;
+  /** Device sessions: the window in ms, or null for indefinitely. */
+  windowMs?: number | null;
+  geo?: Geo | null;
+}
 
 // MARK: Row mapping
 
@@ -176,9 +224,16 @@ type Queryable = Pick<pg.PoolClient, "query">;
  * `/changes` cursor can never pass a seq that commits later. NO KEY UPDATE rather than UPDATE so
  * FK checks (blob and member inserts) aren't blocked by it.
  */
-async function roleIn(db: Queryable, spaceId: string, uid: string, lock = false): Promise<{ role: string; kind: string } | null> {
-  const { rows } = await db.query<{ role: string; kind: string }>(
-    `SELECT m.role, s.kind FROM space_members m JOIN spaces s ON s.id = m.space_id
+interface Membership {
+  role: string;
+  kind: string;
+  can_send: boolean;
+  can_see_secrets: boolean;
+}
+
+async function roleIn(db: Queryable, spaceId: string, uid: string, lock = false): Promise<Membership | null> {
+  const { rows } = await db.query<Membership>(
+    `SELECT m.role, s.kind, m.can_send, m.can_see_secrets FROM space_members m JOIN spaces s ON s.id = m.space_id
      WHERE m.space_id = $1 AND m.uid = $2${lock ? " FOR NO KEY UPDATE OF s" : ""}`,
     [spaceId, uid],
   );
@@ -254,6 +309,13 @@ const isShared = (kind: string) => kind !== "personal";
 /** Who a pair of uids is, in the order direct_pairs stores them. */
 const orderedPair = (a: string, b: string): [string, string] => (a < b ? [a, b] : [b, a]);
 
+/** Member access (Send) applies to groups only; contacts, personal spaces and authenticators are unchanged. */
+const canSend = (m: Membership) => m.kind !== "group" || m.can_send;
+/** Member access (Secrets) applies to groups only. */
+const canSeeSecrets = (m: Membership) => m.kind !== "group" || m.can_see_secrets;
+const sendNotAllowed = () => new ApiError(403, "send_not_allowed", "You can't send to this group");
+const noSecrets = () => forbidden("You can't see this group's secrets");
+
 /** In a group, an existing item (tombstones included) may be overwritten or deleted only by its author or the group owner. In a direct space either member may. */
 function requireItemWriter(membership: { role: string; kind: string }, item: ItemRow, uid: string) {
   if (membership.kind === "group" && membership.role !== "owner" && item.author_uid !== uid) {
@@ -306,7 +368,8 @@ async function dropBlobs(db: Queryable, spaceId: string, blobIds: string[]): Pro
 // MARK: App
 
 export function buildApp(deps: Deps): FastifyInstance {
-  const { pool, storage, limits } = deps;
+  const { pool, storage, limits, keys } = deps;
+  const feature = { emailCodes: false, geoHeaders: false, ...deps.features };
   // Request logs carry method and URL only: no IPs, and no route takes an email in its URL.
   const logger = deps.logger
     ? {
@@ -321,6 +384,9 @@ export function buildApp(deps: Deps): FastifyInstance {
   // "trust nothing".)
   const app = Fastify({ logger, bodyLimit: Math.ceil(limits.itemBytes * 1.4) + 64 * 1024, trustProxy: (_address: string, hop: number) => hop < limits.trustedProxyHops });
   const requests = new RateLimiter(limits.requestsPerMinute);
+  // Devices poll /v1/heads every few seconds; it has its own per-session bucket so polling never
+  // eats into the budget of the syncs it triggers (and several devices don't add up).
+  const headPolls = new RateLimiter(limits.headsPerMinute);
   const inviteLookups = new RateLimiter(limits.invitesPerMinute);
 
   // The server-wide cap only guards the shared database and bucket, but summing every row on the
@@ -368,41 +434,50 @@ export function buildApp(deps: Deps): FastifyInstance {
   // Not /healthz: Cloud Run's front end reserves that path and answers it with its own 404.
   app.get("/health", async () => ({ ok: true }));
 
-  const PUBLIC_ROUTES = new Set(["/v1/auth/prelogin", "/v1/auth/signup", "/v1/auth/login"]);
+  const PUBLIC_ROUTES = new Set(["/v1/auth/prelogin", "/v1/auth/signup", "/v1/auth/login", "/v1/auth/passwordless/signup"]);
+  /** The new device's side of device requests and recoveries authenticates with the request secret instead. */
+  const PUBLIC_PREFIXES = ["/v1/auth/device-requests", "/v1/auth/recovery"];
+  const isPublic = (path: string) => PUBLIC_ROUTES.has(path) || PUBLIC_PREFIXES.some((p) => path === p || path.startsWith(p + "/"));
 
   app.addHook("onRequest", async (request) => {
-    if (!request.url.startsWith("/v1/") || PUBLIC_ROUTES.has(request.url.split("?")[0]!)) return;
+    if (!request.url.startsWith("/v1/") || isPublic(request.url.split("?")[0]!)) return;
     const header = request.headers.authorization ?? "";
     const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
     if (!token) throw new ApiError(401, "unauthenticated", "Sign in first");
     const hash = tokenHash(token);
-    const { rows } = await pool.query<{ uid: string; email: string; stale: boolean }>(
-      `SELECT s.uid, u.email, s.last_used_at < now() - interval '1 hour' AS stale
-       FROM sessions s JOIN users u ON u.uid = s.uid WHERE s.token_hash = $1 AND s.expires_at > now()`,
+    const { rows } = await pool.query<{ uid: string; id: string; kind: string; stale: boolean }>(
+      `SELECT s.uid, s.id, s.kind, s.last_used_at < now() - interval '1 hour' AS stale
+       FROM sessions s WHERE s.token_hash = $1 AND s.expires_at > now()`,
       [hash],
     );
     const session = rows[0];
     if (!session) throw new ApiError(401, "unauthenticated", "Your session ended; sign in again");
-    const wait = requests.take(session.uid);
+    const wait = request.url.split("?")[0] === "/v1/heads" ? headPolls.take(hash.toString("hex")) : requests.take(session.uid);
     if (wait > 0) throw new ApiError(429, "rate_limited", "Too many requests", { retryAfter: wait });
     if (session.stale) {
-      await pool.query(`UPDATE sessions SET last_used_at = now(), expires_at = now() + make_interval(days => $2) WHERE token_hash = $1`, [hash, SESSION_DAYS]);
+      // Password sessions slide; device sessions keep the hard expiry of their window.
+      await pool.query(
+        `UPDATE sessions SET last_used_at = now(),
+           expires_at = CASE WHEN kind = 'password' THEN now() + make_interval(days => $2) ELSE expires_at END
+         WHERE token_hash = $1`,
+        [hash, SESSION_DAYS],
+      );
     }
-    request.caller = { uid: session.uid, email: session.email, tokenHash: hash };
+    request.caller = { uid: session.uid, tokenHash: hash, sessionId: session.id, sessionKind: session.kind };
   });
 
   /**
    * Shared per-IP and per-email throttle for prelogin, signup and login (and password checks), counted
    * in Postgres in fixed one-minute windows so it holds across instances.
    */
-  const throttleAuth = async (request: FastifyRequest, emailAddress: string) => {
+  const throttleAuth = async (request: FastifyRequest, subject: string) => {
     const key = await serverKey;
     const byIp = rateKey(key, `ip:${request.ip}`);
     const { rows } = await pool.query<{ key: Buffer; hits: number; wait: number }>(
       `INSERT INTO auth_attempts (key, window_start, hits) VALUES ($1, date_trunc('minute', now()), 1), ($2, date_trunc('minute', now()), 1)
        ON CONFLICT (key, window_start) DO UPDATE SET hits = auth_attempts.hits + 1
        RETURNING key, hits, ceil(extract(epoch FROM window_start + interval '1 minute' - now()))::int AS wait`,
-      [byIp, rateKey(key, `email:${emailAddress}`)],
+      [byIp, rateKey(key, `email:${subject}`)],
     );
     const over = rows.filter((r) => r.hits > (r.key.equals(byIp) ? limits.authPerMinutePerIp : limits.authPerMinutePerEmail));
     if (Date.now() - lastAttemptSweep > 60_000) {
@@ -422,20 +497,60 @@ export function buildApp(deps: Deps): FastifyInstance {
     return running;
   };
 
-  const startSession = async (db: Queryable, uid: string, device: string | undefined) => {
-    const token = newSessionToken();
-    const { rows } = await db.query<{ expires_at: Date }>(
-      `INSERT INTO sessions (token_hash, uid, device_name, expires_at) VALUES ($1, $2, $3, now() + make_interval(days => $4)) RETURNING expires_at`,
-      [tokenHash(token), uid, device ?? null, SESSION_DAYS],
-    );
-    return { token, expiresAt: rows[0]!.expires_at.getTime() };
+  const geoOf = (request: FastifyRequest): Geo | null => {
+    if (deps.geo) return deps.geo(request);
+    if (!feature.geoHeaders) return null;
+    const header = (name: string) => {
+      const value = request.headers[name];
+      const text = (Array.isArray(value) ? value[0] : value)?.trim();
+      return text ? text.slice(0, 80) : null;
+    };
+    const country = header("x-client-geo-country");
+    return country ? { country: country.toUpperCase(), city: header("x-client-geo-city") } : null;
   };
 
-  /** Checks authKey against the stored scrypt hash; false for unknown users after the same work. */
+  /** A password session slides 30 days from its last use; a device session ends at its window, hard. */
+  const startSession = async (db: Queryable, uid: string, device: string | undefined | null, options: SessionOptions = {}) => {
+    const token = newSessionToken();
+    const kind = options.kind ?? "password";
+    const windowMs = kind === "device" ? (options.windowMs ?? null) : null;
+    const { rows } = await db.query<{ expires_at: Date; id: string }>(
+      `INSERT INTO sessions (token_hash, uid, device_name, expires_at, kind, platform, device_public_key, window_ms, country, city)
+       VALUES ($1, $2, $3,
+         CASE WHEN $5::text = 'password' THEN now() + make_interval(days => $4)
+              WHEN $8::bigint IS NULL THEN now() + make_interval(years => $11)
+              ELSE now() + make_interval(secs => $8::bigint / 1000.0) END,
+         $5, $6, $7, $8, $9, $10)
+       RETURNING expires_at, id`,
+      [
+        tokenHash(token),
+        uid,
+        device ?? null,
+        SESSION_DAYS,
+        kind,
+        options.platform ?? null,
+        options.devicePublicKey ?? null,
+        windowMs,
+        options.geo?.country ?? null,
+        options.geo?.city ?? null,
+        INDEFINITE_YEARS,
+      ],
+    );
+    const indefinite = kind === "device" && windowMs === null;
+    return { token, expiresAt: indefinite ? null : rows[0]!.expires_at.getTime(), sessionId: rows[0]!.id };
+  };
+
+  const indexOf = (address: string) => emailIndex(keys, address);
+
+  /**
+   * Checks authKey against the stored scrypt hash; null for unknown users (or accounts without a
+   * password) after the same work. By email it finds the account holding the address, or one whose
+   * unverified address a verified account took over (so its password still works).
+   */
   const checkAuthKey = async (db: Queryable, where: { uid?: string; email?: string }, key: Buffer) => {
     const { rows } = await db.query<{ uid: string; auth_salt: Buffer; auth_hash: Buffer }>(
-      where.uid ? "SELECT uid, auth_salt, auth_hash FROM users WHERE uid = $1" : "SELECT uid, auth_salt, auth_hash FROM users WHERE lower(email) = $1",
-      [where.uid ?? where.email],
+      where.uid ? "SELECT uid, auth_salt, auth_hash FROM users WHERE uid = $1 AND auth_hash IS NOT NULL" : PASSWORD_USER_BY_EMAIL,
+      [where.uid ?? indexOf(where.email!)],
     );
     const user = rows[0];
     if (!user) {
@@ -447,22 +562,19 @@ export function buildApp(deps: Deps): FastifyInstance {
 
   // MARK: Account
 
-  const accountJson = (r: {
-    uid: string;
-    email: string;
-    username: string | null;
-    kdf_salt: Buffer;
-    kdf_iterations: number;
-    wrapped_account_key: Buffer;
-    public_key: Buffer;
-    wrapped_private_key: Buffer;
-    personal_space_id: string;
-  }) => ({
+  /**
+   * `kdf` and `wrappedAccountKey` are null for passwordless accounts (only Macs that know them ever
+   * see one). `emailReleased`: a verified account took this unverified address; change it.
+   */
+  const accountJson = (r: UserRow) => ({
     uid: r.uid,
-    email: r.email,
+    email: r.email_enc ? decryptEmail(keys, r.email_enc) : (r.email ?? ""),
+    emailVerified: r.email_verified,
+    emailReleased: r.email_index === null && r.email === null,
     username: r.username,
-    kdf: { alg: "pbkdf2-sha256", salt: r.kdf_salt.toString("base64"), iterations: r.kdf_iterations },
-    wrappedAccountKey: r.wrapped_account_key.toString("base64"),
+    kdf: r.kdf_salt ? { alg: "pbkdf2-sha256", salt: r.kdf_salt.toString("base64"), iterations: r.kdf_iterations } : null,
+    wrappedAccountKey: r.wrapped_account_key ? r.wrapped_account_key.toString("base64") : null,
+    hasPassword: r.wrapped_account_key !== null,
     publicKey: r.public_key.toString("base64"),
     wrappedPrivateKey: r.wrapped_private_key.toString("base64"),
     personalSpaceId: r.personal_space_id,
@@ -471,10 +583,7 @@ export function buildApp(deps: Deps): FastifyInstance {
   app.post("/v1/auth/prelogin", async (request) => {
     const body = preloginBody.parse(request.body);
     await throttleAuth(request, body.email);
-    const { rows } = await pool.query<{ kdf_salt: Buffer; kdf_iterations: number }>(
-      "SELECT kdf_salt, kdf_iterations FROM users WHERE lower(email) = $1",
-      [body.email],
-    );
+    const { rows } = await pool.query<{ kdf_salt: Buffer; kdf_iterations: number }>(PASSWORD_USER_BY_EMAIL, [indexOf(body.email)]);
     const user = rows[0];
     const salt = user ? user.kdf_salt : fakeSalt(await serverKey, body.email);
     return { kdf: { alg: "pbkdf2-sha256", salt: salt.toString("base64"), iterations: user?.kdf_iterations ?? FAKE_KDF_ITERATIONS } };
@@ -510,8 +619,9 @@ export function buildApp(deps: Deps): FastifyInstance {
     // Checked before the scrypt work (and before the email check, so it can't probe for accounts), then again in the transaction.
     await signupInvite(pool, body);
     const verifier = await withScrypt(() => hashAuthKey(body.authKey));
+    const index = indexOf(body.email);
     const result = await tx(pool, async (db) => {
-      const existing = await db.query("SELECT 1 FROM users WHERE lower(email) = $1", [body.email]);
+      const existing = await db.query("SELECT 1 FROM users WHERE email_index = $1", [index]);
       if (existing.rowCount) throw new ApiError(409, "conflict", "An account with that email already exists");
       if (body.username) {
         const taken = await db.query("SELECT 1 FROM users WHERE lower(username) = lower($1)", [body.username]);
@@ -519,11 +629,11 @@ export function buildApp(deps: Deps): FastifyInstance {
       }
       const invite = await signupInvite(db, body);
       const { rows } = await db.query(
-        `INSERT INTO users (uid, email, username, auth_salt, auth_hash, kdf_salt, kdf_iterations, wrapped_account_key, public_key, wrapped_private_key, personal_space_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+        `INSERT INTO users (uid, email_index, email_enc, fallback_name, username, auth_salt, auth_hash, kdf_salt, kdf_iterations, wrapped_account_key, public_key, wrapped_private_key, personal_space_id)
+         VALUES ($1, $12, $2, $13, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
         [
           body.uid,
-          body.email,
+          encryptEmail(keys, body.email),
           body.username ?? null,
           verifier.salt,
           verifier.hash,
@@ -533,6 +643,8 @@ export function buildApp(deps: Deps): FastifyInstance {
           body.publicKey,
           body.wrappedPrivateKey,
           body.personalSpace.id,
+          index,
+          body.username ? null : body.email.split("@")[0],
         ],
       );
       await db.query("INSERT INTO spaces (id, kind, owner_uid) VALUES ($1, 'personal', $2)", [body.personalSpace.id, body.uid]);
@@ -549,7 +661,8 @@ export function buildApp(deps: Deps): FastifyInstance {
         ]);
         if (!used.rowCount) throw inviteInvalid();
       }
-      return { ...(await startSession(db, body.uid, body.deviceName)), account: accountJson(rows[0]) };
+      const { token, expiresAt } = await startSession(db, body.uid, body.deviceName, { geo: geoOf(request) });
+      return { token, expiresAt, account: accountJson(rows[0]) };
     }).catch((error: { code?: string; constraint?: string }) => {
       if (isUsernameConflict(error)) throw usernameTaken();
       if (error.code === "23505") throw new ApiError(409, "conflict", "An account with that email already exists");
@@ -564,7 +677,8 @@ export function buildApp(deps: Deps): FastifyInstance {
     const uid = await checkAuthKey(pool, { email: body.email }, body.authKey);
     if (!uid) throw new ApiError(401, "invalid_credentials", "Wrong email or password");
     const { rows } = await pool.query("SELECT * FROM users WHERE uid = $1", [uid]);
-    return { ...(await startSession(pool, uid, body.deviceName)), account: accountJson(rows[0]) };
+    const { token, expiresAt } = await startSession(pool, uid, body.deviceName, { platform: body.platform ?? null, geo: geoOf(request) });
+    return { token, expiresAt, account: accountJson(rows[0]) };
   });
 
   app.post("/v1/auth/logout", async (request, reply) => {
@@ -581,7 +695,10 @@ export function buildApp(deps: Deps): FastifyInstance {
   app.put("/v1/account/username", async (request) => {
     const body = usernameBody.parse(request.body);
     const { rows } = await pool
-      .query<{ username: string }>("UPDATE users SET username = $2 WHERE uid = $1 RETURNING username", [request.caller.uid, body.username])
+      .query<{ username: string }>("UPDATE users SET username = $2, fallback_name = NULL WHERE uid = $1 RETURNING username", [
+        request.caller.uid,
+        body.username,
+      ])
       .catch((error: { code?: string; constraint?: string }) => {
         if (isUsernameConflict(error)) throw usernameTaken();
         throw error;
@@ -593,7 +710,7 @@ export function buildApp(deps: Deps): FastifyInstance {
   app.put("/v1/account/password", async (request, reply) => {
     const body = passwordBody.parse(request.body);
     const { uid, tokenHash: current } = request.caller;
-    await throttleAuth(request, request.caller.email);
+    await throttleAuth(request, `uid:${uid}`);
     if (!(await checkAuthKey(pool, { uid }, body.authKey))) throw new ApiError(401, "invalid_credentials", "Your current password is wrong");
     const verifier = await withScrypt(() => hashAuthKey(body.newAuthKey));
     await tx(pool, async (db) => {
@@ -607,10 +724,23 @@ export function buildApp(deps: Deps): FastifyInstance {
   });
 
   app.delete("/v1/account", async (request, reply) => {
-    const body = reauthBody.parse(request.body);
+    const body = deleteAccountBody.parse(request.body);
     const { uid } = request.caller;
-    await throttleAuth(request, request.caller.email);
-    if (!(await checkAuthKey(pool, { uid }, body.authKey))) throw new ApiError(401, "invalid_credentials", "Wrong password");
+    await throttleAuth(request, `uid:${uid}`);
+    if (body.authKey) {
+      if (!(await checkAuthKey(pool, { uid }, body.authKey))) throw new ApiError(401, "invalid_credentials", "Wrong password");
+    } else {
+      // Passwordless: a device session confirms with the username, typed. Password accounts always need the password.
+      const { rows } = await pool.query<{ username: string | null; has_password: boolean }>(
+        "SELECT username, auth_hash IS NOT NULL AS has_password FROM users WHERE uid = $1",
+        [uid],
+      );
+      const user = rows[0];
+      if (!user || user.has_password || request.caller.sessionKind !== "device") throw new ApiError(401, "invalid_credentials", "Wrong password");
+      if (!body.confirm || !user.username || body.confirm.trim().normalize("NFC").toLowerCase() !== user.username.toLowerCase()) {
+        throw new ApiError(400, "invalid", "Type your username to confirm");
+      }
+    }
     const paths = await tx(pool, async (db) => {
       // Every direct space they're in or were asked into goes for both people, items and blobs included.
       const { rows: direct } = await db.query<{ id: string }>(
@@ -675,20 +805,12 @@ export function buildApp(deps: Deps): FastifyInstance {
   // MARK: Sessions
 
   app.get("/v1/sessions", async (request) => {
-    const { rows } = await pool.query<{ id: string; device_name: string | null; created_at: Date; last_used_at: Date; current: boolean }>(
-      `SELECT id, device_name, created_at, last_used_at, token_hash = $2 AS current FROM sessions
+    const { rows } = await pool.query(
+      `SELECT ${SESSION_COLUMNS}, token_hash = $2 AS current FROM sessions
        WHERE uid = $1 AND expires_at > now() ORDER BY last_used_at DESC, created_at DESC`,
       [request.caller.uid, request.caller.tokenHash],
     );
-    return {
-      sessions: rows.map((r) => ({
-        id: r.id,
-        deviceName: r.device_name,
-        createdAt: r.created_at.getTime(),
-        lastUsedAt: r.last_used_at.getTime(),
-        current: r.current,
-      })),
-    };
+    return { sessions: rows.map(sessionJson) };
   });
 
   app.delete<{ Params: { id: string } }>("/v1/sessions/:id", async (request, reply) => {
@@ -776,6 +898,19 @@ export function buildApp(deps: Deps): FastifyInstance {
 
   // MARK: Spaces and groups
 
+  // No emails: members see each other's username, or the email's local part as in Space.members.
+  type MemberRow = { uid: string; username: string | null; name: string; role: string; can_send: boolean; can_see_secrets: boolean };
+  const MEMBER_SELECT = `SELECT m.uid, u.username, COALESCE(u.username, u.fallback_name, '') AS name, m.role, m.can_send, m.can_see_secrets
+    FROM space_members m JOIN users u ON u.uid = m.uid WHERE m.space_id = $1`;
+  const memberJson = (r: MemberRow) => ({
+    uid: r.uid,
+    username: r.username,
+    name: r.name,
+    role: r.role,
+    canSend: r.can_send,
+    canSeeSecrets: r.can_see_secrets,
+  });
+
   const spaceJson = (r: {
     id: string;
     kind: string;
@@ -785,6 +920,8 @@ export function buildApp(deps: Deps): FastifyInstance {
     encrypted_name: Buffer | null;
     member_count: number;
     members: { uid: string; name: string }[];
+    can_send: boolean;
+    can_see_secrets: boolean;
     created_at: Date;
   }) => ({
     id: r.id,
@@ -795,13 +932,15 @@ export function buildApp(deps: Deps): FastifyInstance {
     encryptedName: r.encrypted_name ? r.encrypted_name.toString("base64") : null,
     memberCount: Number(r.member_count),
     members: r.members,
+    // The caller's own access; only groups have it.
+    ...(r.kind === "group" ? { canSend: r.can_send, canSeeSecrets: r.can_see_secrets } : {}),
     createdAt: r.created_at.getTime(),
   });
 
   // members: display name is the username, else the email's local part. Owner first, then by join order.
-  const SPACE_SELECT = `SELECT s.id, s.kind, m.role, s.owner_uid, m.wrapped_key, s.encrypted_name, s.created_at,
+  const SPACE_SELECT = `SELECT s.id, s.kind, m.role, s.owner_uid, m.wrapped_key, s.encrypted_name, s.created_at, m.can_send, m.can_see_secrets,
       (SELECT count(*) FROM space_members x WHERE x.space_id = s.id) AS member_count,
-      (SELECT COALESCE(json_agg(json_build_object('uid', x.uid, 'name', COALESCE(u.username, split_part(u.email, '@', 1)))
+      (SELECT COALESCE(json_agg(json_build_object('uid', x.uid, 'name', COALESCE(u.username, u.fallback_name, ''))
                                 ORDER BY x.role DESC, x.added_at, x.uid), '[]'::json)
          FROM space_members x JOIN users u ON u.uid = x.uid WHERE x.space_id = s.id) AS members
     FROM space_members m JOIN spaces s ON s.id = m.space_id`;
@@ -819,6 +958,51 @@ export function buildApp(deps: Deps): FastifyInstance {
       [request.caller.uid, include.includes("direct"), include.includes("authenticator")],
     );
     return { spaces: rows.map(spaceJson) };
+  });
+
+  /**
+   * What changed, cheaply: polled every few seconds so a device runs its full sync only when
+   * something did (PROTOCOL.md → Heads). One statement: per membership one backward probe of
+   * items_changes; the revisions hash the few rows that feed /v1/spaces, /v1/shared-codes, the
+   * owner's share lists and the contact lists. Secrets a member can't see never move their head.
+   */
+  app.get("/v1/heads", async (request) => {
+    const { rows } = await pool.query<{ heads: Record<string, number | null>; spaces: string; codes: string; contacts: string; security: string }>(
+      `WITH mine AS (
+         SELECT m.space_id, m.role, m.can_send, m.can_see_secrets, m.wrapped_key, s.kind, s.owner_uid, s.encrypted_name
+         FROM space_members m JOIN spaces s ON s.id = m.space_id WHERE m.uid = $1)
+       SELECT
+         (SELECT COALESCE(json_object_agg(mine.space_id, (
+             SELECT i.seq FROM items i
+             WHERE i.space_id = mine.space_id AND NOT (mine.kind = 'group' AND NOT mine.can_see_secrets AND i.category = 'secret')
+             ORDER BY i.seq DESC LIMIT 1)), '{}'::json) FROM mine) AS heads,
+         (SELECT md5(COALESCE(string_agg(concat_ws('|', mine.space_id, mine.kind, mine.role, mine.owner_uid, mine.can_send, mine.can_see_secrets,
+                   md5(mine.wrapped_key), md5(COALESCE(mine.encrypted_name, ''::bytea)),
+                   (SELECT string_agg(concat_ws(':', x.uid, x.role, ${nameOf}), ',' ORDER BY x.uid)
+                      FROM space_members x JOIN users u ON u.uid = x.uid WHERE x.space_id = mine.space_id)),
+                 ';' ORDER BY mine.space_id), '')) FROM mine) AS spaces,
+         (SELECT md5(COALESCE(string_agg(concat_ws('|', a.space_id, a.recipient_uid, a.codes_until, a.updated_at, a.owner_name),
+                   ';' ORDER BY a.space_id, a.recipient_uid), ''))
+            FROM (SELECT a.space_id, a.recipient_uid, a.codes_until, a.updated_at, ${nameOf} AS owner_name
+                    FROM authenticator_shares a JOIN spaces s ON s.id = a.space_id JOIN users u ON u.uid = s.owner_uid
+                    WHERE a.recipient_uid = $1
+                  UNION ALL
+                  SELECT a.space_id, a.recipient_uid, a.codes_until, a.updated_at, NULL
+                    FROM authenticator_shares a JOIN mine ON mine.space_id = a.space_id
+                    WHERE mine.kind = 'authenticator' AND mine.role = 'owner') a) AS codes,
+         md5(concat(
+           (SELECT string_agg(concat_ws('|', r.space_id, r.requester, r.recipient), ';' ORDER BY r.space_id)
+              FROM contact_requests r WHERE r.requester = $1 OR r.recipient = $1),
+           '#',
+           (SELECT string_agg(i.id, ';' ORDER BY i.id) FROM invites i JOIN spaces s ON s.id = i.space_id
+              WHERE i.created_by = $1 AND s.kind = 'direct' AND i.expires_at > now()))) AS contacts,
+         ${SECURITY_REVISION} AS security`,
+      [request.caller.uid],
+    );
+    const row = rows[0]!;
+    // An empty space has head 0, like a cursor that has seen nothing.
+    const heads = Object.fromEntries(Object.entries(row.heads).map(([id, seq]) => [id, Number(seq ?? 0)]));
+    return { heads, spaces: row.spaces, codes: row.codes, contacts: row.contacts, security: row.security };
   });
 
   app.post("/v1/groups", async (request, reply) => {
@@ -864,13 +1048,27 @@ export function buildApp(deps: Deps): FastifyInstance {
     const id = uuid.parse(request.params.id);
     const membership = await requireMember(pool, id, request.caller.uid);
     if (membership.kind !== "group") throw notFound();
-    // No emails: members see each other's username, or the email's local part as in Space.members.
-    const { rows } = await pool.query<{ uid: string; username: string | null; name: string; role: string }>(
-      `SELECT m.uid, u.username, COALESCE(u.username, split_part(u.email, '@', 1)) AS name, m.role
-       FROM space_members m JOIN users u ON u.uid = m.uid WHERE m.space_id = $1 ORDER BY m.role DESC, m.added_at, m.uid`,
-      [id],
-    );
-    return { members: rows };
+    const { rows } = await pool.query<MemberRow>(`${MEMBER_SELECT} ORDER BY m.role DESC, m.added_at, m.uid`, [id]);
+    return { members: rows.map(memberJson) };
+  });
+
+  app.patch<{ Params: { id: string; uid: string } }>("/v1/groups/:id/members/:uid", async (request) => {
+    const id = uuid.parse(request.params.id);
+    const target = request.params.uid;
+    const body = memberAccessBody.parse(request.body);
+    return tx(pool, async (db) => {
+      await requireGroupOwner(db, id, request.caller.uid);
+      const found = await db.query<{ role: string }>("SELECT role FROM space_members WHERE space_id = $1 AND uid = $2 FOR UPDATE", [id, target]);
+      if (!found.rows[0]) throw notFound();
+      if (found.rows[0].role === "owner") throw new ApiError(400, "invalid", "The owner always has full access");
+      await db.query(
+        `UPDATE space_members SET can_send = COALESCE($3, can_send), can_see_secrets = COALESCE($4, can_see_secrets)
+         WHERE space_id = $1 AND uid = $2`,
+        [id, target, body.canSend ?? null, body.canSeeSecrets ?? null],
+      );
+      const { rows } = await db.query<MemberRow>(`${MEMBER_SELECT} AND m.uid = $2`, [id, target]);
+      return memberJson(rows[0]!);
+    });
   });
 
   // MARK: Invites
@@ -935,7 +1133,7 @@ export function buildApp(deps: Deps): FastifyInstance {
     }>(
       `SELECT i.space_id, s.kind, i.sealed_key, s.encrypted_name, i.expires_at,
          (SELECT count(*)::int FROM space_members m WHERE m.space_id = i.space_id) AS member_count,
-         (SELECT COALESCE(u.username, split_part(u.email, '@', 1)) FROM users u WHERE u.uid = s.owner_uid) AS owner_name
+         (SELECT COALESCE(u.username, u.fallback_name, '') FROM users u WHERE u.uid = s.owner_uid) AS owner_name
        FROM invites i JOIN spaces s ON s.id = i.space_id WHERE i.id = $1 AND i.expires_at > now()`,
       [invite],
     );
@@ -1003,7 +1201,7 @@ export function buildApp(deps: Deps): FastifyInstance {
 
   // MARK: Contacts
 
-  const nameOf = "COALESCE(u.username, split_part(u.email, '@', 1))";
+  const nameOf = "COALESCE(u.username, u.fallback_name, '')";
 
   app.get<{ Params: { username: string } }>("/v1/users/:username", async (request) => {
     const name = username.parse(request.params.username);
@@ -1370,7 +1568,10 @@ export function buildApp(deps: Deps): FastifyInstance {
   app.get<{ Params: { id: string } }>("/v1/spaces/:id/changes", async (request) => {
     const id = uuid.parse(request.params.id);
     const query = changesQuery.parse(request.query);
-    requireAuthenticatorOwner(await requireMember(pool, id, request.caller.uid));
+    const membership = await requireMember(pool, id, request.caller.uid);
+    requireAuthenticatorOwner(membership);
+    // Without Secrets a group's secrets don't exist for the caller: no rows, not even tombstones.
+    const hideSecrets = !canSeeSecrets(membership);
     await purgeTombstones(id);
     // One snapshot for the horizon and the page, so a purge in between can't hide tombstones from this cursor.
     return tx(pool, async (db) => {
@@ -1379,11 +1580,9 @@ export function buildApp(deps: Deps): FastifyInstance {
       if (!query.full && query.since > 0 && query.since < (space.rows[0]?.purged_seq ?? 0)) {
         return { items: [], nextSince: 0, hasMore: false, resetRequired: true };
       }
-      const { rows } = await db.query<ItemRow>(`SELECT ${ITEM_COLUMNS} FROM items WHERE space_id = $1 AND seq > $2 ORDER BY seq LIMIT $3`, [
-        id,
-        query.since,
-        query.limit + 1,
-      ]);
+      const { rows } = await db.query<ItemRow>(`SELECT ${ITEM_COLUMNS} FROM items WHERE space_id = $1 AND seq > $2 AND NOT ($4 AND category = 'secret') ORDER BY seq LIMIT $3`,
+        [id, query.since, query.limit + 1, hideSecrets],
+      );
       const hasMore = rows.length > query.limit;
       const page = rows.slice(0, query.limit);
       return { items: page.map(itemJson), nextSince: page.at(-1)?.seq ?? query.since, hasMore, resetRequired: false };
@@ -1403,13 +1602,20 @@ export function buildApp(deps: Deps): FastifyInstance {
     const outcome = await tx(pool, async (db) => {
       const membership = await requireMember(db, spaceId, uid, true);
       requireAuthenticatorOwner(membership);
+      if (!canSend(membership)) throw sendNotAllowed();
+      if (body.category === "secret" && !canSeeSecrets(membership)) throw noSecrets();
       // An authenticator holds its `otp` item and nothing else; `otp` lives nowhere else.
       if ((membership.kind === "authenticator") !== (body.category === "otp")) {
         throw new ApiError(400, "invalid", "otp items go in authenticators, and authenticators hold only otp items");
       }
+      // Origins (Auth's sites edited by hand) are personal: only the personal space holds them.
+      if (body.category === "origin" && membership.kind !== "personal") {
+        throw new ApiError(400, "invalid", "origin items go in the personal space");
+      }
       await requireContactEstablished(db, spaceId, membership);
       const { rows: current } = await db.query<ItemRow>(`SELECT ${ITEM_COLUMNS} FROM items WHERE space_id = $1 AND id = $2 FOR UPDATE`, [spaceId, itemId]);
       const existing = current[0];
+      if (existing?.category === "secret" && !canSeeSecrets(membership)) throw noSecrets();
       if (existing) requireItemWriter(membership, existing, uid);
       if (existing && existing.updated_at > body.updatedAt) return { conflict: existing };
 
@@ -1513,6 +1719,8 @@ export function buildApp(deps: Deps): FastifyInstance {
       const { rows } = await db.query<ItemRow>(`SELECT ${ITEM_COLUMNS} FROM items WHERE space_id = $1 AND id = $2 FOR UPDATE`, [spaceId, itemId]);
       const existing = rows[0];
       if (!existing) return { seq: 0, paths: [] as string[] };
+      // Before the idempotent no-op below, so not even a secret's tombstone is touched without Secrets.
+      if (existing.category === "secret" && !canSeeSecrets(membership)) throw noSecrets();
       // Deleting what's already deleted changes nothing, so it stays idempotent for everyone.
       if (existing.deleted === "user") return { seq: existing.seq, paths: [] as string[] };
       requireItemWriter(membership, existing, request.caller.uid);
@@ -1560,6 +1768,7 @@ export function buildApp(deps: Deps): FastifyInstance {
     await tx(pool, async (db) => {
       const membership = await requireMember(db, spaceId, uid, true);
       if (membership.kind === "authenticator") throw forbidden("Authenticators have no blobs");
+      if (!canSend(membership)) throw sendNotAllowed();
       await requireContactEstablished(db, spaceId, membership);
       const { rows } = await db.query<{ size: number; owner_uid: string | null }>("SELECT size, owner_uid FROM blobs WHERE space_id = $1 AND id = $2", [
         spaceId,
@@ -1591,6 +1800,24 @@ export function buildApp(deps: Deps): FastifyInstance {
     const found = await pool.query("SELECT 1 FROM blobs WHERE space_id = $1 AND id = $2", [spaceId, blobId]);
     if (!found.rowCount) throw notFound();
     return storage.signedGetUrl(blobPath(spaceId, blobId));
+  });
+
+  registerPasswordless(app, {
+    pool,
+    limits,
+    keys,
+    feature,
+    google: deps.google,
+    mailer: deps.mailer,
+    serverKey,
+    error: (status, code, message, extra) => new ApiError(status, code, message, extra),
+    geoOf,
+    throttleAuth,
+    signupInvite,
+    startSession,
+    accountJson: accountJson as (row: never) => unknown,
+    checkPassword: async (uid, key) => (await checkAuthKey(pool, { uid }, key)) !== null,
+    schemas: { uuid, email, username, sealed, publicKey, authKey, inviteId },
   });
 
   return app;

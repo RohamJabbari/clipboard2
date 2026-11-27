@@ -23,22 +23,24 @@ struct FilterRowTests {
                          characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code)!
     }
 
-    @Test func removedChipsFallBackToAll() {
-        #expect(PanelFilter.chips == [.all, .labelled, .thisApp])
-        #expect(PanelFilter.chips(showsContacts: true) == [.all, .labelled, .thisApp, .inbox])
-        for gone in ["text", "images", "files", "snippets", "secrets", "nonsense", ""] {
-            #expect(PanelFilter(storedValue: gone) == .all)
+    @Test func removedChipsFallBackToCopies() {
+        #expect(PanelFilter.chips == [.copies, .labelled, .auth])
+        #expect(PanelFilter.chips(showsContacts: true) == [.copies, .labelled, .auth, .inbox, .groups])
+        #expect(PanelFilter.chips(showsContacts: true).map(\.title) == ["Copies", "Saved", "Auth", "Contacts", "Groups"])
+        for gone in ["all", "thisApp", "text", "images", "files", "snippets", "secrets", "nonsense", ""] {
+            #expect(PanelFilter(storedValue: gone) == .copies)
         }
-        #expect(PanelFilter(storedValue: nil) == .all)
+        #expect(PanelFilter(storedValue: nil) == .copies)
         #expect(PanelFilter(storedValue: "labelled") == .labelled)
-        #expect(PanelFilter(storedValue: "thisApp") == .thisApp)
+        #expect(PanelFilter(storedValue: "auth") == .auth)
         #expect(PanelFilter(storedValue: "inbox") == .inbox)
+        #expect(PanelFilter(storedValue: "groups") == .groups)
     }
 
-    @Test func tabWalksEachGroupsCopiesThenSaved() {
+    @Test func tabWalksTheChipsAndTheShownGroupsCopiesThenSaved() {
         let a = SyncGroup(id: "group-a-\(UUID())", name: "Alpha", isOwner: true, memberCount: 2)
         let b = SyncGroup(id: "group-b-\(UUID())", name: "Beta", isOwner: true, memberCount: 2)
-        env.sync.setUpForTesting(groups: [a, b], uid: "me", authors: [:])
+        env.sync.setUpForTesting(groups: [a, b], uid: "me", authors: [:], signedIn: true)
         defer {
             for group in [a, b] {
                 model.groupFilter = group.id
@@ -46,25 +48,32 @@ struct FilterRowTests {
             }
             env.sync.tearDownTesting()
         }
+        model.groupFilter = a.id
+        model.groupShowsSaved = false
         model.groupFilter = nil
-        model.filter = .thisApp
+        model.filter = .inbox
+        model.contactsShowPeople = true
         let tab = key(KeyCode.tab, "\t"), backTab = key(KeyCode.tab, "\t", flags: .shift)
 
+        // People → Groups opens on the last group shown.
         #expect(model.handleKeyDown(tab))
-        #expect(model.currentStop == .group(a.id, saved: false) && !model.isSavedView)
+        #expect(model.filter == .groups && model.currentStop == .group(a.id, saved: false) && !model.isSavedView)
         #expect(model.handleKeyDown(tab))
         #expect(model.currentStop == .group(a.id, saved: true) && model.isSavedView && model.savedSpaceID == a.id)
+        // Then around to Copies: only the shown group is a stop.
         #expect(model.handleKeyDown(tab))
-        #expect(model.currentStop == .group(b.id, saved: false))
+        #expect(model.currentStop == .chip(.copies) && model.groupFilter == nil)
         #expect(model.handleKeyDown(backTab))
         #expect(model.currentStop == .group(a.id, saved: true))
 
-        // The segment is remembered per group.
-        model.select(.chip(.all))
-        model.groupFilter = a.id
-        #expect(model.groupShowsSaved)
+        // The segment is remembered per group, and Groups remembers the last group.
         model.groupFilter = b.id
         #expect(!model.groupShowsSaved)
+        model.select(.chip(.copies))
+        model.select(.chip(.groups))
+        #expect(model.groupFilter == b.id)
+        model.groupFilter = a.id
+        #expect(model.groupShowsSaved)
     }
 }
 
@@ -79,7 +88,7 @@ struct SavedMixingTests {
         model = PanelViewModel(env: env)
     }
 
-    @Test func savedMixesClipsSecretsAndSnippetsNewestFirstAfterFolders() throws {
+    @Test func savedMixesClipsAndSnippetsNewestFirstAfterFoldersAndSecretsLiveInAuth() throws {
         let tag = UUID().uuidString
         let folder = env.store.createFolder(named: "AAA \(tag)", inSpace: nil)
         let old = env.store.ingest(.text("old \(tag)"), now: .now.addingTimeInterval(-86_400))
@@ -103,33 +112,47 @@ struct SavedMixingTests {
         let ids = model.entries.map(\.id)
         let folderRow = try #require(ids.firstIndex(of: PanelEntry.folder(folder).id))
         let snippetRow = try #require(ids.firstIndex(of: PanelEntry.snippet(snippet).id))
-        let secretRow = try #require(ids.firstIndex(of: PanelEntry.secret(rootSecret).id))
         let clipRow = try #require(ids.firstIndex(of: PanelEntry.clip(old).id))
-        // Folders first, then newest first: the snippet (edited later), the secret (now), the clip (yesterday).
+        // Folders first, then newest first: the snippet (edited later), the clip (yesterday).
         let firstItem = model.entries.firstIndex { $0.folder == nil } ?? 0
         #expect(folderRow < firstItem)
-        #expect(snippetRow < secretRow && secretRow < clipRow)
-        // What's in the folder isn't at the root.
-        #expect(!ids.contains(PanelEntry.secret(folderSecret).id) && !ids.contains(PanelEntry.clip(inFolder).id))
-        #expect(model.folderCounts[folder.id] == 2)
+        #expect(snippetRow < clipRow)
+        // Secrets moved to Auth; what's in the folder isn't at the root.
+        #expect(!ids.contains(PanelEntry.secret(rootSecret).id) && !ids.contains(PanelEntry.secret(folderSecret).id))
+        #expect(!ids.contains(PanelEntry.clip(inFolder).id))
+        #expect(model.folderCounts[folder.id] == 1)
 
-        // The folder holds its clips and secrets, but never snippets.
-        model.openFolder(folder)
-        #expect(Set(model.entries.map(\.id)) == [PanelEntry.clip(inFolder).id, PanelEntry.secret(folderSecret).id])
+        // The folder holds its clips, never snippets or secrets.
+        model.setExpanded(folder, true)
+        let nested = model.entries.filter { model.entryParents[$0.id] == folder.id }.map(\.id)
+        #expect(nested == [PanelEntry.clip(inFolder).id])
+        model.setExpanded(folder, false)
 
-        // Searching from the root finds the secret in the folder, captioned.
-        model.closeFolder()
-        model.query = "Folder secret \(tag)"
-        let hit = PanelEntry.secret(folderSecret).id
+        // Searching finds the clip in the folder, captioned; never a secret.
+        model.query = "in folder \(tag)"
+        let hit = PanelEntry.clip(inFolder).id
         #expect(model.entries.contains { $0.id == hit })
         #expect(model.folderCaptions[hit] == folder.name)
+        model.query = "secret \(tag)"
+        #expect(!model.entries.contains { $0.secret != nil })
 
-        // All still finds secrets and snippets only when searching.
+        // Auth lists both secrets, folder or not, and searches only them.
         model.query = ""
-        model.filter = .all
-        #expect(!model.entries.contains { $0.id == PanelEntry.secret(rootSecret).id })
+        model.filter = .auth
+        let auth = Set(model.entries.map(\.id))
+        #expect(auth.isSuperset(of: [PanelEntry.secret(rootSecret).id, PanelEntry.secret(folderSecret).id]))
+        #expect(!model.entries.contains { $0.clip != nil || $0.snippet != nil || $0.folder != nil })
         model.query = "Root secret \(tag)"
-        #expect(model.entries.contains { $0.id == PanelEntry.secret(rootSecret).id })
+        #expect(model.entries.first?.id == PanelEntry.secret(rootSecret).id)
+
+        // Copies never lists secrets or snippets, searching or not.
+        model.query = ""
+        model.filter = .copies
+        #expect(!model.entries.contains { $0.secret != nil || $0.snippet != nil })
+        model.query = "Root secret \(tag)"
+        #expect(!model.entries.contains { $0.id == PanelEntry.secret(rootSecret).id })
+        model.query = "Snippet \(tag)"
+        #expect(!model.entries.contains { $0.id == PanelEntry.snippet(snippet).id })
     }
 
     @Test func saveAsSecretUsesTheLabelAndKeepsTheFolder() throws {
@@ -156,7 +179,7 @@ struct SavedMixingTests {
             env.secrets.delete(ref)
             if env.store.folder(withID: folder.id) != nil { env.store.deleteFolder(folder) }
         }
-        model.filter = .labelled
+        model.filter = .auth
         model.selectedID = PanelEntry.secret(ref).id
         #expect(model.availableActions.contains(.moveToFolder(folder)))
         #expect(!model.availableActions.contains(.removeFromFolder))
@@ -266,7 +289,7 @@ struct GroupCopyTests {
         #expect(mixed.group == nil && mixed.copiesToPersonal)
     }
 
-    @Test func saveACopyReplacesAddToSavedForAnotherMembersItem() throws {
+    @Test func saveOnAnotherMembersItemSavesACopy() throws {
         let tag = UUID().uuidString
         let (group, theirs) = theirItem("their note \(tag)")
         defer {
@@ -275,10 +298,13 @@ struct GroupCopyTests {
         }
         model.groupFilter = group.id
         model.selectedID = PanelEntry.clip(theirs).id
-        #expect(model.availableActions.contains(.saveCopy))
-        #expect(!model.availableActions.contains(.addToSaved))
+        #expect(model.availableActions.contains(.save))
+        #expect(!model.availableActions.contains(.saveCopy) && !model.availableActions.contains(.addToSaved))
+        #expect(model.title(for: .save) == "Save…")
 
-        model.perform(.saveCopy)
+        model.perform(.save)
+        #expect(model.mode == .save && model.saveForm?.destination == .mine(nil))
+        model.submitSave()
         #expect(model.notice == "Saved a copy to Saved")
         let copy = try #require(env.store.items(inSpace: nil).first { $0.text == "their note \(tag)" })
         #expect(copy.isPinned && copy.folderID == nil)
@@ -286,18 +312,23 @@ struct GroupCopyTests {
         model.groupFilter = nil
     }
 
-    @Test func yourOwnGroupItemsAreStillAddedToSaved() {
+    @Test func yourOwnGroupItemsAreEditedWhereTheyAre() {
         let tag = UUID().uuidString
         let group = setUpGroup(owner: false)
         let mine = env.store.ingest(.text("my group note \(tag)"), spaceID: group.id)   // never synced: yours
+        env.sync.setUpForTesting(groups: [group], uid: "me", authors: [:], signedIn: true)
         defer {
             env.sync.tearDownTesting()
             env.store.delete(mine)
         }
         model.groupFilter = group.id
         model.selectedID = PanelEntry.clip(mine).id
-        #expect(model.availableActions.contains(.addToSaved))
-        #expect(!model.availableActions.contains(.saveCopy))
+        #expect(model.availableActions.contains(.save))
+        env.store.addToSaved([mine])
+        #expect(model.title(for: .save) == "Edit Saved…")
+        model.beginSaveSelection()
+        #expect(model.saveForm?.isEditing == true && model.saveForm?.destination == .group(group.id, nil))
+        model.resetMode()
         model.groupFilter = nil
     }
 

@@ -174,7 +174,7 @@ public sealed class PreviewWindow : Window
     {
         var paging = Model.PreviewPosition is null ? "" : "←→ Previous/Next    ";
         var zoom = _body.Child is ZoomableImage || page?.Kind == PreviewKind.Image ? "Ctrl+Wheel or +/− Zoom    0 Fit    " : "";
-        _hints.Text = paging + "↑↓ Other Items    " + zoom + "Enter Paste    Esc Close";
+        _hints.Text = KeyLabels.Hints(paging + "↑↓ Other Items    " + zoom + "Enter Paste    Esc Close");
     }
 
     // MARK: Keyboard

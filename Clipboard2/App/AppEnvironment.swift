@@ -33,13 +33,19 @@ final class AppEnvironment {
     let secrets: SecretStore
     let slots: QuickSlots
     let authenticators: AuthenticatorStore
+    /// Auth's origins: sites edited by hand, with notes and documents (docs/features/auth-autofill.md → Origins).
+    let origins: OriginStore
     let sync: SyncAccount
     /// System notifications for what syncs bring (docs/features/notifications-contacts.md).
     let notifications: NotificationHub
+    /// Codes from email accounts (docs/features/auth-autofill.md, phase 4). Never synced.
+    let emailCodes: EmailCodeCenter
     let claudeAccount = SubscriptionAccount(cli: .claude)
     let chatGPTAccount = SubscriptionAccount(cli: .codex)
     let updates = UpdateController()
     let modelCatalog = AIModelCatalog()
+    /// Personal info cards (Auth → Me): this Mac only, not synced.
+    let cards = PersonalCardStore()
 
     @ObservationIgnored private(set) lazy var panel = QuickPanelController(env: self)
     @ObservationIgnored private let permissionsWindow = PermissionsWindowController()
@@ -49,6 +55,10 @@ final class AppEnvironment {
     @ObservationIgnored private(set) lazy var contextMenu = ContextMenuController(env: self)
     @ObservationIgnored private(set) lazy var textFieldWatcher = TextFieldWatcher()
     @ObservationIgnored private(set) lazy var pasteIcon = PasteIconController(env: self)
+    /// Offers to save logins whose password was pasted (docs/features/auth-autofill.md → Saving logins).
+    @ObservationIgnored private(set) lazy var loginSaver = LoginSaveWatcher(env: self)
+    /// Settings → Auth → Import: watching for an export, its review list, the Trash's Undo.
+    @ObservationIgnored private(set) lazy var passwordImport = PasswordImportCenter(sink: secrets, authenticators: authenticators)
     @ObservationIgnored private var maintenanceRuns = 0
     /// On-device text recognition for image items (search finds screenshots by their words).
     @ObservationIgnored private(set) lazy var imageText = ImageTextIndexer(store: store, blobs: blobs)
@@ -73,18 +83,26 @@ final class AppEnvironment {
         monitor = ClipboardMonitor(store: store, prefs: prefs, tracker: appTracker, blobs: blobs)
         paste = PasteService(store: store, prefs: prefs, tracker: appTracker)
         snippets = SnippetStore(context: container.mainContext)
+        // AutoFill builds: secrets and authenticators move to the shared Keychain first.
+        if !Self.isRunningTests { KeychainLocation.prepare() }
         secrets = SecretStore(prefs: prefs)
         slots = QuickSlots(defaults: .standard, store: store, snippets: snippets, secrets: secrets)
         // Tests never touch the login keychain's authenticators.
         authenticators = AuthenticatorStore(backing: Self.isRunningTests ? MemoryAuthenticatorBacking() : KeychainAuthenticatorBacking())
+        origins = Self.isRunningTests
+            ? OriginStore(backing: MemoryOriginBacking(), documents: MemoryDocumentVault())
+            : OriginStore(backing: KeychainOriginBacking(), documents: EncryptedFileDocumentVault.standard())
         sync = SyncAccount(prefs: prefs, context: container.mainContext, store: store, snippets: snippets, secrets: secrets,
                            authenticators: authenticators)
+        sync.origins = origins
         notifications = NotificationHub(prefs: prefs)
         sync.notifications = notifications
+        // Tests never touch the Keychain or any mail account.
+        emailCodes = EmailCodeCenter(vault: Self.isRunningTests ? MemoryEmailVault() : KeychainEmailVault())
     }
 
     /// Every persisted model (the newest store version); tests build in-memory containers from it.
-    static let schema = Schema(versionedSchema: StoreSchemaV4.self)
+    static let schema = Schema(versionedSchema: StoreSchemaV5.self)
 
     /// Opens the store with the migration plan. Stores from before the versioned schema (older
     /// than 1.3.0) match no version, so they get the automatic lightweight migration they always
@@ -137,13 +155,19 @@ final class AppEnvironment {
         monitor.onAuthenticatorLink = { [weak self] link in self?.authenticatorLinkFound(link, inImage: false) }
         imageText.onAuthenticatorLink = { [weak self] link in self?.authenticatorLinkFound(link, inImage: true) }
         authenticators.onChange = { [weak self] in self?.sync.localChange() }
+        origins.onChange = { [weak self] in self?.sync.localChange() }
+        // Decrypted copies opened or pasted last time.
+        OriginDocumentFiles.removeAll()
         paste.onPaste = { [weak self] in self?.sync.reportActivity() }
         secrets.onChange = { [weak self] in
             guard let self else { return }
             self.removeHistoryCopiesOfSecrets()
+            self.updateAutoFill()
             self.sync.localChange()
         }
+        authenticators.onReload = { [weak self] in self?.updateAutoFill() }
         removeHistoryCopiesOfSecrets()
+        updateAutoFill()
         store.onCommit = { [weak self] in self?.sync.localChange() }
         snippets.onCommit = { [weak self] in self?.sync.localChange() }
         // Retention only stops tracking items (ClipStore drops their sync metadata itself), so
@@ -151,6 +175,7 @@ final class AppEnvironment {
         restoreSendToGroupDefault()
         sync.onSessionChange = { [weak self] active in self?.setSendToGroupShortcut(active: active) }
         sync.onItemSentHere = { device in HUD.show("Sent from \(device)", symbol: "arrow.down.circle.fill") }
+        sync.onSecurityAlert = { [weak self] text in self?.notifications.postSecurityAlert(text) }
         // System notifications; the HUD bubbles for contacts only when they're off or not allowed.
         notifications.poster = SystemNotifier { [weak self] target in self?.open(target) }
         notifications.showing = { [weak self] in
@@ -158,6 +183,12 @@ final class AppEnvironment {
             return self.panel.model.arrivalPlaceShown
         }
         Task { await notifications.refreshPermission() }
+        emailCodes.onNewCode = { [weak self] code in
+            guard let self else { return }
+            self.notifications.postEmailCode(code, showingCode: self.emailCodes.showsCodeInNotification)
+        }
+        emailCodes.onAccountsChanged = { [weak self] in self?.updateTextFieldIcons() }
+        emailCodes.start()
         applyAppearance()
         if let storeOpenError {
             // On the stand-in store: no capture, no sync, no sweeps (they'd delete every file).
@@ -269,12 +300,19 @@ final class AppEnvironment {
         }
     }
 
+    /// System AutoFill's list and identities (no-op without CLIPBOARD2_AUTOFILL=1). Not in tests.
+    private func updateAutoFill() {
+        guard !Self.isRunningTests else { return }
+        AutoFillIdentities.update(secrets: secrets.secrets, authenticators: authenticators.items)
+    }
+
     func runMaintenance() {
         contextMenu.update()   // starts the right-click tap once Accessibility is granted
         updateTextFieldIcons()   // and the text field icons
+        AutoFillIdentities.checkEnabled()   // re-registers once it's turned on in System Settings
         guard storeOpenError == nil else { return }
         store.enforceRetention(maxItems: prefs.maxItems, maxAge: prefs.maxAge)
-        // Sync polls on its own cadence (3 s / 15 s / 60 s).
+        // Sync polls on its own cadence (heads every 2 s / 10 s; see SyncConfig).
         if maintenanceRuns > 0 { imageText.scheduleBacklog() }   // older images; not during launch
         maintenanceRuns &+= 1
         if maintenanceRuns % 30 == 1 {   // directory scans: every ~30 min
@@ -285,19 +323,35 @@ final class AppEnvironment {
 
     // MARK: Icons in other apps' text fields
 
-    /// Watches other apps' text fields while an icon that needs it is on and Accessibility is allowed.
+    /// Watches other apps' text fields while Accessibility is allowed and an icon that needs it is
+    /// on, or an email account is set up (a focused one-time-code field makes it look faster).
     func updateTextFieldIcons() {
-        guard prefs.pasteIcon, AXPermission.isTrusted else {
+        let watchesCodes = !emailCodes.accounts.isEmpty
+        guard prefs.pasteIcon || watchesCodes || prefs.offerToSavePasswords, AXPermission.isTrusted else {
             textFieldWatcher.stop()
+            loginSaver.stop()
             pasteIcon.hide()
+            emailCodes.setCodeFieldFocused(false)
             return
         }
+        if !prefs.pasteIcon { pasteIcon.hide() }
+        if prefs.offerToSavePasswords {
+            loginSaver.start()
+            paste.willPostPaste = { [weak self] in self?.loginSaver.willPostPaste() }
+        } else {
+            loginSaver.stop()
+            paste.willPostPaste = nil
+        }
         textFieldWatcher.onChange = { [weak self] field in self?.textFieldChanged(field) }
+        textFieldWatcher.detectsCodeFields = watchesCodes
+        textFieldWatcher.onCodeFieldChange = { [weak self] isCode in self?.emailCodes.setCodeFieldFocused(isCode) }
         textFieldWatcher.start()
     }
 
-    /// A focused field gets the paste icon.
+    /// A focused field gets the paste icon; a password field is watched for pastes.
     private func textFieldChanged(_ field: TextFieldWatcher.Field?) {
+        if prefs.offerToSavePasswords { loginSaver.fieldChanged(field) }
+        guard prefs.pasteIcon else { return }
         pasteIcon.update(field.flatMap { isTextIconHidden(in: $0.app, hiddenApps: prefs.pasteIconHiddenApps) ? nil : $0 })
     }
 
@@ -486,6 +540,11 @@ final class AppEnvironment {
             SettingsOpener.open(tab: .sync)
             return
         }
+        guard group.canSend else {
+            NSSound.beep()
+            HUD.show("You can't send to \(group.name)", symbol: "person.2.slash", duration: .seconds(2.5))
+            return
+        }
         guard AXPermission.isTrusted else {
             showPermissions()
             return
@@ -670,7 +729,7 @@ final class AppEnvironment {
             }
         case .secret(let ref):
             pasteSecret(ref, into: target)
-        case .folder, .authenticator, .authenticatorSuggestion:
+        case .folder, .authenticator, .authenticatorSuggestion, .emailCode:
             NSSound.beep()   // slots never hold folders or authenticators
         }
     }

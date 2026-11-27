@@ -14,13 +14,30 @@ nonisolated struct SecretRef: Identifiable, Hashable, Sendable {
     /// The Saved folder (`ClipFolder.id`) it's in. An id with no folder in its space (deleted, or
     /// not synced yet) reads as the root of Saved.
     var folderID: UUID? = nil
+    /// A password's username (nil for a plain secret, or a password without one).
+    var username: String? = nil
+    /// A password's sites, as typed or imported (`https://accounts.google.com`, `google.com`).
+    var urls: [String] = []
+    /// Short hash of the notes, if any (the notes themselves live in a Keychain item of their own).
+    var notesStamp: String? = nil
+    /// The origin (Auth's site edited by hand) it's filed under; nil: grouped by its sites.
+    var originID: String? = nil
+
+    /// A secret with a site or a username is a password.
+    var isPassword: Bool { username?.isEmpty == false || !urls.isEmpty }
 }
 
-/// Secret values live only in the login keychain (one generic-password item each). Names are
+/// Secret values live only in the Keychain (one generic-password item each): the login Keychain, or
+/// in AutoFill builds the shared data-protection one (`AuthKeychain.current`, SharedKeychain.swift). Names are
 /// stored as the item label so listing never needs to touch the values; a sync group id, if
-/// any, as the generic attribute; the Saved folder, if any, as the comment.
+/// any, as the generic attribute; the Saved folder, if any, as the comment; a password's username
+/// and sites as JSON in the description (`SecretExtras`). Notes get an item of their own in
+/// `notesService` (same account), so they're encrypted like the value.
 nonisolated enum SecretVault {
-    static let service = (Bundle.main.bundleIdentifier ?? "at.softmaze.Clippy") + ".secrets"
+    static let service = KeychainServices.secrets
+    static let notesService = KeychainServices.secretNotes
+
+    private static var keychain: any KeychainBackend { AuthKeychain.current }
 
     static func list() -> [SecretRef] {
         let query: [CFString: Any] = [
@@ -29,20 +46,24 @@ nonisolated enum SecretVault {
             kSecReturnAttributes: true,
             kSecMatchLimit: kSecMatchLimitAll,
         ]
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let items = result as? [[String: Any]]
-        else { return [] }
+        let (status, result) = keychain.copyMatching(query)
+        guard status == errSecSuccess, let items = result as? [[String: Any]] else { return [] }
         return items.compactMap { attrs in
             guard let account = attrs[kSecAttrAccount as String] as? String else { return nil }
             let space = (attrs[kSecAttrGeneric as String] as? Data).map { String(decoding: $0, as: UTF8.self) }
+            let extras = SecretExtras(descriptionValue: attrs[kSecAttrDescription as String] as? String)
             return SecretRef(
                 id: account,
                 name: attrs[kSecAttrLabel as String] as? String ?? "Untitled",
-                createdAt: attrs[kSecAttrCreationDate as String] as? Date,
+                createdAt: extras.created.map { Date(timeIntervalSince1970: TimeInterval($0) / 1000) }
+                    ?? attrs[kSecAttrCreationDate as String] as? Date,
                 spaceID: space?.isEmpty == false ? space : nil,
                 updatedAt: attrs[kSecAttrModificationDate as String] as? Date,
-                folderID: (attrs[kSecAttrComment as String] as? String).flatMap(UUID.init(uuidString:))
+                folderID: (attrs[kSecAttrComment as String] as? String).flatMap(UUID.init(uuidString:)),
+                username: extras.username,
+                urls: extras.urls ?? [],
+                notesStamp: extras.notes,
+                originID: extras.origin
             )
         }
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -51,45 +72,93 @@ nonisolated enum SecretVault {
     /// `id` is given for secrets that arrive through sync.
     @discardableResult
     static func add(name: String, value: String, id: String = UUID().uuidString, spaceID: String? = nil,
-                    folderID: UUID? = nil) -> SecretRef? {
+                    folderID: UUID? = nil, username: String? = nil, urls: [String] = [], notes: String? = nil,
+                    origin: String? = nil) -> SecretRef? {
+        let extras = SecretExtras(username: username, urls: urls, notes: SecretExtras.notesStamp(notes), origin: origin)
         var attributes: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: id,
             kSecAttrLabel: name,
-            kSecAttrDescription: "Clipboard2 secret",
+            kSecAttrDescription: extras.descriptionValue,
             kSecValueData: Data(value.utf8),
         ]
         if let spaceID { attributes[kSecAttrGeneric] = Data(spaceID.utf8) }
         if let folderID { attributes[kSecAttrComment] = folderID.uuidString.lowercased() }
-        guard SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess else { return nil }
-        return SecretRef(id: id, name: name, createdAt: .now, spaceID: spaceID, updatedAt: .now, folderID: folderID)
+        guard keychain.add(attributes) == errSecSuccess else { return nil }
+        writeNotes(notes, id: id)
+        return SecretRef(id: id, name: name, createdAt: .now, spaceID: spaceID, updatedAt: .now, folderID: folderID,
+                         username: extras.username, urls: extras.urls ?? [], notesStamp: extras.notes, originID: extras.origin)
     }
 
-    /// `folder` sets the Saved folder: `.some(nil)` takes the secret out of its folder.
+    /// `folder` sets the Saved folder: `.some(nil)` takes the secret out of its folder. `username`,
+    /// `urls`, `notes` and `origin` replace what's there when given (`.some(nil)` and `[]` clear them).
     @discardableResult
-    static func update(id: String, name: String? = nil, value: String? = nil, folder: UUID?? = nil) -> Bool {
+    static func update(id: String, name: String? = nil, value: String? = nil, folder: UUID?? = nil,
+                       username: String?? = nil, urls: [String]? = nil, notes: String?? = nil,
+                       origin: String?? = nil) -> Bool {
         var changes: [CFString: Any] = [:]
         if let name { changes[kSecAttrLabel] = name }
         if let value { changes[kSecValueData] = Data(value.utf8) }
         if let folder { changes[kSecAttrComment] = folder?.uuidString.lowercased() ?? "" }
+        if username != nil || urls != nil || notes != nil || origin != nil {
+            let current = extras(id: id)
+            let extras = SecretExtras(username: username ?? current.username, urls: urls ?? current.urls,
+                                      notes: notes.map(SecretExtras.notesStamp) ?? current.notes, created: current.created,
+                                      origin: origin ?? current.origin)
+            if extras != current { changes[kSecAttrDescription] = extras.descriptionValue }
+            if let notes, SecretExtras.notesStamp(notes) != current.notes { writeNotes(notes, id: id) }
+        }
         guard !changes.isEmpty else { return true }
-        return SecItemUpdate(baseQuery(id) as CFDictionary, changes as CFDictionary) == errSecSuccess
+        return keychain.update(baseQuery(id), changes) == errSecSuccess
+    }
+
+    /// The username, sites and notes stamp, without the value.
+    static func extras(id: String) -> SecretExtras {
+        var query = baseQuery(id)
+        query[kSecReturnAttributes] = true
+        query[kSecMatchLimit] = kSecMatchLimitOne
+        let (status, result) = keychain.copyMatching(query)
+        guard status == errSecSuccess, let attrs = result as? [String: Any] else { return SecretExtras() }
+        return SecretExtras(descriptionValue: attrs[kSecAttrDescription as String] as? String)
+    }
+
+    static func notes(id: String) -> String? {
+        let query: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: notesService,
+                                      kSecAttrAccount: id, kSecReturnData: true, kSecMatchLimit: kSecMatchLimitOne]
+        let (status, result) = keychain.copyMatching(query)
+        guard status == errSecSuccess, let data = result as? Data,
+              let text = String(data: data, encoding: .utf8), !text.isEmpty else { return nil }
+        return text
+    }
+
+    private static func writeNotes(_ notes: String?, id: String) {
+        let base: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: notesService, kSecAttrAccount: id]
+        guard let notes, !notes.isEmpty else {
+            keychain.delete(base)
+            return
+        }
+        let data = Data(notes.utf8)
+        if keychain.update(base, [kSecValueData: data]) == errSecItemNotFound {
+            var add = base
+            add[kSecValueData] = data
+            add[kSecAttrLabel] = "Clipboard2 notes"
+            _ = keychain.add(add)
+        }
     }
 
     static func value(id: String) -> String? {
         var query = baseQuery(id)
         query[kSecReturnData] = true
         query[kSecMatchLimit] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data
-        else { return nil }
+        let (status, result) = keychain.copyMatching(query)
+        guard status == errSecSuccess, let data = result as? Data else { return nil }
         return String(data: data, encoding: .utf8)
     }
 
     static func delete(id: String) {
-        SecItemDelete(baseQuery(id) as CFDictionary)
+        keychain.delete(baseQuery(id))
+        writeNotes(nil, id: id)
     }
 
     private static func baseQuery(_ id: String) -> [CFString: Any] {
@@ -127,14 +196,17 @@ final class SecretStore {
     /// Content hashes of secret values (never the values), so matching copies stay out of history.
     @ObservationIgnored private(set) var valueHashes: Set<String> = []
     @ObservationIgnored var onChange: (() -> Void)?
-    @ObservationIgnored private var lastAuthentication: Date?
+    @ObservationIgnored private var lastAuthentication: Date? { didSet { publishUnlockWindow() } }
     /// Explicit "Leave Unlocked For…" choice. Unlike the automatic window it survives sleep and
     /// screen lock (that's the point of choosing it), but not quitting Clipboard2.
-    private(set) var unlockedUntil: Date?
+    private(set) var unlockedUntil: Date? { didSet { publishUnlockWindow() } }
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
     @ObservationIgnored private let prefs: Preferences
     /// True while the Touch ID / password sheet is up, so the quick panel doesn't close under it.
     @ObservationIgnored private(set) var isAuthenticating = false
+    /// When the last Touch ID / password prompt closed. macOS gives focus back to the previous app a
+    /// moment after a password prompt, which mustn't close the panel that asked.
+    @ObservationIgnored private(set) var authenticationEndedAt: Date?
 
     nonisolated static let authenticationEnded = Notification.Name("at.softmaze.Clipboard2.authenticationEnded")
 
@@ -150,6 +222,11 @@ final class SecretStore {
         observers.append(workspace.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main, using: lock))
         observers.append(DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main, using: lock))
+        // Quitting ends every window, the AutoFill extension's copy included.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { AutoFillIdentities.publishUnlockWindow(until: nil) }
+        })
     }
 
     func reload() {
@@ -160,10 +237,34 @@ final class SecretStore {
     }
 
     @discardableResult
-    func add(name: String, value: String, spaceID: String? = nil, folderID: UUID? = nil) -> SecretRef? {
-        let ref = SecretVault.add(name: name, value: value, spaceID: spaceID, folderID: folderID)
+    func add(name: String, value: String, spaceID: String? = nil, folderID: UUID? = nil,
+             username: String? = nil, urls: [String] = [], notes: String? = nil, origin: String? = nil) -> SecretRef? {
+        let ref = SecretVault.add(name: name, value: value, spaceID: spaceID, folderID: folderID,
+                                  username: username, urls: urls, notes: notes, origin: origin)
         reload()
         return ref
+    }
+
+    /// Files secrets under an origin, or (nil) back under their sites. Only the ones that change are written.
+    func setOrigin(_ originID: String?, for refs: [SecretRef]) {
+        let changing = refs.filter { $0.originID != originID }
+        guard !changing.isEmpty else { return }
+        for ref in changing { SecretVault.update(id: ref.id, origin: .some(originID)) }
+        reload()
+    }
+
+    /// Edit on a password or secret: everything given replaces what's there.
+    @discardableResult
+    func update(_ ref: SecretRef, name: String? = nil, value: String? = nil, username: String?? = nil,
+                urls: [String]? = nil, notes: String?? = nil) -> Bool {
+        let ok = SecretVault.update(id: ref.id, name: name, value: value, username: username, urls: urls, notes: notes)
+        reload()
+        return ok
+    }
+
+    /// A password's notes (they're in the Keychain like the value; ask for Touch ID before showing them).
+    func notes(of ref: SecretRef) -> String? {
+        ref.notesStamp == nil ? nil : SecretVault.notes(id: ref.id)
     }
 
     /// Moves secrets into a Saved folder, or (nil) out to the root of Saved. Only the ones whose
@@ -218,6 +319,16 @@ final class SecretStore {
         return Date.now.timeIntervalSince(lastAuthentication) < TimeInterval(prefs.secretGraceMinutes * 60)
     }
 
+    /// Until when nothing asks for Touch ID; nil: it asks now. The AutoFill extension shares it.
+    var unlockWindowEnd: Date? {
+        AutoFillUnlock.until(lastAuthentication: lastAuthentication, graceMinutes: prefs.secretGraceMinutes,
+                             unlockedUntil: unlockedUntil, now: .now)
+    }
+
+    private func publishUnlockWindow() {
+        AutoFillIdentities.publishUnlockWindow(until: unlockWindowEnd)
+    }
+
     var isManuallyUnlocked: Bool {
         guard let unlockedUntil else { return false }
         return unlockedUntil > .now
@@ -257,6 +368,7 @@ final class SecretStore {
         isAuthenticating = true
         defer {
             isAuthenticating = false
+            authenticationEndedAt = .now
             NotificationCenter.default.post(name: Self.authenticationEnded, object: self)
         }
         do {

@@ -15,6 +15,8 @@ This extends `docs/features/folders.md` and `saved-v2.md`. Mac and Windows build
   - If an older client re-pushes a folder, it drops `parent` and the folder moves to the top. That's short-lived, because installs auto-update.
 
 ## Browsing
+> Mac: the quick panel shows folders as an expandable tree instead of navigating into them and showing a breadcrumb. See `panel-v3.md` §4 → Saved.
+
 - An open folder lists its subfolders first, sorted by name, then its items in the existing order.
 - A folder row's caption counts both: "3 folders · 12 items". Leave out a zero part.
 - The breadcrumb shows the full path: "Saved › Work › Clients". Every segment can be clicked, and every segment is a drop target.

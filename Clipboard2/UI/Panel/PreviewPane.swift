@@ -26,6 +26,15 @@ struct PreviewPane: View {
             }
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .overlay(alignment: .topTrailing) {
+                    // File panes have it in their header, next to Edit.
+                    if let model, model.previewSelection != nil, entry.clip?.kind != .file {
+                        PasteSelectedOnlyButton(model: model)
+                            .fixedSize()
+                            .padding(.top, 8)
+                            .padding(.trailing, 10)
+                    }
+                }
             Divider()
             metadata
                 .padding(.horizontal, 16)
@@ -49,14 +58,25 @@ struct PreviewPane: View {
                     ImagePreviewView(item: item)
                     if let text = item.imageText, !text.isEmpty {
                         Divider()
-                        ImageTextView(text: text, onCopy: model.map { model in { model.copyImageText(text) } })
+                        ImageTextView(text: text, onCopy: model.map { model in { model.copyImageText(text) } }, model: model)
                     }
                 }
             case .file:
                 if let model, item.fileURLs.count > 1 {
-                    FilePreviewView(urls: item.fileURLs, picked: model.pickedFiles,
-                                    onClick: { model.clickFile($0, in: item) },
-                                    onClear: model.clearPickedFiles)
+                    VStack(spacing: 0) {
+                        FilePreviewView(urls: item.fileURLs, picked: model.pickedFiles,
+                                        onClick: { model.clickFile($0, in: item) },
+                                        onClear: model.clearPickedFiles)
+                        // One file picked: its name and contents, as for a single file.
+                        if let url = model.shownFile(of: item) {
+                            Divider()
+                            FileContentsPane(item: item, url: url, model: model)
+                                .id(url)
+                                .frame(maxHeight: .infinity)
+                        }
+                    }
+                } else if let model, let url = model.shownFile(of: item) {
+                    FileContentsPane(item: item, url: url, model: model)
                 } else {
                     FilePreviewView(urls: item.fileURLs)
                 }
@@ -64,8 +84,15 @@ struct PreviewPane: View {
         case .snippet(let snippet):
             TextPreviewView(text: snippet.body, placeholders: true)
         case .secret(let ref):
-            SecretPreviewView(ref: ref, onEdit: onEditSecret.map { edit in { edit(ref) } })
-        case .folder, .authenticator, .authenticatorSuggestion:
+            if ref.isPassword {
+                PasswordPreview(ref: ref, onEdit: onEditSecret.map { edit in { edit(ref) } },
+                                onUse: { model?.noteAuthUse(entry) },
+                                onFill: model.map { model in { remember in model.fill(ref, remember: remember) } },
+                                rememberSite: model?.remembersSite(for: ref))
+            } else {
+                SecretPreviewView(ref: ref, onEdit: onEditSecret.map { edit in { edit(ref) } })
+            }
+        case .folder, .authenticator, .authenticatorSuggestion, .emailCode:
             EmptyView()   // these have their own previews (FolderPreview, AuthenticatorPreview)
         }
     }
@@ -74,7 +101,7 @@ struct PreviewPane: View {
     private func textContent(_ item: ClipItem) -> some View {
         switch ClipContentCache.content(of: item) {
         case .plain:
-            TextPreviewView(text: item.text)
+            TextPreviewView(text: item.text, model: model)
         case .color(let color):
             ColorPreview(color: color, onPasteText: onPasteText)
         case .link(let url):
@@ -158,6 +185,8 @@ struct PreviewPane: View {
                 row("Authenticator", item.title)
             case .authenticatorSuggestion:
                 row("Authenticator", "Not added yet")
+            case .emailCode(let code, _):
+                row("Email code", code.source)
             }
         }
         .font(.caption)
@@ -228,6 +257,8 @@ struct TextPreviewView: View {
     let text: String
     /// Snippets: `{name}` fields are shown as tokens.
     var placeholders = false
+    /// Receives the selected part of the text (Return and ⌘C use just that).
+    var model: PanelViewModel?
     static let displayLimit = 20_000
 
     /// Short single lines read better large and centred in the pane.
@@ -235,16 +266,19 @@ struct TextPreviewView: View {
 
     var body: some View {
         if isShort && !placeholders {
-            Text(text)
-                .font(.system(size: 28, weight: .medium))
-                .textSelection(.enabled)
-                .multilineTextAlignment(.leading)
+            SelectableText(text: text, font: .systemFont(ofSize: 28, weight: .medium), model: model)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 .padding(20)
-                .accessibilityLabel("Preview")
+        } else if !placeholders {
+            ScrollView {
+                SelectableText(text: displayed, font: .systemFont(ofSize: 15), lineSpacing: 3, model: model)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(16)
+            }
+            .accessibilityLabel("Preview")
         } else {
             ScrollView {
-                Text(placeholders ? Self.withPlaceholders(displayed) : AttributedString(displayed))
+                Text(Self.withPlaceholders(displayed))
                     .font(.system(size: 15))
                     .lineSpacing(3)
                     .textSelection(.enabled)
@@ -609,6 +643,8 @@ struct ImageTextView: View {
     let text: String
     /// Copies the recognised text (the header's Copy button); hidden when nil.
     var onCopy: (() -> Void)?
+    /// Receives the selected words (Return pastes and ⌘C copies just those).
+    var model: PanelViewModel?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -646,9 +682,7 @@ struct ImageTextView: View {
     private static let maxHeight: CGFloat = 110
 
     private func textBlock(_ text: String) -> some View {
-        Text(text)
-            .font(.callout)
-            .textSelection(.enabled)
+        SelectableText(text: text, font: .preferredFont(forTextStyle: .callout), model: model)
             .frame(maxWidth: .infinity, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
     }
@@ -842,17 +876,24 @@ struct MultiSelectionPreview: View {
     @ViewBuilder
     private func selectionRows(_ model: PanelViewModel) -> some View {
         let secrets = model.selectedSecrets
-        let labelable = clips.contains { model.canLabel(.clip($0)) }
-        let movable = model.canPickFolder(clips: clips.filter { !$0.isTransient }, secrets: secrets)
-        if labelable || movable {
+        // Clips only: Save… moves them all; with secrets in it, the folder picker.
+        let savable = secrets.isEmpty && model.canSave(clips)
+        let movable = !secrets.isEmpty && model.canPickFolder(clips: clips.filter { !$0.isTransient }, secrets: secrets)
+        if savable || movable {
             Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 5) {
-                if labelable {
+                if savable {
                     GridRow {
-                        Text("Label").foregroundStyle(.secondary)
-                        Button("＋ Label \(clips.count) items") { model.beginLabelSelection() }
+                        Text("Saved").foregroundStyle(.secondary)
+                        Button("＋ Save \(clips.count) items…") { model.beginSaveSelection() }
                             .buttonStyle(.plain)
                             .foregroundStyle(.tint)
-                            .help("⌘L")
+                            .help("⌘S")
+                    }
+                }
+                if savable, let path = commonFolderPath(model) {
+                    GridRow {
+                        Text("Folder").foregroundStyle(.secondary)
+                        Text(path).lineLimit(1)
                     }
                 }
                 if movable {

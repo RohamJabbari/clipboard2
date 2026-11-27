@@ -103,6 +103,16 @@ public sealed partial class QuickPanelWindow : Window
         content.Children.Add(_detail);
 
         var footer = new DockPanel { Margin = new Thickness(16, 7, 16, 8) };
+        // The search row and the footer move the panel, as a title bar would (the box and buttons keep their clicks).
+        foreach (var handle in new Panel[] { searchRow, footer })
+        {
+            handle.Background = Brushes.Transparent;   // hit-testable empty space
+            handle.MouseLeftButtonDown += (_, e) =>
+            {
+                if (e.ButtonState != MouseButtonState.Pressed) return;
+                try { DragMove(); } catch (InvalidOperationException) { }
+            };
+        }
         _syncStatus = new SyncStatusBadge(services.Sync);
         DockPanel.SetDock(_notice, Dock.Right);
         DockPanel.SetDock(_syncStatus, Dock.Right);
@@ -338,7 +348,9 @@ public sealed partial class QuickPanelWindow : Window
     {
         var groupId = chip.GroupId;
         chip.AllowDrop = true;
-        bool Accepts(IDataObject data) => data.GetDataPresent(EntryFormat) || DroppedFiles(data).Count > 0 || DroppedText(data) is not null;
+        // A group whose owner turned this user's Send off takes no drops.
+        bool Accepts(IDataObject data) => Model.CanSendTo(groupId)
+            && (data.GetDataPresent(EntryFormat) || DroppedFiles(data).Count > 0 || DroppedText(data) is not null);
         chip.DragEnter += (_, e) =>
         {
             if (!Accepts(e.Data)) return;
@@ -356,6 +368,12 @@ public sealed partial class QuickPanelWindow : Window
             e.Handled = true;
             chip.BorderThickness = new Thickness(0);
             var groupName = chip.GroupName;
+            if (!Model.CanSendTo(groupId))
+            {
+                ReactivateAfterDrop();
+                Model.ShowNotice($"You can't send to {groupName}");
+                return;
+            }
             if (e.Data.GetData(EntryFormat) is string id)
             {
                 // Dragging one of several selected items shares the whole selection, to the group's root.
@@ -425,7 +443,8 @@ public sealed partial class QuickPanelWindow : Window
         newFolder.MouseLeftButtonUp += (_, _) => Model.CreateFolder();
         AutomationName(newFolder, "New Folder");
         DockPanel.SetDock(newFolder, Dock.Right);
-        bar.Children.Add(newFolder);
+        // A group this user can't send to is only read: no New Folder (nor Add Items).
+        if (Model.CanCreateFolder) bar.Children.Add(newFolder);
         if (Model.CanAddItems)
         {
             var addItems = new Border { Padding = new Thickness(6, 2, 6, 2), CornerRadius = new CornerRadius(6), Cursor = Cursors.Hand, Background = Brushes.Transparent, ToolTip = "Add from clipboard history" };
@@ -745,7 +764,7 @@ public sealed partial class QuickPanelWindow : Window
                 var empty = new StackPanel { Margin = new Thickness(20, 60, 20, 0), HorizontalAlignment = HorizontalAlignment.Center };
                 var inbox = Model.Filter == PanelFilter.Inbox && Model.GroupFilter is null;
                 var (emptyTitle, emptyHint) = Model.Query.Length > 0 ? ("No matches", "Try fewer letters or another filter.")
-                    : Model.OpenFolderId is not null ? ("This folder is empty", "Drag items here, or use Move to Folder in Ctrl+K.")
+                    : Model.OpenFolderId is not null ? ("This folder is empty", $"Drag items here, or use Move to Folder in {KeyLabels.Show("Ctrl+K")}.")
                     : Model.IsSavedView ? ("Nothing saved yet", "Label an item or use Add to Saved to keep it. Secrets and snippets are kept here too.")
                     : inbox ? ("Your Inbox is empty", "What your contacts send you appears here.")
                     : ("Nothing here yet", "Items appear as you copy them.");
@@ -910,7 +929,7 @@ public sealed partial class QuickPanelWindow : Window
         {
             var badge = new Border
             {
-                Child = Fluent.Label($"Ctrl+{shortcut.Number}", 11, selected ? Fluent.AccentText : (shortcut.IsSlot ? Fluent.Accent : Fluent.Tertiary),
+                Child = Fluent.Label(KeyLabels.Show($"Ctrl+{shortcut.Number}"), 11, selected ? Fluent.AccentText : (shortcut.IsSlot ? Fluent.Accent : Fluent.Tertiary),
                     shortcut.IsSlot ? FontWeights.SemiBold : FontWeights.Normal),
                 Padding = new Thickness(shortcut.IsSlot ? 5 : 0, 1, shortcut.IsSlot ? 5 : 0, 1),
                 CornerRadius = new CornerRadius(4),
@@ -986,9 +1005,13 @@ public sealed partial class QuickPanelWindow : Window
         if (entry is PanelEntry.FolderEntry f)
         {
             menu.Items.Add(Item("Open", () => Model.Activate(entry)));
-            menu.Items.Add(Item("Rename…", () => Model.BeginRenameFolder(f.Folder)));
-            menu.Items.Add(Item(f.Folder.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
-            menu.Items.Add(Item("New Folder Inside…", () => Model.NewFolderInside(f.Folder)));
+            // A group's folder can't change without Send.
+            if (Model.CanSendTo(f.Folder.SpaceId))
+            {
+                menu.Items.Add(Item("Rename…", () => Model.BeginRenameFolder(f.Folder)));
+                menu.Items.Add(Item(f.Folder.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
+                menu.Items.Add(Item("New Folder Inside…", () => Model.NewFolderInside(f.Folder)));
+            }
             if (Model.FolderMenuSections([entry]).Count > 0) menu.Items.Add(MoveToFolderMenu(entry, Focus));
             if (Model.ParentFolder(f.Folder) is not null && Model.CanChangeFolder(f.Folder))
                 menu.Items.Add(Item("Move to Top Level", () => Model.MoveFolder(f.Folder, null)));
@@ -1009,7 +1032,7 @@ public sealed partial class QuickPanelWindow : Window
         for (var n = QuickSlots.First; n <= QuickSlots.Last; n++)
         {
             var slot = n;
-            slots.Items.Add(Item($"Ctrl+{slot}", () => { Model.Select(entry.Id); Model.AssignSelection(slot); }));
+            slots.Items.Add(Item(KeyLabels.Show($"Ctrl+{slot}"), () => { Model.Select(entry.Id); Model.AssignSelection(slot); }));
         }
         menu.Items.Add(slots);
         if (ShareMenu(entry, Focus) is { } share) menu.Items.Add(share);
@@ -1040,7 +1063,7 @@ public sealed partial class QuickPanelWindow : Window
                     Focus();   // right-clicking one of several selected items previews them all
                     Model.OpenPreview();
                 });
-                preview.InputGestureText = "Ctrl+Y";
+                preview.InputGestureText = KeyLabels.Show("Ctrl+Y");
                 menu.Items.Add(preview);
             }
             menu.Items.Add(Item(item.Label is null ? "Label…" : "Edit Label…", () => Model.BeginLabel(entry)));
@@ -1130,7 +1153,9 @@ public sealed partial class QuickPanelWindow : Window
             PanelEntry.SecretEntry k => k.Secret.SpaceId,
             _ => null,
         };
-        var groups = Model.GroupNames.Where(g => g.Key != own).OrderBy(g => g.Value, StringComparer.CurrentCultureIgnoreCase).ToList();
+        // Only groups this user can send to; a secret only to those whose secrets they get.
+        var groups = Model.GroupNames.Where(g => g.Key != own && Model.CanSendTo(g.Key) && (entry is not PanelEntry.SecretEntry || Model.CanSeeSecretsIn(g.Key)))
+            .OrderBy(g => g.Value, StringComparer.CurrentCultureIgnoreCase).ToList();
         if (groups.Count == 0) return null;
         var menu = new MenuItem { Header = "Share to Group" };
         foreach (var (id, name) in groups)
@@ -1369,7 +1394,7 @@ public sealed partial class QuickPanelWindow : Window
             row.Background = picked ? Fluent.Accent : Brushes.Transparent;
             check.Text = picked ? "\uE73A" : "\uE739";
             check.Foreground = picked ? Fluent.AccentText : Fluent.Tertiary;
-            name.Foreground = picked ? Fluent.AccentText : (Brush)Application.Current.Resources[SystemColors.ControlTextBrushKey];
+            name.Foreground = picked ? Fluent.AccentText : Fluent.Primary;
             folder.Foreground = picked ? Fluent.AccentText : Fluent.Secondary;
             AutomationName(row, System.IO.Path.GetFileName(path) + (picked ? ", picked" : ""));
         }
@@ -1798,8 +1823,8 @@ public sealed partial class QuickPanelWindow : Window
             return b;
         }
         if (run.Error?.NeedsSettings == true) _aiButtons.Children.Add(Make("Open Settings…", () => { _services.ClosePanel(); _services.OpenSettings("AI"); }, true, ""));
-        if (!Model.IsSelectionMode) _aiButtons.Children.Add(Make("Replace Item", Model.ReplaceItemWithAIOutput, run.IsFinished, "Ctrl+R"));
-        _aiButtons.Children.Add(Make("Copy", Model.CopyAIOutput, run.Output.Length > 0, "Ctrl+C"));
+        if (!Model.IsSelectionMode) _aiButtons.Children.Add(Make("Replace Item", Model.ReplaceItemWithAIOutput, run.IsFinished, KeyLabels.Show("Ctrl+R")));
+        _aiButtons.Children.Add(Make("Copy", Model.CopyAIOutput, run.Output.Length > 0, KeyLabels.Show("Ctrl+C")));
         _aiButtons.Children.Add(Make(Model.IsSelectionMode ? "Replace Selection" : "Paste", Model.PasteAIOutput, run.IsFinished, "Enter"));
     }
 
@@ -1807,7 +1832,7 @@ public sealed partial class QuickPanelWindow : Window
     {
         _notice.Text = Model.Notice ?? "";
         _syncStatus.Update();
-        _hints.Text = Model.Mode switch
+        _hints.Text = KeyLabels.Hints(Model.Mode switch
         {
             PanelMode.Browse when Model.ShowsPeople => Model.SelectedPerson switch
             {
@@ -1842,6 +1867,6 @@ public sealed partial class QuickPanelWindow : Window
             PanelMode.Actions => "↑↓ Choose    Enter Run    Esc Back",
             PanelMode.AI => "Enter Paste    Ctrl+C Copy    Ctrl+R Replace Item    Esc Back",
             _ => "Enter Save    Esc Back",
-        };
+        });
     }
 }

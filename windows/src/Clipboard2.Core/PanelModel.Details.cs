@@ -96,7 +96,7 @@ public sealed partial class PanelModel
     // MARK: Add Items
 
     /// <summary>Saved's Add Items button: recent unsaved clips of this space, to check and add here.</summary>
-    public bool CanAddItems => IsSavedView && SelectionItem is null;
+    public bool CanAddItems => IsSavedView && SelectionItem is null && CanSendTo(SavedSpace);
 
     public void BeginAddItems()
     {

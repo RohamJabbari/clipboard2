@@ -44,6 +44,12 @@ internal sealed class FakeCloud : HttpMessageHandler
     public int MaxContacts { get; set; } = 200;
     /// <summary>Behaves like a server before contacts: no contact routes, direct spaces never exist.</summary>
     public bool NoContacts { get; set; }
+    /// <summary>Behaves like a server before member access (1.10): no <c>canSend</c>/<c>canSeeSecrets</c>, no PATCH of
+    /// a member, nothing enforced.</summary>
+    public bool NoMemberAccess { get; set; }
+    /// <summary>GET /v1/spaces leaves out the caller's access (it reads as on) while writes are still checked: a
+    /// change the client hasn't seen yet.</summary>
+    public bool StaleAccessInSpaces { get; set; }
     public int Count(string prefix) => Log.Count(l => l.StartsWith(prefix));
 
     private long _seq;
@@ -122,6 +128,10 @@ internal sealed class FakeCloud : HttpMessageHandler
         public long CreatedAt;
         public long PurgedSeq;
         public Dictionary<string, (string Role, string Key)> Members { get; } = [];
+        /// <summary>A group member's Send and Secrets (docs/features/member-access.md); missing = both on.</summary>
+        public Dictionary<string, (bool Send, bool Secrets)> Access { get; } = [];
+        public (bool Send, bool Secrets) AccessOf(string uid) =>
+            Kind != "group" || Owner == uid ? (true, true) : Access.GetValueOrDefault(uid, (true, true));
         public Dictionary<string, Item> Items { get; } = [];
         /// <summary>Authenticator shares: recipient uid → their batch.</summary>
         public Dictionary<string, ShareRow> Shares { get; } = [];
@@ -211,6 +221,16 @@ internal sealed class FakeCloud : HttpMessageHandler
         item.UpdatedAt = rollback ? updatedAt : item.UpdatedAt + 1;
         item.Seq = ++_seq;
     }
+
+    /// <summary>Changes a member's Send and/or Secrets, as the owner would on another device.</summary>
+    public void SetAccess(string spaceId, string uid, bool? send = null, bool? secrets = null)
+    {
+        var space = _spaces[spaceId];
+        var (s, k) = space.AccessOf(uid);
+        space.Access[uid] = (send ?? s, secrets ?? k);
+    }
+
+    public (bool Send, bool Secrets) AccessOf(string spaceId, string uid) => _spaces[spaceId].AccessOf(uid);
 
     /// <summary>A hostile server hands a member a different space key.</summary>
     public void ReplaceWrappedKey(string spaceId, string uid, byte[] wrappedKey)
@@ -498,10 +518,19 @@ internal sealed class FakeCloud : HttpMessageHandler
             case "groups" when path.Length >= 4:
                 var grp = Member(path[2], caller.Uid);
                 if (method == "GET")   // no emails (privacy)
-                    return Ok(new JsonObject { ["members"] = new JsonArray([.. grp.Members.Select(m => UserByUid(m.Key) is { } u
-                        ? (JsonNode?)new JsonObject { ["uid"] = m.Key, ["username"] = u.Username, ["name"] = u.Name, ["role"] = m.Value.Role }
-                        : null).OfType<JsonNode>()]) });
+                    return Ok(new JsonObject { ["members"] = new JsonArray([.. grp.Members.Keys.Select(m => (JsonNode?)MemberJson(grp, m)).OfType<JsonNode>()]) });
                 var target = path[4];
+                if (method == "PATCH")
+                {
+                    if (NoMemberAccess) throw new HttpError(HttpStatusCode.NotFound, "Not Found");
+                    if (grp.Owner != caller.Uid) throw new HttpError(HttpStatusCode.Forbidden, "forbidden");
+                    var uid = Uri.UnescapeDataString(target);
+                    if (!grp.Members.ContainsKey(uid)) throw new HttpError(HttpStatusCode.NotFound, "not_found");
+                    if (uid == grp.Owner) throw new HttpError(HttpStatusCode.BadRequest, "invalid") { Detail = "The owner's access can't change" };
+                    bool? Flag(string key) => body?[key] is JsonValue v && v.TryGetValue<bool>(out var b) ? b : null;
+                    SetAccess(grp.Id, uid, Flag("canSend"), Flag("canSeeSecrets"));
+                    return Ok(MemberJson(grp, uid));
+                }
                 if (target == caller.Uid ? grp.Owner == caller.Uid : grp.Owner != caller.Uid) throw new HttpError(HttpStatusCode.Forbidden, "forbidden");
                 grp.Members.Remove(target);
                 return NoContent();
@@ -550,13 +579,15 @@ internal sealed class FakeCloud : HttpMessageHandler
             case "users" or "contacts":   // Fastify's own 404 for a route it doesn't have
                 throw new HttpError(HttpStatusCode.NotFound, "Not Found");
             case "spaces" when path[3] == "changes":
-                return Changes(Member(path[2], caller.Uid), long.Parse(query["since"] ?? "0"), Math.Min(PageLimit, int.Parse(query["limit"] ?? "500")), query["full"] == "1");
+                return Changes(Member(path[2], caller.Uid), long.Parse(query["since"] ?? "0"), Math.Min(PageLimit, int.Parse(query["limit"] ?? "500")), query["full"] == "1",
+                    caller.Uid);
             case "spaces" when path[3] == "items" && method == "PUT":
                 return Put(Established(Member(path[2], caller.Uid)), path[4], body!, caller.Uid);
             case "spaces" when path[3] == "items" && method == "DELETE":
                 return Delete(Member(path[2], caller.Uid), path[4], long.Parse(query["updatedAt"] ?? "0"), caller.Uid);
             case "spaces" when path[3] == "blobs" && method == "POST":
                 var s2 = Established(Member(path[2], caller.Uid));
+                RequireAccess(s2, caller.Uid, send: true, secret: false);
                 var size = body!["size"]!.GetValue<long>();
                 var blobId = B("id");
                 if (s2.Items.Values.Any(i => i.BlobIds.Contains(blobId))) throw new HttpError(HttpStatusCode.Conflict, "conflict");
@@ -731,6 +762,28 @@ internal sealed class FakeCloud : HttpMessageHandler
         foreach (var key in _blobs.Keys.Where(k => k.Space == id).ToList()) _blobs.Remove(key);
     }
 
+    private JsonObject? MemberJson(Space space, string uid)
+    {
+        if (UserByUid(uid) is not { } u) return null;
+        var json = new JsonObject { ["uid"] = uid, ["username"] = u.Username, ["name"] = u.Name, ["role"] = space.Members[uid].Role };
+        if (!NoMemberAccess)
+        {
+            var (send, secrets) = space.AccessOf(uid);
+            json["canSend"] = send;
+            json["canSeeSecrets"] = secrets;
+        }
+        return json;
+    }
+
+    /// <summary>403 for a write the caller's access doesn't allow (nothing on servers before member access).</summary>
+    private void RequireAccess(Space space, string uid, bool send, bool secret)
+    {
+        if (NoMemberAccess) return;
+        var access = space.AccessOf(uid);
+        if (send && !access.Send) throw new HttpError(HttpStatusCode.Forbidden, "send_not_allowed") { Detail = "You can't send to this group" };
+        if (secret && !access.Secrets) throw new HttpError(HttpStatusCode.Forbidden, "forbidden");
+    }
+
     private JsonObject SpaceJson(Space s, string uid)
     {
         var json = new JsonObject
@@ -741,14 +794,23 @@ internal sealed class FakeCloud : HttpMessageHandler
         if (!Legacy)
             json["members"] = new JsonArray([.. s.Members.Keys.Select(m => UserByUid(m)).OfType<User>()
                 .Select(u => (JsonNode?)new JsonObject { ["uid"] = u.Uid, ["name"] = u.Name })]);
+        if (!NoMemberAccess && !StaleAccessInSpaces && s.Kind == "group")
+        {
+            var (send, secrets) = s.AccessOf(uid);
+            json["canSend"] = send;
+            json["canSeeSecrets"] = secrets;
+        }
         return json;
     }
 
-    private HttpResponseMessage Changes(Space space, long since, int limit, bool full = false)
+    private HttpResponseMessage Changes(Space space, long since, int limit, bool full, string uid)
     {
         if (!full && since > 0 && since < space.PurgedSeq)
             return Ok(new JsonObject { ["items"] = new JsonArray(), ["nextSince"] = 0, ["hasMore"] = false, ["resetRequired"] = true });
-        var rows = space.Items.Values.Where(i => i.Seq > since && !HiddenFromChanges.Contains(i.Id)).OrderBy(i => i.Seq).Take(limit + 1).ToList();
+        // Without Secrets, a group's secrets are left out entirely (not even tombstones).
+        var hideSecrets = !NoMemberAccess && !space.AccessOf(uid).Secrets;
+        var rows = space.Items.Values.Where(i => i.Seq > since && !HiddenFromChanges.Contains(i.Id) && !(hideSecrets && i.Category == "secret"))
+            .OrderBy(i => i.Seq).Take(limit + 1).ToList();
         var page = rows.Take(limit).ToList();
         return Ok(new JsonObject
         {
@@ -774,6 +836,7 @@ internal sealed class FakeCloud : HttpMessageHandler
         if (existing is not null && existing.UpdatedAt > updatedAt)
             return Json(HttpStatusCode.Conflict, new JsonObject { ["error"] = "conflict", ["message"] = "newer", ["current"] = existing.Json() });
         RequireWriter(space, existing, uid);
+        RequireAccess(space, uid, send: true, secret: body["category"]!.GetValue<string>() == "secret" || existing?.Category == "secret");
         var ciphertext = body["ciphertext"]!.GetValue<string>();
         if (Convert.FromBase64String(ciphertext).Length > MaxItemBytes) throw new HttpError(HttpStatusCode.RequestEntityTooLarge, "too_large");
         var blobIds = (body["blobIds"] as JsonArray ?? []).Select(b => b!.GetValue<string>()).Distinct().ToList();
@@ -814,6 +877,7 @@ internal sealed class FakeCloud : HttpMessageHandler
         if (existing.Deleted is null && existing.UpdatedAt > updatedAt)
             return Json(HttpStatusCode.Conflict, new JsonObject { ["error"] = "conflict", ["message"] = "changed", ["current"] = existing.Json() });
         RequireWriter(space, existing, uid);
+        RequireAccess(space, uid, send: false, secret: existing.Category == "secret");
         foreach (var b in existing.BlobIds) _blobs.Remove((space.Id, b));
         existing.Deleted = "user";
         existing.Seq = ++_seq;

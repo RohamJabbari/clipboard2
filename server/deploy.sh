@@ -15,4 +15,5 @@ gcloud run deploy clipboard2-api \
   --concurrency=40 \
   --cpu=1 \
   --memory=512Mi \
-  --set-env-vars=INSTANCE_CONNECTION_NAME=pjlogistik-platform:europe-west1:pjlogistik-datasource,DB_USER=clipboard2@rohams-tools.iam,DB_NAME=clipboard2-db,DB_POOL_MAX=4,BUCKET=clipboard2
+  --set-env-vars=INSTANCE_CONNECTION_NAME=pjlogistik-platform:europe-west1:pjlogistik-datasource,DB_USER=clipboard2@rohams-tools.iam,DB_NAME=clipboard2-db,DB_POOL_MAX=4,BUCKET=clipboard2 \
+  --set-secrets=SERVER_SECRET=clipboard2-server-secret:latest

@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import UniformTypeIdentifiers
 
 // MARK: - Snippets
 
@@ -586,6 +587,14 @@ struct SecretsSettingsView: View {
     var body: some View {
         @Bindable var prefs = env.prefs
         Form {
+            AutoFillSettingsSection()
+
+            SavingPasswordsSection()
+
+            PasswordImportSection(center: env.passwordImport)
+
+            EmailAccountsSection()
+
             Section {
                 if env.secrets.secrets.isEmpty {
                     Text("No secrets yet. Add one below, or select a copied password in the quick panel and press ⌘K → Save as Secret.")

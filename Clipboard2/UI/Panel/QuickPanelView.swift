@@ -8,6 +8,8 @@ struct QuickPanelView: View {
     @FocusState private var searchFocused: Bool
     /// Files from Finder hovering over the list.
     @State private var listDropTargeted = false
+    /// The panel's width as laid out (it's resizable); the list and preview share it.
+    @State private var panelWidth: CGFloat = 780
 
     /// Tells the user a drop here adds to history.
     @ViewBuilder
@@ -38,15 +40,17 @@ struct QuickPanelView: View {
             FilterChips(selection: $model.filter, groupSelection: $model.groupFilter,
                         groupShowsSaved: $model.groupShowsSaved, groups: env.sync.groups,
                         showsContacts: env.sync.isSignedIn, contactsShowPeople: $model.contactsShowPeople,
-                        pendingRequests: env.sync.contactRequests.incoming.count,
-                        thisAppName: model.targetRef?.name, dropModel: model)
+                        pendingRequests: env.sync.contactRequests.incoming.count, dropModel: model)
                 .padding(.horizontal, 14)
                 .padding(.bottom, 10)
+                .background(WindowDragArea())   // the chip row moves the panel too
             Hairline()
             HStack(spacing: 0) {
                 VStack(spacing: 0) {
                     if model.isSavedView {
                         SavedHeader(model: model)
+                    } else if model.isAuthView {
+                        AuthHeader(model: model)
                     }
                     IncomingDownloadsBanner(downloads: env.sync.downloads.filter { download in
                         model.groupFilter.map { $0 == download.spaceId } ?? true
@@ -54,7 +58,9 @@ struct QuickPanelView: View {
                     resultsList
                 }
                 .animation(.smooth(duration: 0.3), value: env.sync.downloads.isEmpty)
+                // The header stays at the top however short the list (or its empty state) is.
                 .frame(width: listWidth)
+                .frame(maxHeight: .infinity, alignment: .top)
                 .overlay { listDropHighlight }
                 .onDrop(of: [.fileURL, .clipboard2Clip],
                         delegate: PanelDropDelegate(target: .list, model: model, isTargeted: $listDropTargeted))
@@ -66,13 +72,15 @@ struct QuickPanelView: View {
             Hairline()
             HintBar(entry: model.selectedEntry, mode: model.mode, notice: model.notice,
                     isEditingText: model.isEditingText,
-                    canEditText: model.selectedEntry?.clip.map(model.isEditable) ?? false,
-                    inFolder: model.openFolder != nil,
+                    isEditingFile: model.fileEdit?.isEditing == true,
+                    hasTextSelection: model.previewSelection != nil,
+                    canEditText: model.canEditPreview,
+                    folderExpanded: model.selectedEntry?.folder.map(model.isExpanded),
                     selectionCount: model.isMultiSelecting ? model.selectedClips.count : nil,
                     pickedFiles: model.pickedFileCount,
                     canQuickLook: model.canQuickLook,
-                    canLabel: model.selectedEntry.map(model.canLabel) ?? false,
-                    updateVersion: env.updates.readyVersion,
+                    canLabel: model.selectedEntry.map { $0.clip.map { model.canSave([$0]) } ?? model.canLabel($0) } ?? false,
+                    update: env.updates.indicator,
                     syncIndicator: env.sync.indicator,
                     onUpdate: { env.updates.installNow() },
                     tip: tips.isEmpty ? nil : tips[model.tipIndex % tips.count],
@@ -80,11 +88,12 @@ struct QuickPanelView: View {
                     people: model.showsPeople)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { panelWidth = $0 }
         .onAppear { searchFocused = true }
         .onChange(of: model.focusToken) {
             searchFocused = ![.actions, .snippetForm, .saveSecret, .label, .editSecret, .shareToGroup, .folderName,
                               .authenticatorForm, .authenticatorPeople, .folderPicker, .addItems, .contactPicker,
-                              .addContact].contains(model.mode)
+                              .addContact, .save].contains(model.mode)
         }
         .onChange(of: env.sync.contacts) { model.refresh() }
         .onChange(of: env.sync.contactRequests) { model.refresh() }
@@ -93,10 +102,11 @@ struct QuickPanelView: View {
         .onChange(of: env.authenticators.suggestion) { model.refresh() }
         .onChange(of: env.snippets.revision) { model.refresh() }
         .onChange(of: env.secrets.revision) { model.refresh() }
+        .onChange(of: env.emailCodes.revision) { model.refresh() }
     }
 
     private var listWidth: CGFloat {
-        env.prefs.panelSize.size.width * 0.44
+        PanelLayout.listWidth(panelWidth: panelWidth)
     }
 
     /// One rotates into the hint bar on every open, with the user's own shortcuts.
@@ -130,15 +140,27 @@ struct QuickPanelView: View {
 
     private var searchBar: some View {
         HStack(spacing: 12) {
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 13, weight: .semibold))
+                .rotationEffect(.degrees(90))
+                .foregroundStyle(.tertiary)
+                .frame(width: 14, height: 24)
+                .overlay(WindowDragArea())
+                .help("Drag to move")
+                .accessibilityHidden(true)
+                .padding(.trailing, -4)
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 18, weight: .medium))
                 .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
-            TextField("Search clipboard", text: $model.query)
+            TextField(model.filter.searchPrompt, text: $model.query)
                 .textFieldStyle(.plain)
                 .font(.system(size: 21, weight: .regular))
                 .focused($searchFocused)
-                .accessibilityLabel("Search clipboard history and snippets")
+                .accessibilityLabel(model.filter.searchPrompt)
+            if model.filter == .copies, let target = model.targetRef {
+                OnlyFromAppToggle(app: target, isOn: $model.onlyThisApp)
+            }
             if let target = model.targetRef {
                 HStack(spacing: 5) {
                     Image(systemName: "arrow.turn.down.right")
@@ -160,10 +182,12 @@ struct QuickPanelView: View {
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("Pastes into \(target.name)")
             }
+            KeepOpenButton(isPinned: $model.isPinned)
         }
         .padding(.horizontal, 18)
         .padding(.top, 16)
         .padding(.bottom, 12)
+        .background(WindowDragArea())   // drag the top bar (not the field or buttons) to move
     }
 
     // MARK: List
@@ -174,23 +198,27 @@ struct QuickPanelView: View {
                 PeopleListView(model: model)
             } else if model.entries.isEmpty && model.isSavedView && model.query.isEmpty {
                 ContentUnavailableView {
-                    Label(model.openFolder != nil ? "This Folder Is Empty" : "Nothing Saved Yet",
-                          systemImage: model.openFolder != nil ? "folder" : "bookmark")
+                    Label("Nothing Saved Yet", systemImage: "bookmark")
                 } description: {
-                    Text(model.openFolder != nil
-                         ? "Drag items here, or use Move to Folder in an item's actions."
-                         : "Use Add to Saved or a label to keep an item forever.")
+                    Text("Use Save… (⌘S) to keep an item forever.")
                 }
-            } else if model.entries.isEmpty {
+                .pinnedEmptyState()
+            } else if model.filter == .groups && model.groupFilter == nil {
+                NoGroupsView()
+                    .pinnedEmptyState()
+            } else if model.entries.isEmpty && model.meCards.isEmpty && model.emptyOrigins.isEmpty {
                 let inbox = model.filter == .inbox && model.groupFilter == nil
                 ContentUnavailableView {
                     Label(model.query.isEmpty ? (inbox ? "Your Inbox Is Empty" : "Nothing Here Yet") : "No Matches",
                           systemImage: model.query.isEmpty ? (inbox ? "tray.and.arrow.down" : model.filter.symbol) : "magnifyingglass")
                 } description: {
                     Text(model.query.isEmpty
-                         ? (inbox ? "What your contacts send you shows up here." : "Items appear as you copy them.")
+                         ? (inbox ? "What your contacts send you shows up here."
+                            : model.isAuthView ? "Secrets and authenticator codes show up here."
+                            : "Items appear as you copy them.")
                          : "Try fewer letters or another filter.")
                 }
+                .pinnedEmptyState()
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -198,6 +226,10 @@ struct QuickPanelView: View {
                             ForEach(Array(model.entries.enumerated()), id: \.element.id) { index, entry in
                                 if let title = model.sectionStarts[entry.id] {
                                     SectionHeading(title: title, isFirst: index == 0)
+                                } else if let heading = model.authSourceStarts[entry.id] {
+                                    AuthSourceHeader(heading: heading, isFirst: index == 0,
+                                                     isSelected: heading.key != nil && model.originPage?.key == heading.key,
+                                                     onSelect: heading.key.map { key in { model.openOriginPage(key) } })
                                 }
                                 if let folder = entry.folder {
                                     FolderDropRow(entry: entry, folder: folder, model: model)
@@ -210,6 +242,14 @@ struct QuickPanelView: View {
                                         .id(entry.id)
                                         .onTapGesture { tap(entry) }
                                         .contextMenu { authenticatorContextMenu(item) }
+                                } else if case .emailCode(let code, _) = entry {
+                                    EmailCodeRow(code: code, isSelected: model.isSelected(entry))
+                                        .id(entry.id)
+                                        .onTapGesture { tap(entry) }
+                                        .contextMenu {
+                                            Button("Paste Code") { model.pasteEmailCode(code) }
+                                            Button("Copy Code") { model.copyEmailCode(code) }
+                                        }
                                 } else if case .authenticatorSuggestion(let account) = entry {
                                     AuthenticatorSuggestionRow(account: account, isSelected: model.isSelected(entry))
                                         .id(entry.id)
@@ -221,6 +261,12 @@ struct QuickPanelView: View {
                                 } else {
                                     row(for: entry, at: index)
                                 }
+                            }
+                            if model.isAuthView, !model.emptyOrigins.isEmpty {
+                                OriginsSection(model: model, origins: model.emptyOrigins)
+                            }
+                            if model.isAuthView, !model.meCards.isEmpty {
+                                MeSection(model: model, cards: model.meCards)
                             }
                         }
                         .padding(.horizontal, 8)
@@ -252,7 +298,9 @@ struct QuickPanelView: View {
                  commandHeld: model.isCommandHeld,
                  sharing: sharing(for: entry),
                  badge: entry.clip.flatMap(env.sync.badge),
-                 folderCaption: model.folderCaptions[entry.id])
+                 folderCaption: model.folderCaptions[entry.id],
+                 depth: model.entryDepths[entry.id] ?? 0,
+                 disclosure: model.isSavedView && model.query.isEmpty ? .leaf : nil)
             .id(entry.id)
             // One recogniser reading AppKit's click count: SwiftUI's stacked
             // count:2 / count:1 gestures miss double-clicks in a non-activating panel.
@@ -287,7 +335,7 @@ struct QuickPanelView: View {
     private func authenticatorContextMenu(_ item: AuthenticatorItem) -> some View {
         let actions = PanelAction.authenticatorActions(for: item, signedIn: env.sync.isSignedIn,
                                                        shareCount: model.shareCount(of: item))
-        Button("Paste Code") { model.pasteCode(of: item) }
+        Button("Fill Code") { model.pasteCode(of: item) }
         Button("Copy Code") { model.copyCode(of: item) }
         let more = actions.compactMap { action -> AuthenticatorAction? in
             if case .authenticator(let a) = action { a } else { nil }
@@ -310,7 +358,7 @@ struct QuickPanelView: View {
             Button("Edit…") { model.beginEditSecret(ref) }
             Button("Rename…") { model.beginLabel(entry) }
             folderMenuItems(for: entry)
-            if model.canShareToGroup, env.sync.groups.contains(where: { $0.id != ref.spaceID }) {
+            if model.canShareToGroup, !model.shareGroups(for: ref).isEmpty {
                 Button("Share to Group…") { model.beginShareSecret(ref) }
             }
             if model.canSendToContact(ref) {
@@ -332,7 +380,6 @@ struct QuickPanelView: View {
                 Button("Quick Look") { model.quickLook(entry) }
             }
             Divider()
-            Button(item.label == nil ? "Label…" : "Edit Label…") { model.beginLabel(entry) }
             savedMenuItems(for: entry, item: item)
             if item.kind.isTextual {
                 Button("Save as Secret…") { model.beginSaveSecret(item) }
@@ -346,9 +393,20 @@ struct QuickPanelView: View {
             }
             if model.canShareToGroup {
                 Menu("Share to Group") {
-                    ForEach(env.sync.groups) { group in
-                        Button(group.name) { model.share([item], to: group) }
-                            .disabled(item.spaceID == group.id)
+                    ForEach(model.shareGroups) { group in
+                        // A group with folders is a submenu: the group itself, then its folder tree.
+                        let folders = env.store.folders(inSpace: group.id)
+                        if folders.isEmpty || item.spaceID == group.id {
+                            Button(group.name) { model.share([item], to: group) }
+                                .disabled(item.spaceID == group.id)
+                        } else {
+                            Menu(group.name) {
+                                Button(group.name) { model.share([item], to: group) }
+                                Divider()
+                                FolderMoveMenu(folders: folders, parent: nil,
+                                               onPick: { model.share([item], to: group, folder: $0) }, onNew: nil)
+                            }
+                        }
                     }
                 }
             }
@@ -378,20 +436,19 @@ struct QuickPanelView: View {
         model.refresh()
     }
 
-    /// Add to Saved (or Save a Copy), Remove from Saved, Move to Folder ▸ and Remove from Folder,
-    /// for the row or the selection it's part of.
+    /// Save… (Edit Saved… once saved), Move to Top Level and Remove from Saved, for the row or
+    /// the selection it's part of.
     @ViewBuilder
     private func savedMenuItems(for entry: PanelEntry, item: ClipItem) -> some View {
         let clips = model.clipsForContextAction(on: entry).filter { !$0.isTransient }
         if !clips.isEmpty {
             let changeable = clips.allSatisfy(env.sync.canChange)
-            if changeable && clips.contains(where: { !$0.isPinned }) {
-                Button("Add to Saved") { model.addToSaved(clips) }
+            Button(clips.count == 1 && model.isSaved(clips[0]) ? "Edit Saved…" : "Save…") {
+                if clips.count == 1 { model.beginSave(entry) } else { model.beginSave(clips: clips) }
             }
-            if !changeable {
-                Button("Save a Copy") { model.saveCopies(clips) }
+            if changeable && clips.contains(where: { model.folder(of: $0) != nil }) {
+                Button("Move to Top Level") { model.removeFromFolder(clips) }
             }
-            folderMenuItems(for: entry)
             if changeable && clips.contains(where: { $0.isPinned && $0.label == nil }) {
                 Button("Remove from Saved") { model.removeFromSaved(clips) }
             }
@@ -433,7 +490,7 @@ struct QuickPanelView: View {
 
     @ViewBuilder
     private func folderContextMenu(_ folder: ClipFolder) -> some View {
-        Button("Open") { model.openFolder(folder) }
+        Button(model.isExpanded(folder) ? "Collapse" : "Expand") { model.toggleFolder(folder) }
         Button("Rename…") { model.beginRename(folder) }
         Button(folder.label == nil ? "Label…" : "Edit Label…") { model.beginLabel(.folder(folder)) }
         if model.canChangeFolder(folder) {
@@ -479,9 +536,21 @@ struct QuickPanelView: View {
             if let form = model.labelForm {
                 LabelFormView(form: form) { model.submitLabel() }
             }
+        case .save:
+            if let form = model.saveForm {
+                SaveFormView(form: form, model: model)
+            }
         case .editSecret:
             if let form = model.editSecretForm {
                 EditSecretView(form: form) { model.submitEditSecret() }
+            }
+        case .cardForm:
+            if let form = model.cardForm {
+                CardFormView(form: form) { model.submitCardForm() }
+            }
+        case .originPage:
+            if let page = model.originPage {
+                OriginPageView(page: page, model: model)
             }
         case .shareToGroup:
             if let form = model.shareForm {
@@ -497,7 +566,9 @@ struct QuickPanelView: View {
             }
         case .authenticatorForm:
             if let form = model.authenticatorForm {
-                AuthenticatorFormView(form: form) { model.submitAuthenticatorForm() }
+                AuthenticatorFormView(form: form, onSubmit: { model.submitAuthenticatorForm() },
+                                      onScanScreen: { model.scanQRCodeOnScreen() },
+                                      onChooseImage: { model.chooseQRImage() })
             }
         case .authenticatorPeople:
             if let form = model.peopleForm {
@@ -535,11 +606,17 @@ struct QuickPanelView: View {
             } else if let folder = model.selectedEntry?.folder {
                 FolderPreview(folder: folder, count: model.folderCounts[folder.id] ?? 0, model: model)
                     .id(folder.id)
+            } else if model.selectedID == nil, let card = model.selectedCard {
+                CardPreview(card: card, model: model)
+                    .id(card.id)
             } else if let item = model.selectedEntry?.authenticator {
                 AuthenticatorPreview(item: item, model: model)
                     .id(item.id)
             } else if case .authenticatorSuggestion(let account) = model.selectedEntry {
                 AuthenticatorSuggestionPreview(account: account, model: model)
+            } else if case .emailCode(let code, _) = model.selectedEntry {
+                EmailCodePreview(code: code, model: model)
+                    .id(code.id)
             } else if let entry = model.selectedEntry {
                 PreviewPane(entry: entry, sharing: sharing(for: entry), onEditSecret: model.beginEditSecret,
                             onPasteText: model.pasteText, onSaveAsSecret: model.beginSaveSecret, model: model)
@@ -553,86 +630,83 @@ struct QuickPanelView: View {
 
 // MARK: - Filter chips
 
-/// Every filter in one row, then the sync groups. The selected group's chip grows into a pill
-/// with its Copies | Saved segments.
+/// Copies · Saved · Auth · Contacts · Groups. Under Groups, a second row switches between the
+/// groups; the selected group's pill grows its Copies | Saved segments.
 struct FilterChips: View {
     @Binding var selection: PanelFilter
     @Binding var groupSelection: String?
     /// The selected group's segment: its Saved (true) or its Copies.
     @Binding var groupShowsSaved: Bool
     var groups: [SyncGroup] = []
-    /// The Contacts chip (Inbox | People): whenever you're signed in.
+    /// The Contacts chip (Inbox | People) and Groups: whenever you're signed in.
     var showsContacts = false
     @Binding var contactsShowPeople: Bool
     var pendingRequests = 0
-    let thisAppName: String?
-    /// When set, group chips accept dropped history items and files and share them to the group.
+    /// When set, group pills accept dropped history items and files and share them to the group.
     var dropModel: PanelViewModel?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        if groups.isEmpty && !showsContacts {
+        VStack(alignment: .leading, spacing: 8) {
             chips
-        } else {
-            ScrollViewReader { proxy in
-                ScrollView(.horizontal, showsIndicators: false) { chips }
-                    // A pill that opens near the trailing edge slides into view as it grows.
-                    .onChange(of: groupSelection) { _, id in
-                        guard let id else { return }
-                        if reduceMotion {
-                            proxy.scrollTo(id)
-                        } else {
-                            withAnimation(ChipMotion.morph) { proxy.scrollTo(id) }
-                        }
-                    }
+            if selection == .groups && !groups.isEmpty {
+                groupRow
+                    .transition(reduceMotion ? .identity : .opacity)
             }
         }
+        .animation(reduceMotion ? nil : ChipMotion.morph, value: selection == .groups)
     }
 
     private var chips: some View {
         HStack(spacing: 2) {
             ForEach(PanelFilter.chips(showsContacts: showsContacts)) { filter in
                 if filter == .inbox {
-                    ContactsChip(selected: groupSelection == nil && selection == .inbox, showsPeople: $contactsShowPeople,
+                    ContactsChip(selected: selection == .inbox, showsPeople: $contactsShowPeople,
                                  onSelect: {
                                      groupSelection = nil
                                      selection = .inbox
                                  }, pendingRequests: pendingRequests)
                 } else {
-                    FilterChip(title: title(for: filter), selected: groupSelection == nil && filter == selection) {
-                        groupSelection = nil
+                    FilterChip(title: filter.title, selected: filter == selection) {
+                        if filter != .groups { groupSelection = nil }
                         selection = filter
                     }
                 }
             }
-            if !groups.isEmpty {
-                Rectangle()
-                    .fill(Color.primary.opacity(0.12))
-                    .frame(width: 1, height: 16)
-                    .padding(.horizontal, 6)
-                    .accessibilityHidden(true)
-            }
-            ForEach(groups) { group in
-                GroupChip(group: group, selected: groupSelection == group.id, showsSaved: $groupShowsSaved,
-                          dropModel: dropModel) {
-                    groupSelection = group.id
-                    selection = .all
-                }
-                .id(group.id)
-            }
             Spacer(minLength: 0)
         }
-        // The morph runs however the selection changes: a click or ⇥ (opening the panel resets it
-        // without animating).
-        .animation(reduceMotion ? nil : ChipMotion.morph, value: groupSelection)
-        .animation(reduceMotion ? nil : ChipMotion.morph, value: groupShowsSaved)
         .animation(reduceMotion ? nil : ChipMotion.morph, value: selection)
         .animation(reduceMotion ? nil : ChipMotion.morph, value: contactsShowPeople)
     }
 
-    private func title(for filter: PanelFilter) -> String {
-        if filter == .thisApp, let thisAppName { return thisAppName }
-        return filter.title
+    /// The group switcher: one pill per group, today's group chip.
+    private var groupRow: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 2) {
+                    ForEach(groups) { group in
+                        GroupChip(group: group, selected: groupSelection == group.id, showsSaved: $groupShowsSaved,
+                                  dropModel: dropModel) {
+                            groupSelection = group.id
+                        }
+                        .id(group.id)
+                    }
+                    Spacer(minLength: 0)
+                }
+                // The morph runs however the selection changes: a click or ⇥.
+                .animation(reduceMotion ? nil : ChipMotion.morph, value: groupSelection)
+                .animation(reduceMotion ? nil : ChipMotion.morph, value: groupShowsSaved)
+            }
+            // A pill that opens near the trailing edge slides into view as it grows.
+            .onChange(of: groupSelection) { _, id in
+                guard let id else { return }
+                if reduceMotion {
+                    proxy.scrollTo(id)
+                } else {
+                    withAnimation(ChipMotion.morph) { proxy.scrollTo(id) }
+                }
+            }
+        }
     }
 }
 
@@ -843,7 +917,26 @@ struct SectionHeading: View {
     }
 }
 
+// MARK: - Empty states
+
+extension View {
+    /// An empty list's message sits just under the list's header, never centred in the pane.
+    func pinnedEmptyState() -> some View {
+        fixedSize(horizontal: false, vertical: true)
+            .padding(.top, 24)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+}
+
 // MARK: - Row
+
+/// A row's place in the Saved tree's disclosure column.
+enum RowDisclosure {
+    /// Not a folder: the column stays empty, so names line up.
+    case leaf
+    case collapsed
+    case expanded
+}
 
 struct PanelRow: View {
     let entry: PanelEntry
@@ -866,10 +959,26 @@ struct PanelRow: View {
     var subfolderCount = 0
     /// Something droppable hovers over this folder row.
     var dropHighlighted = false
+    /// How deep it sits in the Saved tree; each level indents it.
+    var depth = 0
+    /// The Saved tree's disclosure column (nil: a flat list without one).
+    var disclosure: RowDisclosure?
     @State private var hovering = false
+
+    static let indentPerLevel: CGFloat = 18
 
     var body: some View {
         HStack(spacing: 10) {
+            if let disclosure {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .rotationEffect(.degrees(disclosure == .expanded ? 90 : 0))
+                    .opacity(disclosure == .leaf ? 0 : 1)
+                    .foregroundStyle(isSelected ? AnyShapeStyle(.white.opacity(0.85)) : AnyShapeStyle(.secondary))
+                    .frame(width: 10)
+                    .padding(.trailing, -4)
+                    .accessibilityHidden(true)
+            }
             if showsCheckmark {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                     .font(.system(size: 15))
@@ -924,6 +1033,7 @@ struct PanelRow: View {
                     .accessibilityHidden(true)
             }
         }
+        .padding(.leading, CGFloat(depth) * Self.indentPerLevel)
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background { rowBackground }
@@ -932,7 +1042,8 @@ struct PanelRow: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(fullAccessibilityLabel)
         .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : .isButton)
-        .accessibilityHint(entry.folder == nil ? "Double-click or press Return to paste" : "Click or press Return to open")
+        .accessibilityHint(entry.folder == nil ? "Double-click or press Return to paste"
+                           : disclosure == .expanded ? "Click or press Return to collapse" : "Click or press Return to expand")
     }
 
     @ViewBuilder
@@ -981,7 +1092,7 @@ struct PanelRow: View {
         case .snippet: .snippet
         case .secret: .secret
         case .folder: .folder
-        case .authenticator, .authenticatorSuggestion: .authenticator
+        case .authenticator, .authenticatorSuggestion, .emailCode: .authenticator
         }
     }
 
@@ -998,10 +1109,11 @@ struct PanelRow: View {
             if item.label == nil, let hiddenKind { return SensitiveText.masked(item.text, kind: hiddenKind) }
             return item.displayTitle
         case .snippet(let snippet): return snippet.name.isEmpty ? "Untitled Snippet" : snippet.name
-        case .secret(let ref): return ref.name
+        case .secret(let ref): return ref.username ?? ref.name
         case .folder(let folder): return folder.name
         case .authenticator(let item): return item.title
         case .authenticatorSuggestion: return "Add to Authenticator"
+        case .emailCode(let code, _): return code.code
         }
     }
 
@@ -1057,12 +1169,15 @@ struct PanelRow: View {
             return [item.sourceAppName, item.lastCopiedAt.shortRelative].compactMap { $0 }.joined(separator: " · ")
         case .snippet(let snippet):
             return snippet.keyword.isEmpty ? "Snippet" : "Snippet · \(snippet.keyword)"
-        case .secret:
-            return "Secret · ••••••••"
+        case .secret(let ref):
+            // A password shows its username as the title; its name goes here.
+            if ref.username != nil { return "\(ref.name) · ••••••••" }
+            return ref.isPassword ? "Password · ••••••••" : "Secret · ••••••••"
         case .folder:
             return FolderCaption.text(folders: subfolderCount, items: folderCount)
         case .authenticator(let item): return item.subtitle
         case .authenticatorSuggestion(let account): return account.issuer
+        case .emailCode(let code, _): return code.source
         }
     }
 
@@ -1074,12 +1189,15 @@ struct PanelRow: View {
             }
             return item.accessibilityDescription
         case .snippet(let snippet): return "Snippet \(snippet.name)"
-        case .secret(let ref): return "Secret \(ref.name)"
+        case .secret(let ref):
+            if ref.isPassword { return "Password \(ref.name)" + (ref.username.map { ", \($0)" } ?? "") }
+            return "Secret \(ref.name)"
         case .folder(let folder):
             return "Folder \(folder.name)" + (folder.label.map { ", label \($0)" } ?? "")
                 + ", " + FolderCaption.text(folders: subfolderCount, items: folderCount)
         case .authenticator(let item): return "Authenticator \(item.title)"
         case .authenticatorSuggestion: return "Add to Authenticator"
+        case .emailCode(let code, _): return "Email code from \(code.source)"
         }
     }
 }
@@ -1091,9 +1209,13 @@ struct HintBar: View {
     let mode: PanelMode
     let notice: String?
     var isEditingText = false
+    /// A copied file's contents are being edited into a new copy.
+    var isEditingFile = false
+    /// Text is selected in the preview: Return pastes just that.
+    var hasTextSelection = false
     var canEditText = false
-    /// A Saved folder is open: esc goes back to the root.
-    var inFolder = false
+    /// The selected Saved folder is expanded (nil: no folder selected).
+    var folderExpanded: Bool?
     var selectionCount: Int?
     /// Some files of a multi-file item are picked in the preview: Return pastes only those.
     var pickedFiles: (picked: Int, total: Int)?
@@ -1101,8 +1223,8 @@ struct HintBar: View {
     var canQuickLook = false
     /// The selection can be labelled (⌘L).
     var canLabel = false
-    /// A downloaded update waiting for a relaunch: shown quietly at the trailing end.
-    var updateVersion: String?
+    /// A new version (found, downloading, or waiting for a relaunch): one small button at the trailing end.
+    var update: UpdateIndicator = .none
     /// Sync state, shown as a dot and a few words at the trailing end while signed in.
     var syncIndicator: SyncIndicator = .hidden
     var onUpdate: () -> Void = {}
@@ -1119,6 +1241,14 @@ struct HintBar: View {
                 hint("⏎", "Send… / Accept")
                 hint("⌘N", "Add Contact")
                 hint("⌫", "Remove")
+            case .browse where isEditingFile:
+                hint("⌘S", "Save as New Copy")
+                hint("⌘Z", "Undo")
+                hint("esc", "Cancel")
+            case .browse where hasTextSelection && selectionCount == nil:
+                hint("⏎", "Paste Selection")
+                hint("⌘C", "Copy")
+                hint("esc", isEditingText ? "Done" : "Clear")
             case .browse where isEditingText:
                 hint("esc", "Done")
                 hint("⌘⏎", "Paste")
@@ -1128,13 +1258,16 @@ struct HintBar: View {
                 hint("⏎", "Paste \(selectionCount ?? 0) Items")
                 hint("⌥⏎", "Plain Text")
                 hint("⌘K", "Actions")
-                hint("⌘L", "Label")
+                hint("⌘S", "Save")
                 hint("⌫", "Delete")
             case .browse where entry?.folder != nil:
-                hint("⏎", "Open")
+                hint("⏎", folderExpanded == true ? "Collapse" : "Expand")
                 hint("⌘K", "Actions")
             case .browse where entry?.authenticator != nil:
-                hint("⏎", "Paste Code")
+                hint("⏎", "Fill Code")
+                hint("⌘K", "Actions")
+            case .browse where entry?.secret?.isPassword == true:
+                hint("⏎", "Fill")
                 hint("⌘K", "Actions")
             case .browse where entry?.isSuggestion == true:
                 hint("⏎", "Add")
@@ -1149,7 +1282,7 @@ struct HintBar: View {
                     if canQuickLook { hint("⌘Y", "Preview") }
                     if canEditText { hint("⌘E", "Edit") }
                     // Only when there's room for it (the notice and tips share the bar).
-                    if canLabel && !canEditText && notice == nil { hint("⌘L", "Label") }
+                    if canLabel && !canEditText && notice == nil { if entry?.clip != nil { hint("⌘S", "Save") } else { hint("⌘L", "Label") } }
                 }
             case .actions:
                 hint("↑↓", "Choose")
@@ -1157,8 +1290,10 @@ struct HintBar: View {
             case .snippetForm:
                 hint("⇥", "Next Field")
                 hint("⏎", "Paste")
-            case .saveSecret, .label, .editSecret, .folderName, .authenticatorForm:
+            case .saveSecret, .label, .editSecret, .folderName, .authenticatorForm, .cardForm:
                 hint("⏎", "Save")
+            case .originPage:
+                hint("esc", "Back to the List")
             case .authenticatorPeople, .folderPicker:
                 hint("↑↓", "Choose")
                 hint("⏎", "Choose")
@@ -1173,6 +1308,9 @@ struct HintBar: View {
                 hint("⌘⏎", "Send to Several")
             case .addContact:
                 hint("⏎", "Add")
+            case .save:
+                hint("↑↓", "Choose")
+                hint("⏎", "Save")
             case .shareToGroup:
                 hint("↑↓", "Choose")
                 hint("⏎", "Share")
@@ -1186,14 +1324,8 @@ struct HintBar: View {
                 Text(notice)
                     .foregroundStyle(.primary)
                     .transition(.opacity)
-            } else if let updateVersion, mode == .browse {
-                Button(action: onUpdate) {
-                    Label("Restart to Update", systemImage: "arrow.down.circle")
-                        .labelStyle(.titleAndIcon)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.tint)
-                .help("Clipboard2 \(updateVersion) is ready. Relaunches in a second; your history stays.")
+            } else if update != .none, mode == .browse {
+                UpdateFooterButton(update: update, action: onUpdate)
             } else if let tip, mode == .browse, selectionCount == nil, !syncIndicator.isVisible {
                 Button(action: onNextTip) {
                     HStack(spacing: 6) {
@@ -1218,7 +1350,7 @@ struct HintBar: View {
                     .layoutPriority(-1)
                     .help(syncIndicator.offersSyncNow ? "\(syncIndicator.title()) — use Sync Now in the menu bar menu" : syncIndicator.title())
             }
-            if !isEditingText { hint("esc", mode == .browse && !inFolder ? "Close" : "Back") }
+            if !isEditingText && !isEditingFile { hint("esc", mode == .browse ? "Close" : "Back") }
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -1237,6 +1369,47 @@ struct HintBar: View {
             Text(label)
         }
         .fixedSize()
+    }
+}
+
+/// The footer's update indicator: "Update available" → "Updating…" → "Restart to Update".
+struct UpdateFooterButton: View {
+    let update: UpdateIndicator
+    let action: () -> Void
+
+    var body: some View {
+        switch update {
+        case .none:
+            EmptyView()
+        case .available(let version):
+            pill("Update available", systemImage: "arrow.down.circle")
+                .help("Clipboard2 \(version) is out. Click to update; your history stays.")
+        case .downloading:
+            HStack(spacing: 5) {
+                ProgressView().controlSize(.mini)
+                Text("Updating…")
+            }
+            .fixedSize()
+            .help("Downloading the new version")
+        case .ready(let version):
+            pill("Restart to Update", systemImage: "arrow.clockwise.circle")
+                .help("Clipboard2 \(version) is ready. Relaunches in a second; your history stays.")
+        }
+    }
+
+    private func pill(_ title: String, systemImage: String) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .labelStyle(.titleAndIcon)
+                .fontWeight(.medium)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(Color.accentColor.opacity(0.14), in: Capsule())
+                .contentShape(Capsule())
+                .fixedSize()
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.tint)
     }
 }
 

@@ -372,10 +372,13 @@ actor FakeSyncServer {
         var wrappedPrivateKey: Data
         var personalSpaceId: String
         var username: String?
+        /// Made without a password: no KDF or wrapped account key on the wire.
+        var passwordless = false
 
         var remote: RemoteAccount {
-            RemoteAccount(uid: uid, email: email, kdf: kdf, wrappedAccountKey: wrappedAccountKey, publicKey: publicKey,
-                          wrappedPrivateKey: wrappedPrivateKey, personalSpaceId: personalSpaceId, username: username)
+            RemoteAccount(uid: uid, email: email, kdf: passwordless ? nil : kdf, wrappedAccountKey: passwordless ? nil : wrappedAccountKey,
+                          publicKey: publicKey, wrappedPrivateKey: wrappedPrivateKey, personalSpaceId: personalSpaceId, username: username,
+                          hasPassword: !passwordless)
         }
 
         var displayName: String { username ?? String(email.prefix { $0 != "@" }) }
@@ -393,7 +396,22 @@ actor FakeSyncServer {
         var uid: String
         var deviceName: String?
         var createdAt: Int64
+        var windowMs: Int64? = nil
+        var isDevice = false
     }
+
+    /// A new device's sign-in request (PROTOCOL.md → New devices).
+    struct DeviceRequest {
+        var uid: String?
+        var secret: String
+        var devicePublicKey: Data
+        var deviceName: String?
+        var windowMs: Int64?
+        var status = "pending"
+        var wrappedAccountKey: Data?
+        var createdAt: Int64
+    }
+    private(set) var deviceRequests: [String: DeviceRequest] = [:]
 
     struct SignupCodeRecord {
         var id: String
@@ -434,6 +452,53 @@ actor FakeSyncServer {
     private(set) var registrations = 0
 
     func setListsMembers(_ value: Bool) { listsMembers = value }
+
+    // Member access (PROTOCOL.md → Member access).
+    /// "space uid" → the member's (Send, Secrets); absent: both on.
+    private var access: [String: (send: Bool, secrets: Bool)] = [:]
+    /// false behaves like a server from before member access: no `canSend` / `canSeeSecrets` anywhere.
+    private(set) var reportsAccess = true
+    private(set) var accessChanges = 0
+
+    func setReportsAccess(_ value: Bool) { reportsAccess = value }
+
+    private func accessKey(_ space: String, _ uid: String) -> String { space + " " + uid }
+
+    /// A member's access; the owner (and anyone outside groups) always has both.
+    func access(space: String, uid: String) -> (send: Bool, secrets: Bool) {
+        guard let group = spaces[space], group.kind == "group", group.owner != uid else { return (true, true) }
+        return access[accessKey(space, uid)] ?? (true, true)
+    }
+
+    /// `PATCH /v1/groups/:id/members/:uid`: owner only, never the owner's own row.
+    func setAccess(caller: String, space: String, uid: String, canSend: Bool?, canSeeSecrets: Bool?) throws -> RemoteMember {
+        guard let group = spaces[space], group.kind == "group", group.members[caller] != nil else { throw Self.error(404, "not_found") }
+        guard group.owner == caller else { throw Self.forbidden }
+        guard group.members[uid] != nil else { throw Self.error(404, "not_found") }
+        guard uid != group.owner else { throw Self.error(400, "invalid", "The owner's access can't be changed") }
+        var current = access(space: space, uid: uid)
+        if let canSend { current.send = canSend }
+        if let canSeeSecrets { current.secrets = canSeeSecrets }
+        access[accessKey(space, uid)] = current
+        accessChanges += 1
+        guard let member = try members(caller: caller, space: space).first(where: { $0.uid == uid }) else {
+            throw Self.error(404, "not_found")
+        }
+        return member
+    }
+
+    /// `GET /v1/groups/:id/members`.
+    func members(caller: String, space: String) throws -> [RemoteMember] {
+        guard let group = spaces[space], group.members[caller] != nil else { throw Self.error(404, "not_found") }
+        return group.members.keys.sorted().map { uid in
+            let rights = access(space: space, uid: uid)
+            return RemoteMember(uid: uid, email: nil, role: group.members[uid]?.role ?? "member", username: accountByUID(uid)?.username,
+                                name: accountByUID(uid)?.displayName ?? uid,
+                                canSend: reportsAccess ? rights.send : nil, canSeeSecrets: reportsAccess ? rights.secrets : nil)
+        }
+    }
+
+    private static let sendNotAllowed = SyncAPIError.server(status: 403, code: "send_not_allowed", message: "", retryAfter: nil)
     func setRequireInvites(_ value: Bool) { requireInvites = value }
     func setChecksClock(_ value: Bool) { checksClock = value }
     func refuse(_ id: String, with error: SyncAPIError) { refusals[id] = error }
@@ -591,6 +656,70 @@ actor FakeSyncServer {
     }
 
     func logout(token: String) { tokens[token] = nil }
+
+    // MARK: Passwordless
+
+    func passwordlessSignup(_ body: PasswordlessSignupRequest) throws -> RemoteSession {
+        let email = body.email ?? "google-\(body.uid.prefix(6))@gmail.com"
+        guard accounts[email] == nil else { throw SyncAPIError.server(status: 409, code: "conflict", message: "", retryAfter: nil) }
+        if isTaken(body.username) { throw Self.usernameTaken() }
+        let account = Account(uid: body.uid, email: email, authKey: Data(), kdf: KDFParams(salt: Data(count: 16), iterations: 600_000),
+                              wrappedAccountKey: Data(), publicKey: body.publicKey, wrappedPrivateKey: body.wrappedPrivateKey,
+                              personalSpaceId: body.personalSpace.id, username: body.username, passwordless: true)
+        accounts[email] = account
+        createSpace(id: body.personalSpace.id, kind: "personal", owner: body.uid, wrappedKey: body.personalSpace.wrappedKey)
+        let token = issueToken(for: body.uid, deviceName: body.device.name)
+        tokens[token]?.isDevice = true
+        return RemoteSession(token: token, expiresAt: nil, account: account.remote)
+    }
+
+    func requestDeviceLogin(_ body: WindowedRequest) -> DeviceLoginTicket {
+        let uid = accounts.values.first { $0.email == body.identifier || $0.username?.lowercased() == body.identifier.lowercased() }?.uid
+        let id = SyncCrypto.newID()
+        let secret = SyncCrypto.newID()
+        deviceRequests[id] = DeviceRequest(uid: uid, secret: secret, devicePublicKey: body.device.publicKey, deviceName: body.device.name,
+                                           windowMs: body.window.milliseconds, createdAt: Date.now.syncMillis)
+        return DeviceLoginTicket(requestId: id, secret: secret, expiresAt: Date.now.addingTimeInterval(300).syncMillis)
+    }
+
+    func pendingDeviceRequests(uid: String) -> [PendingDeviceRequest] {
+        deviceRequests.filter { $0.value.uid == uid && $0.value.status == "pending" }.map { id, r in
+            PendingDeviceRequest(id: id, deviceName: r.deviceName, platform: "macos", country: nil, city: nil, newCountry: false,
+                                 windowMs: r.windowMs, devicePublicKey: r.devicePublicKey, createdAt: r.createdAt,
+                                 expiresAt: r.createdAt + 300_000)
+        }
+    }
+
+    func approveDeviceRequest(uid: String, id: String, number: Int, wrappedAccountKey: Data?) throws {
+        guard var request = deviceRequests[id], request.uid == uid else { throw SyncAPIError.server(status: 404, code: "not_found", message: "", retryAfter: nil) }
+        guard request.status == "pending" else { throw SyncAPIError.server(status: 409, code: "request_closed", message: "", retryAfter: nil) }
+        guard number == PasswordlessCrypto.matchNumber(requestId: id, devicePublicKey: request.devicePublicKey) else {
+            request.status = "mismatch"
+            deviceRequests[id] = request
+            throw SyncAPIError.server(status: 409, code: "number_mismatch", message: "", retryAfter: nil)
+        }
+        request.status = "approved"
+        request.wrappedAccountKey = wrappedAccountKey
+        deviceRequests[id] = request
+    }
+
+    func denyDeviceRequest(uid: String, id: String) {
+        if deviceRequests[id]?.uid == uid { deviceRequests[id]?.status = "denied" }
+    }
+
+    func pollDeviceLogin(id: String, secret: String) throws -> DeviceLoginPoll {
+        guard let request = deviceRequests[id], request.secret == secret else {
+            throw SyncAPIError.server(status: 404, code: "not_found", message: "", retryAfter: nil)
+        }
+        guard request.status == "approved", let uid = request.uid else { return DeviceLoginPoll(status: request.status) }
+        deviceRequests[id]?.status = "completed"
+        let token = issueToken(for: uid, deviceName: request.deviceName)
+        tokens[token]?.isDevice = true
+        tokens[token]?.windowMs = request.windowMs
+        return DeviceLoginPoll(status: "approved", token: token,
+                               expiresAt: request.windowMs.map { Date.now.syncMillis + $0 },
+                               account: try account(uid: uid).remote, wrappedAccountKey: request.wrappedAccountKey)
+    }
 
     private func account(uid: String) throws -> Account {
         guard let account = accounts.values.first(where: { $0.uid == uid }) else {
@@ -899,15 +1028,48 @@ actor FakeSyncServer {
             let names = space.members.keys.sorted().compactMap { uid in
                 accounts.values.first { $0.uid == uid }.map { MemberName(uid: uid, name: $0.displayName) }
             }
+            let rights = access(space: space.id, uid: uid)
+            let reports = reportsAccess && space.kind == "group"
             return RemoteSpace(id: space.id, kind: space.kind, role: member.role, ownerUid: space.owner,
                                wrappedKey: member.wrappedKey, encryptedName: space.encryptedName,
                                memberCount: space.members.count, createdAt: space.createdAt,
-                               members: listsMembers ? names : nil)
+                               members: listsMembers ? names : nil,
+                               canSend: reports ? rights.send : nil, canSeeSecrets: reports ? rights.secrets : nil)
         }
         .sorted { $0.createdAt < $1.createdAt }
     }
 
-    func changes(space: String, since: Int64, limit: Int, full: Bool = false) throws -> ChangesPage {
+    /// false behaves like a server from before heads: `GET /v1/heads` is `404`.
+    private(set) var supportsHeads = true
+    private(set) var headsRequests = 0
+
+    func setSupportsHeads(_ value: Bool) { supportsHeads = value }
+
+    /// `GET /v1/heads`: newest visible seq per membership, and revisions of what else a tick reads.
+    func heads(uid: String) throws -> RemoteHeads {
+        headsRequests += 1
+        guard supportsHeads else { throw Self.error(404, "not_found") }
+        var heads: [String: Int64] = [:]
+        for space in spaces.values where space.members[uid] != nil {
+            let hidesSecrets = !access(space: space.id, uid: uid).secrets
+            heads[space.id] = (items[space.id] ?? [:]).values.filter { !(hidesSecrets && $0.category == "secret") }.map(\.seq).max() ?? 0
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let digest = { (data: Data?) in SyncCrypto.sha256Hex(data ?? Data()) }
+        let listed = spaces.values.filter { $0.members[uid] != nil }.map(\.id).sorted()
+        let shareState = shares.sorted { $0.key < $1.key }.flatMap { id, byRecipient in
+            byRecipient.sorted { $0.key < $1.key }.filter { $0.key == uid || spaces[id]?.owner == uid }
+                .map { "\(id)|\($0.key)|\($0.value.codesUntil ?? -1)|\($0.value.updatedAt)" }
+        }
+        return RemoteHeads(
+            heads: heads,
+            spaces: digest(try? encoder.encode(spaces(for: uid).sorted { $0.id < $1.id })) + listed.joined(),
+            codes: digest(Data(shareState.joined(separator: ";").utf8)),
+            contacts: digest(try? encoder.encode([contactRequests(uid: uid)])) + digest(try? encoder.encode(contactCodes(uid: uid))))
+    }
+
+    func changes(space: String, since: Int64, limit: Int, full: Bool = false, uid: String? = nil) throws -> ChangesPage {
         if resetNext.contains(space) && since > 0 && !full {
             resetNext.remove(space)
             return ChangesPage(items: [], nextSince: since, hasMore: false, resetRequired: true)
@@ -916,7 +1078,10 @@ actor FakeSyncServer {
             failChangesAfterReset = nil
             throw error
         }
-        let all = (items[space] ?? [:]).values.filter { $0.seq > since }.sorted { $0.seq < $1.seq }
+        // Without Secrets, a group's secrets are left out entirely (not even tombstones).
+        let hidesSecrets = uid.map { !access(space: space, uid: $0).secrets } ?? false
+        let all = (items[space] ?? [:]).values.filter { $0.seq > since && !(hidesSecrets && $0.category == "secret") }
+            .sorted { $0.seq < $1.seq }
         let page = Array(all.prefix(limit))
         return ChangesPage(items: page, nextSince: page.last?.seq ?? since, hasMore: all.count > limit, resetRequired: false)
     }
@@ -928,6 +1093,9 @@ actor FakeSyncServer {
         putAttempts[id, default: 0] += 1
         if rateLimited { throw Self.rateLimit }
         if let refusal = refusals[id] { throw refusal }
+        let rights = access(space: space, uid: uid)
+        if !rights.send { throw Self.sendNotAllowed }
+        if !rights.secrets && (body.category == "secret" || items[space]?[id]?.category == "secret") { throw Self.forbidden }
         try checkClock(body.updatedAt, sortAt: body.sortAt)
         try checkMayOverwrite(space: space, id: id, uid: uid)
         if let existing = items[space]?[id], existing.updatedAt > body.updatedAt { return .conflict(existing) }
@@ -953,6 +1121,7 @@ actor FakeSyncServer {
 
     func delete(space: String, id: String, updatedAt: Int64, uid: String) throws -> WriteOutcome {
         deleteRequests.append(id)
+        if !access(space: space, uid: uid).secrets && items[space]?[id]?.category == "secret" { throw Self.forbidden }
         try checkClock(updatedAt)
         try checkMayOverwrite(space: space, id: id, uid: uid)
         guard let existing = items[space]?[id] else { return .saved(seq: 0, trimmed: []) }
@@ -974,7 +1143,8 @@ actor FakeSyncServer {
         items[space]?[id] = item
     }
 
-    func register(space: String, blob: String) -> BlobUploadTicket {
+    func register(space: String, blob: String, uid: String? = nil) throws -> BlobUploadTicket {
+        if let uid, !access(space: space, uid: uid).send { throw Self.sendNotAllowed }
         registrations += 1
         registered.insert("\(space)/\(blob)")
         return BlobUploadTicket(url: URL(string: "fake://\(space)/\(blob)")!, method: "PUT", headers: [:], expiresAt: nil)
@@ -1039,6 +1209,14 @@ nonisolated struct FakeClient: SyncService {
         try await server.login(email: email, authKey: authKey, deviceName: deviceName)
     }
     func logout() async throws { await server.logout(token: try await token()) }
+    func passwordlessSignup(_ body: PasswordlessSignupRequest) async throws -> RemoteSession { try await server.passwordlessSignup(body) }
+    func requestDeviceLogin(_ body: WindowedRequest) async throws -> DeviceLoginTicket { await server.requestDeviceLogin(body) }
+    func pollDeviceLogin(id: String, secret: String) async throws -> DeviceLoginPoll { try await server.pollDeviceLogin(id: id, secret: secret) }
+    func deviceRequests() async throws -> [PendingDeviceRequest] { await server.pendingDeviceRequests(uid: try await caller()) }
+    func approveDeviceRequest(id: String, number: Int, wrappedAccountKey: Data?) async throws {
+        try await server.approveDeviceRequest(uid: try await caller(), id: id, number: number, wrappedAccountKey: wrappedAccountKey)
+    }
+    func denyDeviceRequest(id: String, block: Bool) async throws { await server.denyDeviceRequest(uid: try await caller(), id: id) }
     func changePassword(_ body: PasswordChange) async throws {
         try await server.changePassword(uid: try await caller(), token: try await token(), body)
     }
@@ -1059,6 +1237,7 @@ nonisolated struct FakeClient: SyncService {
     }
 
     func spaces() async throws -> [RemoteSpace] { await server.spaces(for: try await caller()) }
+    func heads() async throws -> RemoteHeads { try await server.heads(uid: try await caller()) }
     func createGroup(id: String, encryptedName: Data, wrappedKey: Data) async throws -> RemoteSpace {
         let uid = try await caller()
         await server.createSpace(id: id, kind: "group", owner: uid, wrappedKey: wrappedKey, encryptedName: encryptedName)
@@ -1066,7 +1245,12 @@ nonisolated struct FakeClient: SyncService {
     }
     func renameGroup(id: String, encryptedName: Data) async throws { await server.rename(space: id, encryptedName: encryptedName) }
     func deleteGroup(id: String) async throws {}
-    func members(groupId: String) async throws -> [RemoteMember] { [] }
+    func members(groupId: String) async throws -> [RemoteMember] {
+        try await server.members(caller: try await caller(), space: groupId)
+    }
+    func setMemberAccess(groupId: String, uid: String, canSend: Bool?, canSeeSecrets: Bool?) async throws -> RemoteMember {
+        try await server.setAccess(caller: try await caller(), space: groupId, uid: uid, canSend: canSend, canSeeSecrets: canSeeSecrets)
+    }
     func removeMember(groupId: String, uid: String) async throws { await server.removeMember(space: groupId, uid: uid) }
 
     func createInvite(groupId: String, inviteId: String, sealedKey: Data) async throws {
@@ -1126,8 +1310,8 @@ nonisolated struct FakeClient: SyncService {
     }
 
     func changes(spaceId: String, since: Int64, limit: Int, full: Bool) async throws -> ChangesPage {
-        _ = try await caller()
-        return try await server.changes(space: spaceId, since: since, limit: limit, full: full)
+        let uid = try await caller()
+        return try await server.changes(space: spaceId, since: since, limit: limit, full: full, uid: uid)
     }
     func putItem(spaceId: String, itemId: String, _ body: ItemUpload) async throws -> WriteOutcome {
         try await server.put(space: spaceId, id: itemId, body: body, uid: try await caller())
@@ -1136,8 +1320,8 @@ nonisolated struct FakeClient: SyncService {
         try await server.delete(space: spaceId, id: itemId, updatedAt: updatedAt, uid: try await caller())
     }
     func registerBlob(spaceId: String, blobId: String, size: Int) async throws -> BlobUploadTicket {
-        _ = try await caller()
-        return await server.register(space: spaceId, blob: blobId)
+        let uid = try await caller()
+        return try await server.register(space: spaceId, blob: blobId, uid: uid)
     }
     func uploadBlob(_ ticket: BlobUploadTicket, data: Data) async throws {
         try Task.checkCancellation()
@@ -1164,25 +1348,34 @@ final class FakeSecrets: SyncSecretSource {
     var values: [String: String] = [:] { didSet { onChange?() } }
 
     var syncSecrets: [SecretRef] { Array(refs.values) }
+    var notes: [String: String] = [:] { didSet { onChange?() } }
+
     func syncValue(id: String) -> String? { values[id] }
-    func syncUpsert(id: String, name: String, value: String, spaceID: String?, folderID: UUID?) {
+    func syncNotes(id: String) -> String? { notes[id] }
+    func syncUpsert(id: String, name: String, value: String, spaceID: String?, folderID: UUID?,
+                    username: String?, urls: [String], notes: String?, origin: String?) {
         let created = refs[id]?.createdAt ?? Date(timeIntervalSince1970: 1_000)
         refs[id] = SecretRef(id: id, name: name, createdAt: created, spaceID: refs[id]?.spaceID ?? spaceID, updatedAt: .now,
-                             folderID: folderID)
+                             folderID: folderID, username: username, urls: urls, notesStamp: SecretExtras.notesStamp(notes),
+                             originID: origin)
         values[id] = value
+        self.notes[id] = notes
     }
     func syncDelete(id: String) {
         refs[id] = nil
         values[id] = nil
+        notes[id] = nil
     }
     func syncDidChange() {}
 
     @discardableResult
-    func add(name: String, value: String, spaceID: String? = nil, folderID: UUID? = nil) -> String {
+    func add(name: String, value: String, spaceID: String? = nil, folderID: UUID? = nil,
+             username: String? = nil, urls: [String] = [], notes: String? = nil) -> String {
         let id = UUID().uuidString
         refs[id] = SecretRef(id: id, name: name, createdAt: Date(timeIntervalSince1970: 1_000), spaceID: spaceID, updatedAt: .now,
-                             folderID: folderID)
+                             folderID: folderID, username: username, urls: urls, notesStamp: SecretExtras.notesStamp(notes))
         values[id] = value
+        if let notes { self.notes[id] = notes }
         return id
     }
 
@@ -1223,6 +1416,7 @@ final class FakeDevice {
     let snippets: SnippetStore
     let secrets = FakeSecrets()
     let authenticators = AuthenticatorStore(backing: MemoryAuthenticatorBacking())
+    let origins = OriginStore(backing: MemoryOriginBacking(), documents: MemoryDocumentVault())
     let engine: SyncEngine
 
     init(_ user: FakeUser) throws {
@@ -1234,7 +1428,7 @@ final class FakeDevice {
         let token = user.token
         engine = SyncEngine(api: FakeClient(server: user.server, token: { token }), identity: user.identity,
                             context: container.mainContext, store: store, snippets: snippets, secrets: secrets,
-                            authenticators: authenticators)
+                            authenticators: authenticators, origins: origins)
         // Like the app (SyncAccount.localChange): local commits ask the next tick to upload.
         let engine = self.engine
         let noteChange = { [weak engine] in
@@ -1245,6 +1439,7 @@ final class FakeDevice {
         snippets.onCommit = noteChange
         secrets.onChange = noteChange
         authenticators.onChange = noteChange
+        origins.onChange = noteChange
     }
 
     func texts(inSpace space: String? = nil) -> Set<String> { Set(store.items(inSpace: space).map(\.text)) }
@@ -1843,14 +2038,15 @@ final class AccountHarness {
     let container: ModelContainer
     let store: ClipStore
     let snippets: SnippetStore
-    let credentials = MemoryCredentials()
+    let credentials: MemoryCredentials
     let prefs: Preferences
     let account: SyncAccount
     /// Background ticks can outlive a test; freeing the container would reset the context under
     /// them (the app's container lives as long as the process), so keep every one alive.
     private static var keepAlive: [ModelContainer] = []
 
-    init(_ server: FakeSyncServer) throws {
+    init(_ server: FakeSyncServer, credentials: MemoryCredentials = MemoryCredentials()) throws {
+        self.credentials = credentials
         container = try ModelContainer(for: AppEnvironment.schema,
                                        configurations: ModelConfiguration(schema: AppEnvironment.schema, isStoredInMemoryOnly: true))
         Self.keepAlive.append(container)
@@ -2602,18 +2798,116 @@ struct SyncHardeningTests {
 
         var now = Date.now.addingTimeInterval(86_400)
         mac.account.clock = { now }
-        #expect(mac.account.pollInterval == .seconds(60))
+        #expect(mac.account.pollInterval == .seconds(10))
         mac.account.reportActivity()
-        #expect(mac.account.pollInterval == .seconds(15))
+        #expect(mac.account.pollInterval == .seconds(2))
         now = now.addingTimeInterval(4 * 60)
-        #expect(mac.account.pollInterval == .seconds(15))
+        #expect(mac.account.pollInterval == .seconds(2))
         now = now.addingTimeInterval(2 * 60)
+        #expect(mac.account.pollInterval == .seconds(10))
+        mac.account.setPanelOpen(true)
+        #expect(mac.account.pollInterval == .seconds(2))
+        mac.account.setPanelOpen(false)
+        #expect(mac.account.pollInterval == .seconds(2))   // opening the panel was activity
+        await mac.settle()
+
+        // A server without heads: full syncs at the old cadence.
+        await server.setSupportsHeads(false)
+        #expect(await mac.account.poll())
+        #expect(!mac.account.usesHeads)
+        #expect(mac.account.pollInterval == .seconds(15))
+        now = now.addingTimeInterval(6 * 60)
         #expect(mac.account.pollInterval == .seconds(60))
         mac.account.setPanelOpen(true)
         #expect(mac.account.pollInterval == .seconds(3))
         mac.account.setPanelOpen(false)
-        #expect(mac.account.pollInterval == .seconds(15))   // opening the panel was activity
         await mac.settle()
+    }
+
+    /// Waits until no tick is running or about to (a poll's tick starts on its own task).
+    private func idle(_ mac: AccountHarness) async {
+        for _ in 0..<50 { await Task.yield() }
+        for _ in 0..<1000 where mac.account.isSyncing { try? await Task.sleep(for: .milliseconds(5)) }
+    }
+
+    @Test func headsPollsSyncOnlyWhenSomethingChanged() async throws {
+        let server = FakeSyncServer()
+        let mac1 = try AccountHarness(server), mac2 = try AccountHarness(server)
+        await mac1.account.signUp(email: "a@x.at", password: "a password", username: "usera")
+        await mac2.account.signIn(email: "a@x.at", password: "a password")
+        await mac1.settle()
+        await mac2.settle()
+
+        // Nothing changed: heads only, no tick.
+        let ticks = mac2.account.ticksStarted
+        let headsBefore = await server.headsRequests
+        #expect(await mac2.account.poll() == false)
+        #expect(await mac2.account.poll() == false)
+        #expect(mac2.account.ticksStarted == ticks)
+        #expect(await server.headsRequests == headsBefore + 2)
+
+        // Another device copies something: the next poll syncs and it arrives.
+        mac1.store.ingest(.text("from mac1"))
+        await mac1.settle()
+        #expect(await mac2.account.poll())
+        await idle(mac2)
+        #expect(mac2.account.ticksStarted > ticks)
+        #expect(mac2.store.allItems().map(\.text) == ["from mac1"])
+        // …and once it has, polls are quiet again.
+        let after = mac2.account.ticksStarted
+        #expect(await mac2.account.poll() == false)
+        #expect(mac2.account.ticksStarted == after)
+
+        // A group rename (no item) is a change too.
+        let group = try await mac1.account.createGroup(named: "Team")
+        await mac1.settle()
+        #expect(await mac2.account.poll())
+        await idle(mac2)
+        #expect(mac2.account.groups.map(\.name) == ["Team"])
+        try await mac1.account.renameGroup(group, to: "Crew")
+        #expect(await mac2.account.poll())
+        await idle(mac2)
+        #expect(mac2.account.groups.map(\.name) == ["Crew"])
+
+        // At least every 5 minutes it syncs regardless.
+        var now = Date.now.addingTimeInterval(6 * 60)
+        mac2.account.clock = { now }
+        #expect(await mac2.account.poll())
+        await idle(mac2)
+        now = now.addingTimeInterval(1)
+        #expect(await mac2.account.poll() == false)
+    }
+
+    @Test func headsFallBackToFullSyncsOnAnOlderServer() async throws {
+        let server = FakeSyncServer()
+        await server.setSupportsHeads(false)
+        let mac1 = try AccountHarness(server), mac2 = try AccountHarness(server)
+        await mac1.account.signUp(email: "a@x.at", password: "a password", username: "usera")
+        await mac2.account.signIn(email: "a@x.at", password: "a password")
+        await mac2.settle()
+        #expect(!mac2.account.usesHeads)
+        #expect(mac2.account.lastHeads == nil)
+
+        // Every poll is a full sync, as before heads.
+        let ticks = mac2.account.ticksStarted
+        #expect(await mac2.account.poll())
+        await idle(mac2)
+        #expect(mac2.account.ticksStarted == ticks + 1)
+        mac1.store.ingest(.text("still syncs"))
+        await mac1.settle()
+        #expect(await mac2.account.poll())
+        await idle(mac2)
+        #expect(mac2.store.allItems().map(\.text) == ["still syncs"])
+
+        // An hour later it asks again and picks up a server that has heads by now.
+        await server.setSupportsHeads(true)
+        var now = Date.now.addingTimeInterval(3601)
+        mac2.account.clock = { now }
+        #expect(mac2.account.usesHeads)
+        await mac2.settle()
+        #expect(mac2.account.lastHeads != nil)
+        now = now.addingTimeInterval(1)
+        #expect(await mac2.account.poll() == false)
     }
 }
 

@@ -21,7 +21,7 @@ nonisolated enum NotificationKind: String, CaseIterable, Identifiable, Codable, 
     var summary: String {
         switch self {
         case .groupActivity: "New items in your groups, and renamed groups."
-        case .groupMembers: "People joining or leaving your groups."
+        case .groupMembers: "People joining or leaving your groups, and changes to what you can do in them."
         case .contacts: "Contact requests, new contacts and what they send you."
         case .authenticators: "Authenticators shared with you or handed over to you."
         }
@@ -38,8 +38,10 @@ nonisolated enum NotificationTarget: Codable, Equatable, Hashable, Sendable {
     case people(requestSpaceId: String?)
     /// Contacts → Inbox, with this entry (if any) selected.
     case inbox(entryID: String?)
-    /// Saved, with this authenticator selected.
+    /// Auth, with this authenticator selected.
     case authenticator(spaceId: String)
+    /// Auth, with this email code selected (phase 4).
+    case emailCode(id: String)
 
     /// Round trip through a notification's `userInfo`.
     var encoded: String {
@@ -82,6 +84,9 @@ nonisolated struct NotificationSnapshot: Codable, Equatable, Sendable {
         var isOwner: Bool
         /// uid → name; empty when the server doesn't list members.
         var members: [String: String]
+        /// Your own access; nil in snapshots from before member access (read as allowed).
+        var canSend: Bool? = nil
+        var canSeeSecrets: Bool? = nil
     }
     nonisolated struct Contact: Codable, Equatable, Sendable {
         var name: String
@@ -172,6 +177,16 @@ nonisolated enum NotificationDiff {
                 events.append(AppNotification(kind: .groupActivity, title: group.name, body: "\(before.name) was renamed",
                                               target: .group(id), groupId: id))
             }
+            // Your own access, changed by the owner (only the owner can).
+            if !group.isOwner {
+                if let body = accessChange(before.canSend, group.canSend, on: "You can send again", off: "You can no longer send") {
+                    events.append(AppNotification(kind: .groupMembers, title: group.name, body: body, target: .group(id), groupId: id))
+                }
+                if let body = accessChange(before.canSeeSecrets, group.canSeeSecrets,
+                                           on: "You can see secrets again", off: "You can no longer see secrets") {
+                    events.append(AppNotification(kind: .groupMembers, title: group.name, body: body, target: .group(id), groupId: id))
+                }
+            }
             // Servers that don't list members say nothing about who came or went.
             guard !before.members.isEmpty, !group.members.isEmpty else { continue }
             for (uid, name) in group.members.sorted(by: { $0.value < $1.value }) where before.members[uid] == nil && uid != me {
@@ -246,6 +261,13 @@ nonisolated enum NotificationDiff {
                                           target: .authenticator(spaceId: id)))
         }
         return events
+    }
+
+    /// The body for an access switch that changed (missing reads as on), nil when it didn't.
+    private static func accessChange(_ before: Bool?, _ now: Bool?, on: String, off: String) -> String? {
+        let was = before ?? true, isOn = now ?? true
+        guard was != isOn else { return nil }
+        return isOn ? on : off
     }
 
     /// New incoming contact requests (already filtered to ones not seen before).

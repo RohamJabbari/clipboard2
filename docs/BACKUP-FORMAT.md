@@ -84,7 +84,8 @@ as in sync. Older readers ignore both, and those clips import at the root of Sav
 ### `secrets`
 
 Only present when the user ticked "Include secrets" and confirmed with Touch ID or Windows Hello. Each
-entry is a secret payload (`"v":1,"type":"secret","name","value","createdAt"`, and `"folder"` like a clip's, 1.7+) plus `"id"`. Personal
+entry is a secret payload (`"v":1,"type":"secret","name","value","createdAt"`, and `"folder"` like a clip's, 1.7+) plus `"id"`.
+A password also carries `"username"`, `"urls"` and `"notes"` (1.11+, each omitted when empty), as in sync. Personal
 secrets only. The values are in the plaintext, protected only by the passphrase.
 
 ### `authenticators`
@@ -101,6 +102,7 @@ with Touch ID or Windows Hello), and omitted when there are none. Each entry is 
 - `secret` is base32 without padding; `algorithm` is `SHA1`, `SHA256` or `SHA512`; `digits` is 6–8.
 - Writers include **only authenticators the user owns**. Ones shared with them hold codes, not the secret, and
   aren't exported. The seed is in the plaintext, protected only by the passphrase, like secrets.
+- `urls` (Edit → Website, 1.11+) is written when set, as in sync.
 - Sync-only data (the authenticator space, shares) isn't written. `rev` is left out.
 
 ## Import

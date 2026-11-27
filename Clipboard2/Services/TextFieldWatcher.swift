@@ -2,8 +2,9 @@ import AppKit
 import ApplicationServices
 
 /// Follows the focused text field in the frontmost app through the Accessibility API, for the
-/// paste icon in text fields. It reads only when focus changes, never reads text, skips password
-/// fields, and gives up quickly on apps that don't answer.
+/// paste icon in text fields. It reads only when focus changes and never reads text. Password
+/// fields are reported too (flagged `isSecure`), for Auth's items there; it gives up quickly on
+/// apps that don't answer.
 ///
 /// It deliberately doesn't set `AXManualAccessibility` on Electron apps: that makes them build
 /// their whole accessibility tree, which slowed typing and copying in them by seconds.
@@ -12,10 +13,20 @@ final class TextFieldWatcher {
     struct Field: Equatable {
         let frame: CGRect
         let app: NSRunningApplication
+        /// A password field.
+        var isSecure = false
+        /// The field itself, for Fill (its kind, the form around it).
+        var element: AXElement?
     }
 
     /// Called on the main thread whenever the focused field changes (nil: none).
     var onChange: (Field?) -> Void = { _ in }
+    /// Called on the main thread when the focused field starts or stops looking like it waits for
+    /// a one-time code (email codes are looked for faster meanwhile). Digit boxes too small for an
+    /// icon count.
+    var onCodeFieldChange: (Bool) -> Void = { _ in }
+    /// Off: no one-time-code guessing (a few more Accessibility reads per focus change).
+    var detectsCodeFields = false
 
     private var app: NSRunningApplication?
     private var appElement: AXUIElement?
@@ -24,6 +35,7 @@ final class TextFieldWatcher {
     private var monitors: [Any] = []
     private var pending: DispatchWorkItem?
     private var reported: Field?
+    private var reportedCodeField = false
     private let ownPID = ProcessInfo.processInfo.processIdentifier
     private(set) var isRunning = false
 
@@ -60,6 +72,7 @@ final class TextFieldWatcher {
         monitors = []
         detach()
         report(nil)
+        reportCodeField(false)
     }
 
     // MARK: Observing one app
@@ -126,20 +139,31 @@ final class TextFieldWatcher {
         guard isRunning, let app, let appElement else { return }
         guard let element = Self.element(appElement, kAXFocusedUIElementAttribute) else {
             report(nil)
+            reportCodeField(false)
             return
         }
         let subrole: String? = Self.value(element, kAXSubroleAttribute)
-        if subrole == (kAXSecureTextFieldSubrole as String) {
+        let role: String? = Self.value(element, kAXRoleAttribute)
+        let secure = subrole == (kAXSecureTextFieldSubrole as String) || role == "AXSecureTextField"
+        guard secure || Self.isEditable(element) else {
             report(nil)
+            reportCodeField(false)
             return
         }
-        report(Self.isEditable(element) ? Self.visibleFrame(of: element).map { Field(frame: $0, app: app) } : nil)
+        reportCodeField(detectsCodeFields && !secure && FieldAX.looksLikeOneTimeCode(AXElement(raw: element)))
+        report(Self.visibleFrame(of: element).map { Field(frame: $0, app: app, isSecure: secure, element: AXElement(raw: element)) })
     }
 
     private func report(_ field: Field?) {
         guard reported != field else { return }
         reported = field
         onChange(field)
+    }
+
+    private func reportCodeField(_ isCode: Bool) {
+        guard reportedCodeField != isCode else { return }
+        reportedCodeField = isCode
+        onCodeFieldChange(isCode)
     }
 
     private static func isEditable(_ element: AXUIElement) -> Bool {

@@ -14,8 +14,11 @@ public enum OtpAlgorithm { SHA1, SHA256, SHA512 }
 /// <param name="SpaceId">Its authenticator space on the server, or null until the first sync creates one (and always
 /// while signed out).</param>
 /// <param name="Shares">Who it's shared with, as the server last said (local only, never in the payload).</param>
+/// <param name="Extras">Payload fields this client doesn't manage (e.g. <c>urls</c>), as compact JSON: kept with it and
+/// written back on every push (<see cref="SyncPayload.ExtrasOf"/>).</param>
 public sealed record Authenticator(string Id, string Issuer, string Account, string Secret, OtpAlgorithm Algorithm, int Digits, int Period,
-                                   DateTime CreatedAt, DateTime UpdatedAt, string? SpaceId = null, IReadOnlyList<OtpShare>? Shares = null)
+                                   DateTime CreatedAt, DateTime UpdatedAt, string? SpaceId = null, IReadOnlyList<OtpShare>? Shares = null,
+                                   string? Extras = null)
 {
     public IReadOnlyList<OtpShare> People => Shares ?? [];
 
@@ -344,6 +347,8 @@ public sealed class AuthenticatorStore
     private Dictionary<string, Authenticator> _all = [];
     private Dictionary<string, SharedAuthenticator> _shared = [];
     private const string SharedPrefix = "shared-";
+    /// <summary>Kept next to the payload in each entry, never synced.</summary>
+    private static readonly string[] LocalFields = ["spaceId", "shares"];
 
     public AuthenticatorStore(IProtectedStore backing, Func<DateTime>? clock = null)
     {
@@ -400,7 +405,10 @@ public sealed class AuthenticatorStore
                         shared[s.SpaceId] = s;
                     continue;
                 }
-                if (Guid.TryParse(key, out var id) && SyncPayload.Parse(json, id, null) is ItemPayload.Otp { Authenticator: var a })
+                // The otp payload plus this device's own fields, which aren't payload extras.
+                var payload = (JsonObject)json.DeepClone();
+                foreach (var local in LocalFields) payload.Remove(local);
+                if (Guid.TryParse(key, out var id) && SyncPayload.Parse(payload, id, null) is ItemPayload.Otp { Authenticator: var a })
                     all[a.Id] = a with
                     {
                         SpaceId = json["spaceId"] is JsonValue sp && sp.TryGetValue<string>(out var space) ? space : null,

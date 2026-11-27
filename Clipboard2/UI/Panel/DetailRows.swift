@@ -8,7 +8,24 @@ struct DetailLabelRow: View {
     let model: PanelViewModel
 
     var body: some View {
-        if model.canLabel(entry) {
+        if let item = entry.clip {
+            // A history item's label is set in Save… (⌘S), along with where it's kept.
+            if model.canSave([item]) {
+                GridRow {
+                    Text("Label").foregroundStyle(.secondary)
+                    if let label, !label.isEmpty {
+                        Button { model.beginSave(entry) } label: { chip(label) }
+                            .buttonStyle(.plain)
+                            .help("Edit Saved… (⌘S)")
+                    } else {
+                        Button(model.isSaved(item) ? "＋ Edit Saved…" : "＋ Save…") { model.beginSave(entry) }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.tint)
+                            .help("Label it and choose where it's kept (⌘S)")
+                    }
+                }
+            }
+        } else if model.canLabel(entry) {
             GridRow {
                 Text("Label").foregroundStyle(.secondary)
                 if let label, !label.isEmpty {
@@ -38,6 +55,17 @@ struct DetailLabelRow: View {
             }
         }
     }
+
+    private func chip(_ label: String) -> some View {
+        Label(label, systemImage: "tag.fill")
+            .labelStyle(.titleAndIcon)
+            .lineLimit(1)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .foregroundStyle(.tint)
+            .background(Color.accentColor.opacity(0.12), in: Capsule())
+            .contentShape(Capsule())
+    }
 }
 
 /// Right under Label: where the item is ("Saved › Work › Clients"), or "＋ Move to folder".
@@ -50,7 +78,19 @@ struct DetailFolderRow: View {
         let clips = entry.clip.map { [$0] } ?? []
         let secrets = entry.secret.map { [$0] } ?? []
         let path = model.folderPath(of: entry)
-        if model.canPickFolder(clips: clips, secrets: secrets) {
+        if let item = entry.clip {
+            // Where it's kept; Save… moves it.
+            if let path {
+                GridRow {
+                    Text("Folder").foregroundStyle(.secondary)
+                    if model.canSave([item]) {
+                        FolderChip(path: path) { model.beginSave(entry) }
+                    } else {
+                        Text(path).lineLimit(2)
+                    }
+                }
+            }
+        } else if model.canPickFolder(clips: clips, secrets: secrets) {
             GridRow {
                 Text("Folder").foregroundStyle(.secondary)
                 FolderChip(path: path) {

@@ -71,13 +71,20 @@ nonisolated struct KDFParams: Codable, Sendable, Equatable {
 nonisolated struct RemoteAccount: Codable, Sendable, Equatable {
     var uid: String
     var email: String
-    var kdf: KDFParams
-    var wrappedAccountKey: Data
+    /// nil for passwordless accounts (PROTOCOL.md → Passwordless).
+    var kdf: KDFParams?
+    /// nil for passwordless accounts: devices get the account key from another device instead.
+    var wrappedAccountKey: Data?
     var publicKey: Data
     var wrappedPrivateKey: Data
     var personalSpaceId: String
     /// nil for accounts made before usernames, and from servers that don't have them yet.
     var username: String?
+    /// nil from servers before passwordless accounts.
+    var emailVerified: Bool? = nil
+    /// A verified account took this (unverified) address: the user should change it.
+    var emailReleased: Bool? = nil
+    var hasPassword: Bool? = nil
 }
 
 /// `POST /v1/auth/signup`: the verifier plus everything the account's keys need, all wrapped.
@@ -122,6 +129,15 @@ nonisolated struct RemoteDevice: Codable, Sendable, Equatable, Identifiable {
     var createdAt: Int64
     var lastUsedAt: Int64
     var current: Bool
+    /// `password` or `device` (passwordless); nil from older servers.
+    var kind: String? = nil
+    var platform: String? = nil
+    /// Device sessions: the window, nil for indefinitely.
+    var windowMs: Int64? = nil
+    /// nil for a device kept indefinitely (and from older servers).
+    var expiresAt: Int64? = nil
+    var country: String? = nil
+    var city: String? = nil
 }
 
 /// `PUT /v1/account/password`.
@@ -217,6 +233,24 @@ nonisolated struct SharedCodesEntry: Codable, Sendable, Equatable {
     var updatedAt: Int64
 }
 
+/// `GET /v1/heads` (PROTOCOL.md → Heads): a cheap look at whether a full sync would find anything.
+nonisolated struct RemoteHeads: Codable, Sendable, Equatable {
+    /// Space id → the newest seq the caller can see there.
+    var heads: [String: Int64]
+    /// Opaque revisions: the spaces list, shared codes and shares, contact requests and codes.
+    var spaces: String
+    var codes: String
+    var contacts: String
+    /// Device requests, recoveries and sessions (PROTOCOL.md → Heads); nil from older servers.
+    var security: String? = nil
+
+    /// Something a full sync fetches moved since `old` (contacts are reloaded on their own).
+    func needsSync(since old: RemoteHeads?) -> Bool {
+        guard let old else { return true }
+        return heads != old.heads || spaces != old.spaces || codes != old.codes
+    }
+}
+
 nonisolated struct RemoteSpace: Codable, Sendable, Equatable {
     var id: String
     var kind: String          // personal | group | direct | authenticator
@@ -228,6 +262,9 @@ nonisolated struct RemoteSpace: Codable, Sendable, Equatable {
     var createdAt: Int64
     /// Who is in the space, to show who copied an item (absent on servers without usernames).
     var members: [MemberName]?
+    /// Your own access in a group (PROTOCOL.md → Member access). Absent on older servers: allowed.
+    var canSend: Bool?
+    var canSeeSecrets: Bool?
 
     var isPersonal: Bool { kind == "personal" }
     /// A contact: two people, no name.
@@ -248,7 +285,13 @@ nonisolated struct RemoteMember: Codable, Sendable, Equatable, Identifiable {
     var role: String
     var username: String?
     var name: String?
+    /// The member's access; absent on older servers (allowed).
+    var canSend: Bool?
+    var canSeeSecrets: Bool?
     var id: String { uid }
+
+    var sendAllowed: Bool { canSend ?? true }
+    var secretsAllowed: Bool { canSeeSecrets ?? true }
 
     var displayName: String { username ?? name ?? email.map { String($0.prefix { $0 != "@" }) } ?? "Member" }
 }
@@ -339,7 +382,7 @@ nonisolated enum SyncAPIError: LocalizedError, Equatable {
     /// Retrying the same item write won't help (too big, over quota, rejected, clock off, or
     /// someone else's item in a group). `forbidden` on a read means the space is gone instead.
     var isPermanentForItem: Bool {
-        ["too_large", "quota_exceeded", "invalid", "clock_skew", "forbidden"].contains(code ?? "")
+        ["too_large", "quota_exceeded", "invalid", "clock_skew", "forbidden", "send_not_allowed"].contains(code ?? "")
     }
 
     var errorDescription: String? {
@@ -360,6 +403,7 @@ nonisolated enum SyncAPIError: LocalizedError, Equatable {
             case "invalid_credentials": "Wrong email or password."
             case "unauthenticated": "Your sync session ended. Enter your password again."
             case "clock_skew": "Your clock is off, so sync can't save changes. Turn on “Set time and date automatically” in System Settings → General → Date & Time."
+            case "send_not_allowed": "You can't send to this group. Ask its owner to let you."
             case "forbidden": "Only the person who shared an item, or the group's owner, can change or delete it."
             case "invite_required": "Sign-up needs an invite code. Ask someone who uses Clipboard2 Sync for one."
             case "invite_invalid": "This invite code is unknown, already used or expired. Ask for a new one."
@@ -373,7 +417,7 @@ nonisolated enum SyncAPIError: LocalizedError, Equatable {
 // MARK: - Service
 
 /// Every server call sync makes. `SyncAPI` talks HTTP; tests use an in-memory server.
-nonisolated protocol SyncService: Sendable {
+nonisolated protocol SyncService: PasswordlessService {
     // Auth (prelogin, signup and login need no session)
     func prelogin(email: String) async throws -> KDFParams
     func signup(_ body: SignupRequest) async throws -> RemoteSession
@@ -394,11 +438,15 @@ nonisolated protocol SyncService: Sendable {
     func revokeSession(id: String) async throws
 
     func spaces() async throws -> [RemoteSpace]
+    /// `404` from a server without it (PROTOCOL.md → Heads).
+    func heads() async throws -> RemoteHeads
     func createGroup(id: String, encryptedName: Data, wrappedKey: Data) async throws -> RemoteSpace
     func renameGroup(id: String, encryptedName: Data) async throws
     func deleteGroup(id: String) async throws
     func members(groupId: String) async throws -> [RemoteMember]
     func removeMember(groupId: String, uid: String) async throws
+    /// Owner only: a member's Send and Secrets access (nil leaves it as it is).
+    func setMemberAccess(groupId: String, uid: String, canSend: Bool?, canSeeSecrets: Bool?) async throws -> RemoteMember
 
     // Invites
     func createInvite(groupId: String, inviteId: String, sealedKey: Data) async throws
@@ -448,6 +496,11 @@ nonisolated protocol SyncService: Sendable {
 }
 
 extension SyncService {
+    /// Services that don't know heads behave like an older server.
+    func heads() async throws -> RemoteHeads {
+        throw SyncAPIError.server(status: 404, code: "not_found", message: "", retryAfter: nil)
+    }
+
     func downloadBlob(spaceId: String, blobId: String, progress: @escaping DownloadProgress) async throws -> Data {
         let data = try await downloadBlob(spaceId: spaceId, blobId: blobId)
         progress(Int64(data.count), Int64(data.count))
@@ -464,9 +517,10 @@ nonisolated struct SyncAPI: SyncService {
     private static let encoder = JSONEncoder()
     private static let decoder = JSONDecoder()
 
-    nonisolated private struct Empty: Codable {}
+    nonisolated struct Empty: Codable {}
     nonisolated private struct SpacesBody: Codable { var spaces: [RemoteSpace] }
     nonisolated private struct MembersBody: Codable { var members: [RemoteMember] }
+    nonisolated private struct AccessBody: Codable { var canSend: Bool?; var canSeeSecrets: Bool? }
     nonisolated private struct SavedBody: Codable { var seq: Int64; var trimmed: [String]? }
     nonisolated private struct ConflictBody: Codable { var current: RemoteItem }
     nonisolated private struct ErrorBody: Codable { var error: String?; var message: String?; var scope: String?; var retryAfter: Int? }
@@ -474,7 +528,7 @@ nonisolated struct SyncAPI: SyncService {
     nonisolated private struct RenameBody: Codable { var encryptedName: Data }
     nonisolated private struct EmailBody: Codable { var email: String }
     nonisolated private struct PreloginBody: Codable { var kdf: KDFParams }
-    nonisolated private struct LoginBody: Codable { var email: String; var authKey: Data; var deviceName: String? }
+    nonisolated private struct LoginBody: Codable { var email: String; var authKey: Data; var deviceName: String?; var platform: String? = "macos" }
     nonisolated private struct AuthKeyBody: Codable { var authKey: Data }
     nonisolated private struct InviteBody: Codable { var inviteId: String; var sealedKey: Data }
     nonisolated private struct InvitesBody: Codable { var invites: [PendingInvite] }
@@ -563,6 +617,10 @@ nonisolated struct SyncAPI: SyncService {
         try await send("GET", "v1/spaces", query: ["include": "direct,authenticator"], as: SpacesBody.self).spaces
     }
 
+    func heads() async throws -> RemoteHeads {
+        try await send("GET", "v1/heads", as: RemoteHeads.self)
+    }
+
     func createGroup(id: String, encryptedName: Data, wrappedKey: Data) async throws -> RemoteSpace {
         try await send("POST", "v1/groups", body: GroupBody(id: id, encryptedName: encryptedName, wrappedKey: wrappedKey),
                        as: RemoteSpace.self)
@@ -583,6 +641,12 @@ nonisolated struct SyncAPI: SyncService {
     func removeMember(groupId: String, uid: String) async throws {
         let escaped = uid.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? uid
         _ = try await send("DELETE", "v1/groups/\(groupId)/members/\(escaped)", as: Empty.self)
+    }
+
+    func setMemberAccess(groupId: String, uid: String, canSend: Bool?, canSeeSecrets: Bool?) async throws -> RemoteMember {
+        let escaped = uid.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? uid
+        return try await send("PATCH", "v1/groups/\(groupId)/members/\(escaped)",
+                              body: AccessBody(canSend: canSend, canSeeSecrets: canSeeSecrets), as: RemoteMember.self)
     }
 
     // MARK: Invites
@@ -785,18 +849,18 @@ nonisolated struct SyncAPI: SyncService {
         return request
     }
 
-    private func send<T: Decodable>(_ method: String, _ path: String, query: [String: String] = [:],
+    func send<T: Decodable>(_ method: String, _ path: String, query: [String: String] = [:],
                                     as type: T.Type) async throws -> T {
         try await send(method, path, query: query, bodyData: nil, as: type, authenticated: true)
     }
 
-    private func send<B: Encodable, T: Decodable>(_ method: String, _ path: String, query: [String: String] = [:],
+    func send<B: Encodable, T: Decodable>(_ method: String, _ path: String, query: [String: String] = [:],
                                                   body: B, as type: T.Type, authenticated: Bool = true) async throws -> T {
         try await send(method, path, query: query, bodyData: try Self.encoder.encode(body), as: type,
                        authenticated: authenticated)
     }
 
-    private func send<T: Decodable>(_ method: String, _ path: String, query: [String: String],
+    func send<T: Decodable>(_ method: String, _ path: String, query: [String: String],
                                     bodyData: Data?, as type: T.Type, authenticated: Bool) async throws -> T {
         let request = makeRequest(method, path, query: query, body: bodyData,
                                   token: authenticated ? try await token() : nil)

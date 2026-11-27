@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Input;
 using System.Windows.Interop;
@@ -201,6 +202,89 @@ public readonly record struct KeyCombo(uint Modifiers, Key Key)
     }
 
     public uint VirtualKey => (uint)KeyInterop.VirtualKeyFromKey(Key);
+
+    /// <summary>As printed on this keyboard: "Strg+Alt+Ö" on a German layout. <see cref="ToString"/> stays the stored form.</summary>
+    public string Display()
+    {
+        var parts = new List<string>();
+        if ((Modifiers & Native.MOD_CONTROL) != 0) parts.Add(KeyLabels.Show("Ctrl"));
+        if ((Modifiers & Native.MOD_ALT) != 0) parts.Add(KeyLabels.Show("Alt"));
+        if ((Modifiers & Native.MOD_SHIFT) != 0) parts.Add(KeyLabels.Show("Shift"));
+        if ((Modifiers & Native.MOD_WIN) != 0) parts.Add("Win");
+        parts.Add(KeyNames.Of(Key));
+        return string.Join("+", parts);
+    }
+
+    /// <summary>A stored shortcut ("Ctrl+Alt+C") as this keyboard shows it.</summary>
+    public static string Display(string? text) =>
+        Parse(text) is { } combo ? combo.Display() : KeyLabels.Show(text ?? "");
+}
+
+/// <summary>Key names from the active keyboard layout, the way Windows itself names them.</summary>
+public static class KeyNames
+{
+    private static readonly Dictionary<string, (uint Scan, bool Extended)> Scans = new()
+    {
+        ["Ctrl"] = (0x1D, false), ["Shift"] = (0x2A, false), ["Alt"] = (0x38, false), ["Enter"] = (0x1C, false),
+        ["Esc"] = (0x01, false), ["Del"] = (0x53, true), ["Backspace"] = (0x0E, false), ["Tab"] = (0x0F, false),
+        ["Space"] = (0x39, false),
+    };
+
+    private static IntPtr _layout;
+
+    /// <summary>
+    /// Reads the keyboard layout of <paramref name="window"/> (the app being typed in; else this one's) into
+    /// <see cref="KeyLabels.Names"/>. English layouts keep the short English names.
+    /// </summary>
+    public static void Refresh(IntPtr window = default)
+    {
+        var thread = window == IntPtr.Zero ? 0 : Native.GetWindowThreadProcessId(window, out _);
+        var layout = Native.GetKeyboardLayout(thread);
+        if (layout == IntPtr.Zero) layout = Native.GetKeyboardLayout(0);
+        if (layout == _layout && KeyLabels.Names.Count > 0) return;
+        _layout = layout;
+        var language = (int)(layout.ToInt64() & 0xFFFF);
+        var names = new Dictionary<string, string>();
+        if ((language & 0x3FF) != 0x09)   // LANG_ENGLISH
+        {
+            foreach (var (key, (scan, extended)) in Scans)
+                if (Name(layout, scan, extended) is { } name && !name.Equals(key, StringComparison.OrdinalIgnoreCase)) names[key] = name;
+        }
+        KeyLabels.Names = names;
+    }
+
+    /// <summary>The key itself: its character on this layout for letter and punctuation keys ("Ö", not "Oem3").</summary>
+    public static string Of(Key key)
+    {
+        if (key is >= Key.D0 and <= Key.D9) return ((char)('0' + (key - Key.D0))).ToString();
+        if (key is >= Key.A and <= Key.Z or >= Key.F1 and <= Key.F24) return key.ToString();
+        var vk = (uint)KeyInterop.VirtualKeyFromKey(key);
+        var ch = Native.MapVirtualKeyEx(vk, Native.MAPVK_VK_TO_CHAR, Layout) & 0x7FFFFFFF;   // high bit: dead key
+        if (ch > 0x20) return char.ToUpper((char)ch, System.Globalization.CultureInfo.CurrentCulture).ToString();
+        var scan = Native.MapVirtualKeyEx(vk, Native.MAPVK_VK_TO_VSC, Layout);
+        var extended = key is Key.Insert or Key.Delete or Key.Home or Key.End or Key.PageUp or Key.PageDown
+            or Key.Left or Key.Right or Key.Up or Key.Down or Key.Divide or Key.PrintScreen;
+        return scan != 0 && Name(Layout, scan, extended) is { } name ? name : key.ToString();
+    }
+
+    private static IntPtr Layout => _layout != IntPtr.Zero ? _layout : Native.GetKeyboardLayout(0);
+
+    /// <summary>GetKeyNameText reads this thread's layout, so it is switched to <paramref name="layout"/> for the call.</summary>
+    private static string? Name(IntPtr layout, uint scan, bool extended)
+    {
+        var buffer = new StringBuilder(64);
+        var lParam = (int)((scan << 16) | (extended ? 1u << 24 : 0));
+        var own = Native.GetKeyboardLayout(0);
+        var previous = own == layout ? IntPtr.Zero : Native.ActivateKeyboardLayout(layout, 0);
+        try
+        {
+            return Native.GetKeyNameText(lParam, buffer, buffer.Capacity) > 0 ? KeyLabels.Tidy(buffer.ToString()) : null;
+        }
+        finally
+        {
+            if (previous != IntPtr.Zero && previous != layout) Native.ActivateKeyboardLayout(previous, 0);
+        }
+    }
 }
 
 /// <summary>Global shortcuts via RegisterHotKey on a message-only window.</summary>

@@ -577,6 +577,27 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
         }
     }
 
+    /// <summary>The owner turns a member's Send and/or Secrets on or off (null leaves it as is), at once. Returns the
+    /// member as the server now has them, or why it couldn't be changed; the sync status is left alone.</summary>
+    public async Task<(GroupMember? Member, string? Error)> SetMemberAccessAsync(string groupId, string uid, bool? canSend = null, bool? canSeeSecrets = null)
+    {
+        try { return (await _api.SetMemberAccessAsync(groupId, uid, canSend, canSeeSecrets), null); }
+        catch (SyncApiException ex)
+        {
+            Logger?.Invoke($"Couldn't change access of {uid} in {groupId}: {ex.Code} {ex.Message}");
+            return (null, ex.Code switch
+            {
+                "forbidden" => "Only the group's owner can change what members may do.",
+                "not_found" => "That member or the group is gone, or the sync server doesn't support this yet.",
+                "network" => ex.Message,
+                _ => Friendly(ex),
+            });
+        }
+    }
+
+    /// <summary>"You can't send to ‹Group›": Ctrl+Alt+C and drops to a group whose owner turned this user's Send off.</summary>
+    public static string CantSendMessage(SpaceRecord group) => $"You can't send to {group.DisplayName}";
+
     public Task<bool> RemoveMemberAsync(string id, string uid) => Run("Removing…", async ct =>
     {
         await _api.RemoveMemberAsync(id, uid, ct);
@@ -1089,13 +1110,11 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
                 if (_engine is not { } engine) break;
                 if (!_accountFresh) await RefreshAccountAsync(ct);
                 if (!_devicesFresh) await RefreshDevicesQuietlyAsync(ct);
+                engine.Pulled = pulled => ReportActivity(engine, pulled);
                 var report = await engine.TickAsync(ct);
                 await RefreshContactsAsync(force: false, ct);
-                if (_engine == engine && Uid is { } self)
-                {
-                    var found = Activity.Observe(Snapshot(self, _seenRequests is null ? null : IncomingRequests), report.Arrivals);
-                    if (found.Count > 0) Notifications?.Invoke(found);
-                }
+                // Again, for what the rest of the tick changed (contact requests, authenticators).
+                ReportActivity(engine, report);
                 LastSync = _now();
                 _offline = false;
                 RetryAfter = null;
@@ -1181,6 +1200,15 @@ public sealed partial class SyncAccount : INotifyPropertyChanged
     // MARK: Internals
 
     /// <summary>What <see cref="Activity"/> compares: the spaces as stored, pending requests and authenticators.</summary>
+    /// <summary>Compares with the last look and raises notifications; the report's arrivals are used up.</summary>
+    private void ReportActivity(SyncEngine engine, SyncReport report)
+    {
+        if (_engine != engine || Uid is not { } self) return;
+        var found = Activity.Observe(Snapshot(self, _seenRequests is null ? null : IncomingRequests), [.. report.Arrivals]);
+        report.Arrivals.Clear();
+        if (found.Count > 0) Notifications?.Invoke(found);
+    }
+
     private SyncSnapshot Snapshot(string self, IReadOnlyList<ContactRequest>? requests) =>
         new(self, _store.SyncSpaces(), requests, [.. Authenticators.Shared], [.. Authenticators.All]);
 

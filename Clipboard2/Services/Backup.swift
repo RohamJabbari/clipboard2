@@ -312,13 +312,22 @@ nonisolated struct BackupSecret: Codable, Equatable, Sendable {
     var createdAt: Int64
     /// The id of the backup folder it's in (1.7+), like a clip's `folder`.
     var folder: String?
+    /// A password's username, sites and notes (1.11+), as in the sync payload; omitted when empty.
+    var username: String?
+    var urls: [String]?
+    var notes: String?
 
-    init(id: String, name: String, value: String, createdAt: Int64, folder: String? = nil) {
+    init(id: String, name: String, value: String, createdAt: Int64, folder: String? = nil,
+         username: String? = nil, urls: [String]? = nil, notes: String? = nil) {
         self.id = id
         self.name = name
         self.value = value
         self.createdAt = createdAt
         self.folder = folder
+        self.username = SecretExtras.cleanUsername(username)
+        let sites = SecretExtras.cleanURLs(urls ?? [])
+        self.urls = sites.isEmpty ? nil : sites
+        self.notes = notes?.isEmpty == true ? nil : notes
     }
 
     init(from decoder: any Decoder) throws {
@@ -330,6 +339,9 @@ nonisolated struct BackupSecret: Codable, Equatable, Sendable {
         value = try c.decodeIfPresent(String.self, forKey: .value) ?? ""
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
         folder = try c.decodeIfPresent(String.self, forKey: .folder)
+        username = try? c.decodeIfPresent(String.self, forKey: .username)
+        urls = try? c.decodeIfPresent([String].self, forKey: .urls)
+        notes = try? c.decodeIfPresent(String.self, forKey: .notes)
     }
 }
 
@@ -347,8 +359,11 @@ nonisolated struct BackupAuthenticator: Codable, Equatable, Sendable {
     var period: Int
     var createdAt: Int64
     var updatedAt: Int64
+    /// Edit → Website (1.11+); omitted when empty.
+    var urls: [String]?
 
     init(_ authenticator: Authenticator) {
+        urls = authenticator.urls.isEmpty ? nil : authenticator.urls
         id = authenticator.id
         issuer = authenticator.issuer
         account = authenticator.account
@@ -373,6 +388,7 @@ nonisolated struct BackupAuthenticator: Codable, Equatable, Sendable {
         period = try c.decodeIfPresent(Int.self, forKey: .period) ?? 30
         createdAt = try c.decodeIfPresent(Int64.self, forKey: .createdAt) ?? 0
         updatedAt = try c.decodeIfPresent(Int64.self, forKey: .updatedAt) ?? createdAt
+        urls = try? c.decodeIfPresent([String].self, forKey: .urls)
     }
 
     /// nil when the secret or settings are unusable.
@@ -456,7 +472,9 @@ enum BackupExporter {
         let secretList = secrets?.map {
             BackupSecret(id: $0.ref.id.lowercased(), name: $0.ref.name, value: $0.value,
                          createdAt: ($0.ref.createdAt ?? .now).backupMillis,
-                         folder: $0.ref.folderID?.uuidString.lowercased())
+                         folder: $0.ref.folderID?.uuidString.lowercased(),
+                         username: $0.ref.username, urls: $0.ref.urls,
+                         notes: $0.ref.notesStamp == nil ? nil : SecretVault.notes(id: $0.ref.id))
         }
         // Parents first, each with its effective parent (an unusable one reads as top level).
         let personalFolders = store.folders(inSpace: nil)
@@ -517,7 +535,15 @@ protocol BackupSecretSink {
     func existingSecrets() -> [(name: String, value: String)]
     /// `folderID`: the personal Saved folder it goes in, if any.
     func addSecret(name: String, value: String, folderID: UUID?) -> Bool
+    /// With a password's username, sites and notes (defaults to `addSecret(name:value:folderID:)`).
+    func addSecret(_ secret: BackupSecret, folderID: UUID?) -> Bool
     func finishImport()
+}
+
+extension BackupSecretSink {
+    func addSecret(_ secret: BackupSecret, folderID: UUID?) -> Bool {
+        addSecret(name: secret.name, value: secret.value, folderID: folderID)
+    }
 }
 
 extension SecretStore: BackupSecretSink {
@@ -527,6 +553,11 @@ extension SecretStore: BackupSecretSink {
 
     func addSecret(name: String, value: String, folderID: UUID?) -> Bool {
         SecretVault.add(name: name, value: value, folderID: folderID) != nil
+    }
+
+    func addSecret(_ secret: BackupSecret, folderID: UUID?) -> Bool {
+        SecretVault.add(name: secret.name, value: secret.value, folderID: folderID, username: secret.username,
+                        urls: secret.urls ?? [], notes: secret.notes) != nil
     }
 
     func finishImport() {
@@ -628,7 +659,7 @@ enum BackupImporter {
                 summary.authenticatorsSkipped += 1
                 continue
             }
-            if store.add(account, now: backup.createdAt > 0 ? Date(backupMillis: backup.createdAt) : .now) != nil {
+            if store.add(account, urls: backup.urls ?? [], now: backup.createdAt > 0 ? Date(backupMillis: backup.createdAt) : .now) != nil {
                 summary.authenticatorsAdded += 1
             } else {
                 summary.authenticatorsFailed += 1
@@ -828,7 +859,7 @@ enum BackupImporter {
                 summary.secretsSkipped += 1
                 continue
             }
-            if sink.addSecret(name: secret.name, value: secret.value, folderID: secret.folder.flatMap { folders[$0] }) {
+            if sink.addSecret(secret, folderID: secret.folder.flatMap { folders[$0] }) {
                 summary.secretsAdded += 1
             } else {
                 summary.secretsFailed += 1

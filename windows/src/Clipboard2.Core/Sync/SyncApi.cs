@@ -12,8 +12,11 @@ public sealed record AccountInfo(string Uid, string Email, byte[] Salt, int Iter
                                  byte[] PublicKey, byte[] WrappedPrivateKey, string PersonalSpaceId, string? Username = null);
 
 /// <param name="Members">Member uid → name (username, or the email's part before @); null from servers without it.</param>
+/// <param name="CanSend">The caller may add to the group; true when the server doesn't say.</param>
+/// <param name="CanSeeSecrets">The caller gets the group's secrets; true when the server doesn't say.</param>
 public sealed record SpaceInfo(string Id, string Kind, string Role, string OwnerUid, byte[] WrappedKey, byte[]? EncryptedName,
-                               int MemberCount, long CreatedAt, IReadOnlyDictionary<string, string>? Members = null)
+                               int MemberCount, long CreatedAt, IReadOnlyDictionary<string, string>? Members = null,
+                               bool CanSend = true, bool CanSeeSecrets = true)
 {
     public bool IsPersonal => Kind == "personal";
 }
@@ -45,7 +48,12 @@ public sealed record ContactRequest(string SpaceId, string Uid, string? Username
 public sealed record ContactCode(string SpaceId, string InviteId, long CreatedAt, long ExpiresAt);
 
 /// <param name="Name">The username, or the email's part before @ (servers before October 2026 send only the email).</param>
-public sealed record GroupMember(string Uid, string Name, string Role, string? Username = null);
+/// <param name="CanSend">May add to the group (docs/features/member-access.md); true when the server doesn't say.</param>
+/// <param name="CanSeeSecrets">Gets the group's secrets; true when the server doesn't say.</param>
+public sealed record GroupMember(string Uid, string Name, string Role, string? Username = null, bool CanSend = true, bool CanSeeSecrets = true)
+{
+    public bool IsOwner => Role == "owner";
+}
 
 /// <summary>A sign-up code just created: <see cref="Code"/> is shown once.</summary>
 public sealed record SignupCode(string Id, string Code, long ExpiresAt);
@@ -261,10 +269,22 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
     public async Task<List<GroupMember>> MembersAsync(string groupId, CancellationToken ct = default)
     {
         var (_, json) = await SendAsync(HttpMethod.Get, $"/v1/groups/{groupId}/members", null, ct);
-        return (json?["members"] as JsonArray ?? []).OfType<JsonObject>()
-            .Select(m => new GroupMember(S(m, "uid"),
-                Str(m, "name") ?? Str(m, "username") ?? Str(m, "email") ?? "", S(m, "role"), Str(m, "username"))).ToList();
+        return (json?["members"] as JsonArray ?? []).OfType<JsonObject>().Select(Member).ToList();
     }
+
+    /// <summary>Owner only: changes a member's Send and/or Secrets (null leaves it). Returns the member as listed.</summary>
+    public async Task<GroupMember> SetMemberAccessAsync(string groupId, string uid, bool? canSend, bool? canSeeSecrets, CancellationToken ct = default)
+    {
+        var body = new JsonObject();
+        if (canSend is { } send) body["canSend"] = send;
+        if (canSeeSecrets is { } secrets) body["canSeeSecrets"] = secrets;
+        var (_, json) = await SendAsync(HttpMethod.Patch, $"/v1/groups/{groupId}/members/{Uri.EscapeDataString(uid)}", body, ct);
+        return json is null ? throw new SyncApiException(0, "invalid_response", "Unexpected answer from the sync server.") : Member(json);
+    }
+
+    private static GroupMember Member(JsonObject m) =>
+        new(S(m, "uid"), Str(m, "name") ?? Str(m, "username") ?? Str(m, "email") ?? "", S(m, "role"), Str(m, "username"),
+            Flag(m, "canSend"), Flag(m, "canSeeSecrets"));
 
     public Task RemoveMemberAsync(string groupId, string uid, CancellationToken ct = default) =>
         SendAsync(HttpMethod.Delete, $"/v1/groups/{groupId}/members/{Uri.EscapeDataString(uid)}", null, ct);
@@ -539,7 +559,10 @@ public sealed class SyncApi(Func<string?> token, Func<string> baseUrl, HttpClien
     private static SpaceInfo Space(JsonObject j) => new(
         S(j, "id"), S(j, "kind"), S(j, "role"), S(j, "ownerUid"), Bytes(j, "wrappedKey"),
         j["encryptedName"] is JsonValue ? Bytes(j, "encryptedName") : null,
-        (int)L(j, "memberCount"), L(j, "createdAt"), Members(j["members"] as JsonArray));
+        (int)L(j, "memberCount"), L(j, "createdAt"), Members(j["members"] as JsonArray), Flag(j, "canSend"), Flag(j, "canSeeSecrets"));
+
+    /// <summary>A permission flag: true unless the server says false (older servers don't send it).</summary>
+    private static bool Flag(JsonObject json, string key) => json[key] is not JsonValue v || !v.TryGetValue<bool>(out var b) || b;
 
     private static Dictionary<string, string>? Members(JsonArray? members)
     {

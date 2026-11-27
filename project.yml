@@ -3,6 +3,7 @@ options:
   bundleIdPrefix: at.softmaze
   deploymentTarget:
     macOS: "14.0"
+    iOS: "17.0"
   createIntermediateGroups: true
   groupSortPosition: top
 
@@ -17,9 +18,18 @@ settings:
     CODE_SIGN_STYLE: Manual
     CODE_SIGN_IDENTITY: "Apple Development"
     ENABLE_HARDENED_RUNTIME: YES
-    MARKETING_VERSION: "1.7.0"
-    CURRENT_PROJECT_VERSION: "15"
+    MARKETING_VERSION: "1.12.2"
+    CURRENT_PROJECT_VERSION: "23"
     DEAD_CODE_STRIPPING: YES
+    # System AutoFill (docs/features/autofill-setup.md). 1 needs the two Developer ID provisioning
+    # profiles: it embeds the extension, adds the AutoFill and Keychain-sharing entitlements and
+    # compiles with AUTOFILL. 0 (the default) builds exactly what shipped before.
+    CLIPBOARD2_AUTOFILL: "0"
+    AUTOFILL_CONDITION_1: AUTOFILL
+    AUTOFILL_ENTITLEMENTS_1: "-AutoFill"
+    # Provisioning profile UUIDs, passed by scripts/autofill-profiles.sh; empty: none.
+    CLIPBOARD2_APP_PROFILE: ""
+    CLIPBOARD2_AUTOFILL_PROFILE: ""
 
 packages:
   KeyboardShortcuts:
@@ -35,6 +45,13 @@ targets:
     platform: macOS
     sources:
       - path: Clipboard2
+        excludes:
+          - Resources/PublicSuffixList.dat
+      # Trimmed public suffix list for grouping Auth by site (AuthSources.swift).
+      - path: Clipboard2/Resources/PublicSuffixList.dat
+        buildPhase: resources
+      # Platform-neutral code shared with the iOS app (docs/features/ios.md).
+      - path: Core
     info:
       path: Clipboard2/Info.plist
       properties:
@@ -83,10 +100,6 @@ targets:
             NSPortName: clipboard2-test
             NSReturnTypes: [public.utf8-plain-text, NSStringPboardType]
             NSRequiredContext: {}
-    entitlements:
-      path: Clipboard2/Clipboard2.entitlements
-      properties:
-        com.apple.security.app-sandbox: false
     settings:
       base:
         # A separate app: its own name, bundle id, data folder and keychain entries, so it
@@ -98,6 +111,12 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ENABLE_APP_SANDBOX: NO
         COMBINE_HIDPI_IMAGES: YES
+        # Clipboard2.entitlements, or Clipboard2-AutoFill.entitlements with CLIPBOARD2_AUTOFILL=1.
+        CODE_SIGN_ENTITLEMENTS: Clipboard2/Clipboard2$(AUTOFILL_ENTITLEMENTS_$(CLIPBOARD2_AUTOFILL)).entitlements
+        PROVISIONING_PROFILE_SPECIFIER: $(CLIPBOARD2_APP_PROFILE)
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) $(AUTOFILL_CONDITION_$(CLIPBOARD2_AUTOFILL))
+        # The embed script below writes into the app bundle.
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
       configs:
         Debug:
           PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.test.debug
@@ -107,6 +126,61 @@ targets:
     dependencies:
       - package: KeyboardShortcuts
       - package: Sparkle
+      # Always built (it signs without a profile when CLIPBOARD2_AUTOFILL is 0), embedded only with 1.
+      - target: Clipboard2 AutoFill
+        embed: false
+    postBuildScripts:
+      - name: Embed AutoFill Extension
+        basedOnDependencyAnalysis: false
+        script: |
+          DEST="${TARGET_BUILD_DIR}/${PLUGINS_FOLDER_PATH}"
+          if [ "${CLIPBOARD2_AUTOFILL}" = "1" ]; then
+            mkdir -p "$DEST"
+            rm -rf "$DEST/Clipboard2 AutoFill.appex"
+            ditto "${BUILT_PRODUCTS_DIR}/Clipboard2 AutoFill.appex" "$DEST/Clipboard2 AutoFill.appex"
+          else
+            rm -rf "$DEST/Clipboard2 AutoFill.appex"
+            rmdir "$DEST" 2>/dev/null || true
+          fi
+
+  # System AutoFill (docs/features/auth-autofill.md → Phase 3). Shares the Keychain code with the app.
+  Clipboard2 AutoFill:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Clipboard2AutoFill
+      - path: Clipboard2/Shared
+      - path: Core/Auth/TOTP.swift
+    info:
+      path: Clipboard2AutoFill/Info.plist
+      properties:
+        CFBundleDisplayName: Clipboard2
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        NSHumanReadableCopyright: "© 2026 Softmaze Solutions GmbH"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.authentication-services-credential-provider-ui
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).CredentialProviderViewController
+          NSExtensionAttributes:
+            ASCredentialProviderExtensionShowsConfigurationUI: false
+            ASCredentialProviderExtensionCapabilities:
+              ProvidesPasswords: true
+              # macOS 15+; older systems ignore it.
+              ProvidesOneTimeCodes: true
+    settings:
+      base:
+        PRODUCT_NAME: Clipboard2 AutoFill
+        PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.autofill
+        CODE_SIGN_ENTITLEMENTS: Clipboard2AutoFill/Clipboard2AutoFill$(AUTOFILL_ENTITLEMENTS_$(CLIPBOARD2_AUTOFILL)).entitlements
+        PROVISIONING_PROFILE_SPECIFIER: $(CLIPBOARD2_AUTOFILL_PROFILE)
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) $(AUTOFILL_CONDITION_$(CLIPBOARD2_AUTOFILL))
+        SKIP_INSTALL: YES
+      configs:
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.debug.autofill
+        Release:
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
 
   Clipboard2Tests:
     type: bundle.unit-test
@@ -120,6 +194,117 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.ClippyTests
         GENERATE_INFOPLIST_FILE: YES
 
+  # iOS app (docs/features/ios.md). Shares Core/ with the Mac app. Apple Development, automatic
+  # signing: Developer ID can't sign iOS. Simulator builds need no provisioning profile.
+  Clipboard2 iOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: iOS/App
+      - path: iOS/Shared
+      - path: iOS/Resources
+      - path: Core
+      - path: Clipboard2/Resources/PublicSuffixList.dat
+        buildPhase: resources
+    info:
+      path: iOS/App/Info.plist
+      properties:
+        CFBundleDisplayName: Clipboard2
+        CFBundleName: Clipboard2
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.productivity
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        NSFaceIDUsageDescription: Clipboard2 asks for Face ID before showing or copying a password.
+        # Read at run time to name the shared Keychain group (SharedContainer.swift).
+        AppIdentifierPrefix: $(AppIdentifierPrefix)
+        NSHumanReadableCopyright: "© 2026 Softmaze Solutions GmbH"
+    entitlements:
+      path: iOS/App/Clipboard2iOS.entitlements
+      properties:
+        com.apple.security.application-groups: [group.at.softmaze.Clippy.ios]
+        keychain-access-groups: [$(AppIdentifierPrefix)at.softmaze.Clippy.ios.shared]
+    settings:
+      base:
+        PRODUCT_NAME: Clipboard2
+        PRODUCT_MODULE_NAME: Clipboard2iOS
+        PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.ios
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: Apple Development
+        ENABLE_HARDENED_RUNTIME: NO
+    dependencies:
+      - target: Clipboard2 Share
+
+  # "Share to Clipboard2": text, links, images and files into Copies or Saved.
+  Clipboard2 Share:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: iOS/ShareExtension
+      - path: iOS/Shared
+      - path: Core
+    info:
+      path: iOS/ShareExtension/Info.plist
+      properties:
+        CFBundleDisplayName: Clipboard2
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        AppIdentifierPrefix: $(AppIdentifierPrefix)
+        NSHumanReadableCopyright: "© 2026 Softmaze Solutions GmbH"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsText: true
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsImageWithMaxCount: 10
+              NSExtensionActivationSupportsMovieWithMaxCount: 10
+              NSExtensionActivationSupportsFileWithMaxCount: 10
+              NSExtensionActivationSupportsAttachmentsWithMaxCount: 10
+    entitlements:
+      path: iOS/ShareExtension/Clipboard2Share.entitlements
+      properties:
+        com.apple.security.application-groups: [group.at.softmaze.Clippy.ios]
+        keychain-access-groups: [$(AppIdentifierPrefix)at.softmaze.Clippy.ios.shared]
+    settings:
+      base:
+        PRODUCT_NAME: Clipboard2 Share
+        PRODUCT_MODULE_NAME: Clipboard2Share
+        PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.ios.share
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: Apple Development
+        ENABLE_HARDENED_RUNTIME: NO
+        SKIP_INSTALL: YES
+
+  Clipboard2 iOS Tests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: iOS/Tests
+    dependencies:
+      - target: Clipboard2 iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: at.softmaze.Clippy.iosTests
+        GENERATE_INFOPLIST_FILE: YES
+        # The app's product is Clipboard2.app, not "Clipboard2 iOS.app".
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Clipboard2.app/Clipboard2
+        BUNDLE_LOADER: $(TEST_HOST)
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: Apple Development
+        ENABLE_HARDENED_RUNTIME: NO
+
 schemes:
   Clipboard2:
     build:
@@ -132,5 +317,18 @@ schemes:
       config: Debug
       targets:
         - Clipboard2Tests
+    archive:
+      config: Release
+  Clipboard2 iOS:
+    build:
+      targets:
+        Clipboard2 iOS: all
+        Clipboard2 iOS Tests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - Clipboard2 iOS Tests
     archive:
       config: Release

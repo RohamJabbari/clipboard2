@@ -30,7 +30,7 @@ public static class Glyphs
         FontFamily = (FontFamily)Application.Current.Resources["IconFont"],
         FontSize = size,
         VerticalAlignment = VerticalAlignment.Center,
-        Foreground = brush ?? (Brush)Application.Current.Resources[SystemColors.ControlTextBrushKey],
+        Foreground = brush ?? Fluent.Primary,
     };
 
     public static string For(PanelFilter filter) => filter switch
@@ -96,10 +96,12 @@ public static class Icons
 
 public static class Fluent
 {
+    /// <summary>The app always runs an explicit Light or Dark theme (see AppServices.ApplyAppearance), so this
+    /// and the theme's own brushes can't disagree.</summary>
     public static bool IsDark => Application.Current.ThemeMode == ThemeMode.Dark
         || (Application.Current.ThemeMode == ThemeMode.System && SystemUsesDarkTheme());
 
-    private static bool SystemUsesDarkTheme()
+    public static bool SystemUsesDarkTheme()
     {
         try
         {
@@ -118,6 +120,12 @@ public static class Fluent
         Native.SetDwm(hwnd, Native.DWMWA_SYSTEMBACKDROP_TYPE, transient ? Native.DWMSBT_TRANSIENTWINDOW : Native.DWMSBT_MAINWINDOW);
     }
 
+    /// <summary>
+    /// Body text. The theme's own text brush, not SystemColors.ControlText: that one is the Win32 system colour and
+    /// can be white on a light window (custom or contrast colours), which made every label invisible.
+    /// </summary>
+    public static Brush Primary => Application.Current.TryFindResource("TextFillColorPrimaryBrush") as Brush
+        ?? new SolidColorBrush(IsDark ? Colors.White : Color.FromRgb(0x1B, 0x1B, 0x1B));
     public static Brush Accent => (Brush)Application.Current.Resources[SystemColors.HighlightBrushKey];
     public static Brush AccentText => (Brush)Application.Current.Resources[SystemColors.HighlightTextBrushKey];
     public static Brush Secondary => new SolidColorBrush(IsDark ? Color.FromArgb(0xB0, 0xFF, 0xFF, 0xFF) : Color.FromArgb(0xA0, 0, 0, 0));
@@ -131,7 +139,7 @@ public static class Fluent
     {
         Text = text,
         FontSize = size,
-        Foreground = brush ?? (Brush)Application.Current.Resources[SystemColors.ControlTextBrushKey],
+        Foreground = brush ?? Fluent.Primary,
         FontWeight = weight ?? FontWeights.Normal,
         TextWrapping = wrap ? TextWrapping.Wrap : TextWrapping.NoWrap,
         TextTrimming = wrap ? TextTrimming.None : TextTrimming.CharacterEllipsis,
@@ -205,7 +213,7 @@ public sealed class HotkeyBox : TextBox
         IsReadOnly = true;
         IsReadOnlyCaretVisible = false;
         MinWidth = 180;
-        Text = combo ?? "";
+        Text = KeyCombo.Display(combo);
         ToolTip = "Click, then press the new shortcut. Backspace removes it.";
         GotKeyboardFocus += (_, _) => { _hotkeys.Suspend(true); if (Text.Length == 0) Text = "Press keys…"; };
         LostKeyboardFocus += (_, _) => { _hotkeys.Suspend(false); if (Text == "Press keys…") Text = ""; };
@@ -228,9 +236,10 @@ public sealed class HotkeyBox : TextBox
         if (Keyboard.Modifiers.HasFlag(ModifierKeys.Alt)) mods |= Native.MOD_ALT;
         if (Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)) mods |= Native.MOD_SHIFT;
         if (Keyboard.Modifiers.HasFlag(ModifierKeys.Windows)) mods |= Native.MOD_WIN;
-        if (mods == 0 || mods == Native.MOD_SHIFT) { Text = "Add Ctrl, Alt or Win"; return; }
-        var combo = new KeyCombo(mods, key).ToString();
-        Text = combo;
+        if (mods == 0 || mods == Native.MOD_SHIFT) { Text = $"Add {KeyLabels.Show("Ctrl")}, {KeyLabels.Show("Alt")} or Win"; return; }
+        var parsed = new KeyCombo(mods, key);
+        var combo = parsed.ToString();   // stored in English; shown as on this keyboard
+        Text = parsed.Display();
         ComboChanged?.Invoke(combo);
     }
 }
@@ -262,7 +271,7 @@ public sealed class TrayIcon : IDisposable
             Visible = true,
         };
         var menu = new System.Windows.Forms.ContextMenuStrip();
-        menu.Items.Add($"Open Clipboard2 ({services.Settings.Hotkeys[Hotkey.QuickPanel]})", null, (_, _) => services.ShowPanel());
+        menu.Items.Add($"Open Clipboard2 ({KeyCombo.Display(services.Settings.Hotkeys[Hotkey.QuickPanel])})", null, (_, _) => services.ShowPanel());
         // Sync: a status line (an error opens Settings → Sync) and Sync Now. Hidden when signed out.
         _syncStatusItem = new System.Windows.Forms.ToolStripMenuItem("", null, (_, _) => services.OpenSettings("Sync"));
         _syncNowItem = new System.Windows.Forms.ToolStripMenuItem("Sync Now", null, (_, _) => _ = services.Sync.SyncNowAsync());

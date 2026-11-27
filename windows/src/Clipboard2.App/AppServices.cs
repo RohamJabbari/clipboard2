@@ -133,6 +133,11 @@ public sealed class AppServices : IPanelHost
 
     public void Start(bool background)
     {
+        // Our windows are Window subclasses, which the Fluent theme's implicit Window style doesn't reach: without
+        // this their text inherits the Win32 system text colour, which can be white on a light window.
+        EventManager.RegisterClassHandler(typeof(Window), FrameworkElement.LoadedEvent, new RoutedEventHandler((sender, _) =>
+            ((Window)sender).SetResourceReference(System.Windows.Controls.Control.ForegroundProperty, "TextFillColorPrimaryBrush")));
+        KeyNames.Refresh(Native.GetForegroundWindow());
         ApplyAppearance();
         _listener.Changed += OnClipboardChanged;
         RemoveSecretCopies();
@@ -183,11 +188,11 @@ public sealed class AppServices : IPanelHost
             Settings.HasLaunchedBefore = true;
             Settings.Save();
             StartupRegistration.SetEnabled(Settings.LaunchAtLogin);
-            _tray.ShowBalloon("Clipboard2 is running", "Press Ctrl+Shift+V to open your clipboard history. Click the tray icon for more.");
+            _tray.ShowBalloon("Clipboard2 is running", $"Press {KeyCombo.Display(Settings.Hotkeys.GetValueOrDefault(Hotkey.QuickPanel))} to open your clipboard history. Click the tray icon for more.");
         }
         else if (!background)
         {
-            _tray.ShowBalloon("Clipboard2 is running", $"Press {Settings.Hotkeys[Hotkey.QuickPanel]} to open it.");
+            _tray.ShowBalloon("Clipboard2 is running", $"Press {KeyCombo.Display(Settings.Hotkeys[Hotkey.QuickPanel])} to open it.");
         }
     }
 
@@ -236,13 +241,27 @@ public sealed class AppServices : IPanelHost
 
     public void ApplyAppearance()
     {
-        Application.Current.ThemeMode = Settings.Appearance switch
+        // "System" is resolved here rather than left to WPF, so the theme and our own brushes (Fluent.IsDark)
+        // always agree; a change in Windows' setting re-applies it.
+        var dark = Settings.Appearance switch
         {
-            AppearanceMode.Light => ThemeMode.Light,
-            AppearanceMode.Dark => ThemeMode.Dark,
-            _ => ThemeMode.System,
+            AppearanceMode.Light => false,
+            AppearanceMode.Dark => true,
+            _ => Fluent.SystemUsesDarkTheme(),
         };
+        Application.Current.ThemeMode = dark ? ThemeMode.Dark : ThemeMode.Light;
+        if (!_watchingSystemTheme)
+        {
+            _watchingSystemTheme = true;
+            Microsoft.Win32.SystemEvents.UserPreferenceChanged += (_, e) =>
+            {
+                if (e.Category == Microsoft.Win32.UserPreferenceCategory.General && Settings.Appearance == AppearanceMode.System)
+                    Dispatcher.BeginInvoke(ApplyAppearance);
+            };
+        }
     }
+
+    private bool _watchingSystemTheme;
 
     public void RunMaintenance()
     {
@@ -346,6 +365,7 @@ public sealed class AppServices : IPanelHost
     public void ShowPanel()
     {
         _panelTarget = Tracker.TargetWindow;
+        KeyNames.Refresh(_panelTarget);   // shortcut names as printed on the keyboard in use (Strg on German ones)
         Panel.PrepareForOpen(Tracker.AppFor(_panelTarget));
         PanelWindow.ShowNear(_panelTarget);
         Sync.SetPanelOpen(true);   // syncs once, then polls every 3 s while open
@@ -376,6 +396,7 @@ public sealed class AppServices : IPanelHost
     {
         Dispatcher.BeginInvoke(() =>
         {
+            KeyNames.Refresh(Native.GetForegroundWindow());
             if (_settingsWindow is null || !_settingsWindow.IsLoaded)
             {
                 _settingsWindow = new SettingsWindow(this);
@@ -675,6 +696,12 @@ public sealed class AppServices : IPanelHost
             OpenSettings("Sync");
             return;
         }
+        // The group's owner turned this user's Send off: reading and pasting still work, sending doesn't.
+        if (!group.CanSend)
+        {
+            Hud.ShowMessage(Tracker.TargetWindow, Glyphs.Cancel, SyncAccount.CantSendMessage(group));
+            return;
+        }
         var source = Tracker.AppFor(Tracker.TargetWindow);
         var raw = await CopySelectionCaptureAsync(source);
         var capture = raw is null ? null : await CaptureProcessor.ProcessAsync(raw, Store.Blobs);
@@ -699,6 +726,11 @@ public sealed class AppServices : IPanelHost
     /// <summary>Shares a history item to a group from outside the panel, or says why it can't be.</summary>
     public void ShareToGroup(ClipItem item, SpaceRecord group)
     {
+        if (!group.CanSend)
+        {
+            Hud.ShowMessage(Tracker.TargetWindow, Glyphs.Cancel, SyncAccount.CantSendMessage(group));
+            return;
+        }
         if (SyncEngine.GroupShareProblem(item) is { } problem)
         {
             ShowGroupShareProblem(group.DisplayName, problem);
@@ -740,7 +772,7 @@ public sealed class AppServices : IPanelHost
         if (_hudNotices.Count == 0) return;
         var notices = _hudNotices.ToList();
         _hudNotices.Clear();
-        var hotkey = Settings.Hotkeys.GetValueOrDefault(Hotkey.QuickPanel);
+        var hotkey = KeyCombo.Display(Settings.Hotkeys.GetValueOrDefault(Hotkey.QuickPanel));
         if (notices.All(n => n.Target is NotificationTarget.People))
         {
             var first = notices[0];
@@ -848,7 +880,7 @@ public sealed class AppServices : IPanelHost
         if (Tracker.TargetWindow != target)
         {
             Copy(item);
-            Hud.ShowMessage(target, Glyphs.Check, "Ready — press Ctrl+V to paste");
+            Hud.ShowMessage(target, Glyphs.Check, $"Ready — press {KeyLabels.Show("Ctrl+V")} to paste");
             return;
         }
         Hud.HideHud();
@@ -944,7 +976,7 @@ public sealed class AppServices : IPanelHost
     /// <summary>Files dropped on the panel's list (into history) or on a group chip (shared to that group).</summary>
     public ClipItem? AddDroppedFiles(IReadOnlyList<string> paths, string? spaceId = null)
     {
-        if (paths.Count == 0) return null;
+        if (paths.Count == 0 || !CanSendTo(spaceId)) return null;
         var item = Store.Ingest(ProcessedCapture.ForFiles(paths), spaceId: spaceId);
         Sync.ReportActivity();
         return item;
@@ -954,11 +986,14 @@ public sealed class AppServices : IPanelHost
     public ClipItem? AddDroppedText(string text, string? spaceId = null)
     {
         var capture = ProcessedCapture.ForText(text);
-        if (string.IsNullOrWhiteSpace(text) || Secrets.ValueHashes.Contains(capture.Hash) || !CaptureFilter.ShouldStore(capture)) return null;
+        if (string.IsNullOrWhiteSpace(text) || Secrets.ValueHashes.Contains(capture.Hash) || !CaptureFilter.ShouldStore(capture) || !CanSendTo(spaceId)) return null;
         var item = Store.Ingest(capture, spaceId: spaceId);
         Sync.ReportActivity();
         return item;
     }
+
+    /// <summary>Whether this user may add to a space: anything but a group whose owner turned their Send off.</summary>
+    public bool CanSendTo(string? spaceId) => spaceId is null || Store.Groups().FirstOrDefault(g => g.Id == spaceId) is not { CanSend: false };
 
     // MARK: AI
 

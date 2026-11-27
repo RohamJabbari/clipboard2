@@ -22,7 +22,11 @@ public sealed class SyncSpace(SpaceInfo info, byte[] key, string? name)
     public bool IsDirect => Info.Kind == SpaceKinds.Direct;
     /// <summary>The <c>space_id</c> used locally: null for the personal space.</summary>
     public string? LocalId => IsPersonal ? null : Id;
-    public SpaceRecord Record => new(Id, Info.Kind, Info.Role, Name, Info.OwnerUid, Info.MemberCount, Info.Members);
+    /// <summary>This user may add to the space: always, except a group whose owner turned their Send off.</summary>
+    public bool CanSend => Info.Kind != SpaceKinds.Group || Info.CanSend;
+    /// <summary>This user gets the space's secrets: always, except a group whose owner turned their Secrets off.</summary>
+    public bool CanSeeSecrets => Info.Kind != SpaceKinds.Group || Info.CanSeeSecrets;
+    public SpaceRecord Record => new(Id, Info.Kind, Info.Role, Name, Info.OwnerUid, Info.MemberCount, Info.Members, CanSend, CanSeeSecrets);
 }
 
 /// <summary>What one tick did.</summary>
@@ -147,6 +151,8 @@ public sealed partial class SyncEngine
     private readonly HashSet<string> _announceFromStart = [];
     /// <summary>Spaces pulled at least once by this engine: an empty one's cursor stays 0, yet what comes next is new.</summary>
     private readonly HashSet<string> _pulledOnce = [];
+    /// <summary>Spaces pulled from the start again because their secrets came back: that pull announces nothing.</summary>
+    private readonly HashSet<string> _quietPull = [];
 
     public SyncEngine(ClipStore store, ISecretVault vault, SyncApi api, SyncIdentity identity, Func<DateTime>? clock = null,
                       SpaceKeyPins? pins = null, AuthenticatorStore? authenticators = null)
@@ -186,6 +192,10 @@ public sealed partial class SyncEngine
 
     // MARK: Tick
 
+    /// <summary>Every space has been pulled; pushes and authenticator codes come after. Notifications go out here, so
+    /// they don't wait seconds behind the items they're about.</summary>
+    public Action<SyncReport>? Pulled { get; set; }
+
     public async Task<SyncReport> TickAsync(CancellationToken ct = default)
     {
         var report = new SyncReport();
@@ -199,6 +209,7 @@ public sealed partial class SyncEngine
             ct.ThrowIfCancellationRequested();
             await PullAsync(space, report, ct);
         }
+        Pulled?.Invoke(report);
         // Authenticators added here (or while signed out) get their space before the pushes.
         await CreatePendingAuthenticatorsAsync(report, ct);
         spaces = _spaces.Values.OrderBy(s => s.IsPersonal).ToList();
@@ -334,8 +345,39 @@ public sealed partial class SyncEngine
         foreach (var record in store.SyncSpaces().Where(r => (r.IsGroup || r.IsDirect || r.IsAuthenticator) && !live.Contains(r.Id))) RemoveGroupLocally(record.Id);
         // An authenticator whose space went (deleted on another device, or transferred to someone else).
         foreach (var gone in Authenticators.All.Where(a => a.SpaceId is { } s && !live.Contains(s)).ToList()) Authenticators.Delete(gone.Id);
+        ApplySecretsAccess(cached);
         // A blocked group stays listed (with its local items) so it can be left.
         store.SaveSyncSpaces(_spaces.Values.Select(s => s.Record).Concat(blocked));
+    }
+
+    /// <summary>Secrets access (docs/features/member-access.md): a group whose Secrets this user lost has its secrets
+    /// dropped from this device; one where it came back (false → true) is pulled from the start again, so its secrets
+    /// download once more.</summary>
+    private void ApplySecretsAccess(IReadOnlyDictionary<string, SpaceRecord> cached)
+    {
+        foreach (var space in _spaces.Values)
+        {
+            if (!space.CanSeeSecrets) DropSecrets(space);
+            else if (cached.GetValueOrDefault(space.Id) is { CanSeeSecrets: false })
+            {
+                Logger?.Invoke($"Secrets of {space.Id} are visible again; pulling it from the start");
+                store.SetSyncCursor(space.Id, 0);
+                _quietPull.Add(space.Id);   // what comes down again isn't news
+            }
+        }
+    }
+
+    /// <summary>Deletes a space's secrets here, and what was known of them on the server (so nothing is deleted there).</summary>
+    private void DropSecrets(SyncSpace space)
+    {
+        var doomed = vault.Secrets.Where(s => s.SpaceId == space.LocalId).ToList();
+        foreach (var secret in doomed)
+        {
+            vault.Delete(secret);
+            store.SetSecretFolder(secret.Id, null);
+        }
+        store.DeleteSyncMetas(space.Id, SyncCategory.Secret);
+        if (doomed.Count > 0) Logger?.Invoke($"Dropped {doomed.Count} secrets of {space.Id}: no access to them");
     }
 
     /// <summary>Deletes a group's (or contact's) items, snippets, secrets and sync state on this device. Its key pin
@@ -345,6 +387,7 @@ public sealed partial class SyncEngine
         _spaces.Remove(spaceId);
         _announceFromStart.Remove(spaceId);
         _pulledOnce.Remove(spaceId);
+        _quietPull.Remove(spaceId);
         _keyChanged.Remove(spaceId);
         foreach (var secret in vault.Secrets.Where(s => s.SpaceId == spaceId).ToList()) vault.Delete(secret);
         foreach (var a in Authenticators.All.Where(a => a.SpaceId == spaceId).ToList()) Authenticators.Delete(a.Id);
@@ -398,7 +441,7 @@ public sealed partial class SyncEngine
         var complete = false;
         // A contact's or a group's new items get a notice, except on the first pull of a space (sign-in, joining a
         // group, an old contact on a new device): a new contact's very first pull is announced.
-        var announce = (space.IsDirect || space.Info.Kind == SpaceKinds.Group) && !resync
+        var announce = (space.IsDirect || space.Info.Kind == SpaceKinds.Group) && !resync && !_quietPull.Remove(space.Id)
             && (since > 0 || _pulledOnce.Contains(space.Id) || space.IsDirect && _announceFromStart.Contains(space.Id));
         _pulledOnce.Add(space.Id);
         while (true)
@@ -500,6 +543,8 @@ public sealed partial class SyncEngine
     /// <paramref name="force"/> (a 409's current version) applies it even over unpushed local changes.</summary>
     private async Task<Prepared?> PrepareAsync(SyncSpace space, RemoteItem item, bool force, CancellationToken ct)
     {
+        // The server leaves them out; one that slips through (access just changed) isn't kept either.
+        if (item.Category == SyncCategory.Secret && !space.CanSeeSecrets) return null;
         var meta = store.SyncMetaFor(space.Id, item.Id);
         if (!force && meta is not null && item.Seq <= meta.RemoteSeq)   // already applied (often our own write)
         {
@@ -820,7 +865,7 @@ public sealed partial class SyncEngine
                 Authenticators.Put(otp.Authenticator with { SpaceId = space.Id, Shares = Authenticators.Find(otp.Authenticator.Id)?.Shares });
                 break;
             case ItemPayload.Secret secret:
-                vault.Put(id, secret.Name, secret.Value, space.LocalId);
+                vault.Put(id, secret.Name, secret.Value, space.LocalId, secret.Extras);
                 store.SetSecretFolder(ClipStore.SyncId(id), secret.Folder);   // an unknown id reads as the root
                 break;
         }
@@ -861,7 +906,7 @@ public sealed partial class SyncEngine
         public sealed record Clip(string Id, ClipItem Item) : LocalItem(Id);
         public sealed record SnippetItem(string Id, Snippet Snippet) : LocalItem(Id);
         public sealed record FolderItem(string Id, ClipFolder Folder) : LocalItem(Id);
-        public sealed record Secret(string Id, SecretRef Ref, string Value) : LocalItem(Id);
+        public sealed record Secret(string Id, SecretRef Ref, string Value, string? Extras) : LocalItem(Id);
         public sealed record OtpItem(string Id, Authenticator Authenticator) : LocalItem(Id);
     }
 
@@ -874,7 +919,7 @@ public sealed partial class SyncEngine
             SyncCategory.ForClip(c.Item), SyncPayload.Millis(c.Item.LastCopiedAt)),
         LocalItem.SnippetItem s => new(SyncPayload.ForSnippet(s.Snippet), SyncCategory.Snippet, SyncPayload.Millis(s.Snippet.UpdatedAt)),
         LocalItem.FolderItem f => new(SyncPayload.ForFolder(f.Folder), SyncCategory.Folder, SyncPayload.Millis(f.Folder.CreatedAt)),
-        LocalItem.Secret k => new(SyncPayload.ForSecret(k.Ref.Name, k.Value, k.Ref.CreatedAt, store.SecretFolderId(k.Ref.Id)), SyncCategory.Secret,
+        LocalItem.Secret k => new(SyncPayload.ForSecret(k.Ref.Name, k.Value, k.Ref.CreatedAt, store.SecretFolderId(k.Ref.Id), k.Extras), SyncCategory.Secret,
             SyncPayload.Millis(k.Ref.CreatedAt ?? _now())),
         LocalItem.OtpItem o => new(SyncPayload.ForOtp(o.Authenticator), SyncCategory.Otp, SyncPayload.Millis(o.Authenticator.CreatedAt)),
         _ => throw new InvalidOperationException(),
@@ -927,7 +972,7 @@ public sealed partial class SyncEngine
         if (store.FindFolder(id) is { } folder && folder.SpaceId == space.LocalId) return new LocalItem.FolderItem(itemId, folder);
         if (vault.Secrets.FirstOrDefault(s => SecretGuid(s) == id && s.SpaceId == space.LocalId) is { } secret
             && vault.ReadValue(secret) is { } value)
-            return new LocalItem.Secret(itemId, secret, value);
+            return new LocalItem.Secret(itemId, secret, value, vault.ReadExtras(secret));
         return null;
     }
 
@@ -967,12 +1012,12 @@ public sealed partial class SyncEngine
             live.Add(id);
             push.Add(new LocalItem.FolderItem(id, folder));
         }
-        foreach (var secret in vault.Secrets.Where(s => s.SpaceId == space.LocalId))
+        foreach (var secret in vault.Secrets.Where(s => s.SpaceId == space.LocalId && space.CanSeeSecrets))
         {
             if (SecretGuid(secret) is not { } guid) continue;
             var id = ClipStore.SyncId(guid);
             live.Add(id);
-            if (vault.ReadValue(secret) is { } value) push.Add(new LocalItem.Secret(id, secret, value));
+            if (vault.ReadValue(secret) is { } value) push.Add(new LocalItem.Secret(id, secret, value, vault.ReadExtras(secret)));
         }
         return (push, live);
     }
@@ -1026,6 +1071,11 @@ public sealed partial class SyncEngine
         }
 
         foreach (var gone in _leftOut.Keys.Where(k => k.Space == space.Id && !live.Contains(k.Id)).ToList()) _leftOut.Remove(gone);
+        // Without Send nothing new or changed goes up (deleting one's own earlier items still does, above). Edits made
+        // here meanwhile stay on this device, and go up if Send comes back.
+        if (!space.CanSend) return;
+        foreach (var key in _refusedForNow.Where(r => r.Key.Space == space.Id && r.Value.Reason == SendNotAllowed).Select(r => r.Key).ToList())
+            _refusedForNow.Remove(key);
         var refused = store.SyncRejections(space.Id);
         foreach (var stale in refused.Keys.Where(id => !live.Contains(id))) store.ClearSyncRejected(space.Id, stale);
         foreach (var local in push)
@@ -1061,8 +1111,19 @@ public sealed partial class SyncEngine
                 Note(report, space, ex);
                 _refusedForNow[(space.Id, local.Id)] = (fingerprint, ex.Code);
             }
+            catch (SyncApiException ex) when (ex.Code == SendNotAllowed)
+            {
+                // Send was turned off after the last look at the spaces: the next tick learns it. Nothing else here goes up now.
+                Logger?.Invoke($"Not allowed to send to {space.Id}: {ex.Message}");
+                report.Warnings.Add($"You can't send to {space.Name ?? "this group"}.");
+                _refusedForNow[(space.Id, local.Id)] = (fingerprint, ex.Code);
+                break;
+            }
         }
     }
+
+    /// <summary>403 for a write to a group whose owner turned this user's Send off.</summary>
+    public const string SendNotAllowed = "send_not_allowed";
 
     private void Note(SyncReport report, SyncSpace space, SyncApiException ex)
     {

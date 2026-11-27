@@ -138,7 +138,7 @@ internal sealed class GroupChip : Border
         }
         // The colours follow (also picking up a theme or accent change on the next render).
         Tint(_background, selected ? accent : ColorOf(Fluent.Subtle, Colors.Transparent));
-        Tint(_headBrush, selected ? onAccent : ColorOf((Brush)Application.Current.Resources[SystemColors.ControlTextBrushKey], Colors.Black));
+        Tint(_headBrush, selected ? onAccent : ColorOf(Fluent.Primary, Colors.Black));
         Tint(_iconBrush, selected ? onAccent : ColorOf(Fluent.Secondary, Colors.Gray));
         Tint(_highlightBrush, onAccent);
         Tint(_dividerBrush, Fade(onAccent, 0x70));

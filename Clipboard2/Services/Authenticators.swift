@@ -23,6 +23,10 @@ nonisolated struct Authenticator: Identifiable, Hashable, Sendable {
     var updatedAt: Date
     /// The authenticator space; nil until it's been created on the server (or while signed out).
     var spaceID: String?
+    /// Sites set with Edit → Website; they pick its source in Auth over the issuer.
+    var urls: [String] = []
+    /// The origin (Auth's site edited by hand) it's filed under; nil: grouped by its sites or issuer.
+    var originID: String? = nil
 
     init(id: String = SyncCrypto.newID(), account: OTPAccount, createdAt: Date = .now, spaceID: String? = nil) {
         self.id = id
@@ -51,11 +55,14 @@ nonisolated struct Authenticator: Identifiable, Hashable, Sendable {
         createdAt = Date(syncMillis: payload.createdAt)
         updatedAt = Date(syncMillis: payload.updatedAt)
         self.spaceID = spaceID
+        urls = SecretExtras.cleanURLs(payload.urls ?? [])
+        originID = payload.origin
     }
 
     var payload: OTPPayload {
         OTPPayload(issuer: issuer, account: account, secret: secret, algorithm: algorithm.rawValue, digits: digits,
-                   period: period, createdAt: createdAt.syncMillis, updatedAt: updatedAt.syncMillis)
+                   period: period, createdAt: createdAt.syncMillis, updatedAt: updatedAt.syncMillis, urls: urls,
+                   origin: originID)
     }
 
     var otpAccount: OTPAccount {
@@ -68,43 +75,7 @@ nonisolated struct Authenticator: Identifiable, Hashable, Sendable {
     }
 }
 
-/// `codesJSON` (PROTOCOL.md → Authenticators): the codes from `from` (Unix seconds, start of a
-/// step) on, one per step.
-nonisolated struct CodeBatch: Codable, Equatable, Hashable, Sendable {
-    var v = 1
-    var issuer: String
-    var account: String
-    var digits: Int
-    var period: Int
-    var from: Int64
-    var codes: [String]
-
-    static let duration: TimeInterval = 24 * 3600
-    /// Keeps a batch under the server's 64 KiB for very short periods.
-    static let maxCodes = 4_000
-    /// Owner devices top a share up once fewer than this many seconds of codes remain.
-    static let topUpThreshold: TimeInterval = 12 * 3600
-
-    init(issuer: String, account: String, digits: Int, period: Int, from: Int64, codes: [String]) {
-        self.issuer = issuer
-        self.account = account
-        self.digits = digits
-        self.period = period
-        self.from = from
-        self.codes = codes
-    }
-
-    init(from decoder: any Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        v = try c.decodeIfPresent(Int.self, forKey: .v) ?? 1
-        issuer = try c.decodeIfPresent(String.self, forKey: .issuer) ?? ""
-        account = try c.decodeIfPresent(String.self, forKey: .account) ?? ""
-        digits = try c.decodeIfPresent(Int.self, forKey: .digits) ?? 6
-        period = max(1, try c.decodeIfPresent(Int.self, forKey: .period) ?? 30)
-        from = try c.decodeIfPresent(Int64.self, forKey: .from) ?? 0
-        codes = try c.decodeIfPresent([String].self, forKey: .codes) ?? []
-    }
-
+nonisolated extension CodeBatch {
     /// The next 24 hours of codes, starting with the current step.
     static func make(for authenticator: Authenticator, now: Date) -> CodeBatch? {
         guard let key = Base32.decode(authenticator.secret), authenticator.period > 0 else { return nil }
@@ -119,22 +90,6 @@ nonisolated struct CodeBatch: Codable, Equatable, Hashable, Sendable {
         }
         return CodeBatch(issuer: authenticator.issuer, account: authenticator.account, digits: authenticator.digits,
                          period: period, from: step * Int64(period), codes: codes)
-    }
-
-    /// End of the last code's step.
-    var until: Date { Date(timeIntervalSince1970: TimeInterval(from + Int64(codes.count * period))) }
-
-    func code(at time: Date) -> String? {
-        let seconds = Int64(floor(time.timeIntervalSince1970))
-        guard seconds >= from else { return nil }
-        let index = Int((seconds - from) / Int64(period))
-        return codes.indices.contains(index) ? codes[index] : nil
-    }
-
-    func encoded() throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        return try encoder.encode(self)
     }
 }
 
@@ -246,6 +201,12 @@ nonisolated enum AuthenticatorItem: Identifiable, Hashable, Sendable {
     }
 
     var searchText: String { issuer + " " + account }
+
+    /// Sites the owner set (Edit → Website); shared ones have none (their source comes from the issuer).
+    var urls: [String] { owned?.urls ?? [] }
+
+    /// The origin it's filed under: only your own carry one (shared ones are filed by the origin's `entries`).
+    var originID: String? { owned?.originID }
 }
 
 // MARK: - Storage
@@ -262,25 +223,23 @@ protocol AuthenticatorBacking: AnyObject {
 
 /// One generic-password item per authenticator, like secrets: the payload (with the seed) as the
 /// value, the authenticator space as the generic attribute. Code batches shared with you get
-/// their own service.
+/// their own service. In the login Keychain, or in AutoFill builds the shared one (`AuthKeychain.current`).
 final class KeychainAuthenticatorBacking: AuthenticatorBacking {
-    nonisolated static let ownedService = (Bundle.main.bundleIdentifier ?? "at.softmaze.Clippy") + ".authenticators"
-    nonisolated static let sharedService = (Bundle.main.bundleIdentifier ?? "at.softmaze.Clippy") + ".sharedcodes"
+    nonisolated static let ownedService = KeychainServices.authenticators
+    nonisolated static let sharedService = KeychainServices.sharedCodes
 
+    private let keychain: any KeychainBackend
+
+    init(keychain: any KeychainBackend = AuthKeychain.current) {
+        self.keychain = keychain
+    }
+
+    /// Attributes of all items first, then each one's value: the login (file-based) Keychain refuses
+    /// kSecReturnData together with kSecMatchLimitAll (errSecParam), which left every list empty.
     private func all(service: String) -> [(account: String, generic: String?, data: Data)] {
-        let query: [CFString: Any] = [
-            kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
-            kSecReturnAttributes: true,
-            kSecReturnData: true,
-            kSecMatchLimit: kSecMatchLimitAll,
-        ]
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let items = result as? [[String: Any]] else { return [] }
-        return items.compactMap { attrs in
+        keychain.allAttributes(service: service).compactMap { attrs in
             guard let account = attrs[kSecAttrAccount as String] as? String,
-                  let data = attrs[kSecValueData as String] as? Data else { return nil }
+                  let data = keychain.data(service: service, account: account) else { return nil }
             let generic = (attrs[kSecAttrGeneric as String] as? Data).map { String(decoding: $0, as: UTF8.self) }
             return (account, generic?.isEmpty == false ? generic : nil, data)
         }
@@ -290,16 +249,16 @@ final class KeychainAuthenticatorBacking: AuthenticatorBacking {
         let base: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecAttrAccount: account]
         var changes: [CFString: Any] = [kSecValueData: data, kSecAttrLabel: label,
                                         kSecAttrGeneric: Data((generic ?? "").utf8)]
-        let status = SecItemUpdate(base as CFDictionary, changes as CFDictionary)
+        let status = keychain.update(base, changes)
         if status == errSecSuccess { return true }
         guard status == errSecItemNotFound else { return false }
         changes.merge(base) { new, _ in new }
         changes[kSecAttrDescription] = "Clipboard2 authenticator"
-        return SecItemAdd(changes as CFDictionary, nil) == errSecSuccess
+        return keychain.add(changes) == errSecSuccess
     }
 
     private func remove(service: String, account: String) {
-        SecItemDelete([kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecAttrAccount: account] as CFDictionary)
+        keychain.remove(service: service, account: account)
     }
 
     func loadOwned() -> [Authenticator] {
@@ -357,6 +316,8 @@ final class AuthenticatorStore {
     private(set) var shareCounts: [String: Int] = [:]
     /// A local change that sync should upload.
     @ObservationIgnored var onChange: (() -> Void)?
+    /// After every reload (local changes and sync): AutoFill re-registers its codes.
+    @ObservationIgnored var onReload: (() -> Void)?
     @ObservationIgnored private let backing: any AuthenticatorBacking
 
     init(backing: any AuthenticatorBacking) {
@@ -368,6 +329,7 @@ final class AuthenticatorStore {
         owned = backing.loadOwned().sorted { $0.createdAt > $1.createdAt }
         shared = backing.loadShared().sorted { $0.addedAt > $1.addedAt }
         revision &+= 1
+        onReload?()
     }
 
     /// Owned and shared, newest first.
@@ -390,19 +352,31 @@ final class AuthenticatorStore {
     // MARK: Local changes
 
     @discardableResult
-    func add(_ account: OTPAccount, now: Date = .now) -> Authenticator? {
-        let authenticator = Authenticator(account: account, createdAt: now)
+    func add(_ account: OTPAccount, urls: [String] = [], origin: String? = nil, now: Date = .now) -> Authenticator? {
+        var authenticator = Authenticator(account: account, createdAt: now)
+        authenticator.urls = SecretExtras.cleanURLs(urls)
+        authenticator.originID = origin
         guard backing.saveOwned(authenticator) else { return nil }
         if suggestion?.secret == account.secret { suggestion = nil }
         changed()
         return authenticator
     }
 
-    /// Edits issuer and account (the owner's Rename).
-    func rename(id: String, issuer: String, account: String, now: Date = .now) {
+    /// Edits issuer, account and (when given) the sites: the owner's Edit.
+    func rename(id: String, issuer: String, account: String, urls: [String]? = nil, now: Date = .now) {
         guard var authenticator = authenticator(withID: id) else { return }
         authenticator.issuer = issuer
         authenticator.account = account
+        if let urls { authenticator.urls = SecretExtras.cleanURLs(urls) }
+        authenticator.updatedAt = max(now, authenticator.updatedAt.addingTimeInterval(0.001))
+        backing.saveOwned(authenticator)
+        changed()
+    }
+
+    /// Files it under an origin, or (nil) back under its sites or issuer.
+    func setOrigin(_ originID: String?, id: String, now: Date = .now) {
+        guard var authenticator = authenticator(withID: id), authenticator.originID != originID else { return }
+        authenticator.originID = originID
         authenticator.updatedAt = max(now, authenticator.updatedAt.addingTimeInterval(0.001))
         backing.saveOwned(authenticator)
         changed()

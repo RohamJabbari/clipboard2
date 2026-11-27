@@ -28,7 +28,8 @@ public abstract record ItemPayload
     public sealed record SnippetPayload(Snippet Snippet) : ItemPayload;
     public sealed record FolderPayload(ClipFolder Folder) : ItemPayload;
     /// <param name="Folder">The Saved folder it's in (1.7+), like a clip's; an id this device doesn't have reads as the root.</param>
-    public sealed record Secret(string Name, string Value, DateTime? CreatedAt, Guid? Folder = null) : ItemPayload;
+    /// <param name="Extras">The fields this client doesn't manage (<see cref="SyncPayload.ExtrasOf"/>), written back as they came.</param>
+    public sealed record Secret(string Name, string Value, DateTime? CreatedAt, Guid? Folder = null, string? Extras = null) : ItemPayload;
     /// <summary>An authenticator (only in its own authenticator space, only ever read by its owner).</summary>
     public sealed record Otp(Authenticator Authenticator) : ItemPayload;
 }
@@ -88,7 +89,7 @@ public static partial class SyncPayload
         json["contentHash"] = item.ContentHash;
         // Only saved clips are in a folder; left out otherwise, so fingerprints of other clips stay as they were.
         if (item.IsPinned && item.FolderId is { } folder) json["folder"] = ClipStore.SyncId(folder);
-        return json;
+        return WithExtras(json, item.Extras);
     }
 
     public static JsonObject ForFolder(ClipFolder folder)
@@ -98,7 +99,7 @@ public static partial class SyncPayload
         json["createdAt"] = Millis(folder.CreatedAt);
         json["updatedAt"] = Millis(folder.UpdatedAt);
         if (folder.ParentId is { } parent) json["parent"] = ClipStore.SyncId(parent);   // 1.8; left out at the top level
-        return json;
+        return WithExtras(json, folder.Extras);
     }
 
     /// <summary>"folder" only when true, so payloads (and fingerprints) of plain files stay as they were.</summary>
@@ -109,7 +110,7 @@ public static partial class SyncPayload
         return json;
     }
 
-    public static JsonObject ForOtp(Authenticator a) => new()
+    public static JsonObject ForOtp(Authenticator a) => WithExtras(new()
     {
         ["v"] = Version,
         ["type"] = "otp",
@@ -121,9 +122,9 @@ public static partial class SyncPayload
         ["period"] = a.Period,
         ["createdAt"] = Millis(a.CreatedAt),
         ["updatedAt"] = Millis(a.UpdatedAt),
-    };
+    }, a.Extras);
 
-    public static JsonObject ForSnippet(Snippet snippet) => new()
+    public static JsonObject ForSnippet(Snippet snippet) => WithExtras(new()
     {
         ["v"] = Version,
         ["type"] = "snippet",
@@ -132,14 +133,58 @@ public static partial class SyncPayload
         ["body"] = snippet.Body,
         ["createdAt"] = Millis(snippet.CreatedAt),
         ["updatedAt"] = Millis(snippet.UpdatedAt),
-    };
+    }, snippet.Extras);
 
     /// <summary>"folder" only when the secret is in one, so the fingerprints of other secrets stay as they were.</summary>
-    public static JsonObject ForSecret(string name, string value, DateTime? createdAt, Guid? folder = null)
+    public static JsonObject ForSecret(string name, string value, DateTime? createdAt, Guid? folder = null, string? extras = null)
     {
         var json = new JsonObject { ["v"] = Version, ["type"] = "secret", ["name"] = name, ["value"] = value };
         json["createdAt"] = Millis(createdAt ?? DateTime.UtcNow);
         if (folder is { } f) json["folder"] = ClipStore.SyncId(f);
+        return WithExtras(json, extras);
+    }
+
+    // MARK: Fields this client doesn't manage
+
+    /// <summary>Every top-level field this client writes, per payload type. Anything else in a received payload (a
+    /// password's username, urls and notes, an authenticator's urls, whatever later versions add) is kept as is and
+    /// written back on every push, so an edit here never wipes it (PROTOCOL.md → Unknown fields).</summary>
+    private static readonly Dictionary<string, HashSet<string>> Managed = new()
+    {
+        ["clip"] = ["v", "type", "kind", "text", "preview", "rtf", "html", "files", "fileBlobs", "imageBlob", "thumbBlob", "imageWidth",
+                    "imageHeight", "byteCount", "sourceId", "sourceName", "isPinned", "pinnedAt", "label", "copyCount", "createdAt",
+                    "lastCopiedAt", "contentHash", "folder"],
+        ["folder"] = ["v", "type", "name", "label", "parent", "createdAt", "updatedAt"],
+        ["snippet"] = ["v", "type", "name", "keyword", "body", "createdAt", "updatedAt"],
+        ["secret"] = ["v", "type", "name", "value", "createdAt", "folder"],
+        ["otp"] = ["v", "type", "issuer", "account", "secret", "algorithm", "digits", "period", "createdAt", "updatedAt"],
+    };
+
+    /// <summary>The fields of a received payload this client doesn't manage (nor <see cref="WriteFields"/>), as compact
+    /// JSON with sorted keys; null when there are none.</summary>
+    public static string? ExtrasOf(JsonObject json)
+    {
+        if (Str(json, "type") is not { } type || !Managed.TryGetValue(type, out var managed)) return null;
+        var extras = new JsonObject();
+        foreach (var (key, value) in json.OrderBy(p => p.Key, StringComparer.Ordinal))
+            if (!managed.Contains(key) && !WriteFields.Contains(key)) extras[key] = Canonical(value);
+        return extras.Count == 0 ? null : Json(extras);
+    }
+
+    /// <summary>Adds kept fields back to a payload this client built. Its own fields win (they never overlap anyway).</summary>
+    private static JsonObject WithExtras(JsonObject json, string? extras)
+    {
+        if (extras is null) return json;
+        try
+        {
+            if (JsonNode.Parse(extras) is not JsonObject kept) return json;
+            foreach (var (key, value) in kept.ToList())
+            {
+                kept.Remove(key);
+                if (!json.ContainsKey(key)) json[key] = value;
+            }
+        }
+        catch (JsonException) { }   // unreadable: nothing to add
         return json;
     }
 
@@ -175,7 +220,7 @@ public static partial class SyncPayload
 
     // MARK: Reading
 
-    /// <summary>Parses a decrypted payload. Unknown fields are ignored; unknown types return null.</summary>
+    /// <summary>Parses a decrypted payload. Fields it doesn't manage are kept as the item's extras; unknown types return null.</summary>
     public static ItemPayload? Parse(byte[] plaintext, Guid id, string? spaceId) =>
         JsonNode.Parse(plaintext) is JsonObject json ? Parse(json, id, spaceId) : null;
 
@@ -224,6 +269,7 @@ public static partial class SyncPayload
                     CopyCount = Math.Max(1, Int(json, "copyCount")),
                     CreatedAt = created,
                     LastCopiedAt = Time(json, "lastCopiedAt") ?? created,
+                    Extras = ExtrasOf(json),
                 };
                 // A clip in a folder is saved: clearing isPinned clears the folder.
                 if (item.IsPinned && Guid.TryParse(Str(json, "folder"), out var folder)) item.FolderId = folder;
@@ -242,6 +288,7 @@ public static partial class SyncPayload
                     Body = Str(json, "body") ?? "",
                     CreatedAt = Time(json, "createdAt") ?? DateTime.UtcNow,
                     UpdatedAt = Time(json, "updatedAt") ?? Time(json, "createdAt") ?? DateTime.UtcNow,
+                    Extras = ExtrasOf(json),
                 });
             case "folder":
                 return new ItemPayload.FolderPayload(new ClipFolder
@@ -253,10 +300,11 @@ public static partial class SyncPayload
                     CreatedAt = Time(json, "createdAt") ?? DateTime.UtcNow,
                     UpdatedAt = Time(json, "updatedAt") ?? Time(json, "createdAt") ?? DateTime.UtcNow,
                     ParentId = Guid.TryParse(Str(json, "parent"), out var parentFolder) && parentFolder != id ? parentFolder : null,
+                    Extras = ExtrasOf(json),
                 });
             case "secret":
                 return new ItemPayload.Secret(Str(json, "name") ?? "Untitled", Str(json, "value") ?? "", Time(json, "createdAt"),
-                    Guid.TryParse(Str(json, "folder"), out var secretFolder) ? secretFolder : null);
+                    Guid.TryParse(Str(json, "folder"), out var secretFolder) ? secretFolder : null, ExtrasOf(json));
             case "otp":
                 var otpSecret = Base32.Normalize(Str(json, "secret") ?? "");
                 if (Base32.Decode(otpSecret) is null) return null;
@@ -266,7 +314,7 @@ public static partial class SyncPayload
                 var period = Int(json, "period");
                 return new ItemPayload.Otp(new Authenticator(ClipStore.SyncId(id), Str(json, "issuer") ?? "", Str(json, "account") ?? "", otpSecret,
                     algorithm, digits is >= 6 and <= 8 ? digits : Authenticator.DefaultDigits, period > 0 ? period : Authenticator.DefaultPeriod,
-                    otpCreated, Time(json, "updatedAt") ?? otpCreated, spaceId));
+                    otpCreated, Time(json, "updatedAt") ?? otpCreated, spaceId, Extras: ExtrasOf(json)));
             default:
                 return null;
         }

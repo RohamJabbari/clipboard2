@@ -14,16 +14,26 @@ APP_NAME=Clipboard2
 
 [[ -z "$(git status --porcelain)" ]] || { echo "Commit or stash your changes first."; exit 1; }
 git rev-parse "v$VERSION" >/dev/null 2>&1 && { echo "v$VERSION already exists."; exit 1; }
+# Gmail sign-in needs the client secret, kept out of the public repo (see OAuthClients.plist).
+/usr/libexec/PlistBuddy -c "Print :GoogleClientSecret" Clipboard2/Resources/OAuthSecrets.plist 2>/dev/null | grep -q . \
+  || { echo "Clipboard2/Resources/OAuthSecrets.plist with GoogleClientSecret is missing; Gmail sign-in would break."; exit 1; }
 
 BUILD=$(( $(sed -n 's/.*CURRENT_PROJECT_VERSION: "\([0-9]*\)".*/\1/p' project.yml) + 1 ))
 sed -i '' -e "s/MARKETING_VERSION: \".*\"/MARKETING_VERSION: \"$VERSION\"/" \
           -e "s/CURRENT_PROJECT_VERSION: \".*\"/CURRENT_PROJECT_VERSION: \"$BUILD\"/" project.yml
 echo "▸ $APP_NAME $VERSION (build $BUILD)"
 
-scripts/make-pkg.sh
+# System AutoFill goes in when the two provisioning profiles are in ~/.clipboard2/profiles
+# (docs/features/autofill-setup.md). Once a release had it, every later one must: AutoFill builds
+# move secrets to the shared Keychain, which builds without it can't read.
+AUTOFILL_MARKER=scripts/autofill-required
+CLIPBOARD2_REQUIRE_AUTOFILL=$([[ -f "$AUTOFILL_MARKER" ]] && echo 1 || echo 0) scripts/make-pkg.sh
 
 APP="build/Build/Products/Release/$APP_NAME.app"
 xcrun stapler validate "$APP" >/dev/null || { echo "The app isn't notarized; refusing to publish an update."; exit 1; }
+if [[ -d "$APP/Contents/PlugIns/$APP_NAME AutoFill.appex" && ! -f "$AUTOFILL_MARKER" ]]; then
+    echo "This release ships system AutoFill: every later release needs the AutoFill provisioning profiles." > "$AUTOFILL_MARKER"
+fi
 ZIP="dist/$APP_NAME-$VERSION.zip"
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
 
@@ -37,6 +47,7 @@ URL="https://github.com/$REPO/releases/download/v$VERSION/$APP_NAME-$VERSION.zip
 python3 scripts/appcast.py appcast.xml "$VERSION" "$BUILD" "$URL" "$SIGNATURE"
 
 git add project.yml appcast.xml
+[[ -f "$AUTOFILL_MARKER" ]] && git add "$AUTOFILL_MARKER"
 git commit -q -m "chore(release): $VERSION"
 git tag "v$VERSION"
 git push -q origin HEAD "v$VERSION"

@@ -132,6 +132,10 @@ private struct ClipTextEditor: NSViewRepresentable {
             coordinator.save()
             coordinator.load(item)
         }
+        // The model let go of the selection (a click elsewhere).
+        if model.previewSelection == nil, let textView = coordinator.textView, textView.selectedRange().length > 0 {
+            textView.setSelectedRange(NSRange(location: NSMaxRange(textView.selectedRange()), length: 0))
+        }
         if coordinator.focusToken != model.editorFocusToken {
             coordinator.focusToken = model.editorFocusToken
             if let textView = coordinator.textView, let window = textView.window {
@@ -195,6 +199,13 @@ private struct ClipTextEditor: NSViewRepresentable {
                 return text
             }
             return nil
+        }
+
+        /// A selection in the editor is what Return and ⌘C act on (see `previewSelection`).
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard let view = notification.object as? NSTextView else { return }
+            let selected = SelectableText.Coordinator.selectedText(in: view)
+            if model.previewSelection != selected { model.previewSelection = selected }
         }
 
         func textDidChange(_ notification: Notification) {
@@ -334,6 +345,7 @@ final class ClipEditorTextView: NSTextView {
     override func resignFirstResponder() -> Bool {
         let accepted = super.resignFirstResponder()
         if accepted, let coordinator = editorCoordinator {
+            if selectedRange().length > 0 { setSelectedRange(NSRange(location: NSMaxRange(selectedRange()), length: 0)) }
             coordinator.save()
             coordinator.model.isEditingText = false
         }

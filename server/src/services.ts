@@ -1,4 +1,9 @@
 // External services behind small interfaces so tests can swap them for fakes.
+
+/** Sends one plain-text email. None is wired up yet: email codes and email recovery stay off without it. */
+export interface Mailer {
+  send(message: { to: string; subject: string; text: string }): Promise<void>;
+}
 import { Storage } from "@google-cloud/storage";
 
 export interface BlobStorage {

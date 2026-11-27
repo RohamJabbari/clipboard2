@@ -89,7 +89,7 @@ final class QuickSlots {
         case .secret(let ref): ref.name
         case .folder(let folder): folder.name
         case .authenticator(let item): item.title
-        case .authenticatorSuggestion, nil: nil
+        case .authenticatorSuggestion, .emailCode, nil: nil
         }
     }
 
